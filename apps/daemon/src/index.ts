@@ -1,6 +1,9 @@
 import { serve } from "@hono/node-server";
 import { createDatabase } from "@openeuler/db";
+import { createFakeDriver, createDriverRegistry } from "@openeuler/drivers";
+import { WorktreeManager } from "@openeuler/engine";
 import { createApp } from "./app.js";
+import { createExecutor } from "./executor.js";
 import { createLogger } from "./logger.js";
 
 const DEFAULT_PORT = 8787;
@@ -13,9 +16,20 @@ function resolvePort(): number {
 export async function main(): Promise<void> {
   const logger = createLogger();
   const db = createDatabase();
-  const { app, onShutdown, handleShutdown } = createApp({ db, logger });
 
+  // Driver composition at boot. `fake` is the only backend for now; the real
+  // opencode driver arrives later. OPENEULER_DRIVER selects the run driver.
+  const drivers = createDriverRegistry();
+  drivers.registerDriver(createFakeDriver());
+
+  const worktrees = new WorktreeManager();
+  const executor = createExecutor({ db, worktrees, drivers, logger });
+
+  const { app, onShutdown, handleShutdown } = createApp({ db, logger, executor });
+
+  // LIFO: http-server → executor → db.
   onShutdown(() => db.close(), "db");
+  onShutdown(() => executor.shutdown(), "executor");
 
   const port = resolvePort();
   const server = serve({ fetch: app.fetch, port }, (info) => {

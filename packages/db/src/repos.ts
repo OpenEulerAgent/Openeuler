@@ -1,4 +1,4 @@
-import { eq, sql } from "drizzle-orm";
+import { and, eq, sql } from "drizzle-orm";
 import type { BetterSQLite3Database } from "drizzle-orm/better-sqlite3";
 import {
   AgentEventSchema,
@@ -20,6 +20,14 @@ type Db = BetterSQLite3Database<typeof schema>;
  */
 type DistributiveOmit<T, K extends keyof never> = T extends unknown ? Omit<T, K> : never;
 export type AgentEventInput = DistributiveOmit<AgentEvent, "seq">;
+
+/** Fields of a run that may change after creation; `null` clears a field. */
+export type RunPatch = {
+  status?: RunStatus;
+  output?: string | null;
+  error?: string | null;
+  iteration?: number;
+};
 
 /** Fields of a step run that may change after creation; `null` clears a field. */
 export type StepRunPatch = {
@@ -48,13 +56,17 @@ export interface RunRepo {
   create(run: Run): Run;
   get(id: string): Run | undefined;
   /** Runs for a project (all projects when omitted), newest first. */
-  list(projectId?: string): Run[];
+  list(projectId?: string, status?: RunStatus): Run[];
   updateStatus(id: string, status: RunStatus): Run | undefined;
+  /** Patches mutable fields (`status`, `output`, `error`, `iteration`). */
+  update(id: string, patch: RunPatch): Run | undefined;
 }
 
 export interface StepRunRepo {
   create(stepRun: StepRun): StepRun;
   update(id: string, patch: StepRunPatch): StepRun | undefined;
+  /** Step runs belonging to a run, ordered by iteration then id. */
+  listByRun(runId: string): StepRun[];
 }
 
 export interface EventRepo {
@@ -62,6 +74,8 @@ export interface EventRepo {
   append(runId: string, event: AgentEventInput): AgentEvent;
   /** Events for the run with `seq > afterSeq`, in seq order. */
   getSince(runId: string, afterSeq?: number): AgentEvent[];
+  /** Number of events persisted for the run. */
+  count(runId: string): number;
 }
 
 export function createProjectRepo(db: Db): ProjectRepo {
@@ -187,20 +201,32 @@ export function createRunRepo(db: Db): RunRepo {
       const row = db.select().from(schema.runs).where(eq(schema.runs.id, id)).get();
       return row ? toDomain(row) : undefined;
     },
-    list(projectId) {
+    list(projectId, status) {
+      const filters = [
+        ...(projectId ? [eq(schema.runs.projectId, projectId)] : []),
+        ...(status ? [eq(schema.runs.status, status)] : []),
+      ];
       const rows = db
         .select()
         .from(schema.runs)
-        .where(projectId ? eq(schema.runs.projectId, projectId) : undefined)
+        .where(filters.length > 0 ? and(...filters) : undefined)
         .orderBy(sql`${schema.runs.createdAt} desc`, schema.runs.id)
         .all();
       return rows.map(toDomain);
     },
     updateStatus(id, status) {
-      const value = RunStatusSchema.parse(status);
+      return this.update(id, { status });
+    },
+    update(id, patch) {
       const row = db
         .update(schema.runs)
-        .set({ status: value, updatedAt: new Date().toISOString() })
+        .set({
+          ...(patch.status === undefined ? {} : { status: RunStatusSchema.parse(patch.status) }),
+          ...(patch.iteration === undefined ? {} : { iteration: patch.iteration }),
+          ...(patch.output === undefined ? {} : { output: patch.output }),
+          ...(patch.error === undefined ? {} : { error: patch.error }),
+          updatedAt: new Date().toISOString(),
+        })
         .where(eq(schema.runs.id, id))
         .returning()
         .get();
@@ -253,6 +279,15 @@ export function createStepRunRepo(db: Db): StepRunRepo {
         .get();
       return row ? toDomain(row) : undefined;
     },
+    listByRun(runId) {
+      const rows = db
+        .select()
+        .from(schema.stepRuns)
+        .where(eq(schema.stepRuns.runId, runId))
+        .orderBy(schema.stepRuns.iteration, schema.stepRuns.id)
+        .all();
+      return rows.map(toDomain);
+    },
   };
 }
 
@@ -291,6 +326,14 @@ export function createEventRepo(db: Db): EventRepo {
       return rows.map((row) =>
         AgentEventSchema.parse({ ...JSON.parse(row.payload), seq: row.seq }),
       );
+    },
+    count(runId) {
+      const row = db
+        .select({ total: sql<number>`count(*)` })
+        .from(schema.events)
+        .where(eq(schema.events.runId, runId))
+        .get();
+      return row?.total ?? 0;
     },
   };
 }

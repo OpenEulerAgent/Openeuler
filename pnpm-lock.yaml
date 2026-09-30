@@ -196,6 +196,12 @@ importers:
       '@openeuler/db':
         specifier: workspace:*
         version: link:../../packages/db
+      '@openeuler/drivers':
+        specifier: workspace:*
+        version: link:../../packages/drivers
+      '@openeuler/engine':
+        specifier: workspace:*
+        version: link:../../packages/engine
       hono:
         specifier: ^4.7.0
         version: 4.13.11

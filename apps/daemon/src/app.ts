@@ -3,6 +3,7 @@ import { Hono } from "hono";
 import type { ContentfulStatusCode } from "hono/utils/http-status";
 import { cors } from "hono/cors";
 import { ZodError } from "zod";
+import type { Executor } from "./executor.js";
 import { HttpError } from "./errors.js";
 import { healthPayload } from "./health.js";
 import { createLogger } from "./logger.js";
@@ -11,6 +12,7 @@ import { createShutdownRegistry } from "./shutdown.js";
 import type { ShutdownHook, ShutdownRegistryOptions } from "./shutdown.js";
 import { createProjectsRouter } from "./routes/projects.js";
 import { createFilesRouter } from "./routes/files.js";
+import { createRunsRouter } from "./routes/runs.js";
 
 export const DEFAULT_CORS_ORIGIN = "http://localhost:3000";
 
@@ -18,12 +20,14 @@ export interface AppEnv {
   Variables: {
     logger: Logger;
     db: Db | undefined;
+    executor: Executor | undefined;
   };
 }
 
 export interface CreateAppOptions {
   db?: Db;
   logger?: Logger;
+  executor?: Executor;
   corsOrigin?: string;
   shutdown?: ShutdownRegistryOptions;
 }
@@ -42,6 +46,7 @@ export interface ErrorBody {
 export function createApp(options: CreateAppOptions = {}): DaemonApp {
   const logger = options.logger ?? createLogger();
   const db = options.db;
+  const executor = options.executor;
   const corsOrigin = options.corsOrigin ?? process.env["CORS_ORIGIN"] ?? DEFAULT_CORS_ORIGIN;
 
   const app = new Hono<AppEnv>();
@@ -72,6 +77,7 @@ export function createApp(options: CreateAppOptions = {}): DaemonApp {
   app.use("*", (c, next) => {
     c.set("logger", logger);
     c.set("db", db);
+    c.set("executor", executor);
     return next();
   });
 
@@ -79,6 +85,7 @@ export function createApp(options: CreateAppOptions = {}): DaemonApp {
 
   app.route("/api/projects", createProjectsRouter());
   app.route("/api/projects", createFilesRouter());
+  app.route("/api/runs", createRunsRouter());
 
   app.onError((err, c) => {
     if (err instanceof HttpError) {
