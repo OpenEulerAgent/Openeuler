@@ -20,10 +20,11 @@ export type RunStreamEvent = AgentEvent | RunStatusEvent;
 /**
  * Connection lifecycle as seen by the client. `reconnecting` means the browser
  * is retrying on its own (it resends `Last-Event-ID` so the daemon resumes
- * from our cursor); `closed` is permanent (terminal event, fatal error, or
- * explicit cleanup).
+ * from our cursor); `error` means the source failed fatally (daemon down,
+ * HTTP error, stream cap) and waits for an explicit `reconnect()`;
+ * `closed` is permanent (terminal event or explicit cleanup).
  */
-export type RunStreamState = "connecting" | "open" | "reconnecting" | "closed";
+export type RunStreamState = "connecting" | "open" | "reconnecting" | "error" | "closed";
 
 /** Absolute SSE URL for a run's event stream, with an optional explicit cursor. */
 export function runEventsUrl(
@@ -96,6 +97,12 @@ export interface RunEventsOptions {
 export interface RunEventsHandle {
   /** Stop the stream permanently and drop all listeners. Idempotent. */
   close(): void;
+  /**
+   * Ditch the current source and dial again, resuming from the last
+   * delivered seq. No-op once the stream closed for good (terminal event
+   * or explicit `close()`).
+   */
+  reconnect(): void;
   /** Highest event seq delivered so far (the Last-Event-ID reconnect cursor). */
   readonly lastSeq: number;
   readonly state: RunStreamState;
@@ -107,8 +114,9 @@ export interface RunEventsHandle {
  * one listener per type rather than `onmessage`. Reconnects are left to the
  * browser: `EventSource` retries automatically and resends `Last-Event-ID`
  * (the last `id:` frame it saw), which the daemon honors as the replay
- * cursor. The stream ends for good when a terminal `run.status` arrives, the
- * source fails fatally (readyState CLOSED), or the caller invokes `close()`.
+ * cursor. The stream ends for good when a terminal `run.status` arrives or
+ * the caller invokes `close()`; a fatal source failure moves to the `error`
+ * state until `reconnect()` dials again.
  */
 export function connectRunEvents(options: RunEventsOptions): RunEventsHandle {
   const { runId, afterSeq, onEvent, onStateChange } = options;
@@ -118,8 +126,7 @@ export function connectRunEvents(options: RunEventsOptions): RunEventsHandle {
   let state: RunStreamState = "connecting";
   let lastSeq = afterSeq ?? -1;
   let closed = false;
-
-  const source = new sourceFactory(runEventsUrl(runId, baseUrl, afterSeq));
+  let source: RunEventSource | null = new sourceFactory(runEventsUrl(runId, baseUrl, afterSeq));
 
   const setState = (next: RunStreamState): void => {
     if (closed || state === next) return;
@@ -132,41 +139,59 @@ export function connectRunEvents(options: RunEventsOptions): RunEventsHandle {
     closed = true;
     state = "closed";
     onStateChange?.("closed");
-    source.close();
+    source?.close();
+    source = null;
   };
 
-  source.addEventListener("open", () => {
-    setState("open");
-  });
-
-  source.addEventListener("error", () => {
-    if (closed) return;
-    // readyState CONNECTING (0): the browser is already retrying with
-    // Last-Event-ID — surface it and wait. readyState CLOSED (2): fatal
-    // (HTTP error, unknown run, stream cap) — the source gave up for good.
-    if (source.readyState === 2) close();
-    else setState("reconnecting");
-  });
-
-  for (const type of RUN_EVENT_TYPES) {
-    source.addEventListener(type, (event) => {
-      if (closed || typeof event.data !== "string") return;
-      const parsed = parseRunStreamEvent(event.data);
-      // Skip malformed frames and replays the cursor already covers (e.g. an
-      // overlapping resend after a reconnect).
-      if (!parsed || parsed.seq <= lastSeq) return;
-      lastSeq = parsed.seq;
-      onEvent(parsed);
-      if (parsed.type === "run.status") {
-        // Terminal: the daemon closes the stream; mirror that locally so the
-        // browser does not reconnect against a finished run.
-        close();
-      }
+  const wire = (target: RunEventSource): void => {
+    target.addEventListener("open", () => {
+      setState("open");
     });
-  }
+
+    target.addEventListener("error", () => {
+      if (closed) return;
+      // readyState CONNECTING (0): the browser is already retrying with
+      // Last-Event-ID — surface it and wait. readyState CLOSED (2): fatal
+      // (daemon down, HTTP error, stream cap) — the source gave up for
+      // good, so surface the failure and wait for an explicit reconnect().
+      if (target.readyState !== 2) {
+        setState("reconnecting");
+        return;
+      }
+      target.close();
+      if (target === source) source = null;
+      setState("error");
+    });
+
+    for (const type of RUN_EVENT_TYPES) {
+      target.addEventListener(type, (event) => {
+        if (closed || typeof event.data !== "string") return;
+        const parsed = parseRunStreamEvent(event.data);
+        // Skip malformed frames and replays the cursor already covers (e.g. an
+        // overlapping resend after a reconnect).
+        if (!parsed || parsed.seq <= lastSeq) return;
+        lastSeq = parsed.seq;
+        onEvent(parsed);
+        if (parsed.type === "run.status") {
+          // Terminal: the daemon closes the stream; mirror that locally so the
+          // browser does not reconnect against a finished run.
+          close();
+        }
+      });
+    }
+  };
+
+  wire(source);
 
   return {
     close,
+    reconnect: (): void => {
+      if (closed) return;
+      source?.close();
+      source = new sourceFactory(runEventsUrl(runId, baseUrl, lastSeq >= 0 ? lastSeq : undefined));
+      wire(source);
+      setState("connecting");
+    },
     get lastSeq() {
       return lastSeq;
     },

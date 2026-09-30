@@ -1,6 +1,7 @@
 import type {
   AgentMessageDeltaEvent,
   AgentEvent,
+  Run,
   RunStatus,
   RunStatusEvent,
   TerminalRunStatus,
@@ -34,6 +35,19 @@ export const FEED_WINDOW_STEP = 200;
 /** `true` while a run can still produce events (elapsed time keeps ticking). */
 export function isLiveRun(status: RunStatus): boolean {
   return status === "queued" || status === "running";
+}
+
+/**
+ * End timestamp to anchor the elapsed label when the stream reports a
+ * terminal status: the run row's `updatedAt` once that row is itself
+ * terminal (authoritative, so replayed runs keep their true duration),
+ * otherwise the moment the live→terminal transition was observed (the row
+ * is stale until it is refetched).
+ */
+export function terminalEndMs(run: Run | null, observedAtMs: number): number {
+  if (run === null || isLiveRun(run.status)) return observedAtMs;
+  const rowEndMs = Date.parse(run.updatedAt);
+  return Number.isNaN(rowEndMs) ? observedAtMs : rowEndMs;
 }
 
 /**

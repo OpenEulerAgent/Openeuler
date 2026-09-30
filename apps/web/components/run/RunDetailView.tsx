@@ -1,12 +1,12 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import type { Project, Run, StepRun, TerminalRunStatus } from "@openeuler/core";
 import { Button } from "@/components/Button";
 import { Card } from "@/components/Card";
 import { apiFetch, ApiError } from "@/lib/api";
 import { connectRunEvents, type RunStreamEvent, type RunStreamState } from "@/lib/run-events";
-import { appendFeedEvent, isLiveRun, type FeedEntry } from "@/lib/run-feed";
+import { appendFeedEvent, isLiveRun, terminalEndMs, type FeedEntry } from "@/lib/run-feed";
 import { DiffPanel } from "./DiffPanel";
 import { EventFeed } from "./EventFeed";
 import { OutputPanel } from "./OutputPanel";
@@ -61,6 +61,7 @@ export function RunDetailView({ runId }: { runId: string }) {
   const [terminalStatus, setTerminalStatus] = useState<TerminalRunStatus | null>(null);
   const [endedMs, setEndedMs] = useState<number | null>(null);
   const [nowMs, setNowMs] = useState(() => Date.now());
+  const runRef = useRef<Run | null>(null);
 
   const refresh = useCallback(async (): Promise<void> => {
     setLoad(await fetchRunDetail(runId));
@@ -80,6 +81,7 @@ export function RunDetailView({ runId }: { runId: string }) {
   // Live stream: connects for every run — for terminal runs the daemon
   // replays persisted events, sends the final run.status and closes.
   const streamRunId = load.phase === "ready" ? load.detail.run.id : null;
+  const streamHandleRef = useRef<ReturnType<typeof connectRunEvents> | null>(null);
   useEffect(() => {
     if (!streamRunId) return;
     const handle = connectRunEvents({
@@ -88,15 +90,23 @@ export function RunDetailView({ runId }: { runId: string }) {
         setEntries((prev) => appendFeedEvent(prev, event));
         if (event.type === "run.status") {
           setTerminalStatus(event.status);
-          setEndedMs(Date.now());
+          // A run row that is already terminal carries the authoritative end
+          // time; Date.now() only approximates a live→terminal transition
+          // observed before the row was refetched.
+          setEndedMs(terminalEndMs(runRef.current, Date.now()));
         }
       },
       onStateChange: setStreamState,
     });
-    return () => handle.close();
+    streamHandleRef.current = handle;
+    return () => {
+      streamHandleRef.current = null;
+      handle.close();
+    };
   }, [streamRunId]);
 
   const run = load.phase === "ready" ? load.detail.run : null;
+  runRef.current = run;
   const effectiveStatus = terminalStatus ?? run?.status;
   const live = effectiveStatus === undefined ? false : isLiveRun(effectiveStatus);
 
@@ -157,7 +167,7 @@ export function RunDetailView({ runId }: { runId: string }) {
   const diff = steps
     .map((step) => step.diff ?? "")
     .filter((part) => part.length > 0)
-    .join("\n");
+    .join("\n\n");
   const showPanels = effectiveStatus !== undefined && !live;
   const shownRun: Run =
     terminalStatus !== null ? { ...detail.run, status: terminalStatus } : detail.run;
@@ -172,7 +182,11 @@ export function RunDetailView({ runId }: { runId: string }) {
         onAborted={() => void refresh()}
       />
 
-      <EventFeed entries={entries} streamState={streamState} />
+      <EventFeed
+        entries={entries}
+        streamState={streamState}
+        onReconnect={() => streamHandleRef.current?.reconnect()}
+      />
 
       {showPanels && output.length > 0 ? <OutputPanel output={output} /> : null}
       {showPanels && diff.length > 0 ? <DiffPanel diff={diff} /> : null}

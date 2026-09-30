@@ -186,14 +186,69 @@ describe("connectRunEvents", () => {
     expect(events).toHaveLength(2);
   });
 
-  it("closes for good on a fatal error (readyState CLOSED)", () => {
+  it("moves to error (not closed) on a fatal error and keeps the handle", () => {
     const events: RunStreamEvent[] = [];
     const states: RunStreamState[] = [];
-    const { source } = connect({ events, states });
+    const { handle, source } = connect({ events, states });
 
     source.simulateError(false);
     expect(source.closed).toBe(true);
-    expect(states).toEqual(["closed"]);
+    expect(states).toEqual(["error"]);
+    expect(handle.state).toBe("error");
+    expect(handle.lastSeq).toBe(-1);
+  });
+
+  it("reconnect() dials a fresh source resuming from the last delivered seq", () => {
+    const events: RunStreamEvent[] = [];
+    const states: RunStreamState[] = [];
+    const { handle, source } = connect({ events, states });
+
+    source.simulateOpen();
+    source.simulateEvent({ type: "message-delta", seq: 2, delta: "a" });
+    source.simulateError(false);
+    expect(handle.state).toBe("error");
+
+    handle.reconnect();
+    const next = MockEventSource.instances[1];
+    if (!next) throw new Error("reconnect did not construct a new EventSource");
+    expect(next.url).toBe("http://daemon.test:8787/api/runs/run-1/events?afterSeq=2");
+    expect(next.closed).toBe(false);
+    expect(handle.state).toBe("connecting");
+    expect(states).toEqual(["open", "error", "connecting"]);
+
+    next.simulateOpen();
+    next.simulateEvent({ type: "message-delta", seq: 3, delta: "b" });
+    next.simulateEvent({ type: "message-delta", seq: 2, delta: "replayed" });
+    expect(handle.state).toBe("open");
+    expect(handle.lastSeq).toBe(3);
+    expect(events).toEqual([
+      { type: "message-delta", seq: 2, delta: "a" },
+      { type: "message-delta", seq: 3, delta: "b" },
+    ]);
+  });
+
+  it("reconnect() omits the cursor when nothing was delivered yet", () => {
+    const { handle, source } = connect({ events: [] });
+
+    source.simulateError(false);
+    handle.reconnect();
+    const next = MockEventSource.instances[1];
+    if (!next) throw new Error("reconnect did not construct a new EventSource");
+    expect(next.url).toBe("http://daemon.test:8787/api/runs/run-1/events");
+  });
+
+  it("reconnect() is a no-op once the stream closed for good", () => {
+    const events: RunStreamEvent[] = [];
+    const states: RunStreamState[] = [];
+    const { handle, source } = connect({ events, states });
+
+    source.simulateOpen();
+    source.simulateEvent({ type: "run.status", seq: 1, status: "success" });
+    expect(handle.state).toBe("closed");
+
+    handle.reconnect();
+    expect(MockEventSource.instances).toHaveLength(1);
+    expect(states).toEqual(["open", "closed"]);
   });
 
   it("ignores malformed frames without throwing", () => {

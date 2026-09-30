@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import type { AgentEvent, RunStatusEvent } from "@openeuler/core";
+import type { AgentEvent, Run, RunStatusEvent } from "@openeuler/core";
 import {
   appendFeedEvent,
   buildFeed,
@@ -9,6 +9,7 @@ import {
   filterFeed,
   formatElapsed,
   isLiveRun,
+  terminalEndMs,
   windowFeed,
   type FeedEntry,
 } from "./run-feed";
@@ -221,5 +222,42 @@ describe("isLiveRun", () => {
     expect(isLiveRun("failed")).toBe(false);
     expect(isLiveRun("aborted")).toBe(false);
     expect(isLiveRun("interrupted")).toBe(false);
+  });
+});
+
+describe("terminalEndMs", () => {
+  const completedRun: Run = {
+    id: "run-1",
+    projectId: "proj-1",
+    status: "success",
+    branch: "openeuler/run-1",
+    iteration: 0,
+    createdAt: "2026-09-30T10:00:00.000Z",
+    updatedAt: "2026-09-30T10:07:30.000Z",
+  };
+
+  it("prefers the run row's updatedAt for an already-terminal row", () => {
+    expect(terminalEndMs(completedRun, Date.parse("2026-10-01T09:00:00.000Z"))).toBe(
+      Date.parse("2026-09-30T10:07:30.000Z"),
+    );
+  });
+
+  it("falls back to the observed time while the row is still live", () => {
+    const liveRun: Run = { ...completedRun, status: "running" };
+    expect(terminalEndMs(liveRun, 1234)).toBe(1234);
+  });
+
+  it("falls back to the observed time without a run row", () => {
+    expect(terminalEndMs(null, 1234)).toBe(1234);
+  });
+
+  it("falls back to the observed time when updatedAt is unparseable", () => {
+    expect(terminalEndMs({ ...completedRun, updatedAt: "yesterday" }, 1234)).toBe(1234);
+  });
+
+  it("anchors a completed run's duration at createdAt→updatedAt, not now", () => {
+    const startedMs = Date.parse(completedRun.createdAt);
+    const endMs = terminalEndMs(completedRun, Date.now());
+    expect(formatElapsed(startedMs, endMs)).toBe("7m 30s");
   });
 });

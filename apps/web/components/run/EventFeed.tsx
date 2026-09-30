@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { Button } from "@/components/Button";
 import { cn } from "@/lib/cn";
 import {
@@ -22,25 +22,29 @@ const STREAM_STATE_STYLES: Record<RunStreamState, { label: string; className: st
   connecting: { label: "Connecting…", className: "bg-amber-50 text-amber-700" },
   open: { label: "Live", className: "bg-emerald-50 text-emerald-700" },
   reconnecting: { label: "Reconnecting…", className: "bg-amber-50 text-amber-700" },
+  error: { label: "Stream error", className: "bg-red-50 text-red-700" },
   closed: { label: "Stream closed", className: "bg-slate-100 text-slate-500" },
 };
 
 /**
- * Scrollable run event feed: filters, last-N windowing with a load-earlier
- * affordance, and auto-scroll that pauses when the user scrolls up (resumed
- * via the "jump to latest" button).
+ * Scrollable run event feed: filters, last-N windowing with a scroll-
+ * compensated load-earlier affordance, and auto-scroll that pauses when the
+ * user scrolls up (resumed via the "jump to latest" button).
  */
 export function EventFeed({
   entries,
   streamState,
+  onReconnect,
 }: {
   entries: FeedEntry[];
   streamState: RunStreamState;
+  onReconnect: () => void;
 }) {
   const [filter, setFilter] = useState<FeedFilter>("all");
   const [extra, setExtra] = useState(0);
   const [atBottom, setAtBottom] = useState(true);
   const scrollRef = useRef<HTMLDivElement | null>(null);
+  const prependHeightRef = useRef<number | null>(null);
 
   const filtered = useMemo(() => filterFeed(entries, filter), [entries, filter]);
   const { visible, hiddenCount } = useMemo(
@@ -63,6 +67,16 @@ export function EventFeed({
     el.scrollTop = el.scrollHeight;
   }, [visible, atBottom]);
 
+  // Prepending rows grows the content above the viewport; keep the anchor
+  // stable where the browser lacks scroll anchoring (Safari).
+  useLayoutEffect(() => {
+    const el = scrollRef.current;
+    const beforeHeight = prependHeightRef.current;
+    if (!el || beforeHeight === null) return;
+    prependHeightRef.current = null;
+    el.scrollTop += el.scrollHeight - beforeHeight;
+  }, [visible]);
+
   const handleScroll = (): void => {
     const el = scrollRef.current;
     if (!el) return;
@@ -73,6 +87,12 @@ export function EventFeed({
     const el = scrollRef.current;
     if (el) el.scrollTop = el.scrollHeight;
     setAtBottom(true);
+  };
+
+  const loadEarlier = (): void => {
+    const el = scrollRef.current;
+    prependHeightRef.current = el ? el.scrollHeight : null;
+    setExtra((current) => current + FEED_WINDOW_STEP);
   };
 
   const streamStyle = STREAM_STATE_STYLES[streamState];
@@ -98,13 +118,12 @@ export function EventFeed({
             {streamStyle.label}
           </span>
         </div>
-        <div role="tablist" aria-label="Event filter" className="flex items-center gap-1">
+        <div role="group" aria-label="Event filter" className="flex items-center gap-1">
           {FEED_FILTERS.map(({ id, label }) => (
             <button
               key={id}
               type="button"
-              role="tab"
-              aria-selected={filter === id}
+              aria-pressed={filter === id}
               onClick={() => setFilter(id)}
               className={cn(
                 "rounded-md px-2.5 py-1 text-xs font-medium transition-colors",
@@ -122,6 +141,19 @@ export function EventFeed({
         </div>
       </header>
 
+      {streamState === "error" ? (
+        <div className="flex items-center justify-between gap-3 border-b border-red-200 bg-red-50 px-5 py-2.5">
+          <p className="text-sm text-red-700">Stream connection lost — events may be incomplete.</p>
+          <Button
+            variant="secondary"
+            onClick={onReconnect}
+            className="border-red-200 text-red-700 hover:bg-red-100"
+          >
+            Reconnect
+          </Button>
+        </div>
+      ) : null}
+
       <div className="relative">
         <div
           ref={scrollRef}
@@ -131,7 +163,7 @@ export function EventFeed({
           {hiddenCount > 0 ? (
             <button
               type="button"
-              onClick={() => setExtra((current) => current + FEED_WINDOW_STEP)}
+              onClick={loadEarlier}
               className="mx-auto rounded-md border border-slate-200 bg-slate-50 px-3 py-1.5 text-xs font-medium text-slate-600 hover:bg-slate-100"
             >
               Showing last {visible.length} of {filtered.length} — load earlier
