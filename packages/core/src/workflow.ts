@@ -63,7 +63,7 @@ export const ExitConditionSchema = z.discriminatedUnion("type", [
 
 export type ExitCondition = z.infer<typeof ExitConditionSchema>;
 
-/** Jump back to an earlier step while `when` holds, bounded by maxIterations. */
+/** Jump back to an earlier step until `when` is met (exit condition), bounded by maxIterations. */
 export const LoopBackSchema = z.strictObject({
   toStepIndex: z.number().int().min(0, "toStepIndex must be an integer >= 0"),
   when: ExitConditionSchema,
