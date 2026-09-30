@@ -33,8 +33,14 @@ export type {
   Workflow,
 } from "./workflow.js";
 
-export { RunSchema, RunStatusSchema, StepRunSchema } from "./run.js";
-export type { Run, RunStatus, StepRun } from "./run.js";
+export {
+  RunSchema,
+  RunStatusSchema,
+  StepRunSchema,
+  TERMINAL_RUN_STATUSES,
+  TerminalRunStatusSchema,
+} from "./run.js";
+export type { Run, RunStatus, StepRun, TerminalRunStatus } from "./run.js";
 
 export {
   AgentDoneEventSchema,
@@ -45,6 +51,7 @@ export {
   AgentStartedEventSchema,
   AgentToolCallEventSchema,
   AgentToolOutputEventSchema,
+  RunStatusEventSchema,
 } from "./agent-event.js";
 export type {
   AgentDoneEvent,
@@ -55,6 +62,7 @@ export type {
   AgentStartedEvent,
   AgentToolCallEvent,
   AgentToolOutputEvent,
+  RunStatusEvent,
 } from "./agent-event.js";
 
 export { PROMPT_TEMPLATE_VARIABLES, renderPromptTemplate } from "./prompt.js";

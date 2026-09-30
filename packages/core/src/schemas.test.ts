@@ -10,6 +10,7 @@ import {
   OutputMatchesConditionSchema,
   ProjectSchema,
   RunSchema,
+  RunStatusEventSchema,
   StepRunSchema,
   StepSchema,
   WorkflowSchema,
@@ -244,6 +245,33 @@ describe("invalid fixtures are rejected with clear messages", () => {
       "seq must be an integer >= 0",
     );
     expectRejected(AgentEventSchema, { type: "message-delta", seq: 1, delta: 42 }, "string");
+  });
+
+  it("keeps run.status out of the persisted agent event union", () => {
+    // The synthetic SSE-only terminal event must NOT validate as a persisted
+    // AgentEvent (the events table stays driver-only; engine events land with #15).
+    expectRejected(AgentEventSchema, { type: "run.status", seq: 1, status: "success" });
+  });
+
+  it("parses synthetic run.status events for every terminal status", () => {
+    for (const status of ["success", "failed", "aborted", "interrupted"] as const) {
+      expect(RunStatusEventSchema.parse({ type: "run.status", seq: 8, status })).toEqual({
+        type: "run.status",
+        seq: 8,
+        status,
+      });
+    }
+  });
+
+  it("rejects malformed synthetic run.status events", () => {
+    expectRejected(RunStatusEventSchema, { type: "run.status", seq: 8, status: "queued" });
+    expectRejected(RunStatusEventSchema, { type: "run.status", seq: 8, status: "running" });
+    expectRejected(RunStatusEventSchema, { type: "run.status", seq: -1, status: "success" });
+    expectRejected(
+      RunStatusEventSchema,
+      { type: "run.status", seq: 8, status: "success", extra: true },
+      "Unrecognized key",
+    );
   });
 
   it("rejects malformed file nodes and file content payloads", () => {

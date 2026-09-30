@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { TerminalRunStatusSchema } from "./run.js";
 
 /**
  * Monotonic sequence number letting consumers order/reorder events that
@@ -75,3 +76,19 @@ export const AgentEventSchema = z.discriminatedUnion("type", [
 ]);
 
 export type AgentEvent = z.infer<typeof AgentEventSchema>;
+
+/**
+ * Synthetic terminal-status event appended to an SSE stream when a run reaches
+ * a terminal status. It is NOT a member of `AgentEventSchema` and is never
+ * persisted to the events table: persisted events stay driver-only for now
+ * (engine-emitted events land with #15). The streaming layer computes it from
+ * the run row, reusing the per-run seq space (`lastSeq + 1`) so web clients
+ * can parse it with this schema and keep a monotonic cursor.
+ */
+export const RunStatusEventSchema = z.strictObject({
+  type: z.literal("run.status"),
+  seq: seqSchema,
+  status: TerminalRunStatusSchema,
+});
+
+export type RunStatusEvent = z.infer<typeof RunStatusEventSchema>;
