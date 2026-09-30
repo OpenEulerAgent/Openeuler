@@ -263,7 +263,11 @@ describe("createExecutor", () => {
     const { runId } = h.enqueue();
     h.executor.startRun(runId);
 
+    // Wait until the driver is actually mid-stream before aborting: the
+    // run row flips `running` before the worktree/step start, and an abort
+    // landing in that earlier window now removes the not-yet-used worktree.
     await waitForStatus(h, runId, "running");
+    await waitUntil(() => h.driver.calls.length > 0, "driver started");
     await expect(h.executor.abortRun(runId)).resolves.toEqual({ outcome: "aborted" });
 
     await waitForStatus(h, runId, "aborted");
@@ -304,23 +308,43 @@ describe("createExecutor", () => {
     });
   });
 
-  it("shutdown aborts active runs and waits for them to settle", async () => {
+  it("shutdown (SIGTERM) aborts active runs — never interrupted — settles step runs and events", async () => {
     const h = setup({
       events: [
-        { type: "message-delta", seq: 1, delta: "a" },
-        { type: "message-delta", seq: 2, delta: "b" },
-        { type: "message-delta", seq: 3, delta: "c" },
+        { type: "session", seq: 1, sessionId: "s_1" },
+        { type: "message-delta", seq: 2, delta: "a" },
+        { type: "message-delta", seq: 3, delta: "b" },
+        { type: "message-delta", seq: 4, delta: "c" },
       ],
-      delayMs: 60,
+      delayMs: 40,
     });
     const { runId } = h.enqueue();
     h.executor.startRun(runId);
     await waitForStatus(h, runId, "running");
+    await waitUntil(() => h.driver.calls.length > 0, "driver started");
 
     await h.executor.shutdown();
 
+    // SIGTERM is a graceful abort: the run ends `aborted` (the `interrupted`
+    // status is reserved for the boot sweep of a dead daemon).
     expect(h.db.runs.get(runId)?.status).toBe("aborted");
     expect(h.executor.activeRunIds()).toEqual([]);
+    expect(h.db.stepRuns.listByRun(runId)[0]).toMatchObject({ status: "aborted" });
+    expect(h.db.events.lastRunStatus(runId)).toMatchObject({
+      type: "run.status",
+      status: "aborted",
+    });
+
+    // A later boot sweep finds nothing left to interrupt.
+    const { sweepInterruptedRuns } = await import("./recovery.js");
+    const sweep = await sweepInterruptedRuns({
+      db: h.db,
+      worktrees: h.worktrees,
+      executor: h.executor,
+      logger: createLogger("silent"),
+    });
+    expect(sweep.interruptedRunIds).toEqual([]);
+    expect(h.db.runs.get(runId)?.status).toBe("aborted");
   });
 
   it("ignores duplicate startRun calls for the same run", async () => {

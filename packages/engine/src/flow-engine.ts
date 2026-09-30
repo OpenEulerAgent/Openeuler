@@ -83,6 +83,12 @@ export interface FlowEngine {
    * `step.started`, `step.completed`, `loop.iteration`) into the run's event
    * log around the driver events. Never throws: every failure lands in the
    * run row (`failed` + error).
+   *
+   * Resumable: when the run already has StepRun rows (a run re-queued after
+   * an interruption), execution continues from the first non-successful step
+   * in the latest iteration — restarting it with its recorded sessionId,
+   * reusing the existing worktree, and reconstructing loop position from the
+   * rows plus the workflow config.
    */
   executeRun(runId: string, control: RunControl, opts?: ExecuteRunOptions): Promise<void>;
 }
@@ -309,15 +315,19 @@ export function createFlowEngine(options: FlowEngineOptions): FlowEngine {
   }
 
   /**
-   * Reuses a pre-existing queued StepRun for this (step, iteration) — created
-   * ahead of execution by older writers — or creates a fresh running row.
+   * Reuses a pre-existing queued — or interrupted (resume) — StepRun for this
+   * (step, iteration), or creates a fresh running row. Reuse keeps exactly one
+   * row per (step, iteration) across a resume and preserves the recorded
+   * sessionId for the restart.
    */
   function beginStepRun(runId: string, step: StepDefinition, iteration: number): StepRun {
     const existing = db.stepRuns
       .listByRun(runId)
       .find(
         (row) =>
-          row.stepId === step.stepId && row.iteration === iteration && row.status === "queued",
+          row.stepId === step.stepId &&
+          row.iteration === iteration &&
+          (row.status === "queued" || row.status === "interrupted"),
       );
     if (existing) {
       return db.stepRuns.update(existing.id, { status: "running" }) ?? existing;
@@ -355,6 +365,64 @@ export function createFlowEngine(options: FlowEngineOptions): FlowEngine {
     return prevSessionId;
   }
 
+  /**
+   * SessionId recorded on an interrupted StepRun at exactly this (step,
+   * iteration) — the step restarts in its own context on resume — or null
+   * when there is nothing to restart from.
+   */
+  function restartSessionFor(
+    runId: string,
+    step: StepDefinition,
+    iteration: number,
+  ): string | undefined {
+    const row = db.stepRuns
+      .listByRun(runId)
+      .find(
+        (row) =>
+          row.stepId === step.stepId && row.iteration === iteration && row.status === "interrupted",
+      );
+    return row?.sessionId;
+  }
+
+  /**
+   * Where a resumed run continues from, reconstructed from the recorded
+   * StepRun rows plus the (workflow-configured) step order: the first step
+   * that did NOT succeed — in iteration order, then workflow order — is the
+   * restart point; `startIndex === steps.length` means every recorded step
+   * succeeded and only the loop verdict / finalize remains to be re-run.
+   * Returns undefined for runs that never started a step (fresh execution).
+   */
+  function reconstructResume(
+    runId: string,
+    steps: readonly StepDefinition[],
+  ):
+    | {
+        iteration: number;
+        startIndex: number;
+        prevOutput: string;
+        prevSessionId: string | undefined;
+      }
+    | undefined {
+    const rows = db.stepRuns.listByRun(runId);
+    if (rows.length === 0) return undefined;
+    const byKey = new Map(rows.map((row) => [`${row.iteration}#${row.stepId}`, row]));
+    const maxIteration = rows.reduce((max, row) => Math.max(max, row.iteration), 1);
+    let prevOutput = "";
+    let prevSessionId: string | undefined;
+    for (let iteration = 1; iteration <= maxIteration; iteration += 1) {
+      for (let stepIndex = 0; stepIndex < steps.length; stepIndex += 1) {
+        const row = byKey.get(`${iteration}#${steps[stepIndex]?.stepId}`);
+        if (row !== undefined && row.status === "success") {
+          prevOutput = row.output;
+          if (row.sessionId !== undefined) prevSessionId = row.sessionId;
+          continue;
+        }
+        return { iteration, startIndex: stepIndex, prevOutput, prevSessionId };
+      }
+    }
+    return { iteration: maxIteration, startIndex: steps.length, prevOutput, prevSessionId };
+  }
+
   async function runStep(
     runId: string,
     worktreePath: string,
@@ -362,6 +430,7 @@ export function createFlowEngine(options: FlowEngineOptions): FlowEngine {
     iteration: number,
     vars: { task: string; prevOutput: string },
     inheritedSessionId: string | undefined,
+    restartSessionId: string | undefined,
     control: RunControl,
   ): Promise<StepOutcome> {
     const prompt = renderPromptTemplate(step.promptTemplate, {
@@ -380,15 +449,16 @@ export function createFlowEngine(options: FlowEngineOptions): FlowEngine {
     log.info({ runId, stepId: step.stepId, iteration }, "step started");
 
     const driver: AgentDriver = drivers.getDriver(step.driver);
+    // A restarted (resumed) step continues its own recorded session even when
+    // the step is not configured continueSession; otherwise normal chaining.
+    const sessionId = restartSessionId ?? (step.continueSession ? inheritedSessionId : undefined);
     const handle = driver.start({
       cwd: worktreePath,
       prompt,
       mode: step.mode,
       ...(step.model === undefined ? {} : { model: step.model }),
       ...(step.agent === undefined ? {} : { agent: step.agent }),
-      ...(step.continueSession && inheritedSessionId !== undefined
-        ? { sessionId: inheritedSessionId }
-        : {}),
+      ...(sessionId === undefined ? {} : { sessionId }),
     });
     control.onHandle?.(handle);
 
@@ -431,8 +501,9 @@ export function createFlowEngine(options: FlowEngineOptions): FlowEngine {
     }
 
     // The effective session: the one the driver announced, else the one this
-    // step continued (drivers may not re-emit `session` when resuming).
-    const effectiveSessionId = sessionFromEvents ?? inheritedSessionId;
+    // step continued (restarted or inherited — drivers may not re-emit
+    // `session` when resuming).
+    const effectiveSessionId = sessionFromEvents ?? restartSessionId ?? inheritedSessionId;
 
     db.stepRuns.update(stepRun.id, {
       status,
@@ -522,33 +593,54 @@ export function createFlowEngine(options: FlowEngineOptions): FlowEngine {
     }
 
     let worktreePath: string;
-    try {
-      const worktree = await worktrees.create(runId, project);
-      worktreePath = worktree.path;
-    } catch (err) {
-      finalizeRun(runId, "failed", { error: describeError(err) });
-      return;
+    // A resumed run keeps its existing worktree (uncommitted agent changes
+    // included); only a fresh execution creates one.
+    const existingWorktree = worktrees.existing(runId);
+    if (existingWorktree !== null) {
+      worktreePath = existingWorktree.path;
+      log.info({ runId, worktreePath }, "reusing existing worktree (resumed run)");
+    } else {
+      try {
+        const worktree = await worktrees.create(runId, project);
+        worktreePath = worktree.path;
+        log.info({ runId, worktreePath, workflowId: run.workflowId ?? null }, "worktree created");
+      } catch (err) {
+        finalizeRun(runId, "failed", { error: describeError(err) });
+        return;
+      }
     }
-    log.info({ runId, worktreePath, workflowId: run.workflowId ?? null }, "worktree created");
 
-    // An abort may have arrived while the worktree was being created.
+    // An abort may have arrived while the worktree was being created. Nothing
+    // has run in it yet, so remove it instead of leaving an orphan behind.
     if (control.isAbortRequested()) {
       abortRun(runId);
+      if (existingWorktree === null) {
+        try {
+          await worktrees.remove(runId);
+        } catch (err) {
+          log.warn({ err, runId }, "worktree cleanup after pre-start abort failed");
+        }
+      }
       return;
     }
 
     const task = run.task ?? "";
-    let runOutput = "";
+    // Resume position from the recorded StepRun rows: steps before it already
+    // succeeded (their outputs/sessions seed the chaining context); the loop
+    // counter continues at the interrupted iteration.
+    const resume = reconstructResume(runId, steps);
+    let runOutput = resume?.prevOutput ?? "";
     // Context that flows along the whole run, across loop-back jumps: after a
     // jump the first re-run step receives the previous iteration's LAST step
     // output as `{{prevOutput}}` (and, when it continues a session and has no
     // same-step session of its own, the previous iteration's last session).
-    let prevOutput = "";
-    let prevSessionId: string | undefined;
-    // Steps before `loopBack.toStepIndex` do not re-run after a jump.
-    let startIndex = 0;
+    let prevOutput = resume?.prevOutput ?? "";
+    let prevSessionId = resume?.prevSessionId;
+    // Steps before `loopBack.toStepIndex` do not re-run after a jump; on
+    // resume it is the restart step's index instead.
+    let startIndex = resume?.startIndex ?? 0;
 
-    for (let iteration = 1; ; iteration += 1) {
+    for (let iteration = resume?.iteration ?? 1; ; iteration += 1) {
       const rowIteration = iteration - 1; // Run.iteration stays 0-based.
       const currentRow = db.runs.get(runId);
       if (currentRow !== undefined && currentRow.iteration !== rowIteration) {
@@ -569,6 +661,7 @@ export function createFlowEngine(options: FlowEngineOptions): FlowEngine {
           iteration,
           { task, prevOutput },
           inheritedSessionFor(runId, step, iteration, prevSessionId),
+          restartSessionFor(runId, step, iteration),
           control,
         );
 

@@ -19,6 +19,7 @@ interface ApiHarness {
   db: Db;
   storeRoot: string;
   executor: Executor;
+  driver: ReturnType<typeof createFakeDriver>;
   request: (path: string, init?: RequestInit) => Promise<Response>;
   projectId: string;
 }
@@ -82,7 +83,8 @@ const setup = (
 
   const storeRoot = join(dir, "store");
   const drivers = createDriverRegistry();
-  drivers.registerDriver(createFakeDriver(fakeOpts));
+  const driver = createFakeDriver(fakeOpts);
+  drivers.registerDriver(driver);
   const executor = createExecutor({
     db,
     worktrees: new WorktreeManager({ storeRoot }),
@@ -98,6 +100,7 @@ const setup = (
     db,
     storeRoot,
     executor,
+    driver,
     request: (path, init) => Promise.resolve(app.request(path, init)),
     projectId: project.id,
   };
@@ -423,6 +426,172 @@ const insertQueuedRun = (h: ApiHarness, createdAt: string, task: string): string
   });
   return runId;
 };
+
+/** Seeds a run in the given status plus one ad-hoc step run (post-sweep shape). */
+const seedInterruptedRun = (
+  h: ApiHarness,
+  step: { sessionId?: string } | null,
+): { runId: string; stepRunId: string } => {
+  const runId = crypto.randomUUID();
+  const stepRunId = crypto.randomUUID();
+  const now = new Date().toISOString();
+  h.db.runs.create({
+    id: runId,
+    projectId: h.projectId,
+    status: "interrupted",
+    branch: `agentloop/${runId}`,
+    iteration: 0,
+    task: "recover me",
+    createdAt: now,
+    updatedAt: now,
+  });
+  if (step !== null) {
+    h.db.stepRuns.create({
+      id: stepRunId,
+      runId,
+      stepId: "adhoc",
+      iteration: 1,
+      ...(step.sessionId === undefined ? {} : { sessionId: step.sessionId }),
+      status: "interrupted",
+      output: "part",
+    });
+  }
+  return { runId, stepRunId };
+};
+
+describe("POST /api/runs/:id/resume", () => {
+  it("resumes an interrupted run with the recorded sessionId and drives it to success", async () => {
+    const h = setup({ events: script, output: "Feature implemented" });
+    const { runId, stepRunId } = seedInterruptedRun(h, { sessionId: "s_1" });
+
+    const res = await h.request(`/api/runs/${runId}/resume`, { method: "POST" });
+    expect(res.status).toBe(202);
+    const { run } = (await res.json()) as RunBody;
+    expect(["queued", "running"]).toContain(run.status);
+
+    const { final } = await pollRun(h, runId, "success");
+    expect(final.run).toMatchObject({ status: "success", output: "Feature implemented" });
+    // The fake driver received the recorded sessionId in its start opts and
+    // continued that session rather than starting a fresh one.
+    expect(h.driver.calls).toHaveLength(1);
+    expect(h.driver.calls[0]?.sessionId).toBe("s_1");
+    expect(h.driver.calls[0]?.prompt).toBe("recover me");
+
+    // Same StepRun row reused — no duplicate — now successful.
+    expect(final.steps).toHaveLength(1);
+    expect(final.steps[0]).toMatchObject({
+      id: stepRunId,
+      status: "success",
+      sessionId: "s_1",
+    });
+  });
+
+  it("409s with a retry hint when a started step recorded no sessionId", async () => {
+    const h = setup({ events: script });
+    const { runId } = seedInterruptedRun(h, {});
+
+    const res = await h.request(`/api/runs/${runId}/resume`, { method: "POST" });
+    expect(res.status).toBe(409);
+    const body = (await res.json()) as ErrorResponseBody;
+    expect(body.error.code).toBe("RUN_RESUME_NOT_POSSIBLE");
+    expect(body.error.message).toContain("retry");
+    expect(h.db.runs.get(runId)?.status).toBe("interrupted");
+  });
+
+  it("409s for runs that are not interrupted", async () => {
+    const h = setup({ events: script });
+    const queued = insertQueuedRun(h, new Date().toISOString(), "still waiting");
+    const res = await h.request(`/api/runs/${queued}/resume`, { method: "POST" });
+    expect(res.status).toBe(409);
+    expect(((await res.json()) as ErrorResponseBody).error.code).toBe("RUN_NOT_INTERRUPTED");
+
+    const missing = await h.request(`/api/runs/${crypto.randomUUID()}/resume`, { method: "POST" });
+    expect(missing.status).toBe(404);
+  });
+});
+
+describe("POST /api/runs/:id/retry", () => {
+  it("retries an interrupted ad-hoc run as an independent run with a fresh worktree", async () => {
+    const h = setup({
+      events: script,
+      output: "Feature implemented",
+      onStart: (opts) => {
+        writeFileSync(join(opts.cwd, "feature.txt"), "const feature = true;\n");
+      },
+    });
+    const { runId } = seedInterruptedRun(h, {});
+
+    const res = await h.request(`/api/runs/${runId}/retry`, { method: "POST" });
+    expect(res.status).toBe(202);
+    const { run } = (await res.json()) as RunBody;
+    expect(run).toMatchObject({
+      id: expect.not.stringMatching(runId),
+      projectId: h.projectId,
+      status: "queued",
+      branch: `agentloop/${run.id}`,
+      iteration: 0,
+      task: "recover me",
+    });
+
+    const { final } = await pollRun(h, run.id, "success");
+    expect(final.run.output).toBe("Feature implemented");
+    // Fresh worktree under the NEW runId, with the agent's change.
+    expect(existsSync(join(h.storeRoot, run.id, "feature.txt"))).toBe(true);
+    // The original run is untouched.
+    expect(h.db.runs.get(runId)?.status).toBe("interrupted");
+  });
+
+  it("copies the workflowId for workflow runs and executes it", async () => {
+    const h = setup({ events: script });
+    const workflow = h.db.workflows.create({
+      id: crypto.randomUUID(),
+      projectId: h.projectId,
+      name: "flow",
+      steps: [
+        {
+          id: "s1",
+          name: "one",
+          driver: "fake",
+          mode: "auto",
+          promptTemplate: "Task: {{task}}",
+          continueSession: false,
+        },
+      ],
+    });
+    const runId = crypto.randomUUID();
+    const now = new Date().toISOString();
+    h.db.runs.create({
+      id: runId,
+      projectId: h.projectId,
+      workflowId: workflow.id,
+      status: "failed",
+      branch: `agentloop/${runId}`,
+      iteration: 0,
+      task: "again",
+      createdAt: now,
+      updatedAt: now,
+    });
+
+    const res = await h.request(`/api/runs/${runId}/retry`, { method: "POST" });
+    expect(res.status).toBe(202);
+    const { run } = (await res.json()) as RunBody;
+    expect(run.workflowId).toBe(workflow.id);
+
+    const { final } = await pollRun(h, run.id, "success");
+    expect(final.steps[0]).toMatchObject({ stepId: "s1", status: "success" });
+  });
+
+  it("409s while the source run is still queued or running", async () => {
+    const h = setup({ events: script });
+    const queued = insertQueuedRun(h, new Date().toISOString(), "busy");
+    const res = await h.request(`/api/runs/${queued}/retry`, { method: "POST" });
+    expect(res.status).toBe(409);
+    expect(((await res.json()) as ErrorResponseBody).error.code).toBe("RUN_NOT_FINISHED");
+
+    const missing = await h.request(`/api/runs/${crypto.randomUUID()}/retry`, { method: "POST" });
+    expect(missing.status).toBe(404);
+  });
+});
 
 const getStats = async (h: ApiHarness): Promise<RunStatsBody> => {
   const res = await h.request("/api/runs/stats");

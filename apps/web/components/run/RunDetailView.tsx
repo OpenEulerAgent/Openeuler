@@ -15,6 +15,7 @@ import {
 } from "@/lib/run-feed";
 import { DiffPanel } from "./DiffPanel";
 import { EventFeed } from "./EventFeed";
+import { InterruptedRunBanner } from "./InterruptedRunBanner";
 import { OutputPanel } from "./OutputPanel";
 import { RunHeader } from "./RunHeader";
 
@@ -187,6 +188,8 @@ export function RunDetailView({ runId }: { runId: string }) {
         endedMs={endedMs}
         onAborted={() => void refresh()}
       />
+
+      <InterruptedRunBanner run={shownRun} steps={steps} onChanged={() => void refresh()} />
 
       <EventFeed
         entries={entries}
