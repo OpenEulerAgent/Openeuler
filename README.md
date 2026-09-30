@@ -46,6 +46,7 @@ flowchart LR
 
 ```bash
 pnpm install
+pnpm build   # once after cloning: the apps import the workspace packages' dist/
 pnpm dev
 ```
 
