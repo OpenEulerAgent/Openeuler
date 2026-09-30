@@ -23,3 +23,23 @@ export type { DriverRegistry } from "./registry.js";
 
 export { createFakeDriver, FakeDriver } from "./fake.js";
 export type { FakeDriverOptions } from "./fake.js";
+
+export {
+  buildOpencodeArgs,
+  checkOpenCodeInstalled,
+  createOpenCodeDriver,
+  createOpencodeParserState,
+  OpenCodeDriver,
+  OpenCodeAgentHandle,
+  OpenCodeDriverError,
+  parseOpencodeLine,
+} from "./opencode.js";
+export type {
+  CheckOpenCodeOptions,
+  OpenCodeDriverOptions,
+  OpenCodeDriverErrorCode,
+  OpencodeLineResult,
+  OpencodeLineSkipReason,
+  OpencodeParserState,
+  OpencodeUsage,
+} from "./opencode.js";
