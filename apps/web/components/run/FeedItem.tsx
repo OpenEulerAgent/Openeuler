@@ -1,8 +1,8 @@
 import { cn } from "@/lib/cn";
-import type { AgentToolCallEvent, AgentToolOutputEvent } from "@openeuler/core";
+import type { AgentToolCallEvent, AgentToolOutputEvent, RunStatusEvent } from "@openeuler/core";
 import type { ReactNode } from "react";
-import type { RunStatusEvent } from "@openeuler/core";
-import { TERMINAL_STATUS_STYLES, type FeedEntry } from "@/lib/run-feed";
+import type { StepCompletedEvent, StepStartedEvent } from "@openeuler/core";
+import { TERMINAL_STATUS_STYLES, isTerminalRunStatus, type FeedEntry } from "@/lib/run-feed";
 
 function SystemLine({ children }: { children: ReactNode }) {
   return <p className="px-1 py-0.5 font-mono text-xs text-slate-400">{children}</p>;
@@ -42,11 +42,35 @@ function ToolOutputItem({ event }: { event: AgentToolOutputEvent }) {
 }
 
 function RunStatusBanner({ event }: { event: RunStatusEvent }) {
+  // Non-terminal transitions (e.g. `running`) render as a quiet system line;
+  // only terminal statuses get the colored banner.
+  if (!isTerminalRunStatus(event.status)) {
+    return <SystemLine>run {event.status}</SystemLine>;
+  }
   const style = TERMINAL_STATUS_STYLES[event.status];
   return (
     <p className={cn("rounded-lg border px-3 py-2 text-sm font-medium", style.className)}>
       {style.label}
     </p>
+  );
+}
+
+function StepStartedItem({ event }: { event: StepStartedEvent }) {
+  return (
+    <SystemLine>
+      step {event.stepName} started (pass {event.iteration})
+    </SystemLine>
+  );
+}
+
+function StepCompletedItem({ event }: { event: StepCompletedEvent }) {
+  const failed = event.status !== "success";
+  return (
+    <SystemLine>
+      <span className={failed ? "text-red-500" : undefined}>
+        step {event.stepName} {event.status}
+      </span>
+    </SystemLine>
   );
 }
 
@@ -86,5 +110,9 @@ export function FeedItem({ entry }: { entry: FeedEntry }) {
       );
     case "run.status":
       return <RunStatusBanner event={event} />;
+    case "step.started":
+      return <StepStartedItem event={event} />;
+    case "step.completed":
+      return <StepCompletedItem event={event} />;
   }
 }

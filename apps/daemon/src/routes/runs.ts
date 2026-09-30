@@ -1,16 +1,9 @@
 import { randomUUID } from "node:crypto";
-import type {
-  AgentEvent,
-  Run,
-  RunStatus,
-  RunStatusEvent,
-  StepRun,
-  TerminalRunStatus,
-} from "@openeuler/core";
+import type { PersistedEvent, Run, RunStatus, StepRun, TerminalRunStatus } from "@openeuler/core";
 import { TERMINAL_RUN_STATUSES, RunStatusSchema } from "@openeuler/core";
 import type { Db } from "@openeuler/db";
 import { DriverError } from "@openeuler/drivers";
-import { branchForRun } from "@openeuler/engine";
+import { ADHOC_STEP_ID, branchForRun } from "@openeuler/engine";
 import { Hono, type Context } from "hono";
 import { streamSSE } from "hono/streaming";
 import { z } from "zod";
@@ -18,8 +11,11 @@ import type { AppEnv } from "../app.js";
 import type { Executor } from "../executor.js";
 import { HttpError } from "../errors.js";
 
-/** Synthetic step concept backing ad-hoc runs (no workflow yet). */
-export const ADHOC_STEP_ID = "adhoc";
+/**
+ * StepRun `stepId` backing ad-hoc runs (no workflow); defined by the engine,
+ * which executes ad-hoc runs as a single transient step.
+ */
+export { ADHOC_STEP_ID };
 
 const CreateRunBodySchema = z.strictObject({
   projectId: z.string().min(1, "projectId must be a non-empty string"),
@@ -53,10 +49,12 @@ const DEFAULT_EVENT_STREAM: Required<EventStreamOptions> = {
 const isTerminalRunStatus = (status: RunStatus): status is TerminalRunStatus =>
   (TERMINAL_RUN_STATUSES as readonly string[]).includes(status);
 
-/** Run detail payload: the run, its step runs, and a small summary. */
+/** Run detail payload: the run, its step runs (flat + grouped per iteration), and a small summary. */
 export interface RunDetailBody {
   run: Run;
   steps: StepRun[];
+  /** Step runs grouped by 1-based loop pass, ordered by iteration. */
+  iterations: Array<{ iteration: number; steps: StepRun[] }>;
   summary: { eventCount: number };
 }
 
@@ -104,8 +102,21 @@ function delay(ms: number): { promise: Promise<void>; cancel: () => void } {
 }
 
 /** Serializes one streamed event as an SSE frame in the documented wire format. */
-function sseFrame(event: AgentEvent | RunStatusEvent): string {
+function sseFrame(event: PersistedEvent): string {
   return `id: ${event.seq}\nevent: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`;
+}
+
+/** Groups step runs by iteration (1-based), ordered by iteration. */
+function groupByIteration(steps: StepRun[]): Array<{ iteration: number; steps: StepRun[] }> {
+  const groups = new Map<number, StepRun[]>();
+  for (const step of steps) {
+    const bucket = groups.get(step.iteration);
+    if (bucket) bucket.push(step);
+    else groups.set(step.iteration, [step]);
+  }
+  return [...groups.entries()]
+    .sort((a, b) => a[0] - b[0])
+    .map(([iteration, grouped]) => ({ iteration, steps: grouped }));
 }
 
 export interface CreateRunsRouterOptions {
@@ -149,14 +160,8 @@ export function createRunsRouter(options: CreateRunsRouterOptions = {}): Hono<Ap
       updatedAt: now,
     };
     db.runs.create(run);
-    db.stepRuns.create({
-      id: randomUUID(),
-      runId,
-      stepId: ADHOC_STEP_ID,
-      iteration: 1,
-      status: "queued",
-      output: "",
-    });
+    // No StepRun row here: the flow engine executes ad-hoc runs as a single
+    // transient step (ADHOC_STEP_ID) and creates its StepRun when it starts.
 
     c.get("logger").info({ runId, projectId: project.id }, "run accepted");
     // Background execution; never blocks the response.
@@ -189,20 +194,38 @@ export function createRunsRouter(options: CreateRunsRouterOptions = {}): Hono<Ap
   runs.get("/:id", (c) => {
     const db = requireDb(c);
     const run = requireRun(db, c.req.param("id"));
+    const steps = db.stepRuns.listByRun(run.id);
+    // Within an iteration, order steps like the workflow definition when the
+    // run has one (rows themselves only carry iteration + id ordering).
+    let order = new Map<string, number>();
+    if (run.workflowId) {
+      const workflow = db.workflows.get(run.workflowId);
+      if (workflow) {
+        order = new Map(workflow.steps.map((step, index) => [step.id, index]));
+      }
+    }
+    const sorted = [...steps].sort((a, b) => {
+      const ai = order.get(a.stepId) ?? Number.MAX_SAFE_INTEGER;
+      const bi = order.get(b.stepId) ?? Number.MAX_SAFE_INTEGER;
+      return ai === bi ? a.stepId.localeCompare(b.stepId) : ai - bi;
+    });
     const body: RunDetailBody = {
       run,
-      steps: db.stepRuns.listByRun(run.id),
+      steps: sorted,
+      iterations: groupByIteration(sorted),
       summary: { eventCount: db.events.count(run.id) },
     };
     return c.json(body);
   });
 
   // SSE live stream: replay persisted events (from the cursor) in seq order,
-  // then tail the events table until the run reaches a terminal status, emit a
-  // final synthetic `run.status` event, and close. The `run.status` event is
-  // stream-only (never persisted — persisted events stay driver-only until
-  // engine events land with #15) and reuses the per-run seq space (lastSeq+1)
-  // so clients keep a monotonic cursor for Last-Event-ID reconnects.
+  // then tail the events table until the run ends. The engine persists its own
+  // lifecycle events (`run.status`, `step.started`, `step.completed`) into the
+  // same log, so replay naturally ends with the terminal `run.status` event —
+  // the stream closes on it without synthesizing anything. The synthetic
+  // terminal `run.status` (lastSeq+1) remains only as a fallback for runs that
+  // ended without a persisted terminal event (rows written before engine
+  // events, or aborts handled outside the engine).
   runs.get("/:id/events", (c) => {
     const db = requireDb(c);
     const runId = c.req.param("id");
@@ -279,15 +302,23 @@ export function createRunsRouter(options: CreateRunsRouterOptions = {}): Hono<Ap
             await stream.write(sseFrame(event));
             lastSeq = event.seq;
             lastWrite = Date.now();
+            // Persisted terminal run.status: the engine's own closing event.
+            if (event.type === "run.status" && isTerminalRunStatus(event.status)) {
+              return;
+            }
           }
 
-          // Terminal → final synthetic run.status, then close the stream.
+          // Terminal run row without a persisted terminal run.status event
+          // (legacy rows / aborts outside the engine): synthetic close.
           const run = db.runs.get(runId);
           if (run && isTerminalRunStatus(run.status)) {
-            if (!stopped) {
-              await stream.write(
-                sseFrame({ type: "run.status", seq: lastSeq + 1, status: run.status }),
-              );
+            const lastStatus = db.events.lastRunStatus(runId);
+            if (!(lastStatus && isTerminalRunStatus(lastStatus.status))) {
+              if (!stopped) {
+                await stream.write(
+                  sseFrame({ type: "run.status", seq: lastSeq + 1, status: run.status }),
+                );
+              }
             }
             return;
           }

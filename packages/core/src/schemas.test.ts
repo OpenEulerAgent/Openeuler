@@ -8,7 +8,9 @@ import {
   FileNodeSchema,
   LoopBackSchema,
   OutputMatchesConditionSchema,
+  PersistedEventSchema,
   ProjectSchema,
+  RunEventSchema,
   RunSchema,
   RunStatusEventSchema,
   StepRunSchema,
@@ -247,14 +249,21 @@ describe("invalid fixtures are rejected with clear messages", () => {
     expectRejected(AgentEventSchema, { type: "message-delta", seq: 1, delta: 42 }, "string");
   });
 
-  it("keeps run.status out of the persisted agent event union", () => {
-    // The synthetic SSE-only terminal event must NOT validate as a persisted
-    // AgentEvent (the events table stays driver-only; engine events land with #15).
+  it("keeps run.status out of the agent event union (it is a RunEvent)", () => {
+    // Driver events and engine events are separate unions; run.status only
+    // validates as a persisted RunEvent, never as an AgentEvent.
     expectRejected(AgentEventSchema, { type: "run.status", seq: 1, status: "success" });
   });
 
-  it("parses synthetic run.status events for every terminal status", () => {
-    for (const status of ["success", "failed", "aborted", "interrupted"] as const) {
+  it("parses run.status events for every run status", () => {
+    for (const status of [
+      "queued",
+      "running",
+      "success",
+      "failed",
+      "aborted",
+      "interrupted",
+    ] as const) {
       expect(RunStatusEventSchema.parse({ type: "run.status", seq: 8, status })).toEqual({
         type: "run.status",
         seq: 8,
@@ -263,15 +272,79 @@ describe("invalid fixtures are rejected with clear messages", () => {
     }
   });
 
-  it("rejects malformed synthetic run.status events", () => {
-    expectRejected(RunStatusEventSchema, { type: "run.status", seq: 8, status: "queued" });
-    expectRejected(RunStatusEventSchema, { type: "run.status", seq: 8, status: "running" });
+  it("rejects malformed run.status events", () => {
+    expectRejected(RunStatusEventSchema, { type: "run.status", seq: 8, status: "cancelled" });
     expectRejected(RunStatusEventSchema, { type: "run.status", seq: -1, status: "success" });
     expectRejected(
       RunStatusEventSchema,
       { type: "run.status", seq: 8, status: "success", extra: true },
       "Unrecognized key",
     );
+  });
+
+  it("parses step.started / step.completed engine events", () => {
+    expect(
+      RunEventSchema.parse({
+        type: "step.started",
+        seq: 2,
+        stepId: "step-1",
+        stepName: "implement",
+        iteration: 1,
+      }),
+    ).toEqual({
+      type: "step.started",
+      seq: 2,
+      stepId: "step-1",
+      stepName: "implement",
+      iteration: 1,
+    });
+    expect(
+      RunEventSchema.parse({
+        type: "step.completed",
+        seq: 5,
+        stepId: "step-1",
+        stepName: "implement",
+        iteration: 2,
+        status: "success",
+      }),
+    ).toEqual({
+      type: "step.completed",
+      seq: 5,
+      stepId: "step-1",
+      stepName: "implement",
+      iteration: 2,
+      status: "success",
+    });
+    // iteration is 1-based; step ids/names must be non-empty.
+    expectRejected(RunEventSchema, {
+      type: "step.started",
+      seq: 2,
+      stepId: "s",
+      stepName: "x",
+      iteration: 0,
+    });
+    expectRejected(RunEventSchema, {
+      type: "step.completed",
+      seq: 5,
+      stepId: "s",
+      stepName: "",
+      iteration: 1,
+      status: "success",
+    });
+  });
+
+  it("persisted event union accepts driver and engine events", () => {
+    expect(PersistedEventSchema.parse({ type: "done", seq: 1, output: "ok" })).toEqual({
+      type: "done",
+      seq: 1,
+      output: "ok",
+    });
+    expect(PersistedEventSchema.parse({ type: "run.status", seq: 2, status: "running" })).toEqual({
+      type: "run.status",
+      seq: 2,
+      status: "running",
+    });
+    expectRejected(PersistedEventSchema, { type: "log", seq: 3 });
   });
 
   it("rejects malformed file nodes and file content payloads", () => {

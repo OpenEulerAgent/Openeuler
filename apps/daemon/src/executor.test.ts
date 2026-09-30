@@ -166,12 +166,16 @@ describe("createExecutor", () => {
 
     const events = h.db.events.getSince(runId);
     expect(events.map((event) => event.type)).toEqual([
+      "run.status",
+      "step.started",
       "started",
       "session",
       "message-delta",
       "done",
+      "step.completed",
+      "run.status",
     ]);
-    expect(events.map((event) => event.seq)).toEqual([1, 2, 3, 4]);
+    expect(events.map((event) => event.seq)).toEqual([1, 2, 3, 4, 5, 6, 7, 8]);
   });
 
   it("marks the run failed when the driver exits non-zero, storing the message", async () => {
@@ -246,7 +250,15 @@ describe("createExecutor", () => {
 
     expect(existsSync(join(h.dir, "store", runId))).toBe(true);
     expect(h.db.stepRuns.listByRun(runId)[0]).toMatchObject({ status: "aborted" });
-    expect(h.db.events.count(runId)).toBeLessThan(5);
+    // The scripted driver run was cut short: not all 5 events made it to the log.
+    const driverEvents = h.db.events
+      .getSince(runId)
+      .filter((event) => event.type === "message-delta" || event.type === "started");
+    expect(driverEvents.length).toBeLessThan(5);
+    expect(h.db.events.lastRunStatus(runId)).toMatchObject({
+      type: "run.status",
+      status: "aborted",
+    });
   });
 
   it("aborts a queued run that was never started", async () => {

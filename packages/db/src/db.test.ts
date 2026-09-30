@@ -2,7 +2,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import type { AgentEvent, Project, Run, StepRun, Workflow } from "@openeuler/core";
+import type { AgentEvent, PersistedEvent, Project, Run, StepRun, Workflow } from "@openeuler/core";
 import { createDatabase } from "./index.js";
 import type { Db } from "./index.js";
 
@@ -56,7 +56,7 @@ const makeStepRun = (runId: string, over: Partial<StepRun> = {}): StepRun => ({
   id: uuid(),
   runId,
   stepId: uuid(),
-  iteration: 0,
+  iteration: 1,
   status: "running",
   output: "",
   ...over,
@@ -164,6 +164,36 @@ describe("workflows", () => {
     expect(db.workflows.list(project.id)).toEqual([alpha, beta]);
     expect(db.workflows.list()).toHaveLength(3);
   });
+
+  it("patches mutable fields and clears loopBack with null", () => {
+    const project = db.projects.create(makeProject());
+    const workflow = db.workflows.create(makeWorkflow(project.id));
+    const renamed = db.workflows.update(workflow.id, { name: "renamed" });
+    expect(renamed).toEqual({ ...workflow, name: "renamed" });
+
+    const steps = [{ ...(workflow.steps[0] as (typeof workflow.steps)[number]), name: "solo" }];
+    expect(db.workflows.update(workflow.id, { steps })?.steps).toEqual(steps);
+
+    const withLoop = db.workflows.update(workflow.id, {
+      loopBack: { toStepIndex: 0, when: { type: "always" }, maxIterations: 2 },
+    });
+    expect(withLoop?.loopBack).toEqual({
+      toStepIndex: 0,
+      when: { type: "always" },
+      maxIterations: 2,
+    });
+    expect(db.workflows.update(workflow.id, { loopBack: null })?.loopBack).toBeUndefined();
+
+    expect(db.workflows.update(uuid(), { name: "x" })).toBeUndefined();
+  });
+
+  it("deletes workflows and reports unknown ids", () => {
+    const project = db.projects.create(makeProject());
+    const workflow = db.workflows.create(makeWorkflow(project.id));
+    expect(db.workflows.delete(workflow.id)).toBe(true);
+    expect(db.workflows.get(workflow.id)).toBeUndefined();
+    expect(db.workflows.delete(workflow.id)).toBe(false);
+  });
 });
 
 describe("runs", () => {
@@ -198,6 +228,24 @@ describe("runs", () => {
     db.runs.create(makeRun(other.id));
     expect(db.runs.list(project.id)).toEqual([newer, older]);
     expect(db.runs.list()).toHaveLength(3);
+  });
+
+  it("lists runs linked to a workflow, newest first", () => {
+    const project = db.projects.create(makeProject());
+    const workflow = db.workflows.create(makeWorkflow(project.id));
+    const older = makeRun(project.id, {
+      workflowId: workflow.id,
+      createdAt: "2026-01-01T00:00:00.000Z",
+    });
+    const newer = makeRun(project.id, {
+      workflowId: workflow.id,
+      createdAt: "2026-01-02T00:00:00.000Z",
+    });
+    db.runs.create(older);
+    db.runs.create(newer);
+    db.runs.create(makeRun(project.id));
+    expect(db.runs.listByWorkflow(workflow.id)).toEqual([newer, older]);
+    expect(db.runs.listByWorkflow(uuid())).toEqual([]);
   });
 
   it("transitions through every status, updating updatedAt", async () => {
@@ -299,7 +347,7 @@ describe("events", () => {
 
   it("appends events with strictly increasing seq and returns them in order", () => {
     const { runId } = seedRun();
-    const appended: AgentEvent[] = [
+    const appended: PersistedEvent[] = [
       db.events.append(runId, { type: "started" }),
       db.events.append(runId, { type: "session", sessionId: "s-1" }),
       db.events.append(runId, { type: "message-delta", delta: "hi" }),
@@ -361,5 +409,60 @@ describe("events", () => {
     expect(db.events.count(runId)).toBe(2);
     expect(db.events.count(otherRunId)).toBe(1);
     expect(db.events.count(uuid())).toBe(0);
+  });
+
+  it("persists engine events alongside driver events in seq order", () => {
+    const { runId } = seedRun();
+    db.events.append(runId, { type: "run.status", status: "running" });
+    db.events.append(runId, {
+      type: "step.started",
+      stepId: "s1",
+      stepName: "implement",
+      iteration: 1,
+    });
+    db.events.append(runId, { type: "started" });
+    db.events.append(runId, { type: "done", output: "ok" });
+    db.events.append(runId, {
+      type: "step.completed",
+      stepId: "s1",
+      stepName: "implement",
+      iteration: 1,
+      status: "success",
+    });
+    db.events.append(runId, { type: "run.status", status: "success" });
+
+    const events = db.events.getSince(runId);
+    expect(events.map((event) => event.type)).toEqual([
+      "run.status",
+      "step.started",
+      "started",
+      "done",
+      "step.completed",
+      "run.status",
+    ]);
+    expect(events.map((event) => event.seq)).toEqual([1, 2, 3, 4, 5, 6]);
+    expect(events[0]).toEqual({ type: "run.status", seq: 1, status: "running" });
+    expect(events[5]).toEqual({ type: "run.status", seq: 6, status: "success" });
+  });
+
+  it("lastRunStatus returns the newest run.status event", () => {
+    const { runId, otherRunId } = seedRun();
+    expect(db.events.lastRunStatus(runId)).toBeUndefined();
+    db.events.append(runId, { type: "run.status", status: "running" });
+    expect(db.events.lastRunStatus(runId)).toEqual({
+      type: "run.status",
+      seq: 1,
+      status: "running",
+    });
+    db.events.append(runId, { type: "run.status", status: "failed", error: "boom" });
+    expect(db.events.lastRunStatus(runId)).toEqual({
+      type: "run.status",
+      seq: 2,
+      status: "failed",
+      error: "boom",
+    });
+    db.events.append(runId, { type: "started" });
+    expect(db.events.lastRunStatus(runId)?.seq).toBe(2);
+    expect(db.events.lastRunStatus(otherRunId)).toBeUndefined();
   });
 });

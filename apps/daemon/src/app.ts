@@ -14,6 +14,7 @@ import { createProjectsRouter } from "./routes/projects.js";
 import { createFilesRouter } from "./routes/files.js";
 import type { EventStreamOptions } from "./routes/runs.js";
 import { createRunsRouter } from "./routes/runs.js";
+import { createWorkflowsRouter } from "./routes/workflows.js";
 
 export const DEFAULT_CORS_ORIGIN = "http://localhost:3000";
 
@@ -88,6 +89,7 @@ export function createApp(options: CreateAppOptions = {}): DaemonApp {
 
   app.route("/api/projects", createProjectsRouter());
   app.route("/api/projects", createFilesRouter());
+  app.route("/api/workflows", createWorkflowsRouter());
   app.route("/api/runs", createRunsRouter({ eventStream: options.eventStream }));
 
   app.onError((err, c) => {

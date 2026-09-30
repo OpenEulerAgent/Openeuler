@@ -265,7 +265,7 @@ const manyDeltas = (count: number): AgentEvent[] =>
   }));
 
 describe("GET /api/runs/:id/events (SSE)", () => {
-  it("replays persisted events in order, tails live, then closes on run.status", async () => {
+  it("replays persisted events in order, tails live, then closes on the persisted run.status", async () => {
     const h = setup({ events: script, delayMs: 40, output: "all done" });
     const res = await postRun(h, "stream me");
     expect(res.status).toBe(202);
@@ -277,23 +277,43 @@ describe("GET /api/runs/:id/events (SSE)", () => {
     const reader = await openReader(h, run.id);
     const messages = await reader.untilClose();
 
-    expect(messages.map((m) => Number(m.id))).toEqual([1, 2, 3, 4, 5, 6, 7]);
+    expect(messages.map((m) => Number(m.id))).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
     expect(messages.map((m) => m.event)).toEqual([
+      "run.status",
+      "step.started",
       "started",
       "session",
       "message-delta",
       "tool-call",
       "tool-output",
       "done",
+      "step.completed",
       "run.status",
     ]);
-    expect(messages[0]?.data).toBe(JSON.stringify({ type: "started", seq: 1 }));
-    expect(messages[5]?.data).toBe(JSON.stringify({ type: "done", seq: 6, output: "all done" }));
-    // Synthetic terminal event: seq = lastSeq + 1, never persisted.
-    expect(messages[6]?.data).toBe(
-      JSON.stringify({ type: "run.status", seq: 7, status: "success" }),
+    expect(messages[0]?.data).toBe(
+      JSON.stringify({ type: "run.status", seq: 1, status: "running" }),
     );
-    expect(h.db.events.count(run.id)).toBe(6);
+    expect(messages[7]?.data).toBe(JSON.stringify({ type: "done", seq: 8, output: "all done" }));
+    expect(messages[8]?.data).toBe(
+      JSON.stringify({
+        type: "step.completed",
+        seq: 9,
+        stepId: "adhoc",
+        stepName: "ad-hoc",
+        iteration: 1,
+        status: "success",
+      }),
+    );
+    // Terminal close comes from the PERSISTED engine event (seq 10), not a
+    // synthetic one: exactly one terminal run.status, and nothing after it.
+    expect(messages[9]?.data).toBe(
+      JSON.stringify({ type: "run.status", seq: 10, status: "success" }),
+    );
+    expect(
+      messages.filter((m) => m.event === "run.status" && JSON.parse(m.data).status !== "running"),
+    ).toHaveLength(1);
+    expect(h.db.events.count(run.id)).toBe(10);
+    expect(h.db.events.lastRunStatus(run.id)?.seq).toBe(10);
   }, 10_000);
 
   it("resumes from Last-Event-ID without replaying the prefix", async () => {
@@ -306,11 +326,12 @@ describe("GET /api/runs/:id/events (SSE)", () => {
 
     const first = await reader.next();
     expect(first?.id).toBe("3");
-    expect(first?.event).toBe("message-delta");
+    expect(first?.event).toBe("started");
 
     const rest = await reader.untilClose();
-    expect(rest.map((m) => Number(m.id))).toEqual([3, 4, 5, 6, 7]);
-    expect(rest[4]?.event).toBe("run.status");
+    expect(rest.map((m) => Number(m.id))).toEqual([3, 4, 5, 6, 7, 8, 9, 10]);
+    expect(rest[7]?.event).toBe("run.status");
+    expect(JSON.parse(rest[7]?.data ?? "{}")).toMatchObject({ status: "success", seq: 10 });
   }, 10_000);
 
   it("accepts ?afterSeq= as a cursor alias", async () => {
@@ -335,10 +356,42 @@ describe("GET /api/runs/:id/events (SSE)", () => {
 
     const reader = await openReader(h, run.id);
     const messages = await reader.untilClose(2_000);
-    expect(messages.map((m) => m.event)).toEqual(["started", "done", "run.status"]);
-    expect(messages[2]?.data).toBe(
-      JSON.stringify({ type: "run.status", seq: 3, status: "success" }),
+    expect(messages.map((m) => m.event)).toEqual([
+      "run.status",
+      "step.started",
+      "started",
+      "done",
+      "step.completed",
+      "run.status",
+    ]);
+    expect(messages[5]?.data).toBe(
+      JSON.stringify({ type: "run.status", seq: 6, status: "success" }),
     );
+  });
+
+  it("falls back to a synthetic close only for runs without a persisted terminal run.status", async () => {
+    const h = setup({ events: script });
+    const res = await postRun(h, "legacy style");
+    const { run } = (await res.json()) as { run: Run };
+
+    // Simulate a legacy row: driver events only, terminal run row, no engine
+    // events (as written before the engine persisted its lifecycle events).
+    await awaitTerminal(h, run.id);
+    h.db.sqlite
+      .prepare(
+        "delete from events where run_id = ? and type in ('run.status','step.started','step.completed')",
+      )
+      .run(run.id);
+
+    const reader = await openReader(h, run.id);
+    const messages = await reader.untilClose(2_000);
+    const last = messages[messages.length - 1];
+    expect(last?.event).toBe("run.status");
+    expect(JSON.parse(last?.data ?? "{}")).toMatchObject({
+      type: "run.status",
+      status: "success",
+      seq: Number(last?.id), // lastSeq + 1
+    });
   });
 
   it("rejects an invalid cursor with 422", async () => {
@@ -395,7 +448,8 @@ describe("GET /api/runs/:id/events (SSE)", () => {
     // Run unaffected: still completes on its own.
     const final = await awaitTerminal(h, run.id);
     expect(final.status).toBe("success");
-    expect(h.db.events.getSince(run.id)).toHaveLength(13); // started + 12 deltas
+    // 12 deltas + started driver events, plus 4 engine events.
+    expect(h.db.events.getSince(run.id)).toHaveLength(17);
   }, 10_000);
 
   it("caps concurrent streams per run: 6th gets 429, freed slot allows a new one", async () => {
@@ -438,14 +492,20 @@ describe("GET /api/runs/:id/events (SSE)", () => {
     const { run } = (await res.json()) as { run: Run };
 
     await waitFor(
-      "running with no events yet",
-      () => h.db.runs.get(run.id)?.status === "running" && h.db.events.count(run.id) === 0,
+      "engine events persisted, driver still silent",
+      () => h.db.runs.get(run.id)?.status === "running" && h.db.events.count(run.id) === 2,
     );
     const reader = await openReader(h, run.id);
 
-    // The driver stalls 250ms before its first event; heartbeats fill the gap.
+    // The driver stalls 250ms before its first event; engine frames arrive
+    // immediately, then heartbeats fill the gap before the driver frames.
     const first = await reader.next(3_000);
     expect(first?.id).toBe("1");
+    for (;;) {
+      const next = await reader.next(3_000);
+      if (next === null) throw new Error("stream closed before driver events arrived");
+      if (Number(next.id) >= 3) break;
+    }
     expect(reader.pings.length).toBeGreaterThanOrEqual(1);
     expect(reader.pings.every((ping) => ping.startsWith(": ping"))).toBe(true);
 

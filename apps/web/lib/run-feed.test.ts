@@ -60,6 +60,31 @@ describe("appendFeedEvent", () => {
     );
   });
 
+  it("renders engine step events as their own rows", () => {
+    const entries = buildFeed([
+      { type: "run.status", seq: 1, status: "running" },
+      { type: "step.started", seq: 2, stepId: "s1", stepName: "implement", iteration: 1 },
+      { type: "done", seq: 3 },
+      {
+        type: "step.completed",
+        seq: 4,
+        stepId: "s1",
+        stepName: "implement",
+        iteration: 1,
+        status: "success",
+      },
+      { type: "run.status", seq: 5, status: "success" },
+    ]);
+    expect(entries.every((entry) => entry.kind === "event")).toBe(true);
+    expect(entries.map((entry) => (entry.kind === "event" ? entry.event.type : ""))).toEqual([
+      "run.status",
+      "step.started",
+      "done",
+      "step.completed",
+      "run.status",
+    ]);
+  });
+
   it("buildFeed folds a realistic mixed stream", () => {
     const entries = buildFeed([
       { type: "started", seq: 0 },

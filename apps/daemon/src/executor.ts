@@ -1,16 +1,16 @@
 import type { RunStatus } from "@openeuler/core";
-import type { Db, StepRunPatch } from "@openeuler/db";
-import type { AgentDriver, AgentHandle, AgentMode, DriverRegistry } from "@openeuler/drivers";
+import type { Db } from "@openeuler/db";
+import type { AgentHandle, DriverRegistry } from "@openeuler/drivers";
+import { createFlowEngine, DEFAULT_DRIVER_ID } from "@openeuler/engine";
 import type { WorktreeManager } from "@openeuler/engine";
 import type { Logger } from "./logger.js";
 
-/** Default driver id; the real opencode driver lands later (env-overridable). */
-export const DEFAULT_DRIVER_ID = "fake";
+export { DEFAULT_DRIVER_ID };
 
 /** Extra per-run execution options not persisted on the Run row (v1). */
 export interface StartRunOptions {
   model?: string;
-  mode?: AgentMode;
+  mode?: "auto" | "ask";
 }
 
 /** Outcome of {@link Executor.abortRun}; routes map this to HTTP statuses. */
@@ -42,7 +42,7 @@ export interface ExecutorOptions {
   worktrees: WorktreeManager;
   drivers: DriverRegistry;
   logger: Logger;
-  /** Driver used for runs; defaults to `OPENEULER_DRIVER`, then `"fake"`. */
+  /** Driver used for ad-hoc runs; defaults to `OPENEULER_DRIVER`, then `"fake"`. */
   driverId?: string;
   /** How long {@link Executor.shutdown} waits for active runs to settle. */
   shutdownSettleMs?: number;
@@ -50,8 +50,7 @@ export interface ExecutorOptions {
 
 interface ActiveRun {
   runId: string;
-  /** StepRun row being driven; set once execution begins. */
-  stepRunId?: string;
+  /** Live driver handle of the step currently executing, if any. */
   handle?: AgentHandle;
   abortRequested: boolean;
   done: Promise<void>;
@@ -66,159 +65,47 @@ const describeError = (err: unknown): string => (err instanceof Error ? err.mess
 const delay = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 
 /**
- * Runs single-step agent runs end to end: DB row → worktree → driver → event
- * persistence → diff capture → terminal state. Every failure path lands in the
- * run row (`failed` + error message); nothing ever throws into callers, so the
- * daemon stays alive. Kept out of the HTTP layer on purpose: routes only call
- * `startRun`/`abortRun`.
+ * Schedules runs for background execution and owns the live-run bookkeeping
+ * (abort, shutdown, duplicate-start guards). The actual multi-step execution
+ * — worktree, prompt templating, step runs, event persistence — lives in the
+ * flow engine (`@openeuler/engine`); this wrapper keeps the daemon-specific
+ * lifecycle concerns out of the HTTP layer: routes only call
+ * `startRun`/`abortRun`, and the engine never throws into callers.
  */
 export function createExecutor(options: ExecutorOptions): Executor {
   const { db, worktrees, drivers, logger } = options;
   const driverId = options.driverId ?? process.env["OPENEULER_DRIVER"] ?? DEFAULT_DRIVER_ID;
   const shutdownSettleMs = options.shutdownSettleMs ?? 2_000;
   const active = new Map<string, ActiveRun>();
+  const engine = createFlowEngine({ db, worktrees, drivers, logger });
 
-  function patchStepRun(stepRunId: string | undefined, patch: StepRunPatch): void {
-    if (!stepRunId) return;
+  function failRun(runId: string, message: string): void {
+    logger.error({ runId, error: message }, "run failed");
     try {
-      db.stepRuns.update(stepRunId, patch);
-    } catch (err) {
-      logger.error({ err, stepRunId }, "step run patch failed");
-    }
-  }
-
-  function failRun(entry: ActiveRun, message: string): void {
-    logger.error({ runId: entry.runId, error: message }, "run failed");
-    try {
-      const run = db.runs.get(entry.runId);
+      const run = db.runs.get(runId);
       if (!run || isTerminal(run.status)) return;
-      db.runs.update(entry.runId, { status: "failed", error: message });
+      db.runs.update(runId, { status: "failed", error: message });
     } catch (err) {
-      logger.error({ err, runId: entry.runId }, "marking run failed failed");
-    }
-    patchStepRun(entry.stepRunId, { status: "failed" });
-  }
-
-  async function captureDiff(worktreePath: string): Promise<string> {
-    try {
-      const { stat, patch } = await worktrees.diff(worktreePath);
-      return [stat.trim(), patch].filter((part) => part.length > 0).join("\n");
-    } catch (err) {
-      logger.warn({ err, worktreePath }, "diff capture failed (continuing without diff)");
-      return "";
+      logger.error({ err, runId }, "marking run failed failed");
     }
   }
 
   async function execute(entry: ActiveRun, opts: StartRunOptions | undefined): Promise<void> {
     const { runId } = entry;
     try {
-      const run = db.runs.get(runId);
-      if (!run) {
-        logger.warn({ runId }, "startRun called for unknown run");
-        return;
-      }
-      if (run.status !== "queued") {
-        logger.warn({ runId, status: run.status }, "startRun ignored: run is not queued");
-        return;
-      }
-      if (entry.abortRequested) {
-        db.runs.updateStatus(runId, "aborted");
-        patchStepRun(entry.stepRunId, { status: "aborted" });
-        return;
-      }
-
-      db.runs.updateStatus(runId, "running");
-      const stepRun = db.stepRuns.listByRun(runId)[0];
-      entry.stepRunId = stepRun?.id;
-      patchStepRun(entry.stepRunId, { status: "running" });
-      logger.info({ runId, projectId: run.projectId, driverId }, "run started");
-
-      const project = db.projects.get(run.projectId);
-      if (!project) {
-        throw new Error(`project ${run.projectId} not found`);
-      }
-
-      const worktree = await worktrees.create(runId, project);
-      const worktreePath = worktree.path;
-      logger.info({ runId, worktreePath, branch: worktree.branch }, "worktree created");
-
-      // An abort may have arrived while the worktree was being created.
-      if (entry.abortRequested) {
-        db.runs.updateStatus(runId, "aborted");
-        patchStepRun(entry.stepRunId, { status: "aborted" });
-        return;
-      }
-
-      const driver: AgentDriver = drivers.getDriver(driverId);
-      const handle = driver.start({
-        cwd: worktreePath,
-        prompt: run.task ?? "",
-        mode: opts?.mode ?? "auto",
-        ...(opts?.model === undefined ? {} : { model: opts.model }),
-      });
-      entry.handle = handle;
-
-      let lastErrorMessage: string | undefined;
-      try {
-        for await (const event of handle.events) {
-          db.events.append(runId, event);
-          if (event.type === "session") {
-            patchStepRun(entry.stepRunId, { sessionId: event.sessionId });
-          }
-          if (event.type === "error") {
-            lastErrorMessage = event.message;
-          }
-        }
-      } catch (err) {
-        await handle.abort().catch(() => {});
-        throw err;
-      }
-
-      const exit = await handle.exited;
-      const diff = await captureDiff(worktreePath);
-
-      let status: RunStatus;
-      let error: string | undefined;
-      if (exit.reason === "exit" && exit.code === 0) {
-        status = "success";
-      } else if (exit.reason === "aborted" && entry.abortRequested) {
-        status = "aborted";
-      } else {
-        status = "failed";
-        error =
-          exit.reason === "error"
-            ? (lastErrorMessage ?? "agent run errored")
-            : exit.reason === "aborted"
-              ? "agent run aborted unexpectedly"
-              : `agent exited with code ${exit.code ?? "unknown"}`;
-      }
-
-      patchStepRun(entry.stepRunId, {
-        status,
-        output: exit.output,
-        ...(diff.length > 0 ? { diff } : {}),
-      });
-
-      // The abort API marks the run aborted the moment the driver confirms;
-      // only overwrite when the run is still in a live state.
-      const current = db.runs.get(runId);
-      if (current && !isTerminal(current.status)) {
-        db.runs.update(runId, {
-          status,
-          output: exit.output,
-          ...(error === undefined ? {} : { error }),
-        });
-      } else if (current && (exit.output.length > 0 || error !== undefined)) {
-        db.runs.update(runId, {
-          ...(exit.output.length > 0 ? { output: exit.output } : {}),
-          ...(error === undefined ? {} : { error }),
-        });
-      }
-
-      const finalRun = db.runs.get(runId);
-      logger.info({ runId, status: finalRun?.status, exitReason: exit.reason }, "run finished");
+      await engine.executeRun(
+        runId,
+        {
+          isAbortRequested: () => entry.abortRequested,
+          onHandle: (handle) => {
+            entry.handle = handle;
+          },
+        },
+        { driverId, ...opts },
+      );
     } catch (err) {
-      failRun(entry, describeError(err));
+      // Belt and braces: the engine funnels failures into the run row itself.
+      failRun(runId, describeError(err));
     } finally {
       active.delete(runId);
     }
@@ -236,13 +123,12 @@ export function createExecutor(options: ExecutorOptions): Executor {
       done: Promise.resolve(),
     };
     // Deferred so the HTTP response for POST /api/runs is not interleaved with
-    // the executor's first (synchronous) bookkeeping steps.
+    // the engine's first (synchronous) bookkeeping steps.
     entry.done = Promise.resolve()
       .then(() => execute(entry, opts))
       .catch((err: unknown) => {
-        // Belt and braces: execute() already catches everything.
         logger.error({ err, runId }, "executor crashed unexpectedly");
-        failRun(entry, describeError(err));
+        failRun(runId, describeError(err));
         active.delete(runId);
       });
     active.set(runId, entry);
