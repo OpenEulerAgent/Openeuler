@@ -1,14 +1,25 @@
 export const PACKAGE_NAME = "@openeuler/drivers";
 
-export interface DriverDescriptor {
-  id: string;
-  label: string;
-}
+export type {
+  AgentDriver,
+  AgentExit,
+  AgentExitReason,
+  AgentHandle,
+  AgentMode,
+  AgentStartOpts,
+} from "./types.js";
 
-export const PLACEHOLDER_DRIVERS: readonly DriverDescriptor[] = Object.freeze([
-  { id: "placeholder", label: "Placeholder driver" },
-]);
+export { DriverError } from "./error.js";
+export type { DriverErrorCode } from "./error.js";
 
-export function listDriverIds(): string[] {
-  return PLACEHOLDER_DRIVERS.map((driver) => driver.id);
-}
+export {
+  createDriverRegistry,
+  defaultDriverRegistry,
+  getDriver,
+  listDrivers,
+  registerDriver,
+} from "./registry.js";
+export type { DriverRegistry } from "./registry.js";
+
+export { createFakeDriver, FakeDriver } from "./fake.js";
+export type { FakeDriverOptions } from "./fake.js";
