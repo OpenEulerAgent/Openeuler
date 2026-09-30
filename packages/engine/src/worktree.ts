@@ -56,6 +56,16 @@ export interface WorktreeDiff {
   patch: string;
 }
 
+/**
+ * Result of {@link WorktreeManager.stepDiff}: the delta between a base tree
+ * and the worktree's current state, plus the tree oid that snapshots that
+ * state (the base for the NEXT step's diff).
+ */
+export interface StepDiff extends WorktreeDiff {
+  /** Tree oid of the worktree state this diff captured; feed to the next `stepDiff` as `baseRef`. */
+  tree: string;
+}
+
 /** Best-effort {@link WorktreeManager.remove} outcome; `warnings` lists cleanup steps that failed. */
 export interface WorktreeRemoveResult {
   warnings: string[];
@@ -410,6 +420,58 @@ export class WorktreeManager {
       if (xy === "??" && path.length > 0) out.push(path);
     }
     return out;
+  }
+
+  /**
+   * Captures one step's incremental changes as `{ stat, patch, tree }`:
+   * everything the worktree changed since `baseRef` (a commit-ish or tree
+   * oid — the previous step's snapshot tree, or `HEAD` for the first step).
+   *
+   * Stages all changes first (`git add -A`, a superset of `diff`'s
+   * intent-to-add trick) so new files appear in the diff AND the returned
+   * `tree` (`git write-tree`) snapshots the full state — the next call's
+   * `baseRef`. Consecutive snapshots make each step's stored diff exactly
+   * that step's changes, not a cumulative-vs-HEAD replay.
+   */
+  async stepDiff(worktreePath: string, baseRef: string): Promise<StepDiff> {
+    const abs = resolve(worktreePath);
+    await this.#git(abs, ["add", "-A"]);
+    const [stat, patch, tree] = await Promise.all([
+      this.#git(abs, ["diff", "--stat", baseRef]),
+      this.#git(abs, ["diff", baseRef]),
+      this.#git(abs, ["write-tree"]),
+    ]);
+    return { stat, patch, tree: tree.trim() };
+  }
+
+  /**
+   * Full diff of everything the run changed relative to its base branch:
+   * resolves `git merge-base <baseBranch> HEAD` (so commits merged into the
+   * base after the worktree branched off are excluded) and diffs that tree
+   * against the working tree — staged, unstaged, and untracked (via the same
+   * intent-to-add trick as {@link diff}) — in one unified patch. Falls back
+   * to `HEAD` when the base branch cannot be resolved (missing branch, or no
+   * merge base), which degrades to "uncommitted changes vs HEAD".
+   */
+  async diffVsBase(worktreePath: string, baseBranch: string): Promise<WorktreeDiff> {
+    const abs = resolve(worktreePath);
+    let base = "HEAD";
+    try {
+      const merged = (await this.#git(abs, ["merge-base", baseBranch, "HEAD"])).trim();
+      if (merged.length > 0) base = merged;
+    } catch {
+      // Unknown branch or no merge base: keep the HEAD fallback.
+    }
+    const status = await this.#git(abs, ["status", "--porcelain", "-z", "--untracked-files=all"]);
+    const untracked = this.#parseUntracked(status);
+    if (untracked.length > 0) {
+      await this.#git(abs, ["add", "-N", "--", ...untracked]);
+    }
+    const [stat, patch] = await Promise.all([
+      this.#git(abs, ["diff", "--stat", base]),
+      this.#git(abs, ["diff", base]),
+    ]);
+    return { stat, patch };
   }
 
   /**

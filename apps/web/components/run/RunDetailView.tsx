@@ -13,7 +13,7 @@ import {
   terminalEndMs,
   type FeedEntry,
 } from "@/lib/run-feed";
-import { DiffPanel } from "./DiffPanel";
+import { DiffsTab } from "./DiffsTab";
 import { EventFeed } from "./EventFeed";
 import { InterruptedRunBanner } from "./InterruptedRunBanner";
 import { OutputPanel } from "./OutputPanel";
@@ -30,6 +30,9 @@ type LoadState =
   | { phase: "ready"; detail: RunDetail; project: Project | null }
   | { phase: "notfound" }
   | { phase: "error"; message: string };
+
+/** Bottom-panel tabs; Output only appears when the run produced one. */
+type ResultsTab = "output" | "diffs";
 
 /** Fetch the run detail (and its project); every failure collapses to a LoadState. */
 async function fetchRunDetail(runId: string): Promise<LoadState> {
@@ -68,6 +71,7 @@ export function RunDetailView({ runId }: { runId: string }) {
   const [terminalStatus, setTerminalStatus] = useState<TerminalRunStatus | null>(null);
   const [endedMs, setEndedMs] = useState<number | null>(null);
   const [nowMs, setNowMs] = useState(() => Date.now());
+  const [resultsTab, setResultsTab] = useState<ResultsTab | null>(null);
   const runRef = useRef<Run | null>(null);
 
   const refresh = useCallback(async (): Promise<void> => {
@@ -171,13 +175,22 @@ export function RunDetailView({ runId }: { runId: string }) {
   const steps = detail.steps;
   const lastOutput = steps.length > 0 ? (steps[steps.length - 1]?.output ?? "") : "";
   const output = lastOutput.length > 0 ? lastOutput : (detail.run.output ?? "");
-  const diff = steps
-    .map((step) => step.diff ?? "")
-    .filter((part) => part.length > 0)
-    .join("\n\n");
+  const hasDiff = steps.some((step) => (step.diff ?? "").length > 0);
   const showPanels = effectiveStatus !== undefined && !live;
   const shownRun: Run =
     terminalStatus !== null ? { ...detail.run, status: terminalStatus } : detail.run;
+
+  // Bottom tabs: Output (when there is one) | Diffs (issue #20). Diffs stay
+  // reachable even without stored step diffs — the cumulative scope may still
+  // compute something live from the worktree.
+  const availableTabs: ResultsTab[] = [
+    ...(output.length > 0 ? (["output"] as const) : []),
+    "diffs",
+  ];
+  const activeTab: ResultsTab =
+    resultsTab !== null && availableTabs.includes(resultsTab)
+      ? resultsTab
+      : (availableTabs[0] as ResultsTab);
 
   return (
     <div className="flex flex-col gap-6">
@@ -197,8 +210,40 @@ export function RunDetailView({ runId }: { runId: string }) {
         onReconnect={() => streamHandleRef.current?.reconnect()}
       />
 
-      {showPanels && output.length > 0 ? <OutputPanel output={output} /> : null}
-      {showPanels && diff.length > 0 ? <DiffPanel diff={diff} /> : null}
+      {showPanels ? (
+        <Card
+          title="Run results"
+          description={
+            hasDiff
+              ? "Final output and file changes made by this run."
+              : "Final output of this run."
+          }
+        >
+          <div className="flex gap-1 border-b border-slate-200">
+            {availableTabs.map((name) => (
+              <button
+                key={name}
+                type="button"
+                onClick={() => setResultsTab(name)}
+                className={`-mb-px rounded-t-md border-b-2 px-3 py-1.5 text-sm font-medium transition-colors ${
+                  activeTab === name
+                    ? "border-slate-900 text-slate-900"
+                    : "border-transparent text-slate-500 hover:text-slate-700"
+                }`}
+              >
+                {name === "output" ? "Output" : "Diffs"}
+              </button>
+            ))}
+          </div>
+          <div className="mt-4">
+            {activeTab === "output" ? (
+              <OutputPanel output={output} />
+            ) : (
+              <DiffsTab runId={detail.run.id} steps={steps} />
+            )}
+          </div>
+        </Card>
+      ) : null}
     </div>
   );
 }

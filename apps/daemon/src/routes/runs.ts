@@ -4,6 +4,7 @@ import { TERMINAL_RUN_STATUSES, RunStatusSchema } from "@openeuler/core";
 import type { Db } from "@openeuler/db";
 import { DriverError } from "@openeuler/drivers";
 import { ADHOC_STEP_ID, branchForRun } from "@openeuler/engine";
+import type { WorktreeManager } from "@openeuler/engine";
 import { Hono, type Context } from "hono";
 import { streamSSE } from "hono/streaming";
 import { z } from "zod";
@@ -176,9 +177,87 @@ function groupByIteration(steps: StepRun[]): Array<{ iteration: number; steps: S
     .map(([iteration, grouped]) => ({ iteration, steps: grouped }));
 }
 
+// ---------------------------------------------------------------------------
+// GET /api/runs/:id/diff — per-step and cumulative diff payloads.
+//
+
+/**
+ * Server-side cap on returned patch lines: a guard against multi-megabyte
+ * payloads from huge generated changes. The response carries
+ * `truncated: true` + `totalLines` past the cap; there is deliberately NO
+ * `?full=1` escape hatch — the cap IS the guard, and the client banner
+ * explains it (`Showing first N of M lines`).
+ */
+export const MAX_DIFF_PATCH_LINES = 20_000;
+
+/** Query params for `GET /api/runs/:id/diff`. */
+const DiffQuerySchema = z.strictObject({
+  /** `step` (requires `stepRunId`) or `cumulative` (default). */
+  scope: z.enum(["step", "cumulative"]).optional(),
+  stepRunId: z.string().min(1, "stepRunId must be a non-empty string").optional(),
+});
+
+/** Body of `GET /api/runs/:id/diff` for both scopes. */
+export interface RunDiffBody {
+  scope: "step" | "cumulative";
+  /** `git diff --stat` summary (never truncated — small by construction). */
+  stat: string;
+  /** Unified patch, capped at {@link MAX_DIFF_PATCH_LINES} lines. */
+  patch: string;
+  /** True when the patch was cut at the cap. */
+  truncated: boolean;
+  /** Full patch line count before the cap was applied. */
+  totalLines: number;
+  /** The cap applied; echoed so clients can label the banner without hardcoding. */
+  maxLines: number;
+  /** Present for `scope=step`: the StepRun whose stored diff this is. */
+  stepRunId?: string;
+}
+
+/**
+ * Splits a StepRun's stored `diff` column — the engine's `stat\npatch`
+ * combination — back into `{ stat, patch }`. The stat block is everything
+ * before the first `diff --git` line; a stored value with no patch section
+ * (clean tree) is all stat.
+ */
+export function splitStepDiff(stored: string): { stat: string; patch: string } {
+  if (stored.length === 0) return { stat: "", patch: "" };
+  const lines = stored.split("\n");
+  const firstPatchLine = lines.findIndex((line) => line.startsWith("diff --git "));
+  if (firstPatchLine === -1) return { stat: stored.trimEnd(), patch: "" };
+  return {
+    stat: lines.slice(0, firstPatchLine).join("\n").trimEnd(),
+    patch: lines.slice(firstPatchLine).join("\n"),
+  };
+}
+
+/** Applies the {@link MAX_DIFF_PATCH_LINES} cap to a patch. */
+export function capPatchLines(patch: string): {
+  patch: string;
+  truncated: boolean;
+  totalLines: number;
+} {
+  if (patch.length === 0) return { patch, truncated: false, totalLines: 0 };
+  const lines = patch.split("\n");
+  if (lines.length <= MAX_DIFF_PATCH_LINES) {
+    return { patch, truncated: false, totalLines: lines.length };
+  }
+  return {
+    patch: lines.slice(0, MAX_DIFF_PATCH_LINES).join("\n"),
+    truncated: true,
+    totalLines: lines.length,
+  };
+}
+
 export interface CreateRunsRouterOptions {
   /** SSE tuning for `GET /api/runs/:id/events` (tests shrink the timers). */
   eventStream?: EventStreamOptions;
+  /**
+   * Worktree manager for `GET /api/runs/:id/diff?scope=cumulative` (computed
+   * live in the run's worktree). Absent → that scope answers 503; the
+   * per-step scope only reads stored rows and works without it.
+   */
+  worktrees?: WorktreeManager;
 }
 
 export function createRunsRouter(options: CreateRunsRouterOptions = {}): Hono<AppEnv> {
@@ -285,6 +364,85 @@ export function createRunsRouter(options: CreateRunsRouterOptions = {}): Hono<Ap
       iterations: groupByIteration(sorted),
       summary: { eventCount: db.events.count(run.id) },
     };
+    return c.json(body);
+  });
+
+  // Diff payloads for the run detail page's Diffs tab. Two scopes:
+  //
+  // - `?scope=step&stepRunId=<id>` — THAT StepRun's stored diff (the engine
+  //   snapshots a tree after every step, so the stored patch is incremental:
+  //   only that step's changes, even mid-workflow). Works for any run,
+  //   including cleaned-up ones — no worktree needed.
+  // - `?scope=cumulative` (default) — everything the run changed vs its base
+  //   branch, computed LIVE in the run's worktree (`git diff <merge-base of
+  //   base branch and HEAD>` covering staged, unstaged, and untracked
+  //   changes). Needs the worktree to still exist: gone (run cleaned up,
+  //   worktree pruned) → 410 WORKTREE_GONE; per-step scope still works.
+  //
+  // Both responses cap the patch at MAX_DIFF_PATCH_LINES lines
+  // (`truncated: true` + `totalLines` past the cap).
+  runs.get("/:id/diff", async (c) => {
+    const db = requireDb(c);
+    const run = requireRun(db, c.req.param("id"));
+
+    const query = DiffQuerySchema.parse({
+      scope: c.req.query("scope") ?? undefined,
+      stepRunId: c.req.query("stepRunId") ?? undefined,
+    });
+    const scope = query.scope ?? "cumulative";
+
+    if (scope === "step") {
+      if (query.stepRunId === undefined) {
+        throw new HttpError(
+          422,
+          "STEP_RUN_ID_REQUIRED",
+          "scope=step requires a stepRunId query parameter",
+        );
+      }
+      // listByRun both checks existence AND ownership (a stepRunId from
+      // another run is indistinguishable from a missing one — no leaking).
+      const stepRun = db.stepRuns.listByRun(run.id).find((step) => step.id === query.stepRunId);
+      if (!stepRun) {
+        throw new HttpError(
+          404,
+          "STEP_RUN_NOT_FOUND",
+          `run ${run.id} has no step run with id ${query.stepRunId}`,
+        );
+      }
+      const { stat, patch } = splitStepDiff(stepRun.diff ?? "");
+      const capped = capPatchLines(patch);
+      const body: RunDiffBody = {
+        scope,
+        stat,
+        ...capped,
+        maxLines: MAX_DIFF_PATCH_LINES,
+        stepRunId: stepRun.id,
+      };
+      return c.json(body);
+    }
+
+    // scope=cumulative — needs the live worktree.
+    const worktrees = options.worktrees ?? c.get("worktrees");
+    if (!worktrees) {
+      throw new HttpError(
+        503,
+        "WORKTREES_UNAVAILABLE",
+        "worktree manager is not configured; cumulative diffs are unavailable",
+      );
+    }
+    const info = worktrees.existing(run.id);
+    if (info === null) {
+      throw new HttpError(
+        410,
+        "WORKTREE_GONE",
+        `the worktree for run ${run.id} no longer exists (run cleaned up or worktree pruned); the cumulative diff cannot be computed — per-step diffs (?scope=step&stepRunId=…) are still available`,
+      );
+    }
+    const project = db.projects.get(run.projectId);
+    const baseBranch = project?.defaultBranch ?? "HEAD";
+    const { stat, patch } = await worktrees.diffVsBase(info.path, baseBranch);
+    const capped = capPatchLines(patch);
+    const body: RunDiffBody = { scope, stat, ...capped, maxLines: MAX_DIFF_PATCH_LINES };
     return c.json(body);
   });
 

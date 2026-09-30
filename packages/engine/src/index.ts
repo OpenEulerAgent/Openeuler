@@ -17,6 +17,7 @@ export {
   type WorktreeInfo,
   type WorktreeManagerOptions,
   type WorktreeRemoveResult,
+  type StepDiff,
 } from "./worktree.js";
 
 export {
