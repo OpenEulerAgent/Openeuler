@@ -104,6 +104,15 @@ describe("valid fixtures parse", () => {
     expect(ProjectSchema.parse(validProject)).toEqual(validProject);
   });
 
+  it("parses a project with snapshot metadata", () => {
+    const withSnapshot = {
+      ...validProject,
+      remoteUrl: "https://example.com/openeuler.git",
+      dirty: true,
+    };
+    expect(ProjectSchema.parse(withSnapshot)).toEqual(withSnapshot);
+  });
+
   it("parses a workflow with steps and loopBack", () => {
     expect(WorkflowSchema.parse(validWorkflow)).toEqual(validWorkflow);
   });

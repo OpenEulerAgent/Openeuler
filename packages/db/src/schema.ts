@@ -12,6 +12,9 @@ export const projects = sqliteTable("projects", {
   path: text("path").notNull(),
   name: text("name").notNull(),
   defaultBranch: text("default_branch").notNull(),
+  /** Nullable metadata snapshot columns; absent domain fields persist as NULL. */
+  remoteUrl: text("remote_url"),
+  dirty: integer("dirty", { mode: "boolean" }),
   createdAt: text("created_at").notNull(),
 });
 
