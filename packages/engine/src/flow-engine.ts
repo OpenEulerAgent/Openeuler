@@ -12,7 +12,7 @@ import type { Db } from "@openeuler/db";
 import type { AgentDriver, AgentHandle, AgentMode, DriverRegistry } from "@openeuler/drivers";
 import type { WorktreeManager } from "./worktree.js";
 
-/** Default driver id for ad-hoc runs; the real opencode driver lands later. */
+/** Default driver id for ad-hoc runs (override per run via `OPENEULER_DRIVER`). */
 export const DEFAULT_DRIVER_ID = "fake";
 
 /** StepRun `stepId` backing ad-hoc runs executed without a workflow. */

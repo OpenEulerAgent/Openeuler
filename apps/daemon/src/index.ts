@@ -1,6 +1,6 @@
 import { serve } from "@hono/node-server";
 import { createDatabase } from "@openeuler/db";
-import { createDriverRegistry, createFakeDriver } from "@openeuler/drivers";
+import { createDriverRegistry, createFakeDriver, createOpenCodeDriver } from "@openeuler/drivers";
 import { WorktreeManager } from "@openeuler/engine";
 import { createApp } from "./app.js";
 import { createExecutor } from "./executor.js";
@@ -18,10 +18,13 @@ export async function main(): Promise<void> {
   const logger = createLogger();
   const db = createDatabase();
 
-  // Driver composition at boot. `fake` is the only backend for now; the real
-  // opencode driver arrives later. OPENEULER_DRIVER selects the run driver.
+  // Driver composition at boot: every driver listed in `GET /api/drivers`.
+  // `fake` needs no external binary; `opencode` spawns the real CLI.
+  // OPENEULER_DRIVER selects the driver for ad-hoc runs; workflow steps pick
+  // theirs per step in the workflow definition.
   const drivers = createDriverRegistry();
   drivers.registerDriver(createFakeDriver());
+  drivers.registerDriver(createOpenCodeDriver());
 
   const worktrees = new WorktreeManager();
   const executor = createExecutor({ db, worktrees, drivers, logger });
