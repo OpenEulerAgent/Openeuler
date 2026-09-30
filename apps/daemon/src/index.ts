@@ -25,7 +25,7 @@ export async function main(): Promise<void> {
   const worktrees = new WorktreeManager();
   const executor = createExecutor({ db, worktrees, drivers, logger });
 
-  const { app, onShutdown, handleShutdown } = createApp({ db, logger, executor });
+  const { app, onShutdown, handleShutdown } = createApp({ db, logger, executor, drivers });
 
   // LIFO: http-server → executor → db.
   onShutdown(() => db.close(), "db");

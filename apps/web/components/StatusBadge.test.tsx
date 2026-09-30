@@ -21,9 +21,7 @@ describe("statusBadgeStyle", () => {
   });
 
   it("labels statuses in sentence case", () => {
-    const entries = RUN_STATUSES.map(
-      (status) => [status, statusBadgeStyle(status).label] as const,
-    );
+    const entries = RUN_STATUSES.map((status) => [status, statusBadgeStyle(status).label] as const);
     expect(Object.fromEntries(entries)).toEqual({
       queued: "Queued",
       running: "Running",

@@ -6,6 +6,7 @@ import type { Project } from "@openeuler/core";
 import { Button } from "@/components/Button";
 import { Card } from "@/components/Card";
 import { RunsList } from "@/components/RunsList";
+import { WorkflowsList } from "@/components/workflows/WorkflowsList";
 import { apiFetch, ApiError } from "@/lib/api";
 import {
   canGoBack,
@@ -149,13 +150,7 @@ export function WorkspaceView({ projectId }: { projectId: string }) {
         />
       ) : null}
 
-      {tab === "workflows" ? (
-        <Card title="Workflows" description="Repeatable multi-step pipelines for this project.">
-          <p className="py-6 text-sm text-slate-400">
-            Workflow builder coming next — for now, start ad-hoc runs with the New run button.
-          </p>
-        </Card>
-      ) : null}
+      {tab === "workflows" ? <WorkflowsList projectId={project.id} /> : null}
 
       {showNewRun ? (
         <NewRunModal projectId={project.id} onClose={() => setShowNewRun(false)} />

@@ -9,7 +9,6 @@ import { apiFetch, ApiError } from "@/lib/api";
 /**
  * Minimal "New run" modal: prompt textarea plus an optional model override.
  * Creates an ad-hoc run via POST /api/runs and navigates to its detail page.
- * The full workflows UI arrives with #17.
  */
 export function NewRunModal({ projectId, onClose }: { projectId: string; onClose: () => void }) {
   const router = useRouter();
