@@ -16,6 +16,17 @@ describe("GET /health", () => {
     expect(body.version).toMatch(/^\d+\.\d+\.\d+/);
     expect(body.uptime).toBeGreaterThanOrEqual(0);
   });
+
+  it("reports the run-concurrency cap (default 2, configurable)", async () => {
+    const { app } = build();
+    const res = await app.request("/health");
+    const body = (await res.json()) as { maxConcurrentRuns: number };
+    expect(body.maxConcurrentRuns).toBe(2);
+
+    const custom = createApp({ logger: createLogger("silent"), maxConcurrentRuns: 5 });
+    const customRes = await custom.app.request("/health");
+    expect(((await customRes.json()) as { maxConcurrentRuns: number }).maxConcurrentRuns).toBe(5);
+  });
 });
 
 describe("unknown routes", () => {

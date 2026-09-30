@@ -25,7 +25,13 @@ export async function main(): Promise<void> {
   const worktrees = new WorktreeManager();
   const executor = createExecutor({ db, worktrees, drivers, logger });
 
-  const { app, onShutdown, handleShutdown } = createApp({ db, logger, executor, drivers });
+  const { app, onShutdown, handleShutdown } = createApp({
+    db,
+    logger,
+    executor,
+    drivers,
+    maxConcurrentRuns: executor.maxConcurrentRuns,
+  });
 
   // LIFO: http-server → executor → db.
   onShutdown(() => db.close(), "db");
@@ -33,7 +39,10 @@ export async function main(): Promise<void> {
 
   const port = resolvePort();
   const server = serve({ fetch: app.fetch, port }, (info) => {
-    logger.info({ port: info.port, dbPath: db.path }, "@openeuler/daemon listening");
+    logger.info(
+      { port: info.port, dbPath: db.path, maxConcurrentRuns: executor.maxConcurrentRuns },
+      "@openeuler/daemon listening",
+    );
   });
   server.on("error", (err) => {
     logger.error({ err, port }, "http server error");

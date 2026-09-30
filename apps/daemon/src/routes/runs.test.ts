@@ -11,24 +11,35 @@ import { createDriverRegistry, createFakeDriver } from "@openeuler/drivers";
 import { WorktreeManager } from "@openeuler/engine";
 import { createApp } from "../app.js";
 import { createExecutor } from "../executor.js";
+import type { Executor } from "../executor.js";
 import { createLogger } from "../logger.js";
 
 interface ApiHarness {
   dir: string;
   db: Db;
   storeRoot: string;
+  executor: Executor;
   request: (path: string, init?: RequestInit) => Promise<Response>;
   projectId: string;
 }
 
 interface RunBody {
-  run: Run;
+  run: Run & { queuePosition?: number };
 }
 
 interface RunDetailBody {
-  run: Run;
+  run: Run & { queuePosition?: number };
   steps: StepRun[];
   summary: { eventCount: number };
+}
+
+interface RunListBody {
+  runs: Array<Run & { queuePosition?: number }>;
+}
+
+interface RunStatsBody {
+  queued: number;
+  running: number;
 }
 
 interface ErrorResponseBody {
@@ -49,7 +60,10 @@ const git = (cwd: string, ...args: string[]): void => {
 
 const created: { db: Db; dir: string }[] = [];
 
-const setup = (fakeOpts: FakeDriverOptions = {}): ApiHarness => {
+const setup = (
+  fakeOpts: FakeDriverOptions = {},
+  executorOpts: { maxConcurrentRuns?: number } = {},
+): ApiHarness => {
   const dir = mkdtempSync(join(tmpdir(), "openeuler-runs-"));
   const db = createDatabase({ path: join(dir, "test.db") });
   const repoPath = join(dir, "repo");
@@ -74,6 +88,7 @@ const setup = (fakeOpts: FakeDriverOptions = {}): ApiHarness => {
     worktrees: new WorktreeManager({ storeRoot }),
     drivers,
     logger: createLogger("silent"),
+    ...executorOpts,
   });
   const { app } = createApp({ db, logger: createLogger("silent"), executor });
 
@@ -82,6 +97,7 @@ const setup = (fakeOpts: FakeDriverOptions = {}): ApiHarness => {
     dir,
     db,
     storeRoot,
+    executor,
     request: (path, init) => Promise.resolve(app.request(path, init)),
     projectId: project.id,
   };
@@ -390,5 +406,143 @@ describe("driver failure isolation", () => {
 
     const health = await h.request("/health");
     expect(health.status).toBe(200);
+  });
+});
+
+const insertQueuedRun = (h: ApiHarness, createdAt: string, task: string): string => {
+  const runId = crypto.randomUUID();
+  h.db.runs.create({
+    id: runId,
+    projectId: h.projectId,
+    status: "queued",
+    branch: `agentloop/${runId}`,
+    iteration: 0,
+    task,
+    createdAt,
+    updatedAt: createdAt,
+  });
+  return runId;
+};
+
+const getStats = async (h: ApiHarness): Promise<RunStatsBody> => {
+  const res = await h.request("/api/runs/stats");
+  expect(res.status).toBe(200);
+  return (await res.json()) as RunStatsBody;
+};
+
+const waitUntilStats = async (
+  h: ApiHarness,
+  want: RunStatsBody,
+  timeoutMs = 5_000,
+): Promise<void> => {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const stats = await getStats(h);
+    if (stats.queued === want.queued && stats.running === want.running) return;
+    if (Date.now() > deadline) {
+      throw new Error(`stats never reached ${JSON.stringify(want)}; last ${JSON.stringify(stats)}`);
+    }
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+};
+
+const listRuns = async (h: ApiHarness, query = ""): Promise<RunListBody> => {
+  const res = await h.request(`/api/runs${query}`);
+  expect(res.status).toBe(200);
+  return (await res.json()) as RunListBody;
+};
+
+describe("queue positions", () => {
+  it("exposes queuePosition for queued runs in global createdAt order; the field drops once a run starts", async () => {
+    const h = setup({ events: script });
+    const base = Date.now();
+    const first = insertQueuedRun(h, new Date(base).toISOString(), "q0");
+    const second = insertQueuedRun(h, new Date(base + 1_000).toISOString(), "q1");
+    const third = insertQueuedRun(h, new Date(base + 2_000).toISOString(), "q2");
+
+    const queued = await listRuns(h, "?status=queued");
+    // Rows are newest-first, but positions follow global creation order.
+    expect(queued.runs.map((run) => run.id)).toEqual([third, second, first]);
+    expect(queued.runs.map((run) => run.queuePosition)).toEqual([2, 1, 0]);
+
+    const detail = await getRun(h, second);
+    expect(detail.run.queuePosition).toBe(1);
+
+    // The first run starts: it loses the field, the others shift up.
+    h.db.runs.updateStatus(first, "running");
+    const after = await listRuns(h, "?status=queued");
+    expect(after.runs.map((run) => run.id)).toEqual([third, second]);
+    expect(after.runs.map((run) => run.queuePosition)).toEqual([1, 0]);
+    const runningDetail = await getRun(h, first);
+    expect("queuePosition" in runningDetail.run).toBe(false);
+
+    // Non-queued rows in the unfiltered list never carry the field.
+    const all = await listRuns(h);
+    for (const run of all.runs) {
+      if (run.status !== "queued") expect("queuePosition" in run).toBe(false);
+    }
+  });
+});
+
+describe("concurrent scheduling over the API", () => {
+  it("queues above the cap, reports stats, and starts the next queued run (losing its position) after an abort", async () => {
+    const deltas: AgentEvent[] = Array.from({ length: 12 }, (_, i) => ({
+      type: "message-delta",
+      seq: i + 1,
+      delta: "tick ",
+    }));
+    const h = setup({ events: deltas, delayMs: 60 }, { maxConcurrentRuns: 1 });
+    const otherProject = h.db.projects.create({
+      id: crypto.randomUUID(),
+      path: join(h.dir, "repo"),
+      name: "other",
+      defaultBranch: "main",
+      createdAt: new Date().toISOString(),
+    });
+
+    const firstRes = await postRun(h, { projectId: h.projectId, prompt: "long" });
+    const first = ((await firstRes.json()) as RunBody).run;
+    await waitUntilStats(h, { queued: 0, running: 1 });
+
+    const secondRes = await postRun(h, { projectId: otherProject.id, prompt: "second" });
+    const thirdRes = await postRun(h, { projectId: otherProject.id, prompt: "third" });
+    const second = ((await secondRes.json()) as RunBody).run;
+    const third = ((await thirdRes.json()) as RunBody).run;
+    await waitUntilStats(h, { queued: 2, running: 1 });
+
+    // Both waiting runs are queued with distinct positions (global order).
+    const queued = await listRuns(h, "?status=queued");
+    expect(queued.runs.map((run) => run.id).sort()).toEqual([second.id, third.id].sort());
+    expect([...queued.runs.map((run) => run.queuePosition)].sort()).toEqual([0, 1]);
+
+    // Aborting the running run frees the slot: exactly one queued run starts
+    // (and loses queuePosition); the other moves up to position 0.
+    const abortRes = await h.request(`/api/runs/${first.id}/abort`, { method: "POST" });
+    expect(abortRes.status).toBe(200);
+    await pollRun(h, first.id, "aborted");
+    await waitUntilStats(h, { queued: 1, running: 1 });
+
+    const after = await listRuns(h);
+    const secondRow = after.runs.find((run) => run.id === second.id);
+    const thirdRow = after.runs.find((run) => run.id === third.id);
+    expect(secondRow).toBeDefined();
+    expect(thirdRow).toBeDefined();
+    if (!secondRow || !thirdRow) throw new Error("queued runs vanished from the list");
+    const runningRow = secondRow.status === "running" ? secondRow : thirdRow;
+    const queuedRow = secondRow.status === "running" ? thirdRow : secondRow;
+    expect("queuePosition" in runningRow).toBe(false);
+    expect(queuedRow.queuePosition).toBe(0);
+
+    // Clean up: abort the running one, then the queued one (dropped without start).
+    await h.request(`/api/runs/${runningRow.id}/abort`, { method: "POST" });
+    await pollRun(h, runningRow.id, "aborted");
+    await h.request(`/api/runs/${queuedRow.id}/abort`, { method: "POST" });
+    await pollRun(h, queuedRow.id, "aborted");
+    await waitUntilStats(h, { queued: 0, running: 0 });
+  }, 15_000);
+
+  it("GET /api/runs/stats returns zeroed counts on an idle daemon", async () => {
+    const h = setup({ events: script });
+    expect(await getStats(h)).toEqual({ queued: 0, running: 0 });
   });
 });

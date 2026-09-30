@@ -17,6 +17,23 @@ import { HttpError } from "../errors.js";
  */
 export { ADHOC_STEP_ID };
 
+/**
+ * Runs API.
+ *
+ * ## Concurrency & queueing
+ *
+ * Runs execute under a global semaphore (`MAX_CONCURRENT_RUNS`, default 2,
+ * surfaced in `/health`) and are serialized per project: only one run per
+ * project is active at a time — worktrees branch from the same repo HEAD, so
+ * siblings wait (status `queued`) until the current run is terminal. Runs for
+ * different projects execute in parallel up to the global cap.
+ *
+ * A queued run's response carries a computed `queuePosition` field (not part
+ * of the core `Run`): the number of queued runs created before it, in global
+ * `(createdAt, id)` order. The field disappears once the run starts. A
+ * project-level toggle for serialization may arrive later.
+ */
+
 const CreateRunBodySchema = z.strictObject({
   projectId: z.string().min(1, "projectId must be a non-empty string"),
   prompt: z.string().min(1, "prompt must be a non-empty string"),
@@ -51,11 +68,51 @@ const isTerminalRunStatus = (status: RunStatus): status is TerminalRunStatus =>
 
 /** Run detail payload: the run, its step runs (flat + grouped per iteration), and a small summary. */
 export interface RunDetailBody {
-  run: Run;
+  run: RunApiBody;
   steps: StepRun[];
   /** Step runs grouped by 1-based loop pass, ordered by iteration. */
   iterations: Array<{ iteration: number; steps: StepRun[] }>;
   summary: { eventCount: number };
+}
+
+/** Run list payload: runs plus computed queue metadata for queued rows. */
+export interface RunListBody {
+  runs: RunApiBody[];
+}
+
+/** Queue summary for dashboards: how many runs are queued vs executing. */
+export interface RunStatsBody {
+  queued: number;
+  running: number;
+}
+
+/**
+ * A run as returned by the API: the core `Run` plus `queuePosition`, a
+ * computed field present only while the run sits in the global queue. It is
+ * deliberately NOT part of the persisted core Run schema.
+ */
+export type RunApiBody = Run & { queuePosition?: number };
+
+/**
+ * `queuePosition` per queued run id: how many queued runs were created
+ * before it, in global `(createdAt, id)` ascending order (0 = next to
+ * start). Computed from the db, so it reflects both live queued runs and
+ * rows enqueued by other writers.
+ */
+function queuePositionsByRunId(db: Db): Map<string, number> {
+  const queued = [...db.runs.list(undefined, "queued")].sort((a, b) =>
+    a.createdAt === b.createdAt ? (a.id < b.id ? -1 : 1) : a.createdAt < b.createdAt ? -1 : 1,
+  );
+  const positions = new Map<string, number>();
+  queued.forEach((run, index) => positions.set(run.id, index));
+  return positions;
+}
+
+/** Attaches `queuePosition` to queued rows (others pass through untouched). */
+function withQueuePosition(run: Run, positions: Map<string, number>): RunApiBody {
+  if (run.status !== "queued") return run;
+  const queuePosition = positions.get(run.id);
+  return queuePosition === undefined ? run : { ...run, queuePosition };
 }
 
 function requireDb(c: Context<AppEnv>): Db {
@@ -188,7 +245,20 @@ export function createRunsRouter(options: CreateRunsRouterOptions = {}): Hono<Ap
       }
       status = parsed.data;
     }
-    return c.json({ runs: db.runs.list(c.req.query("projectId") || undefined, status) });
+    const runs = db.runs.list(c.req.query("projectId") || undefined, status);
+    const positions = queuePositionsByRunId(db);
+    const body: RunListBody = { runs: runs.map((run) => withQueuePosition(run, positions)) };
+    return c.json(body);
+  });
+
+  // Registered before `/:id` so "stats" is not captured as a run id.
+  runs.get("/stats", (c) => {
+    const db = requireDb(c);
+    const body: RunStatsBody = {
+      queued: db.runs.list(undefined, "queued").length,
+      running: db.runs.list(undefined, "running").length,
+    };
+    return c.json(body);
   });
 
   runs.get("/:id", (c) => {
@@ -210,7 +280,7 @@ export function createRunsRouter(options: CreateRunsRouterOptions = {}): Hono<Ap
       return ai === bi ? a.stepId.localeCompare(b.stepId) : ai - bi;
     });
     const body: RunDetailBody = {
-      run,
+      run: withQueuePosition(run, queuePositionsByRunId(db)),
       steps: sorted,
       iterations: groupByIteration(sorted),
       summary: { eventCount: db.events.count(run.id) },
