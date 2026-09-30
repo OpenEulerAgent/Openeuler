@@ -18,6 +18,7 @@
     "@openeuler/drivers": "workspace:*",
     "@openeuler/engine": "workspace:*",
     "hono": "^4.7.0",
+    "p-limit": "^7.3.3",
     "pino": "^10.0.0",
     "zod": "^4.6.5"
   },

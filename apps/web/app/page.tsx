@@ -1,5 +1,6 @@
 import { Button } from "@/components/Button";
 import { Card } from "@/components/Card";
+import { ActiveRunsCard } from "@/components/ActiveRunsCard";
 import { HealthPill } from "@/components/HealthPill";
 
 export default function DashboardPage() {
@@ -25,11 +26,11 @@ export default function DashboardPage() {
           </div>
         </Card>
 
-        <Card title="Active runs" description="Workflow runs currently queued or executing.">
-          <div className="flex flex-col items-start gap-3 py-6 text-sm text-slate-500">
-            <p>No active runs.</p>
-            <p className="text-xs">Runs appear here once you start a workflow.</p>
-          </div>
+        <Card
+          title="Active runs"
+          description="Workflow runs currently queued or executing, polled from /api/runs/stats."
+        >
+          <ActiveRunsCard />
         </Card>
       </div>
     </div>

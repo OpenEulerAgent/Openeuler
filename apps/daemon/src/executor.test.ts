@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -10,7 +10,7 @@ import type { FakeDriverOptions } from "@openeuler/drivers";
 import { createDriverRegistry, createFakeDriver } from "@openeuler/drivers";
 import { WorktreeManager } from "@openeuler/engine";
 import { createExecutor } from "./executor.js";
-import type { Executor } from "./executor.js";
+import type { Executor, ExecutorOptions } from "./executor.js";
 import { createLogger } from "./logger.js";
 
 const script: AgentEvent[] = [
@@ -27,8 +27,10 @@ interface Harness {
   driver: ReturnType<typeof createFakeDriver>;
   repoPath: string;
   projectId: string;
-  /** Creates a queued run + step run and returns their ids. */
-  enqueue(task?: string): { runId: string; stepRunId: string };
+  /** Creates a queued run + step run (optionally on another project). */
+  enqueue(task?: string, projectId?: string): { runId: string; stepRunId: string };
+  /** Registers another project row pointing at the same repo. */
+  addProject(name?: string): string;
 }
 
 const git = (cwd: string, ...args: string[]): void => {
@@ -46,7 +48,10 @@ const makeRepo = (dir: string): string => {
 
 const created: Harness[] = [];
 
-const setup = (fakeOpts: FakeDriverOptions = {}): Harness => {
+const setup = (
+  fakeOpts: FakeDriverOptions = {},
+  executorOpts: Partial<ExecutorOptions> = {},
+): Harness => {
   const dir = mkdtempSync(join(tmpdir(), "openeuler-executor-"));
   const db = createDatabase({ path: join(dir, "test.db") });
   const repoPath = makeRepo(dir);
@@ -61,7 +66,13 @@ const setup = (fakeOpts: FakeDriverOptions = {}): Harness => {
   const drivers = createDriverRegistry();
   const driver = createFakeDriver(fakeOpts);
   drivers.registerDriver(driver);
-  const executor = createExecutor({ db, worktrees, drivers, logger: createLogger("silent") });
+  const executor = createExecutor({
+    db,
+    worktrees,
+    drivers,
+    logger: createLogger("silent"),
+    ...executorOpts,
+  });
 
   const harness: Harness = {
     dir,
@@ -71,13 +82,13 @@ const setup = (fakeOpts: FakeDriverOptions = {}): Harness => {
     driver,
     repoPath,
     projectId: project.id,
-    enqueue(task = "make it green") {
+    enqueue(task = "make it green", projectId = project.id) {
       const runId = crypto.randomUUID();
       const stepRunId = crypto.randomUUID();
       const now = new Date().toISOString();
       db.runs.create({
         id: runId,
-        projectId: project.id,
+        projectId,
         status: "queued",
         branch: `agentloop/${runId}`,
         iteration: 0,
@@ -94,6 +105,16 @@ const setup = (fakeOpts: FakeDriverOptions = {}): Harness => {
         output: "",
       });
       return { runId, stepRunId };
+    },
+    addProject(name = "extra") {
+      const extra = db.projects.create({
+        id: crypto.randomUUID(),
+        path: repoPath,
+        name,
+        defaultBranch: "main",
+        createdAt: new Date().toISOString(),
+      });
+      return extra.id;
     },
   };
   created.push(harness);
@@ -309,5 +330,239 @@ describe("createExecutor", () => {
     h.executor.startRun(runId);
     await waitForStatus(h, runId, "success");
     expect(h.driver.calls).toHaveLength(1);
+  });
+});
+
+const TERMINAL = new Set<RunStatus>(["success", "failed", "aborted", "interrupted"]);
+
+const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
+
+const statusOf = (h: Harness, runId: string): RunStatus | undefined => h.db.runs.get(runId)?.status;
+
+const countWithStatus = (h: Harness, runIds: string[], status: RunStatus): number =>
+  runIds.filter((runId) => statusOf(h, runId) === status).length;
+
+/** Samples statuses until every run is terminal; returns the sample log. */
+async function runToCompletion(
+  h: Harness,
+  runIds: string[],
+  timeoutMs = 10_000,
+): Promise<RunStatus[][]> {
+  const samples: RunStatus[][] = [];
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const current = runIds.map((runId) => statusOf(h, runId) ?? "aborted");
+    samples.push(current);
+    if (current.every((status) => TERMINAL.has(status))) return samples;
+    if (Date.now() > deadline) {
+      throw new Error(`runs never completed; last statuses ${JSON.stringify(current)}`);
+    }
+    await sleep(5);
+  }
+}
+
+/** Resolves once pred holds; throws on timeout. */
+async function waitUntil(pred: () => boolean, what: string, timeoutMs = 5_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!pred()) {
+    if (Date.now() > deadline) throw new Error(`condition never met: ${what}`);
+    await sleep(5);
+  }
+}
+
+describe("createExecutor concurrency scheduling", () => {
+  it("caps concurrent execution at maxConcurrentRuns (5 runs, cap 2), all complete, isolated worktrees", async () => {
+    const deltas: AgentEvent[] = Array.from({ length: 6 }, (_, i) => ({
+      type: "message-delta",
+      seq: i + 1,
+      delta: "chunk ",
+    }));
+    const h = setup(
+      {
+        events: deltas,
+        delayMs: 25,
+        onStart: (opts) => {
+          writeFileSync(join(opts.cwd, "who.txt"), `${opts.prompt}\n`);
+        },
+      },
+      { maxConcurrentRuns: 2 },
+    );
+    expect(h.executor.maxConcurrentRuns).toBe(2);
+    const projects = [
+      h.projectId,
+      h.addProject("p2"),
+      h.addProject("p3"),
+      h.addProject("p4"),
+      h.addProject("p5"),
+    ];
+    const tasks = projects.map((projectId, index) => h.enqueue(`task-${index}`, projectId));
+    tasks.forEach(({ runId }) => h.executor.startRun(runId));
+
+    const samples = await runToCompletion(
+      h,
+      tasks.map(({ runId }) => runId),
+    );
+
+    const maxInFlight = Math.max(
+      ...samples.map((sample) => sample.filter((s) => s === "running").length),
+    );
+    const maxQueued = Math.max(
+      ...samples.map((sample) => sample.filter((s) => s === "queued").length),
+    );
+    expect(maxInFlight).toBe(2);
+    expect(maxQueued).toBeGreaterThanOrEqual(3);
+    expect(samples.at(-1)).toEqual(["success", "success", "success", "success", "success"]);
+    expect(h.driver.calls).toHaveLength(5);
+
+    // Worktree isolation: every run executed in its own worktree (per runId)
+    // and only saw its own task's file — no shared mutable state between runs.
+    for (const [index, { runId }] of tasks.entries()) {
+      const worktreePath = join(h.dir, "store", runId);
+      expect(existsSync(worktreePath)).toBe(true);
+      expect(readFileSync(join(worktreePath, "who.txt"), "utf8")).toBe(`task-${index}\n`);
+    }
+  });
+
+  it("serializes runs on the same project: the second stays queued until the first is terminal", async () => {
+    const deltas: AgentEvent[] = Array.from({ length: 5 }, (_, i) => ({
+      type: "message-delta",
+      seq: i + 1,
+      delta: "tick ",
+    }));
+    // Cap 2 on purpose: the project gate (not the semaphore) must serialize.
+    const h = setup({ events: deltas, delayMs: 40 }, { maxConcurrentRuns: 2 });
+    const first = h.enqueue("first");
+    const second = h.enqueue("second");
+    h.executor.startRun(first.runId);
+    h.executor.startRun(second.runId);
+
+    await waitUntil(
+      () => statusOf(h, first.runId) === "running" && statusOf(h, second.runId) === "queued",
+      "first running while second queued",
+    );
+
+    const samples = await runToCompletion(h, [first.runId, second.runId]);
+    expect(samples.at(-1)).toEqual(["success", "success"]);
+    expect(Math.max(...samples.map((s) => s.filter((x) => x === "running").length))).toBe(1);
+    // The second run only ever ran after the first was terminal.
+    for (const [firstStatus, secondStatus] of samples) {
+      if (secondStatus === "running") expect(TERMINAL.has(firstStatus ?? "aborted")).toBe(true);
+    }
+    expect(h.driver.calls.map((call) => call.prompt)).toEqual(["first", "second"]);
+  });
+
+  it("runs different projects in parallel up to the cap", async () => {
+    const deltas: AgentEvent[] = Array.from({ length: 6 }, (_, i) => ({
+      type: "message-delta",
+      seq: i + 1,
+      delta: "tick ",
+    }));
+    const h = setup({ events: deltas, delayMs: 40 }, { maxConcurrentRuns: 2 });
+    const a = h.enqueue("a", h.projectId);
+    const b = h.enqueue("b", h.addProject());
+    h.executor.startRun(a.runId);
+    h.executor.startRun(b.runId);
+
+    await waitUntil(
+      () => statusOf(h, a.runId) === "running" && statusOf(h, b.runId) === "running",
+      "both projects running simultaneously",
+    );
+
+    await runToCompletion(h, [a.runId, b.runId]);
+    expect(statusOf(h, a.runId)).toBe("success");
+    expect(statusOf(h, b.runId)).toBe("success");
+  });
+
+  it("aborting a running run frees the global slot for the next queued run", async () => {
+    const deltas: AgentEvent[] = Array.from({ length: 12 }, (_, i) => ({
+      type: "message-delta",
+      seq: i + 1,
+      delta: "tick ",
+    }));
+    const h = setup({ events: deltas, delayMs: 60 }, { maxConcurrentRuns: 1 });
+    const long = h.enqueue("long", h.projectId);
+    const next = h.enqueue("next", h.addProject());
+    h.executor.startRun(long.runId);
+    h.executor.startRun(next.runId);
+
+    await waitUntil(
+      () =>
+        statusOf(h, long.runId) === "running" &&
+        statusOf(h, next.runId) === "queued" &&
+        h.driver.calls.some((call) => call.prompt === "long"),
+      "long running (driver started) while next queued",
+    );
+    expect(countWithStatus(h, [long.runId, next.runId], "running")).toBe(1);
+
+    await expect(h.executor.abortRun(long.runId)).resolves.toEqual({ outcome: "aborted" });
+    await waitForStatus(h, long.runId, "aborted");
+
+    // The freed slot admits the queued run; it drives to success.
+    await waitForStatus(h, next.runId, "running");
+    await waitForStatus(h, next.runId, "success");
+    await waitForIdle(h);
+    expect(h.driver.calls.map((call) => call.prompt)).toEqual(["long", "next"]);
+  });
+
+  it("aborts a scheduler-queued run without starting it and keeps the queue moving", async () => {
+    const deltas: AgentEvent[] = Array.from({ length: 12 }, (_, i) => ({
+      type: "message-delta",
+      seq: i + 1,
+      delta: "tick ",
+    }));
+    const h = setup({ events: deltas, delayMs: 60 }, { maxConcurrentRuns: 1 });
+    const long = h.enqueue("long", h.projectId);
+    const otherProject = h.addProject();
+    const keep = h.enqueue("keep", otherProject);
+    const drop = h.enqueue("drop", otherProject);
+    h.executor.startRun(long.runId);
+    h.executor.startRun(keep.runId);
+    h.executor.startRun(drop.runId);
+
+    await waitUntil(
+      () =>
+        statusOf(h, long.runId) === "running" &&
+        statusOf(h, keep.runId) === "queued" &&
+        statusOf(h, drop.runId) === "queued" &&
+        h.driver.calls.some((call) => call.prompt === "long"),
+      "one running (driver started), two queued",
+    );
+
+    await expect(h.executor.abortRun(drop.runId)).resolves.toEqual({ outcome: "aborted" });
+    expect(statusOf(h, drop.runId)).toBe("aborted");
+    expect(h.db.stepRuns.listByRun(drop.runId)[0]).toMatchObject({ status: "aborted" });
+
+    // The aborted run never starts; the surviving queued run still gets its turn.
+    await expect(h.executor.abortRun(long.runId)).resolves.toEqual({ outcome: "aborted" });
+    await waitForStatus(h, keep.runId, "success");
+    await waitForIdle(h);
+    expect(h.driver.calls.map((call) => call.prompt)).toEqual(["long", "keep"]);
+  });
+
+  it("shutdown settles scheduler-queued runs as aborted without starting them", async () => {
+    const deltas: AgentEvent[] = Array.from({ length: 12 }, (_, i) => ({
+      type: "message-delta",
+      seq: i + 1,
+      delta: "tick ",
+    }));
+    const h = setup({ events: deltas, delayMs: 60 }, { maxConcurrentRuns: 1 });
+    const long = h.enqueue("long", h.projectId);
+    const queued = h.enqueue("queued", h.addProject());
+    h.executor.startRun(long.runId);
+    h.executor.startRun(queued.runId);
+    await waitForStatus(h, long.runId, "running");
+    await waitUntil(
+      () =>
+        statusOf(h, queued.runId) === "queued" &&
+        h.driver.calls.some((call) => call.prompt === "long"),
+      "second run queued, first driver started",
+    );
+
+    await h.executor.shutdown();
+
+    expect(statusOf(h, long.runId)).toBe("aborted");
+    expect(statusOf(h, queued.runId)).toBe("aborted");
+    expect(h.executor.activeRunIds()).toEqual([]);
+    expect(h.driver.calls.map((call) => call.prompt)).toEqual(["long"]);
   });
 });
