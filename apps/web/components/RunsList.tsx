@@ -11,9 +11,10 @@ import { apiFetch, ApiError } from "@/lib/api";
 type ListState =
   { phase: "loading" } | { phase: "ready"; runs: Run[] } | { phase: "error"; message: string };
 
-async function fetchRuns(): Promise<ListState> {
+async function fetchRuns(projectId?: string): Promise<ListState> {
   try {
-    const body = await apiFetch<{ runs: Run[] }>("/api/runs");
+    const query = projectId === undefined ? "" : `?projectId=${encodeURIComponent(projectId)}`;
+    const body = await apiFetch<{ runs: Run[] }>(`/api/runs${query}`);
     return { phase: "ready", runs: body.runs };
   } catch (cause) {
     return {
@@ -24,12 +25,22 @@ async function fetchRuns(): Promise<ListState> {
 }
 
 /** Run history list (newest first): status badge, branch, task, created time. */
-export function RunsList() {
+export function RunsList({
+  projectId,
+  title = "Runs",
+  description,
+  emptyText = "No runs yet. Start one from a project (or POST /api/runs).",
+}: {
+  projectId?: string;
+  title?: string;
+  description?: string;
+  emptyText?: string;
+}) {
   const [state, setState] = useState<ListState>({ phase: "loading" });
 
   const load = useCallback(async (): Promise<void> => {
-    setState(await fetchRuns());
-  }, []);
+    setState(await fetchRuns(projectId));
+  }, [projectId]);
 
   useEffect(() => {
     void load();
@@ -37,8 +48,8 @@ export function RunsList() {
 
   return (
     <Card
-      title="Runs"
-      description="Every run known to the daemon, newest first."
+      title={title}
+      description={description ?? "Every run known to the daemon, newest first."}
       action={
         <Button variant="secondary" onClick={() => void load()}>
           Refresh
@@ -55,9 +66,7 @@ export function RunsList() {
           </Button>
         </div>
       ) : state.runs.length === 0 ? (
-        <p className="py-6 text-sm text-slate-400">
-          No runs yet. Start one from a project (or POST /api/runs).
-        </p>
+        <p className="py-6 text-sm text-slate-400">{emptyText}</p>
       ) : (
         <ul className="divide-y divide-slate-100">
           {state.runs.map((run) => (
