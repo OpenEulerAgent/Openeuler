@@ -43,9 +43,9 @@ export function RunWorkflowModal({
       role="dialog"
       aria-modal="true"
       aria-label={`Run ${workflow.name}`}
-      onClick={onClose}
+      onClick={submitting ? undefined : onClose}
       onKeyDown={(event) => {
-        if (event.key === "Escape") onClose();
+        if (event.key === "Escape" && !submitting) onClose();
       }}
     >
       <div

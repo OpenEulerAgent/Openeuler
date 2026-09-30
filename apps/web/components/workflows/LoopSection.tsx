@@ -131,7 +131,7 @@ export function LoopSection({
                     type="text"
                     value={loop.regex}
                     onChange={(event) => onPatch({ regex: event.target.value })}
-                    placeholder="e.g. (?i)lgtm|approved"
+                    placeholder="e.g. lgtm|approved"
                     className={cn(
                       inputClass,
                       (liveRegexIssue || errors["loopBack.when.regex"]) && "border-red-400",

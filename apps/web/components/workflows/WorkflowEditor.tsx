@@ -11,20 +11,23 @@ import {
   DEFAULT_SAMPLE_TASK,
   createWorkflowDraft,
   draftReducer,
+  errorsAfterAction,
   fieldErrorsFromApiError,
   validateDraft,
   workflowToDraft,
+  type DraftAction,
   type FieldErrors,
 } from "@/lib/workflow-builder";
-import { fetchDriverIds, fetchWorkflow, saveWorkflowDraft } from "@/lib/workflows-api";
+import {
+  fetchDriverIds,
+  fetchWorkflowForEditor,
+  saveWorkflowDraft,
+  type WorkflowLoad,
+} from "@/lib/workflows-api";
 import { LoopSection } from "./LoopSection";
 import { StepCard } from "./StepCard";
 
-type LoadState =
-  | { phase: "loading" }
-  | { phase: "ready"; workflow: Workflow }
-  | { phase: "notfound" }
-  | { phase: "error"; message: string };
+type LoadState = { phase: "loading" } | WorkflowLoad;
 
 /**
  * Workflow editor page shell: loads the workflow (edit mode) and hands off to
@@ -39,29 +42,19 @@ export function WorkflowEditorView({
   workflowId?: string;
 }) {
   const [load, setLoad] = useState<LoadState>({ phase: "loading" });
+  const [attempt, setAttempt] = useState(0);
 
   useEffect(() => {
     if (!workflowId) return;
     let cancelled = false;
     setLoad({ phase: "loading" });
-    void fetchWorkflow(workflowId)
-      .then((workflow) => {
-        if (!cancelled) setLoad({ phase: "ready", workflow });
-      })
-      .catch((cause: unknown) => {
-        if (cancelled) return;
-        if (cause instanceof ApiError && cause.status === 404) setLoad({ phase: "notfound" });
-        else {
-          setLoad({
-            phase: "error",
-            message: cause instanceof ApiError ? cause.message : "Failed to load workflow",
-          });
-        }
-      });
+    void fetchWorkflowForEditor(workflowId).then((state) => {
+      if (!cancelled) setLoad(state);
+    });
     return () => {
       cancelled = true;
     };
-  }, [workflowId]);
+  }, [workflowId, attempt]);
 
   if (!workflowId) return <WorkflowEditor projectId={projectId} />;
 
@@ -87,7 +80,7 @@ export function WorkflowEditorView({
       <Card title="Could not load workflow" description="The daemon did not answer as expected.">
         <div className="flex flex-col items-start gap-3 py-4 text-sm text-slate-500">
           <p className="text-red-600">{load.message}</p>
-          <Button variant="secondary" onClick={() => setLoad({ phase: "loading" })}>
+          <Button variant="secondary" onClick={() => setAttempt((count) => count + 1)}>
             Retry
           </Button>
         </div>
@@ -122,7 +115,7 @@ export function WorkflowEditor({
   workflow?: Workflow;
 }) {
   const router = useRouter();
-  const [draft, dispatch] = useReducer(draftReducer, workflow, (existing) =>
+  const [draft, reduce] = useReducer(draftReducer, workflow, (existing) =>
     existing ? workflowToDraft(existing) : createWorkflowDraft(),
   );
   const [drivers, setDrivers] = useState<string[]>([]);
@@ -130,6 +123,11 @@ export function WorkflowEditor({
   const [errors, setErrors] = useState<FieldErrors>({});
   const [formError, setFormError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
+
+  const dispatch = useCallback((action: DraftAction) => {
+    reduce(action);
+    setErrors((current) => errorsAfterAction(current, action));
+  }, []);
 
   useEffect(() => {
     let cancelled = false;

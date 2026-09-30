@@ -11,6 +11,7 @@ import {
   deleteWorkflow,
   fetchDriverIds,
   fetchWorkflow,
+  fetchWorkflowForEditor,
   fetchWorkflows,
   saveWorkflowDraft,
   startWorkflowRun,
@@ -62,6 +63,46 @@ describe("fetchWorkflow", () => {
     await expect(fetchWorkflow("x", fetcher as unknown as WorkflowFetcher)).rejects.toThrow(
       ApiError,
     );
+  });
+});
+
+describe("fetchWorkflowForEditor (editor load + retry)", () => {
+  it("maps a successful fetch to the ready state", async () => {
+    const fetcher = vi.fn().mockResolvedValue({ workflow: fixtureWorkflow() });
+    const state = await fetchWorkflowForEditor("w-1", fetcher as unknown as WorkflowFetcher);
+    expect(state).toEqual({ phase: "ready", workflow: fixtureWorkflow() });
+    expect(fetcher).toHaveBeenCalledWith("/api/workflows/w-1");
+  });
+
+  it("maps a 404 to notfound and other failures to error messages", async () => {
+    const notFound = vi.fn().mockRejectedValue(new ApiError("WORKFLOW_NOT_FOUND", "nope", 404));
+    expect(await fetchWorkflowForEditor("x", notFound as unknown as WorkflowFetcher)).toEqual({
+      phase: "notfound",
+    });
+
+    const serverError = vi.fn().mockRejectedValue(new ApiError("HTTP_ERROR", "daemon down", 503));
+    expect(await fetchWorkflowForEditor("x", serverError as unknown as WorkflowFetcher)).toEqual({
+      phase: "error",
+      message: "daemon down",
+    });
+
+    const unknown = vi.fn().mockRejectedValue(new Error("network"));
+    expect(await fetchWorkflowForEditor("x", unknown as unknown as WorkflowFetcher)).toEqual({
+      phase: "error",
+      message: "Failed to load workflow",
+    });
+  });
+
+  it("re-fetches on the next call, so Retry triggers a real refetch", async () => {
+    const fetcher = vi
+      .fn()
+      .mockRejectedValueOnce(new ApiError("HTTP_ERROR", "transient", 502))
+      .mockResolvedValueOnce({ workflow: fixtureWorkflow() });
+    const first = await fetchWorkflowForEditor("w-1", fetcher as unknown as WorkflowFetcher);
+    expect(first).toEqual({ phase: "error", message: "transient" });
+    const second = await fetchWorkflowForEditor("w-1", fetcher as unknown as WorkflowFetcher);
+    expect(second).toEqual({ phase: "ready", workflow: fixtureWorkflow() });
+    expect(fetcher).toHaveBeenCalledTimes(2);
   });
 });
 

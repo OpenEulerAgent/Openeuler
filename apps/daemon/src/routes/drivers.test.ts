@@ -1,13 +1,7 @@
-import { afterEach, describe, expect, it } from "vitest";
+import { describe, expect, it } from "vitest";
 import { createDriverRegistry, createFakeDriver } from "@openeuler/drivers";
 import { createApp } from "../app.js";
 import { createLogger } from "../logger.js";
-
-const apps: { close(): void }[] = [];
-
-afterEach(() => {
-  while (apps.length > 0) apps.pop();
-});
 
 function makeRequest(drivers?: ReturnType<typeof createDriverRegistry>): Promise<Response> {
   const { app } = createApp({ logger: createLogger("silent"), drivers });

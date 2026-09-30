@@ -15,7 +15,7 @@ type ListState =
   | { phase: "ready"; workflows: Workflow[] }
   | { phase: "error"; message: string };
 
-/** Badge summarizing a workflow's loop config, or null when it runs linearly. */
+/** Badge body summarizing a workflow's loop config, or null when it runs linearly. */
 export function loopBadge(workflow: Workflow): string | null {
   if (!workflow.loopBack) return null;
   const target = workflow.steps[workflow.loopBack.toStepIndex];
@@ -27,7 +27,7 @@ export function loopBadge(workflow: Workflow): string | null {
       : when.type === "outputMatches"
         ? `output ~ /${when.regex}/`
         : `${when.type.includes("Not") ? "not " : ""}"${when.pattern}"`;
-  return `loop ${targetLabel} while ${condition} (max ${workflow.loopBack.maxIterations})`;
+  return `${targetLabel} while ${condition} (max ${workflow.loopBack.maxIterations})`;
 }
 
 /**

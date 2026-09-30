@@ -441,3 +441,62 @@ export function fieldErrorsFromApiError(
   }
   return errors;
 }
+
+/** LoopDraft field → field-error key it addresses. */
+const LOOP_ERROR_KEYS: Record<keyof LoopDraft, string> = {
+  enabled: "loopBack.when",
+  toStepIndex: "loopBack.toStepIndex",
+  conditionType: "loopBack.when",
+  pattern: "loopBack.when.pattern",
+  regex: "loopBack.when.regex",
+  regexFlags: "loopBack.when.flags",
+  maxIterations: "loopBack.maxIterations",
+};
+
+function omitErrors(errors: FieldErrors, keys: readonly string[]): FieldErrors {
+  let next: FieldErrors | null = null;
+  for (const key of keys) {
+    if (key in errors) {
+      next ??= { ...errors };
+      delete next[key];
+    }
+  }
+  return next ?? errors;
+}
+
+function omitErrorsWhere(errors: FieldErrors, stale: (key: string) => boolean): FieldErrors {
+  return omitErrors(errors, Object.keys(errors).filter(stale));
+}
+
+/**
+ * Field errors made stale by a draft action: structural changes (add, remove,
+ * reorder) drop every index-keyed step error — kept around, those would shift
+ * onto the wrong steps — while renames/patches clear only the fields they
+ * touch. Returns the same object when nothing is stale.
+ */
+export function errorsAfterAction(errors: FieldErrors, action: DraftAction): FieldErrors {
+  switch (action.type) {
+    case "rename":
+      return omitErrors(errors, ["name"]);
+    case "add-step":
+    case "remove-step":
+    case "move-step":
+      return omitErrorsWhere(errors, (key) => key.startsWith("steps."));
+    case "patch-step":
+      return omitErrors(
+        errors,
+        (Object.keys(action.patch) as Array<keyof Omit<StepDraft, "id">>).map((field) =>
+          stepFieldKey(action.index, field),
+        ),
+      );
+    case "set-loop-enabled":
+      return omitErrorsWhere(errors, (key) => key.startsWith("loopBack."));
+    case "patch-loop":
+      return omitErrors(
+        errors,
+        (Object.keys(action.patch) as Array<keyof LoopDraft>).map(
+          (field) => LOOP_ERROR_KEYS[field],
+        ),
+      );
+  }
+}

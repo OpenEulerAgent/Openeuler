@@ -8,6 +8,7 @@ import {
   createWorkflowDraft,
   draftReducer,
   draftToPayload,
+  errorsAfterAction,
   fieldErrorsFromApiError,
   insertAtCursor,
   moveItem,
@@ -16,6 +17,7 @@ import {
   stepFieldKey,
   validateDraft,
   workflowToDraft,
+  type FieldErrors,
   type LoopDraft,
   type StepDraft,
 } from "./workflow-builder";
@@ -344,6 +346,89 @@ describe("validateDraft", () => {
   it("does not flag loop problems when the loop is disabled", () => {
     const draft = draftWithSteps({ enabled: false, conditionType: "outputMatches", regex: "[" });
     expect(validateDraft(draft)).toEqual({});
+  });
+});
+
+describe("errorsAfterAction (stale error clearing)", () => {
+  const seeded: FieldErrors = {
+    name: "name must be a non-empty string",
+    "steps.0.promptTemplate": "promptTemplate must be a non-empty string",
+    "steps.1.name": "name must be a non-empty string",
+    "loopBack.when.regex": "invalid regular expression",
+    "loopBack.maxIterations": "maxIterations is hard-capped at 25",
+  };
+
+  it("drops every step error on structural changes so indexes cannot shift", () => {
+    const structural: Parameters<typeof errorsAfterAction>[1][] = [
+      { type: "add-step" },
+      { type: "remove-step", index: 0 },
+      { type: "move-step", index: 0, dir: -1 },
+    ];
+    for (const action of structural) {
+      expect(errorsAfterAction(seeded, action)).toEqual({
+        name: seeded["name"],
+        "loopBack.when.regex": seeded["loopBack.when.regex"],
+        "loopBack.maxIterations": seeded["loopBack.maxIterations"],
+      });
+    }
+  });
+
+  it("clears only the fields a rename/patch touches", () => {
+    expect(errorsAfterAction(seeded, { type: "rename", name: "n" })).toEqual({
+      "steps.0.promptTemplate": seeded["steps.0.promptTemplate"],
+      "steps.1.name": seeded["steps.1.name"],
+      "loopBack.when.regex": seeded["loopBack.when.regex"],
+      "loopBack.maxIterations": seeded["loopBack.maxIterations"],
+    });
+    expect(
+      errorsAfterAction(seeded, {
+        type: "patch-step",
+        index: 0,
+        patch: { promptTemplate: "go" },
+      }),
+    ).toEqual({
+      name: seeded["name"],
+      "steps.1.name": seeded["steps.1.name"],
+      "loopBack.when.regex": seeded["loopBack.when.regex"],
+      "loopBack.maxIterations": seeded["loopBack.maxIterations"],
+    });
+  });
+
+  it("clears the loop field a patch addresses and all loop errors on toggle", () => {
+    expect(errorsAfterAction(seeded, { type: "patch-loop", patch: { regex: "ok" } })).toEqual({
+      name: seeded["name"],
+      "steps.0.promptTemplate": seeded["steps.0.promptTemplate"],
+      "steps.1.name": seeded["steps.1.name"],
+      "loopBack.maxIterations": seeded["loopBack.maxIterations"],
+    });
+    expect(errorsAfterAction(seeded, { type: "set-loop-enabled", enabled: false })).toEqual({
+      name: seeded["name"],
+      "steps.0.promptTemplate": seeded["steps.0.promptTemplate"],
+      "steps.1.name": seeded["steps.1.name"],
+    });
+  });
+
+  it("returns the same object when nothing is stale", () => {
+    const untouched: FieldErrors = { "steps.0.name": "name must be a non-empty string" };
+    expect(
+      errorsAfterAction(untouched, { type: "patch-step", index: 1, patch: { name: "x" } }),
+    ).toBe(untouched);
+  });
+
+  it("composed with the reducer: a failed-save step error cannot shift onto another step", () => {
+    let draft = draftWithSteps(undefined, 3);
+    let errors = fieldErrorsFromApiError(
+      new ApiError("VALIDATION_ERROR", "boom", 422, {
+        details: [
+          { path: "steps.0.promptTemplate", message: "promptTemplate must be a non-empty string" },
+        ],
+      }),
+    );
+    const action = { type: "remove-step", index: 0 } as const;
+    draft = draftReducer(draft, action);
+    errors = errorsAfterAction(errors, action);
+    expect(errors).toEqual({});
+    expect(draft.steps.map((item) => item.name)).toEqual(["step-2", "step-3"]);
   });
 });
 

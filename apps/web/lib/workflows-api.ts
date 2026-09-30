@@ -25,6 +25,28 @@ export async function fetchWorkflow(
   return body.workflow;
 }
 
+/** Editor load state for one workflow: every failure collapses to a phase. */
+export type WorkflowLoad =
+  | { phase: "ready"; workflow: Workflow }
+  | { phase: "notfound" }
+  | { phase: "error"; message: string };
+
+/** Fetch one workflow for the editor, collapsing failures into a load state. */
+export async function fetchWorkflowForEditor(
+  workflowId: string,
+  fetcher: WorkflowFetcher = apiFetch,
+): Promise<WorkflowLoad> {
+  try {
+    return { phase: "ready", workflow: await fetchWorkflow(workflowId, fetcher) };
+  } catch (cause) {
+    if (cause instanceof ApiError && cause.status === 404) return { phase: "notfound" };
+    return {
+      phase: "error",
+      message: cause instanceof ApiError ? cause.message : "Failed to load workflow",
+    };
+  }
+}
+
 /**
  * Registered driver ids for the step dropdown, from `GET /api/drivers`.
  * Falls back to the static default list when the daemon is unreachable or
