@@ -18,3 +18,15 @@ export {
   type WorktreeManagerOptions,
   type WorktreeRemoveResult,
 } from "./worktree.js";
+
+export {
+  ADHOC_STEP_ID,
+  DEFAULT_DRIVER_ID,
+  createFlowEngine,
+  type ExecuteRunOptions,
+  type FlowEngine,
+  type FlowEngineOptions,
+  type FlowLogger,
+  type RunControl,
+  type StepDefinition,
+} from "./flow-engine.js";

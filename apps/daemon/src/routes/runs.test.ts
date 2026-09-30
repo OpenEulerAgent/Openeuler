@@ -170,15 +170,19 @@ describe("POST /api/runs (ad-hoc single-step run)", () => {
     });
     expect(step[0]?.diff).toContain("feature.txt");
     expect(final.run).toMatchObject({ status: "success", output: "Feature implemented" });
-    expect(final.summary.eventCount).toBe(script.length + 1);
-
-    // Events persisted in seq order matching the fake script.
+    expect(final.summary.eventCount).toBe(script.length + 5);
+    // Engine events (run.status ×2, step.started, step.completed) persist
+    // around the driver events, in seq order.
     const events = h.db.events.getSince(run.id);
     expect(events.map((event) => event.type)).toEqual([
+      "run.status",
+      "step.started",
       "started",
       ...script.map((event) => event.type),
+      "step.completed",
+      "run.status",
     ]);
-    expect(events.map((event) => event.seq)).toEqual([1, 2, 3, 4, 5, 6]);
+    expect(events.map((event) => event.seq)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
 
     // Worktree exists on disk with the agent's file change.
     const worktreePath = join(h.storeRoot, run.id);
@@ -290,15 +294,29 @@ describe("POST /api/runs/:id/abort", () => {
     const created = await postRun(h, { projectId: h.projectId, prompt: "long task" });
     const { run } = (await created.json()) as RunBody;
 
-    await pollRun(h, run.id, "running");
+    // Wait until the step is actually running mid-stream (run.status +
+    // step.started + at least one driver event) so the abort cuts the driver.
+    const started = Date.now();
+    while (
+      h.db.runs.get(run.id)?.status !== "running" ||
+      h.db.stepRuns.listByRun(run.id)[0]?.status !== "running" ||
+      h.db.events.count(run.id) < 3
+    ) {
+      if (Date.now() - started > 5_000) throw new Error("run never started streaming");
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
 
     const abortRes = await h.request(`/api/runs/${run.id}/abort`, { method: "POST" });
     expect(abortRes.status).toBe(200);
     const abortedRun = ((await abortRes.json()) as RunBody).run;
     expect(abortedRun.status).toBe("aborted");
 
-    const { final } = await pollRun(h, run.id, "aborted");
-    expect(final.summary.eventCount).toBeLessThan(6);
+    await pollRun(h, run.id, "aborted");
+    // The scripted driver run was cut short: not all 5 deltas made it to the log.
+    const driverDeltas = h.db.events
+      .getSince(run.id)
+      .filter((event) => event.type === "message-delta");
+    expect(driverDeltas.length).toBeLessThan(5);
 
     // No orphan: the executor settles, the step run finalizes, and the
     // worktree is still on disk for inspection.
@@ -367,7 +385,8 @@ describe("driver failure isolation", () => {
     const { run } = (await created.json()) as RunBody;
     const { final } = await pollRun(h, run.id, "failed");
     expect(final.run.error).toBeTruthy();
-    expect(final.steps[0]?.status).toBe("failed");
+    // The failure happened before any step started: no StepRun rows exist.
+    expect(final.steps).toEqual([]);
 
     const health = await h.request("/health");
     expect(health.status).toBe(200);

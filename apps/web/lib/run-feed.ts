@@ -2,8 +2,8 @@ import type {
   AgentMessageDeltaEvent,
   AgentEvent,
   Run,
+  RunEvent,
   RunStatus,
-  RunStatusEvent,
   TerminalRunStatus,
 } from "@openeuler/core";
 import type { RunStreamEvent } from "./run-events";
@@ -17,7 +17,7 @@ export type NonDeltaFeedEvent = Exclude<AgentEvent, AgentMessageDeltaEvent>;
  */
 export type FeedEntry =
   | { kind: "message"; id: string; text: string }
-  | { kind: "event"; id: string; event: NonDeltaFeedEvent | RunStatusEvent };
+  | { kind: "event"; id: string; event: NonDeltaFeedEvent | RunEvent };
 
 export type FeedFilter = "all" | "messages" | "tools";
 
@@ -35,6 +35,11 @@ export const FEED_WINDOW_STEP = 200;
 /** `true` while a run can still produce events (elapsed time keeps ticking). */
 export function isLiveRun(status: RunStatus): boolean {
   return status === "queued" || status === "running";
+}
+
+/** `true` once a run reached a status it never leaves (negation of {@link isLiveRun}). */
+export function isTerminalRunStatus(status: RunStatus): status is TerminalRunStatus {
+  return !isLiveRun(status);
 }
 
 /**

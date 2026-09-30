@@ -51,7 +51,7 @@ export {
   AgentStartedEventSchema,
   AgentToolCallEventSchema,
   AgentToolOutputEventSchema,
-  RunStatusEventSchema,
+  seqSchema,
 } from "./agent-event.js";
 export type {
   AgentDoneEvent,
@@ -62,8 +62,22 @@ export type {
   AgentStartedEvent,
   AgentToolCallEvent,
   AgentToolOutputEvent,
-  RunStatusEvent,
 } from "./agent-event.js";
+
+export {
+  PersistedEventSchema,
+  RunEventSchema,
+  RunStatusEventSchema,
+  StepCompletedEventSchema,
+  StepStartedEventSchema,
+} from "./run-event.js";
+export type {
+  PersistedEvent,
+  RunEvent,
+  RunStatusEvent,
+  StepCompletedEvent,
+  StepStartedEvent,
+} from "./run-event.js";
 
 export { PROMPT_TEMPLATE_VARIABLES, renderPromptTemplate } from "./prompt.js";
 export type { PromptTemplateVariable, PromptTemplateVars } from "./prompt.js";

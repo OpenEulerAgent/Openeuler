@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import type { AgentEvent, RunStatusEvent } from "@openeuler/core";
+import type { AgentEvent, RunEvent, RunStatusEvent } from "@openeuler/core";
 import {
   connectRunEvents,
   parseRunStreamEvent,
@@ -40,7 +40,7 @@ class MockEventSource {
     this.dispatch("open", {});
   }
 
-  simulateEvent(event: AgentEvent | RunStatusEvent): void {
+  simulateEvent(event: AgentEvent | RunEvent): void {
     this.dispatch(event.type, { data: JSON.stringify(event) });
   }
 
@@ -109,9 +109,29 @@ describe("parseRunStreamEvent", () => {
     }
   });
 
-  it("parses the synthetic run.status event", () => {
+  it("parses the run.status event", () => {
     const event: RunStatusEvent = { type: "run.status", seq: 9, status: "success" };
     expect(parseRunStreamEvent(JSON.stringify(event))).toEqual(event);
+  });
+
+  it("parses engine step events", () => {
+    const started = {
+      type: "step.started",
+      seq: 2,
+      stepId: "s1",
+      stepName: "implement",
+      iteration: 1,
+    };
+    const completed = {
+      type: "step.completed",
+      seq: 7,
+      stepId: "s1",
+      stepName: "implement",
+      iteration: 2,
+      status: "failed" as const,
+    };
+    expect(parseRunStreamEvent(JSON.stringify(started))).toEqual(started);
+    expect(parseRunStreamEvent(JSON.stringify(completed))).toEqual(completed);
   });
 
   it("returns null for malformed or unknown payloads", () => {
@@ -165,6 +185,27 @@ describe("connectRunEvents", () => {
     // Nothing further is delivered once terminal.
     source.simulateEvent({ type: "message-delta", seq: 5, delta: "late" });
     expect(events).toHaveLength(2);
+  });
+
+  it("keeps the stream open on non-terminal run.status frames (engine `running`)", () => {
+    const events: RunStreamEvent[] = [];
+    const states: RunStreamState[] = [];
+    const { handle, source } = connect({ events, states });
+
+    source.simulateOpen();
+    source.simulateEvent({ type: "run.status", seq: 1, status: "running" });
+    source.simulateEvent({
+      type: "step.started",
+      seq: 2,
+      stepId: "s1",
+      stepName: "implement",
+      iteration: 1,
+    });
+    source.simulateEvent({ type: "session", seq: 3, sessionId: "s1" });
+
+    expect(handle.state).toBe("open");
+    expect(source.closed).toBe(false);
+    expect(events.map((event) => event.type)).toEqual(["run.status", "step.started", "session"]);
   });
 
   it("reports reconnecting (not fatal) when the browser retries", () => {

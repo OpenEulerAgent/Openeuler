@@ -15,7 +15,13 @@ import {
 import type { EventRepo, ProjectRepo, RunRepo, StepRunRepo, WorkflowRepo } from "./repos.js";
 
 export * from "./schema.js";
-export type { AgentEventInput, RunPatch, StepRunPatch } from "./repos.js";
+export type {
+  AgentEventInput,
+  EventInput,
+  RunPatch,
+  StepRunPatch,
+  WorkflowPatch,
+} from "./repos.js";
 export type { EventRepo, ProjectRepo, RunRepo, StepRunRepo, WorkflowRepo } from "./repos.js";
 
 export const PACKAGE_NAME = "@openeuler/db";

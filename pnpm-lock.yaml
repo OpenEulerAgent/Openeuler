@@ -328,6 +328,12 @@ importers:
         specifier: workspace:*
         version: link:../core
     devDependencies:
+      '@openeuler/db':
+        specifier: workspace:*
+        version: link:../db
+      '@openeuler/drivers':
+        specifier: workspace:*
+        version: link:../drivers
       '@types/node':
         specifier: ^24.0.2
         version: 24.19.0

@@ -6,7 +6,13 @@ import { Button } from "@/components/Button";
 import { Card } from "@/components/Card";
 import { apiFetch, ApiError } from "@/lib/api";
 import { connectRunEvents, type RunStreamEvent, type RunStreamState } from "@/lib/run-events";
-import { appendFeedEvent, isLiveRun, terminalEndMs, type FeedEntry } from "@/lib/run-feed";
+import {
+  appendFeedEvent,
+  isLiveRun,
+  isTerminalRunStatus,
+  terminalEndMs,
+  type FeedEntry,
+} from "@/lib/run-feed";
 import { DiffPanel } from "./DiffPanel";
 import { EventFeed } from "./EventFeed";
 import { OutputPanel } from "./OutputPanel";
@@ -79,7 +85,7 @@ export function RunDetailView({ runId }: { runId: string }) {
   }, [refresh]);
 
   // Live stream: connects for every run — for terminal runs the daemon
-  // replays persisted events, sends the final run.status and closes.
+  // replays persisted events through the terminal run.status and closes.
   const streamRunId = load.phase === "ready" ? load.detail.run.id : null;
   const streamHandleRef = useRef<ReturnType<typeof connectRunEvents> | null>(null);
   useEffect(() => {
@@ -88,7 +94,7 @@ export function RunDetailView({ runId }: { runId: string }) {
       runId: streamRunId,
       onEvent: (event: RunStreamEvent) => {
         setEntries((prev) => appendFeedEvent(prev, event));
-        if (event.type === "run.status") {
+        if (event.type === "run.status" && isTerminalRunStatus(event.status)) {
           setTerminalStatus(event.status);
           // A run row that is already terminal carries the authoritative end
           // time; Date.now() only approximates a live→terminal transition

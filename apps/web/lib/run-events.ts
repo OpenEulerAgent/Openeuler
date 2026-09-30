@@ -1,8 +1,8 @@
-import type { AgentEvent, RunStatusEvent } from "@openeuler/core";
-import { AgentEventSchema, RunStatusEventSchema } from "@openeuler/core";
+import type { AgentEvent, RunEvent, RunStatusEvent } from "@openeuler/core";
+import { AgentEventSchema, RunEventSchema, TERMINAL_RUN_STATUSES } from "@openeuler/core";
 import { daemonBaseUrl } from "./api";
 
-/** Every event type the daemon may send on a run stream (incl. synthetic `run.status`). */
+/** Every event type the daemon may send on a run stream (driver + engine events). */
 export const RUN_EVENT_TYPES = [
   "started",
   "session",
@@ -12,10 +12,12 @@ export const RUN_EVENT_TYPES = [
   "done",
   "error",
   "run.status",
+  "step.started",
+  "step.completed",
 ] as const;
 
-/** One frame off the wire: an agent event or the synthetic terminal status event. */
-export type RunStreamEvent = AgentEvent | RunStatusEvent;
+/** One frame off the wire: a driver event or an engine (run/step) event. */
+export type RunStreamEvent = AgentEvent | RunEvent;
 
 /**
  * Connection lifecycle as seen by the client. `reconnecting` means the browser
@@ -46,9 +48,14 @@ export function parseRunStreamEvent(raw: string): RunStreamEvent | null {
   }
   const agent = AgentEventSchema.safeParse(data);
   if (agent.success) return agent.data;
-  const status = RunStatusEventSchema.safeParse(data);
-  if (status.success) return status.data;
+  const engine = RunEventSchema.safeParse(data);
+  if (engine.success) return engine.data;
   return null;
+}
+
+/** `run.status` is only terminal for these statuses (`running` keeps the stream open). */
+export function isTerminalRunStatusEvent(event: RunStatusEvent): boolean {
+  return (TERMINAL_RUN_STATUSES as readonly string[]).includes(event.status);
 }
 
 /** Minimal structural slice of `EventSource` the client needs (mockable in tests). */
@@ -172,9 +179,10 @@ export function connectRunEvents(options: RunEventsOptions): RunEventsHandle {
         if (!parsed || parsed.seq <= lastSeq) return;
         lastSeq = parsed.seq;
         onEvent(parsed);
-        if (parsed.type === "run.status") {
+        if (parsed.type === "run.status" && isTerminalRunStatusEvent(parsed)) {
           // Terminal: the daemon closes the stream; mirror that locally so the
-          // browser does not reconnect against a finished run.
+          // browser does not reconnect against a finished run. Non-terminal
+          // `run.status` frames (e.g. `running`) keep the stream open.
           close();
         }
       });

@@ -23,6 +23,8 @@
     "@openeuler/core": "workspace:*"
   },
   "devDependencies": {
+    "@openeuler/db": "workspace:*",
+    "@openeuler/drivers": "workspace:*",
     "@types/node": "^24.0.2",
     "typescript": "^5.9.2",
     "vitest": "^3.2.4"
