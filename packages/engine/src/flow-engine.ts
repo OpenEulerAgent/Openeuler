@@ -265,9 +265,16 @@ export function createFlowEngine(options: FlowEngineOptions): FlowEngine {
     log.info({ runId, status: finalStatus }, "run finished");
   }
 
-  async function captureDiff(worktreePath: string): Promise<string> {
+  /**
+   * Captures one step's incremental diff (`stat\npatch` combined, the stored
+   * StepRun.diff shape) against `base.ref` and advances `base.ref` to the
+   * fresh snapshot tree. Failing to capture never fails the run: the step
+   * just stores no diff (and the base stays put).
+   */
+  async function captureDiff(worktreePath: string, base: { ref: string }): Promise<string> {
     try {
-      const { stat, patch } = await worktrees.diff(worktreePath);
+      const { stat, patch, tree } = await worktrees.stepDiff(worktreePath, base.ref);
+      base.ref = tree;
       return [stat.trim(), patch].filter((part) => part.length > 0).join("\n");
     } catch (err) {
       log.warn({ err, worktreePath }, "diff capture failed (continuing without diff)");
@@ -432,6 +439,7 @@ export function createFlowEngine(options: FlowEngineOptions): FlowEngine {
     inheritedSessionId: string | undefined,
     restartSessionId: string | undefined,
     control: RunControl,
+    diffBase: { ref: string },
   ): Promise<StepOutcome> {
     const prompt = renderPromptTemplate(step.promptTemplate, {
       task: vars.task,
@@ -482,7 +490,7 @@ export function createFlowEngine(options: FlowEngineOptions): FlowEngine {
 
     const exit = await handle.exited;
     control.onHandle?.(undefined);
-    const diff = await captureDiff(worktreePath);
+    const diff = await captureDiff(worktreePath, diffBase);
 
     let status: RunStatus;
     let error: string | undefined;
@@ -625,6 +633,13 @@ export function createFlowEngine(options: FlowEngineOptions): FlowEngine {
     }
 
     const task = run.task ?? "";
+    // Per-step diff base: starts at HEAD (the worktree branch point), then
+    // advances to each completed step's snapshot tree so every StepRun.diff
+    // stores only THAT step's changes. Resumed runs restart at HEAD — the
+    // first step after a resume captures everything since HEAD (the snapshot
+    // trees of earlier steps are not persisted); later steps are incremental
+    // again. The cumulative view (daemon `?scope=cumulative`) is unaffected.
+    const diffBase = { ref: "HEAD" };
     // Resume position from the recorded StepRun rows: steps before it already
     // succeeded (their outputs/sessions seed the chaining context); the loop
     // counter continues at the interrupted iteration.
@@ -663,6 +678,7 @@ export function createFlowEngine(options: FlowEngineOptions): FlowEngine {
           inheritedSessionFor(runId, step, iteration, prevSessionId),
           restartSessionFor(runId, step, iteration),
           control,
+          diffBase,
         );
 
         if (outcome.status === "success") {

@@ -222,6 +222,69 @@ describe("createFlowEngine (workflow runs)", () => {
     });
   });
 
+  it("stores incremental per-step diffs: each step's diff isolates only that step's changes", async () => {
+    const h = setup();
+    // Two writers: step 1 creates alpha.txt (+edits tracked README), step 2
+    // only creates beta.txt. With snapshot-based bases, step 2's stored diff
+    // must NOT replay step 1's changes.
+    const alpha = createFakeDriver({
+      id: "alpha",
+      events: [{ type: "session", seq: 1, sessionId: "s-alpha" }],
+      output: "ALPHA-OUT",
+      onStart: (opts) => {
+        writeFileSync(join(opts.cwd, "alpha.txt"), "const alpha = 1;\n");
+        writeFileSync(join(opts.cwd, "README.md"), "# demo\nalpha was here\n");
+      },
+    });
+    const beta = createFakeDriver({
+      id: "beta",
+      events: [{ type: "session", seq: 1, sessionId: "s-beta" }],
+      output: "BETA-OUT",
+      onStart: (opts) => {
+        writeFileSync(join(opts.cwd, "beta.txt"), "const beta = 2;\n");
+      },
+    });
+    h.registry.registerDriver(alpha);
+    h.registry.registerDriver(beta);
+
+    const workflow = h.makeWorkflow([
+      {
+        id: "w1",
+        name: "alpha",
+        driver: "alpha",
+        mode: "auto",
+        promptTemplate: "write alpha",
+        continueSession: false,
+      },
+      {
+        id: "w2",
+        name: "beta",
+        driver: "beta",
+        mode: "auto",
+        promptTemplate: "write beta",
+        continueSession: false,
+      },
+    ]);
+    const run = h.enqueueRun(workflow.id);
+    await h.engine.executeRun(run.id, noAbort);
+    await awaitStatus(h, run.id, "success");
+
+    const byStep = new Map(
+      h.db.stepRuns.listByRun(run.id).map((stepRun) => [stepRun.stepId, stepRun]),
+    );
+    const step1 = byStep.get("w1")?.diff ?? "";
+    const step2 = byStep.get("w2")?.diff ?? "";
+
+    // Step 1: its own file + the README edit (vs HEAD — nothing came before).
+    expect(step1).toContain("diff --git a/alpha.txt b/alpha.txt");
+    expect(step1).toContain("diff --git a/README.md b/README.md");
+    expect(step1).not.toContain("beta.txt");
+    // Step 2: ONLY its own file — no replay of step 1's changes.
+    expect(step2).toContain("diff --git a/beta.txt b/beta.txt");
+    expect(step2).not.toContain("alpha.txt");
+    expect(step2).not.toContain("README.md");
+  });
+
   it("stops on the first failed step: run failed, earlier steps stay inspectable, later steps never start", async () => {
     const h = setup();
     const workflow = h.makeWorkflow([

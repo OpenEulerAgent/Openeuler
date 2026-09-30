@@ -260,6 +260,81 @@ describe("WorktreeManager.diff", () => {
   });
 });
 
+describe("WorktreeManager.stepDiff", () => {
+  it("diffs against the base ref and returns a snapshot tree that isolates the next step's changes", async () => {
+    const repo = makeRepo();
+    const { manager } = makeManager();
+    const info = await manager.create("run-1", makeProject(repo));
+
+    // Step 1: create a new (untracked) file.
+    writeFileSync(join(info.path, "alpha.txt"), "alpha\n", "utf8");
+    const first = await manager.stepDiff(info.path, "HEAD");
+    expect(first.stat).toContain("alpha.txt");
+    expect(first.patch).toContain("+alpha");
+    expect(first.tree).toMatch(/^[0-9a-f]{40}$/);
+
+    // Step 2: a different change — must not replay step 1's.
+    writeFileSync(join(info.path, "beta.txt"), "beta\n", "utf8");
+    const second = await manager.stepDiff(info.path, first.tree);
+    expect(second.stat).not.toContain("alpha.txt");
+    expect(second.patch).not.toContain("alpha");
+    expect(second.patch).toContain("+beta");
+
+    // No-op step: empty diff against the previous snapshot.
+    const third = await manager.stepDiff(info.path, second.tree);
+    expect(third.stat).toBe("");
+    expect(third.patch).toBe("");
+    expect(third.tree).toBe(second.tree);
+  });
+});
+
+describe("WorktreeManager.diffVsBase", () => {
+  it("diffs the full working tree (staged, unstaged, untracked) against the merge-base of the base branch", async () => {
+    const repo = makeRepo();
+    const { manager } = makeManager();
+    const info = await manager.create("run-1", makeProject(repo));
+
+    writeFileSync(join(info.path, "README.md"), "# changed by agent\n", "utf8");
+    writeFileSync(join(info.path, "new-file.txt"), "brand new\n", "utf8");
+
+    const diff = await manager.diffVsBase(info.path, "main");
+    expect(diff.stat).toContain("README.md");
+    expect(diff.stat).toContain("new-file.txt");
+    expect(diff.patch).toContain("-# test");
+    expect(diff.patch).toContain("+# changed by agent");
+    expect(diff.patch).toContain("+brand new");
+  });
+
+  it("falls back to HEAD when the base branch cannot be resolved", async () => {
+    const repo = makeRepo();
+    const { manager } = makeManager();
+    const info = await manager.create("run-1", makeProject(repo));
+
+    writeFileSync(join(info.path, "note.txt"), "late change\n", "utf8");
+
+    const diff = await manager.diffVsBase(info.path, "no-such-branch");
+    expect(diff.patch).toContain("+late change");
+  });
+
+  it("excludes base-branch commits made after the worktree branched off", async () => {
+    const repo = makeRepo();
+    const { manager } = makeManager();
+    const info = await manager.create("run-1", makeProject(repo));
+
+    // The default branch moves on after the worktree was created…
+    writeFileSync(join(repo, "base-moved.txt"), "moved on main\n", "utf8");
+    git(repo, ["add", "."]);
+    git(repo, ["commit", "-m", "main moved on"]);
+
+    // …while the agent adds its own file in the worktree.
+    writeFileSync(join(info.path, "agent.txt"), "agent work\n", "utf8");
+
+    const diff = await manager.diffVsBase(info.path, "main");
+    expect(diff.patch).toContain("+agent work");
+    expect(diff.patch).not.toContain("base-moved.txt");
+  });
+});
+
 describe("WorktreeManager.remove", () => {
   it("removes the worktree dir, the branch ref, and the metadata", async () => {
     const repo = makeRepo();

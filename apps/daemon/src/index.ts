@@ -44,6 +44,7 @@ export async function main(): Promise<void> {
     logger,
     executor,
     drivers,
+    worktrees,
     maxConcurrentRuns: executor.maxConcurrentRuns,
   });
 

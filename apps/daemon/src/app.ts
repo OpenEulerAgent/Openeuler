@@ -1,5 +1,6 @@
 import type { Db } from "@openeuler/db";
 import type { DriverRegistry } from "@openeuler/drivers";
+import type { WorktreeManager } from "@openeuler/engine";
 import { Hono } from "hono";
 import type { ContentfulStatusCode } from "hono/utils/http-status";
 import { cors } from "hono/cors";
@@ -26,6 +27,8 @@ export interface AppEnv {
     logger: Logger;
     db: Db | undefined;
     executor: Executor | undefined;
+    /** Worktree manager; required for live cumulative diffs (`GET /api/runs/:id/diff`). */
+    worktrees: WorktreeManager | undefined;
   };
 }
 
@@ -33,6 +36,8 @@ export interface CreateAppOptions {
   db?: Db;
   logger?: Logger;
   executor?: Executor;
+  /** Worktree manager backing cumulative run diffs; index.ts passes the daemon-wide instance. */
+  worktrees?: WorktreeManager;
   /** Driver registry composed at boot; backs `GET /api/drivers`. */
   drivers?: DriverRegistry;
   corsOrigin?: string;
@@ -62,6 +67,7 @@ export function createApp(options: CreateAppOptions = {}): DaemonApp {
   const logger = options.logger ?? createLogger();
   const db = options.db;
   const executor = options.executor;
+  const worktrees = options.worktrees;
   const corsOrigin = options.corsOrigin ?? process.env["CORS_ORIGIN"] ?? DEFAULT_CORS_ORIGIN;
   const maxConcurrentRuns =
     options.maxConcurrentRuns ?? resolveMaxConcurrentRuns(process.env["MAX_CONCURRENT_RUNS"]);
@@ -95,6 +101,7 @@ export function createApp(options: CreateAppOptions = {}): DaemonApp {
     c.set("logger", logger);
     c.set("db", db);
     c.set("executor", executor);
+    c.set("worktrees", worktrees);
     return next();
   });
 
@@ -104,7 +111,7 @@ export function createApp(options: CreateAppOptions = {}): DaemonApp {
   app.route("/api/projects", createFilesRouter());
   app.route("/api/drivers", createDriversRouter(options.drivers));
   app.route("/api/workflows", createWorkflowsRouter());
-  app.route("/api/runs", createRunsRouter({ eventStream: options.eventStream }));
+  app.route("/api/runs", createRunsRouter({ eventStream: options.eventStream, worktrees }));
 
   app.onError((err, c) => {
     if (err instanceof HttpError) {
