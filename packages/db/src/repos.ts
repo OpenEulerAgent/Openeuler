@@ -33,6 +33,8 @@ export interface ProjectRepo {
   create(project: Project): Project;
   get(id: string): Project | undefined;
   list(): Project[];
+  /** Deletes the project; returns true when a row was removed. */
+  delete(id: string): boolean;
 }
 
 export interface WorkflowRepo {
@@ -63,19 +65,44 @@ export interface EventRepo {
 }
 
 export function createProjectRepo(db: Db): ProjectRepo {
+  const toDomain = (row: typeof schema.projects.$inferSelect): Project =>
+    ProjectSchema.parse({
+      id: row.id,
+      path: row.path,
+      name: row.name,
+      defaultBranch: row.defaultBranch,
+      ...(row.remoteUrl === null ? {} : { remoteUrl: row.remoteUrl }),
+      ...(row.dirty === null ? {} : { dirty: row.dirty }),
+      createdAt: row.createdAt,
+    });
+
   return {
     create(project) {
       const value = ProjectSchema.parse(project);
-      db.insert(schema.projects).values(value).run();
+      db.insert(schema.projects)
+        .values({
+          id: value.id,
+          path: value.path,
+          name: value.name,
+          defaultBranch: value.defaultBranch,
+          remoteUrl: value.remoteUrl ?? null,
+          dirty: value.dirty ?? null,
+          createdAt: value.createdAt,
+        })
+        .run();
       return value;
     },
     get(id) {
       const row = db.select().from(schema.projects).where(eq(schema.projects.id, id)).get();
-      return row ? ProjectSchema.parse(row) : undefined;
+      return row ? toDomain(row) : undefined;
     },
     list() {
       const rows = db.select().from(schema.projects).orderBy(schema.projects.createdAt).all();
-      return rows.map((row) => ProjectSchema.parse(row));
+      return rows.map(toDomain);
+    },
+    delete(id) {
+      const result = db.delete(schema.projects).where(eq(schema.projects.id, id)).run();
+      return result.changes > 0;
     },
   };
 }

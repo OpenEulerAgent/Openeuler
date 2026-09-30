@@ -9,6 +9,7 @@ import { createLogger } from "./logger.js";
 import type { Logger } from "./logger.js";
 import { createShutdownRegistry } from "./shutdown.js";
 import type { ShutdownHook, ShutdownRegistryOptions } from "./shutdown.js";
+import { createProjectsRouter } from "./routes/projects.js";
 
 export const DEFAULT_CORS_ORIGIN = "http://localhost:3000";
 
@@ -74,6 +75,8 @@ export function createApp(options: CreateAppOptions = {}): DaemonApp {
   });
 
   app.get("/health", (c) => c.json(healthPayload()));
+
+  app.route("/api/projects", createProjectsRouter());
 
   app.onError((err, c) => {
     if (err instanceof HttpError) {

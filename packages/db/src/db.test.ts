@@ -107,6 +107,23 @@ describe("projects", () => {
     expect(db.projects.get(project.id)).toEqual(project);
   });
 
+  it("round-trips snapshot metadata (remoteUrl, dirty)", () => {
+    const project = makeProject({
+      remoteUrl: "https://example.com/demo.git",
+      dirty: true,
+    });
+    db.projects.create(project);
+    expect(db.projects.get(project.id)).toEqual(project);
+  });
+
+  it("deletes projects and reports unknown ids", () => {
+    const project = db.projects.create(makeProject());
+    expect(db.projects.delete(project.id)).toBe(true);
+    expect(db.projects.get(project.id)).toBeUndefined();
+    expect(db.projects.delete(project.id)).toBe(false);
+    expect(db.projects.delete(uuid())).toBe(false);
+  });
+
   it("lists projects in creation order", () => {
     const first = makeProject({ name: "first" });
     const second = makeProject({ name: "second" });
