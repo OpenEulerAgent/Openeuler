@@ -12,6 +12,13 @@ export const RunStatusSchema = z.enum([
 
 export type RunStatus = z.infer<typeof RunStatusSchema>;
 
+/** Statuses a run never leaves; the SSE layer closes streams on these. */
+export const TERMINAL_RUN_STATUSES = ["success", "failed", "aborted", "interrupted"] as const;
+
+export type TerminalRunStatus = (typeof TERMINAL_RUN_STATUSES)[number];
+
+export const TerminalRunStatusSchema = z.enum(TERMINAL_RUN_STATUSES);
+
 /**
  * A single execution of a workflow (or an ad-hoc task) against a project's
  * working copy on its own branch.
