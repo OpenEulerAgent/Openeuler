@@ -4,6 +4,8 @@ import {
   AgentErrorEventSchema,
   AgentEventSchema,
   ExitConditionSchema,
+  FileContentSchema,
+  FileNodeSchema,
   LoopBackSchema,
   OutputMatchesConditionSchema,
   ProjectSchema,
@@ -135,6 +137,20 @@ describe("valid fixtures parse", () => {
       expect(AgentEventSchema.parse(event)).toEqual(event);
     }
   });
+
+  it("parses file nodes and file content payloads", () => {
+    const dirNode = { name: "src", type: "dir", size: 0 };
+    expect(FileNodeSchema.parse(dirNode)).toEqual(dirNode);
+    const fileNode = { name: "alpha.ts", type: "file", size: 26 };
+    expect(FileNodeSchema.parse(fileNode)).toEqual(fileNode);
+    const content = {
+      content: "export const alpha = 1;\n",
+      truncated: false,
+      binary: false,
+      size: 26,
+    };
+    expect(FileContentSchema.parse(content)).toEqual(content);
+  });
 });
 
 describe("invalid fixtures are rejected with clear messages", () => {
@@ -228,6 +244,22 @@ describe("invalid fixtures are rejected with clear messages", () => {
       "seq must be an integer >= 0",
     );
     expectRejected(AgentEventSchema, { type: "message-delta", seq: 1, delta: 42 }, "string");
+  });
+
+  it("rejects malformed file nodes and file content payloads", () => {
+    expectRejected(FileNodeSchema, { name: "a", type: "symlink", size: 1 }, "file", "dir");
+    expectRejected(FileNodeSchema, { name: "a", type: "file", size: -1 }, "non-negative");
+    expectRejected(
+      FileNodeSchema,
+      { name: "a", type: "file", size: 1, mode: 0o644 },
+      "Unrecognized key",
+    );
+    expectRejected(
+      FileContentSchema,
+      { content: "x", truncated: false, binary: false, size: "3" },
+      "number",
+    );
+    expectRejected(FileContentSchema, { content: "x", truncated: false, size: 1 }, "boolean");
   });
 });
 
