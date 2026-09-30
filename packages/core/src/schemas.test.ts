@@ -221,6 +221,25 @@ describe("invalid fixtures are rejected with clear messages", () => {
     expectRejected(WorkflowSchema, { ...validWorkflow, retry: 5 }, "Unrecognized key");
   });
 
+  it("cross-field check: loopBack.toStepIndex must reference an existing step", () => {
+    expectRejected(
+      WorkflowSchema,
+      { ...validWorkflow, loopBack: { ...validWorkflow.loopBack, toStepIndex: 2 } },
+      "loopBack.toStepIndex must be < steps.length",
+    );
+    // The last step is a valid target.
+    expect(
+      WorkflowSchema.parse({
+        ...validWorkflow,
+        loopBack: { ...validWorkflow.loopBack, toStepIndex: 1 },
+      }),
+    ).toMatchObject({ loopBack: { toStepIndex: 1 } });
+    // No loopBack edge: nothing to check.
+    const { loopBack, ...noLoopBack } = validWorkflow;
+    void loopBack;
+    expect(WorkflowSchema.parse(noLoopBack)).toEqual(noLoopBack);
+  });
+
   it("rejects a non-ISO timestamp", () => {
     expectRejected(ProjectSchema, { ...validProject, createdAt: "yesterday" }, "ISO 8601");
   });
@@ -345,6 +364,38 @@ describe("invalid fixtures are rejected with clear messages", () => {
       status: "running",
     });
     expectRejected(PersistedEventSchema, { type: "log", seq: 3 });
+  });
+
+  it("parses loop.iteration engine events with every verdict", () => {
+    for (const verdict of ["continue", "exit-condition-met", "max-iterations", "hard-cap"]) {
+      expect(
+        RunEventSchema.parse({ type: "loop.iteration", seq: 7, iteration: 2, verdict }),
+      ).toEqual({ type: "loop.iteration", seq: 7, iteration: 2, verdict });
+    }
+    expect(
+      PersistedEventSchema.parse({
+        type: "loop.iteration",
+        seq: 8,
+        iteration: 1,
+        verdict: "max-iterations",
+        detail: 'outputContains "DONE" unmet; stopped at maxIterations=1',
+      }),
+    ).toMatchObject({ verdict: "max-iterations" });
+    expectRejected(
+      RunEventSchema,
+      { type: "loop.iteration", seq: 8, iteration: 1, verdict: "because-i-said-so" },
+      "Invalid option",
+    );
+    expectRejected(
+      RunEventSchema,
+      { type: "loop.iteration", seq: 8, iteration: 0, verdict: "continue" },
+      "iteration must be an integer >= 1",
+    );
+    expectRejected(
+      RunEventSchema,
+      { type: "loop.iteration", seq: 8, iteration: 1, verdict: "continue", extra: true },
+      "Unrecognized key",
+    );
   });
 
   it("rejects malformed file nodes and file content payloads", () => {

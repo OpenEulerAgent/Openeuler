@@ -22,6 +22,7 @@ export {
 export {
   ADHOC_STEP_ID,
   DEFAULT_DRIVER_ID,
+  MAX_LOOP_ITERATIONS,
   createFlowEngine,
   type ExecuteRunOptions,
   type FlowEngine,

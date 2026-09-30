@@ -45,11 +45,43 @@ export const StepCompletedEventSchema = z.strictObject({
 
 export type StepCompletedEvent = z.infer<typeof StepCompletedEventSchema>;
 
+/**
+ * Verdict of one completed loop pass: why the engine continued or stopped.
+ * `continue` means another iteration starts at `loopBack.toStepIndex`; every
+ * other verdict is terminal for the loop (the run itself still ends
+ * `success` — the exit condition only decides whether to keep looping).
+ */
+export const LoopVerdictSchema = z.enum([
+  "continue",
+  "exit-condition-met",
+  "max-iterations",
+  "hard-cap",
+]);
+
+export type LoopVerdict = z.infer<typeof LoopVerdictSchema>;
+
+/**
+ * Engine-emitted event: iteration `iteration` finished and the loopBack exit
+ * condition was evaluated against the final step's output. Emitted once per
+ * iteration of a workflow with a `loopBack`, persisted between iterations.
+ */
+export const LoopIterationEventSchema = z.strictObject({
+  type: z.literal("loop.iteration"),
+  seq: seqSchema,
+  iteration: iterationSchema,
+  verdict: LoopVerdictSchema,
+  /** Human-readable reason (e.g. which condition was met or unmet). */
+  detail: z.string().optional(),
+});
+
+export type LoopIterationEvent = z.infer<typeof LoopIterationEventSchema>;
+
 /** Engine-emitted (non-driver) event. All variants are JSON-serializable. */
 export const RunEventSchema = z.discriminatedUnion("type", [
   RunStatusEventSchema,
   StepStartedEventSchema,
   StepCompletedEventSchema,
+  LoopIterationEventSchema,
 ]);
 
 export type RunEvent = z.infer<typeof RunEventSchema>;

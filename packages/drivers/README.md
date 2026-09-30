@@ -112,6 +112,9 @@ const driver = createFakeDriver({
   ],
   delayMs: 0,          // delay between events; 0 = immediate
   output: "final",     // exited.output on normal completion
+  outputs: [           // optional per-start outputs, cycling by call count
+    "WIP", "DONE",     // (start n reports outputs[n % outputs.length];
+  ],                   //  wins over `output` when set — useful for loops)
   exitCode: 0,         // exited.code on normal completion
   failOnAbort: false,  // reject abort() with DriverError when true
 });

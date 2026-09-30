@@ -12,6 +12,12 @@ export interface FakeDriverOptions {
   delayMs?: number;
   /** Final output reported by `exited` on normal completion. Defaults to accumulated text. */
   output?: string;
+  /**
+   * Per-start final outputs, cycling by call count: start `n` reports
+   * `outputs[n % outputs.length]` (wins over {@link output} when set). Lets a
+   * single scripted driver vary its output across loop iterations.
+   */
+  outputs?: string[];
   /** Exit code reported by `exited` on normal completion. Defaults to `0`. */
   exitCode?: number;
   /** When true, `abort()` rejects with `DriverError` (`DRIVER_ABORT_FAILED`). */
@@ -166,11 +172,16 @@ export class FakeDriver implements AgentDriver {
     } catch (err) {
       started = Promise.reject(err);
     }
+    const outputs = this.options.outputs;
+    const output =
+      outputs !== undefined && outputs.length > 0
+        ? outputs[(this.calls.length - 1) % outputs.length]
+        : this.options.output;
     return new FakeAgentHandle({
       id: this.id,
       script: effective,
       delayMs: Math.max(0, this.options.delayMs ?? 0),
-      output: this.options.output,
+      output,
       exitCode: this.options.exitCode,
       failOnAbort: this.options.failOnAbort ?? false,
       started,

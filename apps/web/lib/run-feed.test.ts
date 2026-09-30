@@ -85,6 +85,39 @@ describe("appendFeedEvent", () => {
     ]);
   });
 
+  it("renders loop.iteration events as their own rows (one per pass)", () => {
+    const entries = buildFeed([
+      {
+        type: "loop.iteration",
+        seq: 4,
+        iteration: 1,
+        verdict: "continue",
+        detail: 'outputContains "DONE" unmet',
+      },
+      { type: "step.started", seq: 5, stepId: "s1", stepName: "implement", iteration: 2 },
+      {
+        type: "loop.iteration",
+        seq: 9,
+        iteration: 2,
+        verdict: "exit-condition-met",
+      },
+    ]);
+    expect(entries.every((entry) => entry.kind === "event")).toBe(true);
+    const loops = entries
+      .map((entry) => (entry.kind === "event" ? entry.event : undefined))
+      .filter((event) => event !== undefined && event.type === "loop.iteration");
+    expect(loops).toEqual([
+      {
+        type: "loop.iteration",
+        seq: 4,
+        iteration: 1,
+        verdict: "continue",
+        detail: 'outputContains "DONE" unmet',
+      },
+      { type: "loop.iteration", seq: 9, iteration: 2, verdict: "exit-condition-met" },
+    ]);
+  });
+
   it("buildFeed folds a realistic mixed stream", () => {
     const entries = buildFeed([
       { type: "started", seq: 0 },
