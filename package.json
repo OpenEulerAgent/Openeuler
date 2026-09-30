@@ -17,6 +17,7 @@
     "format:check": "prettier --check ."
   },
   "devDependencies": {
+    "@eslint/eslintrc": "^3.3.7",
     "@eslint/js": "^9.36.0",
     "concurrently": "^9.2.1",
     "eslint": "^9.36.0",
