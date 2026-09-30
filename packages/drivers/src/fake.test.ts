@@ -1,3 +1,6 @@
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import type { AgentEvent } from "@openeuler/core";
 import { createFakeDriver, type FakeDriver } from "./fake.js";
@@ -192,5 +195,50 @@ describe("fake driver event stream", () => {
       reason: "aborted",
       output: "Hello",
     });
+  });
+});
+
+describe("fake driver onStart hook", () => {
+  it("is called once per start with the received opts", async () => {
+    const seen: AgentStartOpts[] = [];
+    const driver = createFakeDriver({ events: script, onStart: (opts) => void seen.push(opts) });
+    await collect(driver.start(startOpts));
+    await collect(driver.start(startOpts));
+    expect(seen).toEqual([startOpts, startOpts]);
+    expect(driver.calls).toEqual([startOpts, startOpts]);
+  });
+
+  it("replays events only after an async onStart settles", async () => {
+    const order: string[] = [];
+    const driver = createFakeDriver({
+      events: [{ type: "message-delta", seq: 1, delta: "hi" }],
+      onStart: async () => {
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        order.push("onStart");
+      },
+    });
+    const handle = driver.start(startOpts);
+    for await (const event of handle.events) {
+      order.push(event.type);
+    }
+    expect(order).toEqual(["onStart", "started", "message-delta"]);
+  });
+
+  it("waits for onStart before exited resolves so cwd writes are visible", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "openeuler-fake-"));
+    try {
+      const driver = createFakeDriver({
+        events: [{ type: "done", seq: 1, output: "written" }],
+        onStart: async (opts) => {
+          await writeFile(join(opts.cwd, "touched.txt"), "by agent\n", "utf8");
+        },
+      });
+      const handle = driver.start({ ...startOpts, cwd: dir });
+      await collect(handle);
+      await expect(handle.exited).resolves.toMatchObject({ reason: "exit" });
+      expect(await readFile(join(dir, "touched.txt"), "utf8")).toBe("by agent\n");
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
   });
 });

@@ -16,6 +16,13 @@ export interface FakeDriverOptions {
   exitCode?: number;
   /** When true, `abort()` rejects with `DriverError` (`DRIVER_ABORT_FAILED`). */
   failOnAbort?: boolean;
+  /**
+   * Called once per `start()` with the received opts. The scripted events wait
+   * for the returned promise (if any) before replaying, so tests can mutate
+   * `opts.cwd` (e.g. write files into the worktree) and trust the changes are
+   * on disk before any event streams or the run exits.
+   */
+  onStart?: (opts: AgentStartOpts) => void | Promise<void>;
 }
 
 interface FakeHandleConfig {
@@ -25,6 +32,7 @@ interface FakeHandleConfig {
   output?: string;
   exitCode?: number;
   failOnAbort: boolean;
+  started: Promise<void>;
 }
 
 type HandleState = "running" | "completed" | "aborted";
@@ -103,6 +111,7 @@ class FakeAgentHandle implements AgentHandle {
   private async *stream(): AsyncGenerator<AgentEvent, void> {
     const { script, delayMs } = this.config;
     try {
+      await this.config.started;
       for (const event of script) {
         if (this.state !== "running") return;
         if (delayMs > 0) {
@@ -151,6 +160,12 @@ export class FakeDriver implements AgentDriver {
     const script = this.options.events ?? [];
     const effective: AgentEvent[] =
       script[0]?.type === "started" ? [...script] : [{ type: "started", seq: 0 }, ...script];
+    let started: Promise<void>;
+    try {
+      started = Promise.resolve(this.options.onStart?.(opts));
+    } catch (err) {
+      started = Promise.reject(err);
+    }
     return new FakeAgentHandle({
       id: this.id,
       script: effective,
@@ -158,6 +173,7 @@ export class FakeDriver implements AgentDriver {
       output: this.options.output,
       exitCode: this.options.exitCode,
       failOnAbort: this.options.failOnAbort ?? false,
+      started,
     });
   }
 }

@@ -216,6 +216,45 @@ describe("runs", () => {
     expect(db.runs.get(run.id)?.updatedAt).not.toBe(run.updatedAt);
     expect(db.runs.updateStatus(uuid(), "running")).toBeUndefined();
   });
+
+  it("filters lists by status on top of the project scope", () => {
+    const project = db.projects.create(makeProject());
+    db.runs.create(makeRun(project.id, { status: "success" }));
+    db.runs.create(
+      makeRun(project.id, { status: "failed", createdAt: "2026-01-03T00:00:00.000Z" }),
+    );
+    db.runs.create(
+      makeRun(project.id, { status: "failed", createdAt: "2026-01-04T00:00:00.000Z" }),
+    );
+    const other = db.projects.create(makeProject({ name: "other" }));
+    db.runs.create(makeRun(other.id, { status: "failed" }));
+    expect(db.runs.list(project.id, "failed").map((run) => run.status)).toEqual([
+      "failed",
+      "failed",
+    ]);
+    expect(db.runs.list(undefined, "success")).toHaveLength(1);
+    expect(db.runs.list(project.id)).toHaveLength(3);
+    expect(db.runs.list(undefined, "queued")).toEqual([]);
+  });
+
+  it("patches output and error via update, clearing with null", () => {
+    const project = db.projects.create(makeProject());
+    const run = db.runs.create(makeRun(project.id));
+    expect(db.runs.update(run.id, { status: "failed", output: "partial", error: "boom" })).toEqual({
+      ...run,
+      status: "failed",
+      output: "partial",
+      error: "boom",
+      updatedAt: expect.any(String),
+    });
+    expect(db.runs.update(run.id, { output: null, error: null })).toMatchObject({
+      status: "failed",
+    });
+    const cleared = db.runs.get(run.id);
+    expect("output" in (cleared ?? {})).toBe(false);
+    expect("error" in (cleared ?? {})).toBe(false);
+    expect(db.runs.update(uuid(), { status: "success" })).toBeUndefined();
+  });
 });
 
 describe("step runs", () => {
@@ -235,6 +274,18 @@ describe("step runs", () => {
     const cleared = db.stepRuns.update(stepRun.id, { diff: null });
     expect("diff" in (cleared ?? {})).toBe(false);
     expect(db.stepRuns.update(uuid(), { status: "success" })).toBeUndefined();
+  });
+
+  it("lists step runs per run ordered by iteration then id", () => {
+    const project = db.projects.create(makeProject());
+    const run = db.runs.create(makeRun(project.id));
+    const otherRun = db.runs.create(makeRun(project.id));
+    const second = db.stepRuns.create(makeStepRun(run.id, { iteration: 2, stepId: "step-b" }));
+    const first = db.stepRuns.create(makeStepRun(run.id, { iteration: 1, stepId: "adhoc" }));
+    db.stepRuns.create(makeStepRun(otherRun.id));
+    expect(db.stepRuns.listByRun(run.id)).toEqual([first, second]);
+    expect(db.stepRuns.listByRun(otherRun.id)).toHaveLength(1);
+    expect(db.stepRuns.listByRun(uuid())).toEqual([]);
   });
 });
 
@@ -299,5 +350,16 @@ describe("events", () => {
     const { runId } = seedRun();
     const event: AgentEvent = { type: "started", seq: 99 };
     expect(db.events.append(runId, event).seq).toBe(1);
+  });
+
+  it("counts events per run", () => {
+    const { runId, otherRunId } = seedRun();
+    expect(db.events.count(runId)).toBe(0);
+    db.events.append(runId, { type: "started" });
+    db.events.append(runId, { type: "session", sessionId: "s-1" });
+    db.events.append(otherRunId, { type: "started" });
+    expect(db.events.count(runId)).toBe(2);
+    expect(db.events.count(otherRunId)).toBe(1);
+    expect(db.events.count(uuid())).toBe(0);
   });
 });
