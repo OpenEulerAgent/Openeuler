@@ -311,7 +311,14 @@ importers:
         version: 3.2.7(@types/node@24.19.0)(jiti@2.7.0)(lightningcss@1.32.0)(supports-color@8.1.1)(tsx@4.23.15)
 
   packages/engine:
+    dependencies:
+      '@openeuler/core':
+        specifier: workspace:*
+        version: link:../core
     devDependencies:
+      '@types/node':
+        specifier: ^24.0.2
+        version: 24.19.0
       typescript:
         specifier: ^5.9.2
         version: 5.9.3
