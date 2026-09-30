@@ -84,6 +84,41 @@ describe("apiFetch", () => {
     expect(error.status).toBe(404);
   });
 
+  it("carries zod 422 validation details on ApiError", async () => {
+    fetchMock.mockResolvedValueOnce(
+      jsonResponse(
+        {
+          error: {
+            code: "VALIDATION_ERROR",
+            message: "promptTemplate must be a non-empty string",
+            details: [
+              {
+                path: "steps.0.promptTemplate",
+                message: "promptTemplate must be a non-empty string",
+              },
+              { path: "loopBack.maxIterations", message: "maxIterations must be an integer >= 1" },
+            ],
+          },
+        },
+        422,
+      ),
+    );
+
+    const error = await errorFrom(apiFetch("/api/workflows"));
+    expect(error.code).toBe("VALIDATION_ERROR");
+    expect(error.status).toBe(422);
+    expect(error.details).toEqual([
+      { path: "steps.0.promptTemplate", message: "promptTemplate must be a non-empty string" },
+      { path: "loopBack.maxIterations", message: "maxIterations must be an integer >= 1" },
+    ]);
+  });
+
+  it("returns undefined for empty (204) bodies", async () => {
+    fetchMock.mockResolvedValueOnce(new Response(null, { status: 204 }));
+
+    await expect(apiFetch("/api/workflows/w-1")).resolves.toBeUndefined();
+  });
+
   it("falls back to a generic code/message for non-JSON error bodies", async () => {
     fetchMock.mockResolvedValueOnce(textResponse("boom", 500));
 

@@ -1,4 +1,5 @@
 import type { Db } from "@openeuler/db";
+import type { DriverRegistry } from "@openeuler/drivers";
 import { Hono } from "hono";
 import type { ContentfulStatusCode } from "hono/utils/http-status";
 import { cors } from "hono/cors";
@@ -11,6 +12,7 @@ import type { Logger } from "./logger.js";
 import { createShutdownRegistry } from "./shutdown.js";
 import type { ShutdownHook, ShutdownRegistryOptions } from "./shutdown.js";
 import { createProjectsRouter } from "./routes/projects.js";
+import { createDriversRouter } from "./routes/drivers.js";
 import { createFilesRouter } from "./routes/files.js";
 import type { EventStreamOptions } from "./routes/runs.js";
 import { createRunsRouter } from "./routes/runs.js";
@@ -30,6 +32,8 @@ export interface CreateAppOptions {
   db?: Db;
   logger?: Logger;
   executor?: Executor;
+  /** Driver registry composed at boot; backs `GET /api/drivers`. */
+  drivers?: DriverRegistry;
   corsOrigin?: string;
   shutdown?: ShutdownRegistryOptions;
   /** SSE tuning for `GET /api/runs/:id/events`; tests shrink the timers. */
@@ -89,6 +93,7 @@ export function createApp(options: CreateAppOptions = {}): DaemonApp {
 
   app.route("/api/projects", createProjectsRouter());
   app.route("/api/projects", createFilesRouter());
+  app.route("/api/drivers", createDriversRouter(options.drivers));
   app.route("/api/workflows", createWorkflowsRouter());
   app.route("/api/runs", createRunsRouter({ eventStream: options.eventStream }));
 
