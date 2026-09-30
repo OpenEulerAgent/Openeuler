@@ -1,0 +1,9 @@
+not json at all
+{"type":"step_start","timestamp":1790781475957,"sessionID":"ses_synth_tolerance","part":{"id":"prt_synth_1","messageID":"msg_synth_1","sessionID":"ses_synth_tolerance","type":"step-start"}}
+{"type":"reasoning","timestamp":1790781475960,"sessionID":"ses_synth_tolerance","part":{"id":"prt_synth_2","messageID":"msg_synth_1","sessionID":"ses_synth_tolerance","type":"reasoning","text":"internal reasoning"}}
+{"type":"totally_new_envelope","timestamp":1790781475961,"sessionID":"ses_synth_tolerance","part":{"id":"prt_synth_3","type":"whatever"}}
+{"type":"tool_use","timestamp":1790781476000,"sessionID":"ses_synth_tolerance","part":{"type":"tool","tool":"bash","callID":"call_synth_1","state":{"status":"running","input":{"command":"sleep 1"}},"id":"prt_synth_4","messageID":"msg_synth_1","sessionID":"ses_synth_tolerance"}}
+{"type":"tool_use","timestamp":1790781476100,"sessionID":"ses_synth_tolerance","part":{"type":"tool","tool":"bash","callID":"call_synth_1","state":{"status":"completed","input":{"command":"sleep 1"},"output":"done in 1s"},"id":"prt_synth_4","messageID":"msg_synth_1","sessionID":"ses_synth_tolerance"}}
+{"type":"tool_use","timestamp":1790781476200,"sessionID":"ses_synth_tolerance","part":{"type":"tool","tool":"edit","callID":"call_synth_2","state":{"status":"error","input":{},"error":"ENOENT: no such file"},"id":"prt_synth_5","messageID":"msg_synth_1","sessionID":"ses_synth_tolerance"}}
+{"type":"text","timestamp":1790781476300,"sessionID":"ses_synth_tolerance","part":{"id":"prt_synth_6","messageID":"msg_synth_2","sessionID":"ses_synth_tolerance","type":"text","text":"all done"}}
+{"type":"step_finish","timestamp":1790781476301,"sessionID":"ses_synth_tolerance","part":{"id":"prt_synth_7","reason":"stop","messageID":"msg_synth_2","sessionID":"ses_synth_tolerance","type":"step-finish","tokens":{"total":100,"input":90,"output":10},"cost":0.00125}}
