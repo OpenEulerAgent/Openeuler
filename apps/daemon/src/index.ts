@@ -1,13 +1,43 @@
 import { serve } from "@hono/node-server";
-import { Hono } from "hono";
-import { healthPayload } from "./health.js";
+import { createDatabase } from "@openeuler/db";
+import { createApp } from "./app.js";
+import { createLogger } from "./logger.js";
 
-const app = new Hono();
+const DEFAULT_PORT = 8787;
 
-app.get("/health", (c) => c.json(healthPayload()));
+function resolvePort(): number {
+  const parsed = Number(process.env["PORT"] ?? DEFAULT_PORT);
+  return Number.isInteger(parsed) && parsed > 0 && parsed <= 65_535 ? parsed : DEFAULT_PORT;
+}
 
-const port = Number(process.env.PORT ?? 8787);
+export async function main(): Promise<void> {
+  const logger = createLogger();
+  const db = createDatabase();
+  const { app, onShutdown, handleShutdown } = createApp({ db, logger });
 
-serve({ fetch: app.fetch, port }, (info) => {
-  console.log(`@openeuler/daemon listening on http://localhost:${info.port}`);
+  onShutdown(() => db.close(), "db");
+
+  const port = resolvePort();
+  const server = serve({ fetch: app.fetch, port }, (info) => {
+    logger.info({ port: info.port, dbPath: db.path }, "@openeuler/daemon listening");
+  });
+  server.on("error", (err) => {
+    logger.error({ err, port }, "http server error");
+    process.exit(1);
+  });
+
+  onShutdown(() => new Promise<void>((resolve) => server.close(() => resolve())), "http-server");
+
+  const onSignal = (signal: NodeJS.Signals) => {
+    void handleShutdown(signal);
+  };
+  process.on("SIGTERM", onSignal);
+  process.on("SIGINT", onSignal);
+
+  logger.info({ pid: process.pid, port, dbPath: db.path }, "daemon started");
+}
+
+main().catch((err) => {
+  console.error("fatal: daemon failed to start", err);
+  process.exit(1);
 });

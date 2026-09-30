@@ -1,8 +1,15 @@
+import { getVersion } from "./version.js";
+
 export interface HealthPayload {
   ok: boolean;
-  service: string;
+  version: string;
+  uptime: number;
 }
 
 export function healthPayload(): HealthPayload {
-  return { ok: true, service: "@openeuler/daemon" };
+  return {
+    ok: true,
+    version: getVersion(),
+    uptime: Math.floor(process.uptime()),
+  };
 }
