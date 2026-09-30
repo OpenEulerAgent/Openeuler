@@ -1,11 +1,20 @@
-import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  readdirSync,
+  renameSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import type { Project } from "@openeuler/core";
 import { GitError, gitExec, isGitExitCode } from "./git.js";
 
 /** Machine-readable failure codes for {@link WorktreeError}. */
-export type WorktreeErrorCode = "EMPTY_REPO" | "BRANCH_COLLISION" | "INVALID_RUN_ID" | "GIT_FAILED";
+export type WorktreeErrorCode =
+  "EMPTY_REPO" | "NOT_A_GIT_REPOSITORY" | "BRANCH_COLLISION" | "INVALID_RUN_ID" | "GIT_FAILED";
 
 /** Typed error thrown by {@link WorktreeManager}. */
 export class WorktreeError extends Error {
@@ -43,8 +52,13 @@ export interface WorktreeInfo {
 export interface WorktreeDiff {
   /** `git diff --stat` summary string (may be empty when clean). */
   stat: string;
-  /** Unified diff patch including untracked files (may be empty when clean). */
+  /** Unified diff patch including staged, unstaged, and untracked files (may be empty when clean). */
   patch: string;
+}
+
+/** Best-effort {@link WorktreeManager.remove} outcome; `warnings` lists cleanup steps that failed. */
+export interface WorktreeRemoveResult {
+  warnings: string[];
 }
 
 /** Per-run bookkeeping persisted at `<storeRoot>/meta/<runId>.json`. */
@@ -60,6 +74,7 @@ interface WorktreeMetadata {
 const BRANCH_PREFIX = "agentloop";
 const META_DIR = "meta";
 const RUN_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
+const RESERVED_RUN_IDS = new Set([META_DIR]);
 
 export function branchForRun(runId: string): string {
   return `${BRANCH_PREFIX}/${runId}`;
@@ -72,10 +87,16 @@ function defaultStoreRoot(): string {
 }
 
 function validateRunId(runId: string): void {
-  if (typeof runId !== "string" || !RUN_ID_PATTERN.test(runId) || runId === "." || runId === "..") {
+  if (
+    typeof runId !== "string" ||
+    !RUN_ID_PATTERN.test(runId) ||
+    runId === "." ||
+    runId === ".." ||
+    RESERVED_RUN_IDS.has(runId.toLowerCase())
+  ) {
     throw new WorktreeError(
       "INVALID_RUN_ID",
-      `runId ${JSON.stringify(runId)} is invalid: it must match ${RUN_ID_PATTERN.source} and is used as a directory name under the worktree store`,
+      `runId ${JSON.stringify(runId)} is invalid: it must match ${RUN_ID_PATTERN.source}, must not be a reserved name (${[...RESERVED_RUN_IDS].join(", ")}), and is used as a directory name under the worktree store`,
     );
   }
 }
@@ -88,6 +109,7 @@ function validateRunId(runId: string): void {
 export class WorktreeManager {
   readonly #storeRoot: string;
   readonly #timeoutMs: number;
+  readonly #inFlight = new Map<string, Promise<unknown>>();
 
   constructor(options: WorktreeManagerOptions = {}) {
     this.#storeRoot = resolve(options.storeRoot ?? defaultStoreRoot());
@@ -97,6 +119,19 @@ export class WorktreeManager {
   /** Absolute worktree store root (created on demand by {@link create}). */
   get storeRoot(): string {
     return this.#storeRoot;
+  }
+
+  /** Serializes create/remove per runId; distinct runIds run in parallel. */
+  #withRunLock<T>(runId: string, op: () => Promise<T>): Promise<T> {
+    const previous = this.#inFlight.get(runId) ?? Promise.resolve();
+    const result = previous.then(op, op);
+    this.#inFlight.set(runId, result);
+    void result
+      .catch(() => {})
+      .finally(() => {
+        if (this.#inFlight.get(runId) === result) this.#inFlight.delete(runId);
+      });
+    return result;
   }
 
   #git(cwd: string, args: readonly string[]): Promise<string> {
@@ -123,7 +158,10 @@ export class WorktreeManager {
 
   #writeMeta(meta: WorktreeMetadata): void {
     mkdirSync(join(this.#storeRoot, META_DIR), { recursive: true });
-    writeFileSync(this.#metaPath(meta.runId), `${JSON.stringify(meta, null, 2)}\n`, "utf8");
+    const file = this.#metaPath(meta.runId);
+    const tmp = `${file}.tmp`;
+    writeFileSync(tmp, `${JSON.stringify(meta, null, 2)}\n`, "utf8");
+    renameSync(tmp, file);
   }
 
   #ensureStore(): void {
@@ -155,15 +193,45 @@ export class WorktreeManager {
     }
   }
 
+  /** Maps a failed `rev-parse HEAD` to the matching typed error. */
+  #headCheckError(projectPath: string, err: unknown): WorktreeError {
+    const stderr = err instanceof GitError ? err.stderr : "";
+    if (/not a git repository/i.test(stderr)) {
+      return new WorktreeError(
+        "NOT_A_GIT_REPOSITORY",
+        `path ${projectPath} is not a git repository; run worktrees can only be created from a git checkout`,
+        { cause: err },
+      );
+    }
+    if (/unknown revision|ambiguous argument/i.test(stderr)) {
+      return new WorktreeError(
+        "EMPTY_REPO",
+        `repository at ${projectPath} has no commits yet; commit something first (e.g. git commit --allow-empty -m init) before creating a run worktree`,
+        { cause: err },
+      );
+    }
+    return new WorktreeError(
+      "GIT_FAILED",
+      `failed to read HEAD of ${projectPath}: ${err instanceof Error ? err.message : String(err)}`,
+      { cause: err },
+    );
+  }
+
   /**
    * Creates `<storeRoot>/<runId>` as a git worktree of `project`'s repo with a
-   * fresh branch `agentloop/<runId>` based on the repo's current HEAD
-   * (normally the default branch). Any stale traces of a previous run with the
-   * same id are cleaned up first. Throws {@link WorktreeError} EMPTY_REPO when
-   * the repo has no commits yet.
+   * fresh branch `agentloop/<runId>` based on the tip of
+   * `project.defaultBranch`; when that branch does not exist locally (e.g. a
+   * shallow clone that never fetched it), it falls back to the repo's current
+   * HEAD. Any stale traces of a previous run with the same id are cleaned up
+   * first. Throws {@link WorktreeError} NOT_A_GIT_REPOSITORY when `project.path`
+   * is not a git repo and EMPTY_REPO when the repo has no commits yet.
    */
   async create(runId: string, project: Project): Promise<WorktreeInfo> {
     validateRunId(runId);
+    return this.#withRunLock(runId, () => this.#create(runId, project));
+  }
+
+  async #create(runId: string, project: Project): Promise<WorktreeInfo> {
     const branch = branchForRun(runId);
     const projectPath = resolve(project.path);
     const worktreePath = this.#worktreePath(runId);
@@ -177,12 +245,9 @@ export class WorktreeManager {
     }
 
     try {
-      await this.#git(projectPath, ["rev-parse", "--verify", "--quiet", "HEAD"]);
-    } catch {
-      throw new WorktreeError(
-        "EMPTY_REPO",
-        `repository at ${projectPath} has no commits yet; commit something first (e.g. git commit --allow-empty -m init) before creating a run worktree`,
-      );
+      await this.#git(projectPath, ["rev-parse", "HEAD"]);
+    } catch (err) {
+      throw this.#headCheckError(projectPath, err);
     }
 
     if (await this.#branchExists(projectPath, branch)) {
@@ -197,8 +262,19 @@ export class WorktreeManager {
       }
     }
 
+    const baseBranch = (await this.#branchExists(projectPath, project.defaultBranch))
+      ? project.defaultBranch
+      : null;
+
     try {
-      await this.#git(projectPath, ["worktree", "add", worktreePath, "-b", branch]);
+      await this.#git(projectPath, [
+        "worktree",
+        "add",
+        "-b",
+        branch,
+        worktreePath,
+        ...(baseBranch ? [baseBranch] : []),
+      ]);
     } catch (err) {
       throw new WorktreeError(
         "GIT_FAILED",
@@ -222,9 +298,17 @@ export class WorktreeManager {
    * Force-removes the run's worktree, prunes git's worktree metadata, deletes
    * the `agentloop/<runId>` branch ref if it still exists, and drops the run's
    * store metadata. Safe when the worktree and/or branch are already gone.
+   * Never throws for git failures: when the branch cannot be deleted (e.g. it
+   * is checked out in another worktree) the failure is reported in
+   * `warnings` and the run metadata is kept so a later `remove(runId)` can
+   * retry the branch deletion.
    */
-  async remove(runId: string): Promise<void> {
+  async remove(runId: string): Promise<WorktreeRemoveResult> {
     validateRunId(runId);
+    return this.#withRunLock(runId, () => this.#remove(runId));
+  }
+
+  async #remove(runId: string): Promise<WorktreeRemoveResult> {
     const meta = this.#readMeta(runId);
     const repoPath =
       meta && existsSync(meta.projectPath)
@@ -232,12 +316,14 @@ export class WorktreeManager {
         : existsSync(this.#worktreePath(runId))
           ? await this.#repoForExistingWorktree(this.#worktreePath(runId))
           : null;
-    await this.#cleanupRun(runId, repoPath ?? undefined);
+    const warnings = await this.#cleanupRun(runId, repoPath ?? undefined);
+    return { warnings };
   }
 
-  async #cleanupRun(runId: string, repoPath?: string): Promise<void> {
+  async #cleanupRun(runId: string, repoPath?: string): Promise<string[]> {
     const worktreePath = this.#worktreePath(runId);
     const branch = branchForRun(runId);
+    const warnings: string[] = [];
 
     if (repoPath && existsSync(worktreePath)) {
       try {
@@ -260,26 +346,27 @@ export class WorktreeManager {
       try {
         await this.#git(repoPath, ["branch", "-D", branch]);
       } catch (err) {
-        throw new WorktreeError(
-          "GIT_FAILED",
+        warnings.push(
           `failed to delete branch ${branch} from ${repoPath} while removing run ${runId}: ${err instanceof Error ? err.message : String(err)}`,
-          { cause: err },
         );
+        return warnings;
       }
     }
     const metaFile = this.#metaPath(runId);
     if (existsSync(metaFile)) rmSync(metaFile);
+    return warnings;
   }
 
   /**
    * Captures uncommitted agent changes in the worktree as `{ stat, patch }`.
    *
    * Untracked files are included via the intent-to-add trick: each untracked
-   * path is registered with `git add -N`, which makes plain `git diff` (and
-   * `git diff --stat`) render new-file content without staging blob content.
-   * This mutates the worktree's index (empty intent-to-add entries); that is
-   * the documented trade-off, preferred over `git diff --no-index` because it
-   * keeps a single unified patch that mixes edits and new files.
+   * path is registered with `git add -N`, then `git diff HEAD` (and
+   * `git diff --stat HEAD`) renders staged, unstaged, and new-file content in
+   * a single unified patch. This mutates the worktree's index (empty
+   * intent-to-add entries); that is the documented trade-off, preferred over
+   * `git diff --no-index` because it keeps a single unified patch that mixes
+   * edits and new files.
    */
   async diff(worktreePath: string): Promise<WorktreeDiff> {
     const abs = resolve(worktreePath);
@@ -289,8 +376,8 @@ export class WorktreeManager {
       await this.#git(abs, ["add", "-N", "--", ...untracked]);
     }
     const [stat, patch] = await Promise.all([
-      this.#git(abs, ["diff", "--stat"]),
-      this.#git(abs, ["diff"]),
+      this.#git(abs, ["diff", "--stat", "HEAD"]),
+      this.#git(abs, ["diff", "HEAD"]),
     ]);
     return { stat, patch };
   }

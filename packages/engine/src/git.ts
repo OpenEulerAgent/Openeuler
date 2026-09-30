@@ -61,8 +61,11 @@ export async function gitExec(
   } catch (err) {
     const details = err as { code?: number | string; stderr?: string; killed?: boolean };
     const timedOut = details.killed === true;
+    const stderrText = typeof details.stderr === "string" ? details.stderr.trim() : "";
+    const errMessage = err instanceof Error ? err.message : String(err);
+    const detail = stderrText.length > 0 ? stderrText : errMessage;
     throw new GitError(
-      `git ${args.join(" ")} failed in ${cwd}${details.stderr ? `: ${details.stderr.trim()}` : ""}`,
+      `git ${args.join(" ")} failed in ${cwd}${detail.length > 0 ? `: ${detail}` : ""}`,
       {
         exitCode: typeof details.code === "number" ? details.code : undefined,
         stderr: details.stderr ?? "",

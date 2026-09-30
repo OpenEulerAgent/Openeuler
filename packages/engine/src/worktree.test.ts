@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -60,7 +60,7 @@ afterEach(() => {
 });
 
 describe("WorktreeManager.create", () => {
-  it("creates a worktree at <store>/<runId> on branch agentloop/<runId> from current HEAD", async () => {
+  it("creates a worktree at <store>/<runId> on branch agentloop/<runId> from the default branch HEAD", async () => {
     const repo = makeRepo();
     const { manager, store } = makeManager();
     const head = git(repo, ["rev-parse", "HEAD"]);
@@ -79,6 +79,32 @@ describe("WorktreeManager.create", () => {
     expect(existsSync(join(store, "meta", "run-1.json"))).toBe(true);
   });
 
+  it("bases the worktree branch on the default branch, not the checked-out topic branch", async () => {
+    const repo = makeRepo();
+    const mainTip = git(repo, ["rev-parse", "main"]);
+    git(repo, ["checkout", "-b", "topic"]);
+    writeFileSync(join(repo, "topic.txt"), "topic work\n", "utf8");
+    git(repo, ["add", "."]);
+    git(repo, ["commit", "-m", "topic change"]);
+    const { manager } = makeManager();
+
+    const info = await manager.create("run-1", makeProject(repo));
+
+    expect(git(info.path, ["rev-parse", "HEAD"])).toBe(mainTip);
+    expect(git(repo, ["branch", "--show-current"])).toBe("topic");
+  });
+
+  it("falls back to the current HEAD when the default branch does not exist locally", async () => {
+    const repo = makeRepo();
+    const head = git(repo, ["rev-parse", "HEAD"]);
+    const { manager } = makeManager();
+    const project: Project = { ...makeProject(repo), defaultBranch: "nonexistent-default" };
+
+    const info = await manager.create("run-1", project);
+
+    expect(git(info.path, ["rev-parse", "HEAD"])).toBe(head);
+  });
+
   it("rejects invalid run ids before touching the filesystem", async () => {
     const repo = makeRepo();
     const { manager } = makeManager();
@@ -86,6 +112,38 @@ describe("WorktreeManager.create", () => {
       name: "WorktreeError",
       code: "INVALID_RUN_ID",
     });
+  });
+
+  it("rejects the reserved run id 'meta' (case-insensitively) without touching the metadata dir", async () => {
+    const repo = makeRepo();
+    const { manager, store } = makeManager();
+    mkdirSync(join(store, "meta"), { recursive: true });
+    writeFileSync(join(store, "meta", "run-keep.json"), "{}\n", "utf8");
+
+    for (const reserved of ["meta", "META", "Meta"]) {
+      await expect(manager.create(reserved, makeProject(repo))).rejects.toMatchObject({
+        name: "WorktreeError",
+        code: "INVALID_RUN_ID",
+      });
+      await expect(manager.remove(reserved)).rejects.toMatchObject({
+        name: "WorktreeError",
+        code: "INVALID_RUN_ID",
+      });
+    }
+
+    expect(existsSync(join(store, "meta", "run-keep.json"))).toBe(true);
+    expect(readdirSync(store)).toEqual(["meta"]);
+  });
+
+  it("throws a typed NOT_A_GIT_REPOSITORY error for a non-git directory", async () => {
+    const notARepo = tempDir("notrepo");
+    const { manager } = makeManager();
+
+    const err = await manager.create("run-1", makeProject(notARepo)).catch((e: unknown) => e);
+
+    expect(err).toBeInstanceOf(WorktreeError);
+    expect((err as WorktreeError).code).toBe("NOT_A_GIT_REPOSITORY");
+    expect((err as WorktreeError).message).toContain("not a git repository");
   });
 
   it("throws a typed EMPTY_REPO error for a repo without commits", async () => {
@@ -113,6 +171,34 @@ describe("WorktreeManager.create", () => {
     expect(
       git(repo, ["for-each-ref", "refs/heads/agentloop/run-1", "--format=%(refname:short)"]),
     ).toBe("agentloop/run-1");
+  });
+
+  it("throws BRANCH_COLLISION when the run branch is checked out in another worktree", async () => {
+    const repo = makeRepo();
+    const { manager } = makeManager();
+    const other = tempDir("other");
+    git(repo, ["branch", "agentloop/run-1"]);
+    git(repo, ["worktree", "add", other, "agentloop/run-1"]);
+
+    await expect(manager.create("run-1", makeProject(repo))).rejects.toMatchObject({
+      name: "WorktreeError",
+      code: "BRANCH_COLLISION",
+    });
+  });
+
+  it("serializes concurrent create() calls with the same runId", async () => {
+    const repo = makeRepo();
+    const { manager } = makeManager();
+    const project = makeProject(repo);
+
+    const [first, second] = await Promise.all([
+      manager.create("run-1", project),
+      manager.create("run-1", project),
+    ]);
+
+    expect(first.path).toBe(second.path);
+    expect(git(second.path, ["branch", "--show-current"])).toBe("agentloop/run-1");
+    expect(existsSync(second.path)).toBe(true);
   });
 
   it("recovers from a stale directory left in the store", async () => {
@@ -148,6 +234,21 @@ describe("WorktreeManager.diff", () => {
     expect(diff.patch).toContain("+brand new");
   });
 
+  it("includes staged changes that have no unstaged counterpart", async () => {
+    const repo = makeRepo();
+    const { manager } = makeManager();
+    const info = await manager.create("run-1", makeProject(repo));
+
+    writeFileSync(join(info.path, "README.md"), "# staged by agent\n", "utf8");
+    git(info.path, ["add", "README.md"]);
+    expect(git(info.path, ["diff"])).toBe("");
+
+    const diff = await manager.diff(info.path);
+    expect(diff.stat).toContain("README.md");
+    expect(diff.patch).toContain("-# test");
+    expect(diff.patch).toContain("+# staged by agent");
+  });
+
   it("returns empty strings for a clean worktree", async () => {
     const repo = makeRepo();
     const { manager } = makeManager();
@@ -177,7 +278,32 @@ describe("WorktreeManager.remove", () => {
 
   it("is a no-op when nothing exists for the run", async () => {
     const { manager } = makeManager();
-    await expect(manager.remove("never-created")).resolves.toBeUndefined();
+    await expect(manager.remove("never-created")).resolves.toEqual({ warnings: [] });
+  });
+
+  it("reports a warning and keeps metadata when the branch is checked out in a locked worktree", async () => {
+    const repo = makeRepo();
+    const { manager, store } = makeManager();
+    const info = await manager.create("run-1", makeProject(repo));
+    git(repo, ["worktree", "lock", info.path]);
+
+    const result = await manager.remove("run-1");
+
+    expect(result.warnings.length).toBe(1);
+    expect(result.warnings[0]).toContain("agentloop/run-1");
+    expect(existsSync(info.path)).toBe(false);
+    expect(
+      git(repo, ["for-each-ref", "refs/heads/agentloop/run-1", "--format=%(refname:short)"]),
+    ).toBe("agentloop/run-1");
+    expect(existsSync(join(store, "meta", "run-1.json"))).toBe(true);
+
+    git(repo, ["worktree", "unlock", info.path]);
+    const retry = await manager.remove("run-1");
+    expect(retry).toEqual({ warnings: [] });
+    expect(
+      git(repo, ["for-each-ref", "refs/heads/agentloop/run-1", "--format=%(refname:short)"]),
+    ).toBe("");
+    expect(existsSync(join(store, "meta", "run-1.json"))).toBe(false);
   });
 
   it("still deletes the branch when the worktree dir was already rm -rf'ed", async () => {

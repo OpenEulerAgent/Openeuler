@@ -16,4 +16,5 @@ export {
   type WorktreeErrorCode,
   type WorktreeInfo,
   type WorktreeManagerOptions,
+  type WorktreeRemoveResult,
 } from "./worktree.js";
