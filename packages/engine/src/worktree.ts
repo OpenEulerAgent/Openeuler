@@ -295,6 +295,23 @@ export class WorktreeManager {
   }
 
   /**
+   * Worktree info for a run that already has one on disk (metadata present
+   * and the working copy exists); null otherwise. Resume uses this to keep an
+   * interrupted run's worktree — with its uncommitted agent changes — instead
+   * of recreating it from the base branch. Report-only: never mutates.
+   */
+  existing(runId: string): WorktreeInfo | null {
+    try {
+      validateRunId(runId);
+    } catch {
+      return null;
+    }
+    const meta = this.#readMeta(runId);
+    if (meta === null || !existsSync(meta.worktreePath)) return null;
+    return { path: meta.worktreePath, branch: meta.branch };
+  }
+
+  /**
    * Force-removes the run's worktree, prunes git's worktree metadata, deletes
    * the `agentloop/<runId>` branch ref if it still exists, and drops the run's
    * store metadata. Safe when the worktree and/or branch are already gone.

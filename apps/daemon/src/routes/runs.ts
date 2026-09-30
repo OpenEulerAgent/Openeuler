@@ -449,5 +449,88 @@ export function createRunsRouter(options: CreateRunsRouterOptions = {}): Hono<Ap
     return c.json({ run: db.runs.get(id) });
   });
 
+  // Resume an interrupted run in place: the engine continues from the current
+  // step/iteration, restarting the interrupted step with its recorded
+  // sessionId and reusing the existing worktree. Only possible when every
+  // started StepRun recorded a sessionId — otherwise the agent context is
+  // gone and only a retry can help.
+  runs.post("/:id/resume", async (c) => {
+    const db = requireDb(c);
+    const executor = requireExecutor(c);
+    const id = c.req.param("id");
+    const run = requireRun(db, id);
+
+    if (run.status !== "interrupted") {
+      throw new HttpError(
+        409,
+        "RUN_NOT_INTERRUPTED",
+        `run ${id} has status ${run.status}; only interrupted runs can be resumed`,
+      );
+    }
+    const withoutSession = db.stepRuns.listByRun(id).filter((step) => step.sessionId === undefined);
+    if (withoutSession.length > 0) {
+      throw new HttpError(
+        409,
+        "RUN_RESUME_NOT_POSSIBLE",
+        `run ${id} cannot be resumed: ${withoutSession.length} step run(s) (e.g. ${withoutSession[0]?.stepId}) recorded no sessionId, so the agent context is lost; retry the run instead via POST /api/runs/${id}/retry`,
+      );
+    }
+
+    db.runs.updateStatus(id, "queued");
+    c.get("logger").info({ runId: id }, "run resumed after interruption");
+    executor.startRun(id);
+    return c.json({ run: db.runs.get(id) }, 202);
+  });
+
+  // Retry any finished (terminal or interrupted) run as a NEW run: same
+  // workflow (or ad-hoc task copy), same project, but a fresh runId — and
+  // with it a fresh worktree/branch — enqueued through the normal scheduler.
+  runs.post("/:id/retry", async (c) => {
+    const db = requireDb(c);
+    const executor = requireExecutor(c);
+    const id = c.req.param("id");
+    const run = requireRun(db, id);
+
+    if (run.status === "queued" || run.status === "running") {
+      throw new HttpError(
+        409,
+        "RUN_NOT_FINISHED",
+        `run ${id} is still ${run.status}; abort it first if you want to retry`,
+      );
+    }
+    if (!db.projects.get(run.projectId)) {
+      throw new HttpError(
+        409,
+        "RETRY_PROJECT_MISSING",
+        `project ${run.projectId} of run ${id} no longer exists; re-register it before retrying`,
+      );
+    }
+    if (run.workflowId && !db.workflows.get(run.workflowId)) {
+      throw new HttpError(
+        409,
+        "RETRY_WORKFLOW_MISSING",
+        `workflow ${run.workflowId} of run ${id} no longer exists; re-create it before retrying`,
+      );
+    }
+
+    const runId = randomUUID();
+    const now = new Date().toISOString();
+    const retry: Run = {
+      id: runId,
+      projectId: run.projectId,
+      ...(run.workflowId === undefined ? {} : { workflowId: run.workflowId }),
+      status: "queued",
+      branch: branchForRun(runId),
+      iteration: 0,
+      ...(run.task === undefined ? {} : { task: run.task }),
+      createdAt: now,
+      updatedAt: now,
+    };
+    db.runs.create(retry);
+    c.get("logger").info({ runId, sourceRunId: id }, "run retried as a new run");
+    executor.startRun(runId);
+    return c.json({ run: db.runs.get(runId) }, 202);
+  });
+
   return runs;
 }

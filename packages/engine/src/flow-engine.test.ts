@@ -1,9 +1,9 @@
 import { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import type { LoopBack, Run, RunStatus, Step, Workflow } from "@openeuler/core";
+import type { LoopBack, Project, Run, RunStatus, Step, StepRun, Workflow } from "@openeuler/core";
 import { createDatabase } from "@openeuler/db";
 import type { Db } from "@openeuler/db";
 import { createDriverRegistry, createFakeDriver } from "@openeuler/drivers";
@@ -16,6 +16,7 @@ interface Harness {
   dir: string;
   db: Db;
   engine: FlowEngine;
+  worktrees: WorktreeManager;
   storeRoot: string;
   projectId: string;
   /** Driver registry: tests register extra scripted drivers on it. */
@@ -77,12 +78,14 @@ const setup = (): Harness => {
   for (const driver of [impl, rev, ship, boom]) drivers.registerDriver(driver);
 
   const storeRoot = join(dir, "store");
-  const engine = createFlowEngine({ db, worktrees: new WorktreeManager({ storeRoot }), drivers });
+  const worktrees = new WorktreeManager({ storeRoot });
+  const engine = createFlowEngine({ db, worktrees, drivers });
 
   const harness: Harness = {
     dir,
     db,
     engine,
+    worktrees,
     storeRoot,
     projectId: project.id,
     registry: drivers,
@@ -781,5 +784,229 @@ describe("createFlowEngine (run abort)", () => {
       "running",
       "aborted",
     ]);
+  });
+});
+
+const seedStepRun = (
+  h: Harness,
+  runId: string,
+  overrides: Partial<StepRun> & { stepId: string; iteration: number },
+): StepRun =>
+  h.db.stepRuns.create({
+    id: crypto.randomUUID(),
+    runId,
+    status: "interrupted",
+    output: "",
+    ...overrides,
+  });
+
+describe("createFlowEngine (resume after interruption)", () => {
+  it("continues from the interrupted step: recorded sessionId, reused worktree, no re-runs", async () => {
+    const h = setup();
+    const workflow = h.makeWorkflow([
+      step({ id: "s1", driver: "impl", promptTemplate: "S1[{{task}}]" }),
+      step({ id: "s2", driver: "rev", promptTemplate: "S2[{{prevOutput}}]" }),
+      step({ id: "s3", driver: "ship", promptTemplate: "S3[{{prevOutput}}]" }),
+    ]);
+    const run = h.enqueueRun(workflow.id);
+
+    // Simulate the post-sweep state of a crashed daemon: s1 succeeded, s2 was
+    // interrupted mid-flight with its session recorded, the run was swept to
+    // `interrupted` and re-queued for resume. The worktree exists with the
+    // agent's uncommitted changes.
+    await h.worktrees.create(run.id, h.db.projects.get(h.projectId) as Project);
+    writeFileSync(join(h.storeRoot, run.id, "wip.txt"), "half-done\n");
+    seedStepRun(h, run.id, {
+      stepId: "s1",
+      iteration: 1,
+      status: "success",
+      sessionId: "s-impl",
+      output: "IMPL-OUT",
+    });
+    seedStepRun(h, run.id, {
+      stepId: "s2",
+      iteration: 1,
+      status: "interrupted",
+      sessionId: "s-rev-partial",
+      output: "part",
+    });
+    h.db.runs.update(run.id, { status: "interrupted", iteration: 0 });
+    h.db.runs.updateStatus(run.id, "queued");
+
+    await h.engine.executeRun(run.id, noAbort);
+    await awaitStatus(h, run.id, "success");
+
+    // s1 never re-ran; s2 restarted with ITS recorded session; s3 chained off
+    // s2's output as normal.
+    expect(h.drivers.impl.calls).toHaveLength(0);
+    expect(h.drivers.rev.calls).toHaveLength(1);
+    expect(h.drivers.rev.calls[0]?.sessionId).toBe("s-rev-partial");
+    expect(h.drivers.rev.calls[0]?.prompt).toBe("S2[IMPL-OUT]");
+    expect(h.drivers.ship.calls[0]?.prompt).toBe("S3[REV-OUT]");
+
+    // One StepRun row per (step, iteration): the interrupted s2 row was
+    // reused, not duplicated, and carries the new output.
+    const byStep = new Map(
+      h.db.stepRuns.listByRun(run.id).map((stepRun) => [stepRun.stepId, stepRun]),
+    );
+    expect([...byStep.keys()].sort()).toEqual(["s1", "s2", "s3"]);
+    expect(byStep.get("s2")).toMatchObject({ status: "success", output: "REV-OUT" });
+
+    // The worktree was reused (uncommitted change preserved) — not recreated
+    // from the base branch.
+    expect(readFileSync(join(h.storeRoot, run.id, "wip.txt"), "utf8")).toBe("half-done\n");
+
+    expect(h.db.runs.get(run.id)).toMatchObject({ status: "success", output: "SHIP-OUT" });
+  });
+
+  it("resumes an interrupted ad-hoc run: single step restarts with its recorded session", async () => {
+    const h = setup();
+    const run = h.enqueueRun(undefined, "ad-hoc recovery");
+    seedStepRun(h, run.id, {
+      stepId: "adhoc",
+      iteration: 1,
+      status: "interrupted",
+      sessionId: "s-adhoc",
+      output: "part",
+    });
+    h.db.runs.updateStatus(run.id, "interrupted");
+    h.db.runs.updateStatus(run.id, "queued");
+
+    await h.engine.executeRun(run.id, noAbort, { driverId: "impl" });
+    await awaitStatus(h, run.id, "success");
+
+    expect(h.drivers.impl.calls[0]?.sessionId).toBe("s-adhoc");
+    expect(h.db.stepRuns.listByRun(run.id)).toHaveLength(1);
+    expect(h.db.stepRuns.listByRun(run.id)[0]).toMatchObject({
+      status: "success",
+      sessionId: "s-impl",
+    });
+  });
+
+  it("reconstructs loop position: resumes mid-iteration-2 and honors maxIterations", async () => {
+    const h = setup();
+    const workflow = h.makeWorkflow(
+      [
+        step({ id: "s1", driver: "impl", promptTemplate: "S1[{{task}}]" }),
+        step({ id: "s2", driver: "rev", promptTemplate: "S2[{{prevOutput}}]#{{iterations}}" }),
+      ],
+      {
+        toStepIndex: 1,
+        when: { type: "outputContains", pattern: "NEVER" },
+        maxIterations: 3,
+      },
+    );
+    const run = h.enqueueRun(workflow.id);
+
+    // Iteration 1 completed fully; iteration 2's s2 was interrupted. The loop
+    // resumes at (s2, iteration 2) with one more pass allowed after it.
+    seedStepRun(h, run.id, {
+      stepId: "s1",
+      iteration: 1,
+      status: "success",
+      sessionId: "s-impl-1",
+      output: "IMPL-1",
+    });
+    seedStepRun(h, run.id, {
+      stepId: "s2",
+      iteration: 1,
+      status: "success",
+      sessionId: "s-rev-1",
+      output: "REV-1",
+    });
+    seedStepRun(h, run.id, {
+      stepId: "s1",
+      iteration: 2,
+      status: "success",
+      sessionId: "s-impl-2",
+      output: "IMPL-2",
+    });
+    seedStepRun(h, run.id, {
+      stepId: "s2",
+      iteration: 2,
+      status: "interrupted",
+      sessionId: "s-rev-2",
+      output: "part",
+    });
+    h.db.runs.update(run.id, { status: "interrupted", iteration: 1 });
+    h.db.runs.updateStatus(run.id, "queued");
+
+    await h.engine.executeRun(run.id, noAbort);
+    await awaitStatus(h, run.id, "success");
+
+    // s1 never re-ran (its iteration-2 row already succeeded; the jump target
+    // is s2 anyway). s2 restarted at iteration 2 with its recorded session,
+    // then ran iteration 3.
+    expect(h.drivers.impl.calls).toHaveLength(0);
+    expect(h.drivers.rev.calls.map((call) => call.prompt)).toEqual([
+      "S2[IMPL-2]#2",
+      "S2[REV-OUT]#3",
+    ]);
+    expect(h.drivers.rev.calls[0]?.sessionId).toBe("s-rev-2");
+
+    // Loop verdicts only for the resumed passes; the run ends at the
+    // iteration cap with the 0-based counter of the final pass.
+    expect(loopEvents(h, run.id)).toEqual([
+      { iteration: 2, verdict: "continue" },
+      { iteration: 3, verdict: "max-iterations" },
+    ]);
+    expect(h.db.runs.get(run.id)).toMatchObject({ status: "success", iteration: 2 });
+    expect(h.db.stepRuns.listByRun(run.id)).toHaveLength(5);
+  });
+
+  it("finalizes without re-running when every recorded step already succeeded", async () => {
+    const h = setup();
+    const workflow = h.makeWorkflow([step({ id: "s1", driver: "impl" })]);
+    const run = h.enqueueRun(workflow.id);
+    seedStepRun(h, run.id, {
+      stepId: "s1",
+      iteration: 1,
+      status: "success",
+      sessionId: "s-impl",
+      output: "IMPL-OUT",
+    });
+    h.db.runs.update(run.id, { status: "interrupted", iteration: 0 });
+    h.db.runs.updateStatus(run.id, "queued");
+
+    await h.engine.executeRun(run.id, noAbort);
+    await awaitStatus(h, run.id, "success");
+
+    expect(h.drivers.impl.calls).toHaveLength(0);
+    expect(h.db.runs.get(run.id)).toMatchObject({ status: "success", output: "IMPL-OUT" });
+    expect(h.db.stepRuns.listByRun(run.id)).toHaveLength(1);
+  });
+});
+
+describe("createFlowEngine (abort vs worktree lifecycle)", () => {
+  it("removes the worktree when an abort lands while it was being created (no orphan)", async () => {
+    const h = setup();
+    const workflow = h.makeWorkflow([step({ id: "s1", driver: "impl" })]);
+    const run = h.enqueueRun(workflow.id);
+
+    // The abort re-check right after worktree creation is the SECOND
+    // isAbortRequested() call of an execution (the first guards the flip to
+    // running) — flip in between to hit exactly that window.
+    let calls = 0;
+    const abortDuringCreate = {
+      isAbortRequested: (): boolean => {
+        calls += 1;
+        return calls >= 2;
+      },
+      onHandle: undefined,
+    };
+
+    await h.engine.executeRun(run.id, abortDuringCreate);
+    await awaitStatus(h, run.id, "aborted");
+
+    expect(h.drivers.impl.calls).toHaveLength(0);
+    expect(h.db.runs.get(run.id)).toMatchObject({ status: "aborted" });
+    // Worktree (directory, branch ref, and store metadata) fully cleaned up.
+    expect(existsSync(join(h.storeRoot, run.id))).toBe(false);
+    expect(existsSync(join(h.storeRoot, "meta", `${run.id}.json`))).toBe(false);
+    const branches = execFileSync("git", ["branch", "--list", `agentloop/${run.id}`], {
+      cwd: join(h.dir, "repo"),
+      encoding: "utf8",
+    });
+    expect(branches.trim()).toBe("");
   });
 });

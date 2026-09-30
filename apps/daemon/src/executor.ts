@@ -327,6 +327,16 @@ export function createExecutor(options: ExecutorOptions): Executor {
       Promise.allSettled(entries.map((entry) => entry.done)),
       delay(shutdownSettleMs),
     ]);
+    // Final settle pass: step rows the engine could not settle within the
+    // window (abort race lost to a slow driver) must not linger as zombies —
+    // the run row is already `aborted`, never `interrupted` (that status is
+    // reserved for the boot sweep of a dead daemon).
+    for (const entry of entries) {
+      const run = db.runs.get(entry.runId);
+      if (run && run.status === "aborted") {
+        settleStepRuns(entry.runId, "aborted");
+      }
+    }
     logger.info("executor shutdown complete");
   }
 
