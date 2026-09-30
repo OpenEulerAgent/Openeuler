@@ -14,6 +14,7 @@ export const RUN_EVENT_TYPES = [
   "run.status",
   "step.started",
   "step.completed",
+  "loop.iteration",
 ] as const;
 
 /** One frame off the wire: a driver event or an engine (run/step) event. */

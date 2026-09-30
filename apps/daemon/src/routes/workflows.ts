@@ -1,6 +1,11 @@
 import { randomUUID } from "node:crypto";
 import type { Run, Workflow } from "@openeuler/core";
-import { LoopBackSchema, StepSchema, WorkflowSchema } from "@openeuler/core";
+import {
+  LoopBackSchema,
+  StepSchema,
+  WorkflowShapeSchema,
+  loopBackToStepIndexIssue,
+} from "@openeuler/core";
 import type { Db } from "@openeuler/db";
 import { branchForRun } from "@openeuler/engine";
 import { Hono, type Context } from "hono";
@@ -9,8 +14,17 @@ import type { AppEnv } from "../app.js";
 import type { Executor } from "../executor.js";
 import { HttpError } from "../errors.js";
 
-/** Create body: a full Workflow minus the server-assigned id. */
-const CreateWorkflowBodySchema = WorkflowSchema.omit({ id: true });
+/**
+ * Create body: a full Workflow minus the server-assigned id. Built from the
+ * unrefined shape (zod cannot `.omit()` on refined objects) with the same
+ * cross-field loopBack refinement `WorkflowSchema` applies.
+ */
+const CreateWorkflowBodySchema = WorkflowShapeSchema.omit({ id: true }).superRefine((body, ctx) => {
+  const issue = loopBackToStepIndexIssue(body);
+  if (issue !== undefined) {
+    ctx.addIssue({ code: "custom", path: ["loopBack", "toStepIndex"], message: issue });
+  }
+});
 
 /** Patch body: any subset of the mutable fields; `loopBack: null` clears it. */
 const PatchWorkflowBodySchema = z.strictObject({

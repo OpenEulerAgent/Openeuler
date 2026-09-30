@@ -62,6 +62,13 @@ const setup = (): ApiHarness => {
       output: "SECOND-OUT",
     }),
   );
+  drivers.registerDriver(
+    createFakeDriver({
+      id: "cycler",
+      events: [{ type: "session", seq: 1, sessionId: "s-cycle" }],
+      outputs: ["WIP", "WIP", "ALL TESTS PASS"],
+    }),
+  );
   const executor = createExecutor({
     db,
     worktrees: new WorktreeManager({ storeRoot: join(dir, "store") }),
@@ -206,6 +213,58 @@ describe("POST /api/workflows", () => {
       expect(res.status).toBe(422);
       expect(((await res.json()) as ErrorResponseBody).error.code).toBe("VALIDATION_ERROR");
     }
+  });
+
+  it("422s when loopBack.toStepIndex is out of bounds or the outputMatches regex is invalid", async () => {
+    const h = setup();
+    const steps = h.makeSteps("first", "second");
+    const cases: Array<{ body: Record<string, unknown>; message: string }> = [
+      // Cross-field: 2 steps, index 2 does not exist.
+      {
+        body: {
+          projectId: h.projectId,
+          name: "x",
+          steps,
+          loopBack: { toStepIndex: 2, when: { type: "always" }, maxIterations: 2 },
+        },
+        message: "loopBack.toStepIndex must be < steps.length",
+      },
+      // Invalid regex must be rejected at save time, never at runtime.
+      {
+        body: {
+          projectId: h.projectId,
+          name: "x",
+          steps,
+          loopBack: {
+            toStepIndex: 0,
+            when: { type: "outputMatches", regex: "([a-z" },
+            maxIterations: 2,
+          },
+        },
+        message: "invalid regular expression",
+      },
+    ];
+    for (const { body, message } of cases) {
+      const res = await postWorkflow(h, body);
+      expect(res.status).toBe(422);
+      const error = ((await res.json()) as ErrorResponseBody).error;
+      expect(error.code).toBe("VALIDATION_ERROR");
+      expect(error.message).toContain(message);
+    }
+
+    // PATCH is covered too, on the merged workflow (steps + loopBack).
+    const workflow = await createWorkflow(h, { projectId: h.projectId, name: "y", steps });
+    const patched = await h.request(`/api/workflows/${workflow.id}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        loopBack: { toStepIndex: 5, when: { type: "always" }, maxIterations: 2 },
+      }),
+    });
+    expect(patched.status).toBe(422);
+    const patchError = ((await patched.json()) as ErrorResponseBody).error;
+    expect(patchError.code).toBe("VALIDATION_ERROR");
+    expect(patchError.message).toContain("loopBack.toStepIndex must be < steps.length");
   });
 
   it("404s for an unknown project", async () => {
@@ -435,5 +494,61 @@ describe("POST /api/workflows/:id/runs", () => {
       body: JSON.stringify({ task: "go" }),
     });
     expect(missing.status).toBe(404);
+  });
+
+  it("loops a workflow run until the exit condition is met, with loop.iteration events", async () => {
+    const h = setup();
+    const workflow = await createWorkflow(h, {
+      projectId: h.projectId,
+      name: "until-green",
+      steps: [
+        {
+          id: "s1",
+          name: "implement",
+          driver: "cycler",
+          mode: "auto",
+          promptTemplate: "{{task}} (pass {{iterations}})",
+          continueSession: false,
+        },
+      ],
+      loopBack: {
+        toStepIndex: 0,
+        when: { type: "outputContains", pattern: "ALL TESTS PASS" },
+        maxIterations: 5,
+      },
+    });
+
+    const res = await h.request(`/api/workflows/${workflow.id}/runs`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ task: "get to green" }),
+    });
+    expect(res.status).toBe(202);
+    const { run } = (await res.json()) as { run: Run };
+
+    await awaitRunStatus(h, run.id, "success");
+    expect(h.db.runs.get(run.id)).toMatchObject({
+      status: "success",
+      output: "ALL TESTS PASS",
+      iteration: 2,
+    });
+
+    // The event log carries one loop.iteration per pass with its verdict.
+    const loops = h.db.events.getSince(run.id).filter((event) => event.type === "loop.iteration");
+    expect(loops).toHaveLength(3);
+    if (loops[0]?.type === "loop.iteration") {
+      expect(loops[0].verdict).toBe("continue");
+      expect(loops[0].iteration).toBe(1);
+      expect(loops[0].detail).toContain('outputContains "ALL TESTS PASS" unmet');
+    }
+    if (loops[2]?.type === "loop.iteration") {
+      expect(loops[2].verdict).toBe("exit-condition-met");
+    }
+
+    // Step runs: one per iteration, grouped in the run detail payload.
+    const detail = (await (await h.request(`/api/runs/${run.id}`)).json()) as {
+      iterations: Array<{ iteration: number; steps: Array<{ stepId: string; status: string }> }>;
+    };
+    expect(detail.iterations.map((group) => group.iteration)).toEqual([1, 2, 3]);
   });
 });

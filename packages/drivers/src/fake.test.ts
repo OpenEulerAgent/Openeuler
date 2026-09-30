@@ -88,6 +88,23 @@ describe("createFakeDriver", () => {
     });
   });
 
+  it("cycles per-start outputs by call count (for loop iterations)", async () => {
+    const driver = createFakeDriver({
+      events: [],
+      output: "static",
+      outputs: ["WIP-1", "WIP-2"],
+    });
+    const outputs: string[] = [];
+    for (let call = 0; call < 5; call += 1) {
+      const handle = driver.start(startOpts);
+      await collect(handle);
+      const exit = await handle.exited;
+      outputs.push(exit.output);
+    }
+    // outputs[n % outputs.length]; wins over the fixed `output`.
+    expect(outputs).toEqual(["WIP-1", "WIP-2", "WIP-1", "WIP-2", "WIP-1"]);
+  });
+
   it("honors a non-zero exitCode", async () => {
     const handle = createFakeDriver({ events: script, exitCode: 3 }).start(startOpts);
     await collect(handle);

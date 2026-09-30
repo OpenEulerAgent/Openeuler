@@ -134,6 +134,31 @@ describe("parseRunStreamEvent", () => {
     expect(parseRunStreamEvent(JSON.stringify(completed))).toEqual(completed);
   });
 
+  it("parses loop.iteration events and registers them on the stream", () => {
+    const loop = {
+      type: "loop.iteration",
+      seq: 5,
+      iteration: 2,
+      verdict: "continue",
+      detail: 'outputContains "DONE" unmet',
+    };
+    expect(parseRunStreamEvent(JSON.stringify(loop))).toEqual(loop);
+
+    // The stream wires one listener per RUN_EVENT_TYPES entry; the loop event
+    // type must be among them so live verdicts reach the feed.
+    expect(RUN_EVENT_TYPES).toContain("loop.iteration");
+    const events: RunStreamEvent[] = [];
+    const { source } = connect({ events });
+    source.simulateOpen();
+    source.simulateEvent({
+      type: "loop.iteration",
+      seq: 6,
+      iteration: 1,
+      verdict: "exit-condition-met",
+    });
+    expect(events).toHaveLength(1);
+  });
+
   it("returns null for malformed or unknown payloads", () => {
     expect(parseRunStreamEvent("not json")).toBeNull();
     expect(parseRunStreamEvent(JSON.stringify({ type: "mystery", seq: 1 }))).toBeNull();

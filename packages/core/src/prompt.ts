@@ -2,7 +2,10 @@
  * Variables usable inside a step's `promptTemplate`:
  *
  * - `{{task}}`        the run's task description
- * - `{{prevOutput}}`  the previous step's output this iteration (empty on the first step)
+ * - `{{prevOutput}}`  the previous step's output this iteration (empty on the
+ *                     first step; after a loop-back jump the first re-run step
+ *                     receives the LAST step's output from the previous
+ *                     iteration, so context flows across the jump)
  * - `{{iterations}}`  the current loop pass, 1-based (`1` on the first pass)
  */
 export const PROMPT_TEMPLATE_VARIABLES = ["task", "prevOutput", "iterations"] as const;

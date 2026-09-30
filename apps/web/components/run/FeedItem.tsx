@@ -1,5 +1,10 @@
 import { cn } from "@/lib/cn";
-import type { AgentToolCallEvent, AgentToolOutputEvent, RunStatusEvent } from "@openeuler/core";
+import type {
+  AgentToolCallEvent,
+  AgentToolOutputEvent,
+  LoopIterationEvent,
+  RunStatusEvent,
+} from "@openeuler/core";
 import type { ReactNode } from "react";
 import type { StepCompletedEvent, StepStartedEvent } from "@openeuler/core";
 import { TERMINAL_STATUS_STYLES, isTerminalRunStatus, type FeedEntry } from "@/lib/run-feed";
@@ -74,6 +79,23 @@ function StepCompletedItem({ event }: { event: StepCompletedEvent }) {
   );
 }
 
+/** Human-readable label for a loop verdict (kept in sync with the engine's detail). */
+const LOOP_VERDICT_LABELS: Record<LoopIterationEvent["verdict"], string> = {
+  continue: "continuing",
+  "exit-condition-met": "exit condition met",
+  "max-iterations": "stopped at maxIterations",
+  "hard-cap": "stopped at the iteration hard cap",
+};
+
+function LoopIterationItem({ event }: { event: LoopIterationEvent }) {
+  return (
+    <SystemLine>
+      loop pass {event.iteration}: {LOOP_VERDICT_LABELS[event.verdict]}
+      {event.detail === undefined ? "" : ` — ${event.detail}`}
+    </SystemLine>
+  );
+}
+
 /** Render one feed row, styled per event type. */
 export function FeedItem({ entry }: { entry: FeedEntry }) {
   if (entry.kind === "message") {
@@ -114,5 +136,7 @@ export function FeedItem({ entry }: { entry: FeedEntry }) {
       return <StepStartedItem event={event} />;
     case "step.completed":
       return <StepCompletedItem event={event} />;
+    case "loop.iteration":
+      return <LoopIterationItem event={event} />;
   }
 }

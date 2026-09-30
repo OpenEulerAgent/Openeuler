@@ -21,6 +21,8 @@ export {
   OutputNotContainsConditionSchema,
   StepSchema,
   WorkflowSchema,
+  WorkflowShapeSchema,
+  loopBackToStepIndexIssue,
 } from "./workflow.js";
 export type {
   AlwaysCondition,
@@ -65,6 +67,8 @@ export type {
 } from "./agent-event.js";
 
 export {
+  LoopIterationEventSchema,
+  LoopVerdictSchema,
   PersistedEventSchema,
   RunEventSchema,
   RunStatusEventSchema,
@@ -72,6 +76,8 @@ export {
   StepStartedEventSchema,
 } from "./run-event.js";
 export type {
+  LoopIterationEvent,
+  LoopVerdict,
   PersistedEvent,
   RunEvent,
   RunStatusEvent,

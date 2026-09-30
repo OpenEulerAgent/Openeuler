@@ -72,12 +72,37 @@ export const LoopBackSchema = z.strictObject({
 
 export type LoopBack = z.infer<typeof LoopBackSchema>;
 
-export const WorkflowSchema = z.strictObject({
+/** Structural workflow shape, before the cross-field loopBack refinement. */
+export const WorkflowShapeSchema = z.strictObject({
   id: idSchema,
   projectId: idSchema,
   name: z.string().min(1, "workflow name must be a non-empty string"),
   steps: z.array(StepSchema).min(1, "a workflow needs at least one step"),
   loopBack: LoopBackSchema.optional(),
+});
+
+/**
+ * Cross-field check (shared by {@link WorkflowSchema} and API bodies):
+ * `loopBack.toStepIndex` must reference an existing step. Returns the issue
+ * message, or `undefined` when the bounds hold.
+ */
+export function loopBackToStepIndexIssue(workflow: {
+  steps: readonly unknown[];
+  loopBack?: { toStepIndex: number } | undefined;
+}): string | undefined {
+  const loopBack = workflow.loopBack;
+  if (loopBack === undefined) return undefined;
+  if (loopBack.toStepIndex >= workflow.steps.length) {
+    return `loopBack.toStepIndex must be < steps.length (got ${loopBack.toStepIndex}, but the workflow has ${workflow.steps.length} step(s))`;
+  }
+  return undefined;
+}
+
+export const WorkflowSchema = WorkflowShapeSchema.superRefine((workflow, ctx) => {
+  const issue = loopBackToStepIndexIssue(workflow);
+  if (issue !== undefined) {
+    ctx.addIssue({ code: "custom", path: ["loopBack", "toStepIndex"], message: issue });
+  }
 });
 
 export type Workflow = z.infer<typeof WorkflowSchema>;

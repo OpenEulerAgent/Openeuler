@@ -1,6 +1,13 @@
 import { randomUUID } from "node:crypto";
 import { renderPromptTemplate } from "@openeuler/core";
-import type { Run, RunStatus, StepRun } from "@openeuler/core";
+import type {
+  ExitCondition,
+  LoopBack,
+  LoopVerdict,
+  Run,
+  RunStatus,
+  StepRun,
+} from "@openeuler/core";
 import type { Db } from "@openeuler/db";
 import type { AgentDriver, AgentHandle, AgentMode, DriverRegistry } from "@openeuler/drivers";
 import type { WorktreeManager } from "./worktree.js";
@@ -10,6 +17,13 @@ export const DEFAULT_DRIVER_ID = "fake";
 
 /** StepRun `stepId` backing ad-hoc runs executed without a workflow. */
 export const ADHOC_STEP_ID = "adhoc";
+
+/**
+ * Hard ceiling on loop iterations, regardless of what `loopBack.maxIterations`
+ * configures: the engine clamps `effective = min(configured, 25)` so a loop
+ * whose exit condition never becomes met cannot run forever.
+ */
+export const MAX_LOOP_ITERATIONS = 25;
 
 /** Structural slice of a pino-style logger; the daemon passes its real one. */
 export interface FlowLogger {
@@ -62,10 +76,13 @@ export interface FlowEngineOptions {
 export interface FlowEngine {
   /**
    * Drives a queued run to a terminal state: worktree → steps (in workflow
-   * order, chaining outputs/sessions via prompt templates) → diff capture →
-   * final status. Persists engine events (`run.status`, `step.started`,
-   * `step.completed`) into the run's event log around the driver events.
-   * Never throws: every failure lands in the run row (`failed` + error).
+   * order, chaining outputs/sessions via prompt templates; loopBack edges
+   * repeat from `toStepIndex` until the exit condition is met or the
+   * iteration cap — hard-capped at {@link MAX_LOOP_ITERATIONS} — is reached)
+   * → diff capture → final status. Persists engine events (`run.status`,
+   * `step.started`, `step.completed`, `loop.iteration`) into the run's event
+   * log around the driver events. Never throws: every failure lands in the
+   * run row (`failed` + error).
    */
   executeRun(runId: string, control: RunControl, opts?: ExecuteRunOptions): Promise<void>;
 }
@@ -79,19 +96,98 @@ interface StepOutcome {
   sessionId: string | undefined;
 }
 
+/** Execution plan for a run: its steps plus the workflow's loopBack edge. */
+interface RunPlan {
+  steps: StepDefinition[];
+  /** Set for workflow runs with a loopBack edge; ad-hoc runs run one pass. */
+  loopBack: LoopBack | undefined;
+}
+
 const TERMINAL_STATUSES = new Set<RunStatus>(["success", "failed", "aborted", "interrupted"]);
 
 const isTerminal = (status: RunStatus): boolean => TERMINAL_STATUSES.has(status);
 
 const describeError = (err: unknown): string => (err instanceof Error ? err.message : String(err));
 
+/** Human-readable form of an exit condition, for event details and errors. */
+function describeCondition(when: ExitCondition): string {
+  switch (when.type) {
+    case "always":
+      return "always";
+    case "outputContains":
+      return `outputContains ${JSON.stringify(when.pattern)}`;
+    case "outputNotContains":
+      return `outputNotContains ${JSON.stringify(when.pattern)}`;
+    case "outputMatches":
+      return `outputMatches /${when.regex}/${when.flags ?? ""}`;
+  }
+}
+
+/**
+ * Exit condition evaluation state, compiled once per run so `outputMatches`
+ * regexes are a single `new RegExp` per execution.
+ */
+interface ExitEvaluator {
+  when: ExitCondition;
+  /** Pre-compiled regex for `outputMatches` conditions. */
+  regex: RegExp | undefined;
+}
+
+/**
+ * Compiles a loopBack exit condition once per run. `outputMatches` regexes are
+ * validated at workflow save time; a compile failure here (data that bypassed
+ * the schema) is surfaced as a clear error instead of a crash.
+ */
+function compileExitCondition(loopBack: LoopBack): ExitEvaluator | Error {
+  const { when } = loopBack;
+  if (when.type !== "outputMatches") {
+    return { when, regex: undefined };
+  }
+  try {
+    return { when, regex: new RegExp(when.regex, when.flags ?? "") };
+  } catch (err) {
+    return new Error(
+      `loopBack.when outputMatches regex ${describeCondition(when)} does not compile: ${describeError(err)}`,
+    );
+  }
+}
+
+/**
+ * Evaluates an exit condition against the final step's output. `always` is
+ * trivially true; `outputContains`/`outputNotContains` are substring checks;
+ * `outputMatches` uses the pre-compiled regex (the pattern controls its own
+ * anchoring via `^`/`$`/`m`). `lastIndex` is reset so `g`/`y` flags cannot
+ * make repeated evaluation stateful.
+ */
+function evaluateExitCondition(evaluator: ExitEvaluator, output: string): boolean {
+  switch (evaluator.when.type) {
+    case "always":
+      return true;
+    case "outputContains":
+      return output.includes(evaluator.when.pattern);
+    case "outputNotContains":
+      return !output.includes(evaluator.when.pattern);
+    case "outputMatches": {
+      const regex = evaluator.regex;
+      if (regex === undefined) return false;
+      regex.lastIndex = 0;
+      return regex.test(output);
+    }
+  }
+}
+
 /**
  * Multi-step workflow engine. Pure with respect to drivers and storage: the
  * db, worktree manager and driver registry are injected, so tests run the
  * real execution path against a temp database/store and scripted fake
- * drivers. Runs execute a single pass today; the step loop below is already
- * wrapped in an iteration loop (1-based, matching `{{iterations}}`) so
- * loop-back (#16) only needs to extend the loop bound and reset `stepIndex`.
+ * drivers. Steps run in workflow order; when the workflow has a `loopBack`
+ * edge, the engine evaluates its exit condition against the final step's
+ * output after every iteration and jumps back to `steps[toStepIndex]` while
+ * the condition is unmet and iterations remain (`{{iterations}}` is 1-based,
+ * `prevOutput` flows across the jump, `continueSession` steps resume the
+ * previous iteration's same-step session). The iteration count is clamped by
+ * the hard cap {@link MAX_LOOP_ITERATIONS}; each iteration's verdict is
+ * persisted as a `loop.iteration` event.
  */
 export function createFlowEngine(options: FlowEngineOptions): FlowEngine {
   const { db, worktrees, drivers } = options;
@@ -173,37 +269,43 @@ export function createFlowEngine(options: FlowEngineOptions): FlowEngine {
     }
   }
 
-  function resolveSteps(run: Run, opts: ExecuteRunOptions | undefined): StepDefinition[] {
+  function resolvePlan(run: Run, opts: ExecuteRunOptions | undefined): RunPlan {
     if (run.workflowId) {
       const workflow = db.workflows.get(run.workflowId);
       if (!workflow) {
         throw new Error(`workflow ${run.workflowId} not found for run ${run.id}`);
       }
-      return workflow.steps.map((step) => ({
-        stepId: step.id,
-        stepName: step.name,
-        driver: step.driver,
-        promptTemplate: step.promptTemplate,
-        ...(step.model === undefined ? {} : { model: step.model }),
-        ...(step.agent === undefined ? {} : { agent: step.agent }),
-        mode: step.mode,
-        continueSession: step.continueSession,
-      }));
+      return {
+        steps: workflow.steps.map((step) => ({
+          stepId: step.id,
+          stepName: step.name,
+          driver: step.driver,
+          promptTemplate: step.promptTemplate,
+          ...(step.model === undefined ? {} : { model: step.model }),
+          ...(step.agent === undefined ? {} : { agent: step.agent }),
+          mode: step.mode,
+          continueSession: step.continueSession,
+        })),
+        loopBack: workflow.loopBack,
+      };
     }
     // Ad-hoc run: a single transient step rendering the task verbatim. The
     // template is the literal `{{task}}` token, so a task containing
     // mustache-like text is substituted verbatim, never re-scanned.
-    return [
-      {
-        stepId: ADHOC_STEP_ID,
-        stepName: "ad-hoc",
-        driver: opts?.driverId ?? process.env["OPENEULER_DRIVER"] ?? DEFAULT_DRIVER_ID,
-        promptTemplate: "{{task}}",
-        ...(opts?.model === undefined ? {} : { model: opts.model }),
-        mode: opts?.mode ?? "auto",
-        continueSession: false,
-      },
-    ];
+    return {
+      steps: [
+        {
+          stepId: ADHOC_STEP_ID,
+          stepName: "ad-hoc",
+          driver: opts?.driverId ?? process.env["OPENEULER_DRIVER"] ?? DEFAULT_DRIVER_ID,
+          promptTemplate: "{{task}}",
+          ...(opts?.model === undefined ? {} : { model: opts.model }),
+          mode: opts?.mode ?? "auto",
+          continueSession: false,
+        },
+      ],
+      loopBack: undefined,
+    };
   }
 
   /**
@@ -228,6 +330,29 @@ export function createFlowEngine(options: FlowEngineOptions): FlowEngine {
       status: "running",
       output: "",
     });
+  }
+
+  /**
+   * Session a `continueSession` step should resume. Across loop iterations the
+   * previous iteration's SAME-STEP StepRun wins (the reviewer keeps its own
+   * full context, including what it said last pass); within the first
+   * iteration — or when the same-step row recorded no session — the previous
+   * step's session in flow order is used, matching linear chaining.
+   */
+  function inheritedSessionFor(
+    runId: string,
+    step: StepDefinition,
+    iteration: number,
+    prevSessionId: string | undefined,
+  ): string | undefined {
+    if (!step.continueSession) return undefined;
+    if (iteration > 1) {
+      const prior = db.stepRuns
+        .listByRun(runId)
+        .find((row) => row.stepId === step.stepId && row.iteration === iteration - 1);
+      if (prior?.sessionId !== undefined) return prior.sessionId;
+    }
+    return prevSessionId;
   }
 
   async function runStep(
@@ -354,13 +479,41 @@ export function createFlowEngine(options: FlowEngineOptions): FlowEngine {
     db.runs.updateStatus(runId, "running");
     emitRunStatus(runId, "running");
 
-    let steps: StepDefinition[];
+    let plan: RunPlan;
     try {
-      steps = resolveSteps(run, opts);
+      plan = resolvePlan(run, opts);
     } catch (err) {
       finalizeRun(runId, "failed", { error: describeError(err) });
       return;
     }
+
+    const { steps, loopBack } = plan;
+
+    // Defensive runtime bound (the schema already rejects this at save time,
+    // but the row may predate the refinement or be written around it).
+    if (loopBack !== undefined && loopBack.toStepIndex >= steps.length) {
+      finalizeRun(runId, "failed", {
+        error: `loopBack.toStepIndex must be < steps.length (got ${loopBack.toStepIndex}, but the workflow has ${steps.length} step(s))`,
+      });
+      return;
+    }
+
+    // Exit condition compiled once per run.
+    let exitEvaluator: ExitEvaluator | undefined;
+    if (loopBack !== undefined) {
+      const compiled = compileExitCondition(loopBack);
+      if (compiled instanceof Error) {
+        finalizeRun(runId, "failed", { error: compiled.message });
+        return;
+      }
+      exitEvaluator = compiled;
+    }
+
+    // Loop bound: the configured cap, clamped by the hard cap. `hitHardCap`
+    // records whether the clamp changed anything (for the event verdict).
+    const configuredMaxIterations = loopBack?.maxIterations ?? 1;
+    const maxIterations = Math.min(configuredMaxIterations, MAX_LOOP_ITERATIONS);
+    const hitHardCap = configuredMaxIterations > MAX_LOOP_ITERATIONS;
 
     const project = db.projects.get(run.projectId);
     if (!project) {
@@ -385,33 +538,37 @@ export function createFlowEngine(options: FlowEngineOptions): FlowEngine {
     }
 
     const task = run.task ?? "";
-    // Single pass today (#16 adds loop-back); the counter is already flowing
-    // so templates and StepRun rows are iteration-aware.
-    const iterations = 1;
     let runOutput = "";
+    // Context that flows along the whole run, across loop-back jumps: after a
+    // jump the first re-run step receives the previous iteration's LAST step
+    // output as `{{prevOutput}}` (and, when it continues a session and has no
+    // same-step session of its own, the previous iteration's last session).
+    let prevOutput = "";
+    let prevSessionId: string | undefined;
+    // Steps before `loopBack.toStepIndex` do not re-run after a jump.
+    let startIndex = 0;
 
-    for (let iteration = 1; iteration <= iterations; iteration += 1) {
+    for (let iteration = 1; ; iteration += 1) {
       const rowIteration = iteration - 1; // Run.iteration stays 0-based.
-      if (run.iteration !== rowIteration) {
+      const currentRow = db.runs.get(runId);
+      if (currentRow !== undefined && currentRow.iteration !== rowIteration) {
         db.runs.update(runId, { iteration: rowIteration });
       }
 
-      let prevOutput = "";
-      let prevSessionId: string | undefined;
-
-      for (const step of steps) {
+      for (let stepIndex = startIndex; stepIndex < steps.length; stepIndex += 1) {
         if (control.isAbortRequested()) {
           abortRun(runId);
           return;
         }
 
+        const step = steps[stepIndex] as StepDefinition;
         const outcome = await runStep(
           runId,
           worktreePath,
           step,
           iteration,
           { task, prevOutput },
-          prevSessionId,
+          inheritedSessionFor(runId, step, iteration, prevSessionId),
           control,
         );
 
@@ -428,6 +585,45 @@ export function createFlowEngine(options: FlowEngineOptions): FlowEngine {
         });
         return;
       }
+
+      // No loopBack edge: a single pass (loop-aware code paths stay dormant).
+      if (loopBack === undefined || exitEvaluator === undefined) {
+        break;
+      }
+
+      // LoopBack edge: evaluate `when` against the FINAL step's output and
+      // decide whether another iteration starts at `toStepIndex`.
+      const conditionMet = evaluateExitCondition(exitEvaluator, runOutput);
+      const description = describeCondition(exitEvaluator.when);
+      let verdict: LoopVerdict;
+      let detail: string;
+      if (conditionMet) {
+        verdict = "exit-condition-met";
+        detail = `${description} met after iteration ${iteration}`;
+      } else if (hitHardCap && iteration >= maxIterations) {
+        verdict = "hard-cap";
+        detail = `${description} unmet; stopped at the hard iteration cap ${MAX_LOOP_ITERATIONS} (maxIterations=${configuredMaxIterations} clamped)`;
+      } else if (iteration >= maxIterations) {
+        verdict = "max-iterations";
+        detail = `${description} unmet; stopped at maxIterations=${maxIterations}`;
+      } else {
+        verdict = "continue";
+        detail = `${description} unmet; jumping back to step ${loopBack.toStepIndex + 1} of ${steps.length}`;
+      }
+
+      db.events.append(runId, {
+        type: "loop.iteration",
+        iteration,
+        verdict,
+        detail,
+      });
+      log.info({ runId, iteration, verdict }, "loop iteration evaluated");
+
+      if (verdict !== "continue") {
+        break;
+      }
+
+      startIndex = loopBack.toStepIndex;
     }
 
     finalizeRun(runId, "success", { output: runOutput });
