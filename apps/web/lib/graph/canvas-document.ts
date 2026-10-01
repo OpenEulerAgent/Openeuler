@@ -222,6 +222,16 @@ export function fromCanvasDocument(doc: CanvasDocument): WorkflowGraph {
 }
 
 /**
+ * Editor dirty check: compares two documents by their serialized
+ * `WorkflowGraph` projections, so React Flow runtime keys written onto nodes
+ * and edges (`selected`, `measured`, `dragging`, `resizing`, …) never read
+ * as unsaved changes — only graph-meaningful edits do.
+ */
+export function canvasDocsEquivalent(a: CanvasDocument, b: CanvasDocument): boolean {
+  return JSON.stringify(fromCanvasDocument(a)) === JSON.stringify(fromCanvasDocument(b));
+}
+
+/**
  * The canvas document for a workflow as served by the daemon: its latest
  * revision graph when present, else one synthesized from the legacy steps
  * mirror (workflows written before revisions, or by older daemons).

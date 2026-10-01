@@ -17,6 +17,7 @@ import {
   AUTO_CONVERTED_CONDITION,
 } from "./canvas-ops";
 import { commit, commitWithBefore, initHistory, redo, replacePresent, undo } from "./history";
+import { validateCanvasDocument } from "./validation";
 
 function node(
   id: string,
@@ -96,7 +97,7 @@ describe("checkConnect / applyConnect", () => {
     ).toBe(false);
   });
 
-  it("auto-converts the existing always edge when a node gains a second outgoing edge", () => {
+  it("keeps the existing always fallback; the NEW second edge is the conditional", () => {
     const doc = chainDoc();
     const withFix: CanvasDocument = {
       nodes: [...doc.nodes, node("fix", { x: 600, y: 200 })],
@@ -105,13 +106,59 @@ describe("checkConnect / applyConnect", () => {
     const check = checkConnect(withFix, { source: "review", target: "fix" });
     expect(check.ok).toBe(true);
     if (!check.ok) return;
-    expect(check.convertedEdgeId).toBe("e-review-exit");
+    expect(check.convertedEdgeId).toBe("e-review-fix");
 
     const next = applyConnect(withFix, check);
-    const converted = next.edges.find((edge) => edge.id === "e-review-exit");
-    expect(converted?.data.condition).toEqual(AUTO_CONVERTED_CONDITION);
+    const fallback = next.edges.find((edge) => edge.id === "e-review-exit");
+    expect(fallback?.data.condition).toEqual({ type: "always" });
     const added = next.edges.find((edge) => edge.target === "fix");
-    expect(added?.data.condition).toEqual({ type: "always" });
+    expect(added?.data.condition).toEqual(AUTO_CONVERTED_CONDITION);
+    // The placeholder's empty pattern is invalid — saving stays blocked
+    // until the user fills the condition in.
+    expect(validateCanvasDocument(next).some((issue) => issue.edgeId === "e-review-fix")).toBe(
+      true,
+    );
+  });
+
+  it("a third connect adds another conditional without churning existing edges", () => {
+    const doc = chainDoc();
+    const withTargets: CanvasDocument = {
+      nodes: [...doc.nodes, node("fix", { x: 600, y: 200 }), node("test", { x: 600, y: 400 })],
+      edges: doc.edges,
+    };
+    const second = checkConnect(withTargets, { source: "review", target: "fix" });
+    expect(second.ok).toBe(true);
+    if (!second.ok) return;
+    const afterSecond = applyConnect(withTargets, second);
+    // The user filled the second edge's condition in.
+    const filled: CanvasDocument = {
+      ...afterSecond,
+      edges: afterSecond.edges.map((edge) =>
+        edge.id === "e-review-fix"
+          ? {
+              ...edge,
+              data: { ...edge.data, condition: { type: "outputContains", pattern: "tests" } },
+            }
+          : edge,
+      ),
+    };
+
+    const third = checkConnect(filled, { source: "review", target: "test" });
+    expect(third.ok).toBe(true);
+    if (!third.ok) return;
+    expect(third.convertedEdgeId).toBe("e-review-test");
+    const after = applyConnect(filled, third);
+
+    expect(after.edges.find((edge) => edge.id === "e-review-exit")?.data.condition).toEqual({
+      type: "always",
+    });
+    expect(after.edges.find((edge) => edge.id === "e-review-fix")?.data.condition).toEqual({
+      type: "outputContains",
+      pattern: "tests",
+    });
+    expect(after.edges.find((edge) => edge.id === "e-review-test")?.data.condition).toEqual(
+      AUTO_CONVERTED_CONDITION,
+    );
   });
 });
 
@@ -301,6 +348,57 @@ describe("history (undo/redo)", () => {
     expect(restoredReview?.data.kind === "agent" && restoredReview.data.config.promptTemplate).toBe(
       "",
     );
+  });
+
+  it("undo inside the debounce window flushes the pending edit first (redo intact)", () => {
+    const withPrompt = (doc: CanvasDocument, prompt: string): CanvasDocument => ({
+      ...doc,
+      nodes: doc.nodes.map((candidate) =>
+        candidate.id === "review" && candidate.data.kind === "agent"
+          ? {
+              ...candidate,
+              data: {
+                ...candidate.data,
+                config: { ...candidate.data.config, promptTemplate: prompt },
+              },
+            }
+          : candidate,
+      ),
+    });
+    const promptOf = (doc: CanvasDocument): string => {
+      const found = doc.nodes.find((candidate) => candidate.id === "review");
+      return found !== undefined && found.data.kind === "agent"
+        ? found.data.config.promptTemplate
+        : "";
+    };
+
+    const base = chainDoc();
+    let history = initHistory(base);
+    // One committed edit before the typing, so a stale flush would corrupt it.
+    history = commit(history, {
+      ...base,
+      nodes: base.nodes.map((candidate) =>
+        candidate.id === "entry" ? { ...candidate, position: { x: 40, y: 0 } } : candidate,
+      ),
+    });
+
+    // Keystrokes land: present moves silently, the before-snapshot is held,
+    // the commit timer is pending.
+    const beforeTyping = history.present;
+    history = replacePresent(history, withPrompt(history.present, "abc"));
+    // Undo arrives inside the window: the editor flushes (commits the pending
+    // edit) BEFORE stepping — exactly one entry, no post-hoc timer fire.
+    history = commitWithBefore(history, beforeTyping, history.present);
+
+    const undone = undo(history);
+    expect(undone.value && promptOf(undone.value)).toBe("");
+    const redone = redo(undone.history);
+    expect(redone.value && promptOf(redone.value)).toBe("abc");
+    // A second undo still reaches the earlier committed edit.
+    const undoneAgain = undo(undone.history);
+    expect(
+      undoneAgain.value?.nodes.find((candidate) => candidate.id === "entry")?.position,
+    ).toEqual({ x: 0, y: 0 });
   });
 });
 

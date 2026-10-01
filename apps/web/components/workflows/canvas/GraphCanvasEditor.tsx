@@ -26,6 +26,7 @@ import { Dialog } from "@/components/ui/dialog";
 import { useToast } from "@/components/ui/toast";
 import { ApiError } from "@/lib/api";
 import {
+  canvasDocsEquivalent,
   createAgentNode,
   createExitNode,
   fromCanvasDocument,
@@ -86,6 +87,17 @@ function isTypingTarget(target: EventTarget | null): boolean {
     target instanceof HTMLElement &&
     (target.isContentEditable || ["INPUT", "TEXTAREA", "SELECT"].includes(target.tagName))
   );
+}
+
+/** Whether any node's position differs between two documents (a real drag). */
+function positionsChanged(before: CanvasDocument, after: CanvasDocument): boolean {
+  return after.nodes.some((node) => {
+    const prior = before.nodes.find((candidate) => candidate.id === node.id);
+    return (
+      prior !== undefined &&
+      (prior.position.x !== node.position.x || prior.position.y !== node.position.y)
+    );
+  });
 }
 
 /** Document → React Flow edges: conditional edges dashed + labelled, issues red. */
@@ -174,7 +186,9 @@ function GraphCanvasInner({
   const editBeforeRef = useRef<CanvasDocument | null>(null);
   const editTimerRef = useRef<number | null>(null);
 
-  const dirty = useMemo(() => JSON.stringify(doc) !== JSON.stringify(savedDoc), [doc, savedDoc]);
+  // Dirty via the serialized projections: React Flow runtime keys (`selected`,
+  // `measured`, `dragging`, …) must never read as unsaved changes.
+  const dirty = useMemo(() => !canvasDocsEquivalent(doc, savedDoc), [doc, savedDoc]);
 
   // Live-refresh the validation overlay while issues are shown, so badges
   // clear as the user fixes things.
@@ -202,6 +216,20 @@ function GraphCanvasInner({
     },
     [clearEditTimer, updateHistory],
   );
+
+  /**
+   * Ends a pending debounced edit now: cancels the timer and commits the
+   * captured before-snapshot as a history entry. Undo/redo/save landing
+   * inside the window call this first so they step over a settled history —
+   * no stale snapshots, no post-hoc entries, redo preserved.
+   */
+  const flushPendingEdit = useCallback(() => {
+    clearEditTimer();
+    const before = editBeforeRef.current;
+    editBeforeRef.current = null;
+    if (before === null) return;
+    updateHistory((current) => commitWithBefore(current, before, current.present));
+  }, [clearEditTimer, updateHistory]);
 
   /** Debounced commit for drawer/edge-panel edits. */
   const patchDocDebounced = useCallback(
@@ -233,21 +261,24 @@ function GraphCanvasInner({
   );
 
   const doUndo = useCallback(() => {
+    flushPendingEdit();
     const step = undo(historyRef.current);
     if (step.value === null) return;
     updateHistory(() => step.history);
     pruneSelection(step.value);
-  }, [pruneSelection, updateHistory]);
+  }, [flushPendingEdit, pruneSelection, updateHistory]);
 
   const doRedo = useCallback(() => {
+    flushPendingEdit();
     const step = redo(historyRef.current);
     if (step.value === null) return;
     updateHistory(() => step.history);
     pruneSelection(step.value);
-  }, [pruneSelection, updateHistory]);
+  }, [flushPendingEdit, pruneSelection, updateHistory]);
 
   const save = useCallback(async () => {
     if (saving) return;
+    flushPendingEdit();
     const clientIssues = validateCanvasDocument(historyRef.current.present);
     setIssues(clientIssues);
     if (clientIssues.length > 0) {
@@ -291,7 +322,7 @@ function GraphCanvasInner({
     } finally {
       setSaving(false);
     }
-  }, [saving, toast, updateHistory, workflow.id]);
+  }, [flushPendingEdit, saving, toast, updateHistory, workflow.id]);
 
   const addNode = useCallback(
     (kind: PaletteNodeKind, position?: { x: number; y: number }) => {
@@ -331,9 +362,9 @@ function GraphCanvasInner({
       if (check.convertedEdgeId !== undefined) {
         toast({
           variant: "info",
-          title: "Edge converted to conditional",
+          title: "Edge added as conditional",
           description:
-            "A node can keep only one always edge (its router fallback) — the previous always edge is now conditional. Set its condition.",
+            "A node can keep only one always edge (its router fallback) — the new edge needs a condition before the graph can be saved.",
         });
       }
     },
@@ -452,11 +483,12 @@ function GraphCanvasInner({
 
   const onNodesChange = useCallback(
     (changes: NodeChange<CanvasFlowNode>[]) => {
-      // Position/dimension/selection only: removals run through the editor's
-      // own history-committed delete path.
+      // Position/selection only: removals run through the editor's own
+      // history-committed delete path, and dimension measurements stay in
+      // React Flow's runtime layer (never serialized into the document).
       const structural = changes.filter(
         (change): change is NodeChange<CanvasNode> =>
-          change.type === "position" || change.type === "dimensions" || change.type === "select",
+          change.type === "position" || change.type === "select",
       ) as unknown as NodeChange<CanvasNode>[];
       updateHistory((current) => ({
         ...current,
@@ -493,6 +525,9 @@ function GraphCanvasInner({
     const before = dragBeforeRef.current;
     dragBeforeRef.current = null;
     if (before === null) return;
+    // Click-to-select fires drag start/stop without moving anything —
+    // skip the history entry for it.
+    if (!positionsChanged(before, historyRef.current.present)) return;
     updateHistory((current) => commitWithBefore(current, before, current.present));
   }, [updateHistory]);
 
@@ -582,7 +617,7 @@ function GraphCanvasInner({
     if (issue.nodeId !== undefined) {
       setSelectedEdgeId(null);
       setSelectedNodeId(issue.nodeId);
-      void fitView({ nodes: [{ id: issue.nodeId }], duration: 320, maxZoom: 1.2, padding: 4 });
+      void fitView({ nodes: [{ id: issue.nodeId }], duration: 320, maxZoom: 1.2, padding: 0.2 });
       return;
     }
     if (issue.edgeId !== undefined) {
@@ -594,7 +629,7 @@ function GraphCanvasInner({
         nodes: [{ id: edge.source }, { id: edge.target }],
         duration: 320,
         maxZoom: 1.2,
-        padding: 4,
+        padding: 0.2,
       });
     }
   };

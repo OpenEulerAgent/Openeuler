@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { applyNodeChanges, type NodeChange } from "@xyflow/react";
 import {
   WorkflowGraphSchema,
   linearToGraph,
@@ -7,11 +8,14 @@ import {
   type WorkflowGraph,
 } from "@openeuler/core";
 import {
+  canvasDocsEquivalent,
   canvasEdgeId,
   fromCanvasDocument,
   starterGraph,
   toCanvasDocument,
   workflowToCanvasDocument,
+  type CanvasDocument,
+  type CanvasNode,
 } from "./canvas-document";
 
 function agent(
@@ -240,5 +244,56 @@ describe("canvas serialization round-trip", () => {
     });
     expect(fromCanvasDocument(doc).nodes[0]?.id).toBe("s1");
     expect(doc.nodes.some((node) => node.data.kind === "agent" && node.data.isEntry)).toBe(true);
+  });
+});
+
+describe("editor dirty tracking (normalized projections)", () => {
+  it("React Flow runtime keys from measured/select changes never read as dirty", () => {
+    const saved = toCanvasDocument(fixLoopGraph());
+    // What React Flow writes onto nodes: `measured`/`resizing` from dimension
+    // changes, `selected` from clicks, `dragging` from position changes.
+    const exitPosition = saved.nodes[2]!.position;
+    const runtimeTouched = {
+      nodes: applyNodeChanges(
+        [
+          {
+            type: "dimensions",
+            id: "implement",
+            dimensions: { width: 240, height: 96 },
+            measured: { width: 240, height: 96 },
+            resizing: true,
+          },
+          { type: "select", id: "review", selected: true },
+          { type: "position", id: "exit", position: exitPosition, dragging: false },
+        ] as unknown as NodeChange<CanvasNode>[],
+        saved.nodes,
+      ),
+      edges: saved.edges.map((edge) => ({ ...edge, selected: true })),
+    } satisfies CanvasDocument;
+    expect(canvasDocsEquivalent(runtimeTouched, saved)).toBe(true);
+  });
+
+  it("a real edit still reads as dirty", () => {
+    const saved = toCanvasDocument(fixLoopGraph());
+    const moved: CanvasDocument = {
+      ...saved,
+      nodes: saved.nodes.map((node) =>
+        node.id === "review" ? { ...node, position: { x: 999, y: 999 } } : node,
+      ),
+    };
+    expect(canvasDocsEquivalent(moved, saved)).toBe(false);
+
+    const relabeled: CanvasDocument = {
+      ...saved,
+      edges: saved.edges.map((edge) =>
+        edge.id === "e-review-exit"
+          ? {
+              ...edge,
+              data: { ...edge.data, condition: { type: "outputContains", pattern: "APPROVED!" } },
+            }
+          : edge,
+      ),
+    };
+    expect(canvasDocsEquivalent(relabeled, saved)).toBe(false);
   });
 });

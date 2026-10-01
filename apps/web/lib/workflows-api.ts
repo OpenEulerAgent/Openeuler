@@ -1,6 +1,5 @@
 import type { Run, Workflow, WorkflowGraph } from "@openeuler/core";
 import { ApiError, apiFetch } from "./api";
-import { DEFAULT_DRIVER_IDS, draftToPayload, type WorkflowDraft } from "./workflow-builder";
 
 /** Injectable transport so submit flows are testable without a browser. */
 export type WorkflowFetcher = typeof apiFetch;
@@ -53,6 +52,9 @@ export async function fetchWorkflowForEditor(
   }
 }
 
+/** Driver dropdown fallback when `GET /api/drivers` is unreachable or empty. */
+const DEFAULT_DRIVER_IDS: readonly string[] = ["opencode"];
+
 /**
  * Registered driver ids for the step dropdown, from `GET /api/drivers`.
  * Falls back to the static default list when the daemon is unreachable or
@@ -65,35 +67,6 @@ export async function fetchDriverIds(fetcher: WorkflowFetcher = apiFetch): Promi
   } catch {
     return [...DEFAULT_DRIVER_IDS];
   }
-}
-
-/**
- * Save a draft: POST to create, PATCH to update. The PATCH always sends
- * name + steps and `loopBack: null` when the loop is disabled, so a stored
- * loop is cleared by disabling it in the editor.
- */
-export async function saveWorkflowDraft(options: {
-  projectId: string;
-  draft: WorkflowDraft;
-  /** Present → PATCH this workflow; absent → POST a new one. */
-  workflowId?: string;
-  fetcher?: WorkflowFetcher;
-}): Promise<Workflow> {
-  const { projectId, draft, workflowId, fetcher = apiFetch } = options;
-  const payload = draftToPayload(draft);
-  const body = workflowId
-    ? { ...payload, loopBack: payload.loopBack ?? null }
-    : { ...payload, projectId };
-
-  const response = await fetcher<{ workflow: Workflow }>(
-    workflowId ? `/api/workflows/${encodeURIComponent(workflowId)}` : "/api/workflows",
-    {
-      method: workflowId ? "PATCH" : "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-    },
-  );
-  return response.workflow;
 }
 
 export async function deleteWorkflow(

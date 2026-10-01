@@ -5,8 +5,8 @@ import { canvasEdgeId } from "./canvas-document";
 /**
  * Pure canvas operations with UX rules beyond the schema (#46): connection
  * validation (entry is a pure source, no duplicate edges, exit is a
- * terminal), the always→conditional auto-conversion when a node gains a
- * second outgoing edge, and selection-aware deletion.
+ * terminal), conditional newcomers when a node gains an extra outgoing edge
+ * (its `always` fallback stays), and selection-aware deletion.
  */
 
 export type ConnectFailureReason = "entry-target" | "duplicate" | "exit-source" | "unknown-node";
@@ -21,7 +21,11 @@ export function isUnconditionalEdge(data: { condition: ExitCondition; invert?: b
   return data.condition.type === "always" && data.invert !== true;
 }
 
-/** The conditional an auto-converted `always` edge becomes until edited. */
+/**
+ * Placeholder condition for an extra outgoing edge whose source already
+ * keeps an `always` fallback — the empty pattern is invalid until the user
+ * fills it in (saving stays blocked until then).
+ */
 export const AUTO_CONVERTED_CONDITION: ExitCondition = { type: "outputContains", pattern: "" };
 
 export interface ConnectParams {
@@ -35,9 +39,10 @@ export interface ConnectParams {
  * - the entry node is a pure source (no incoming edges)
  * - exit nodes are terminals (no outgoing edges)
  * - duplicate source→target edges are rejected
- * - when the source already has an unconditional outgoing edge, that edge is
- *   auto-converted to a conditional one (a node may keep only one `always`
- *   fallback) — `convertedEdgeId` tells the caller to announce it
+ * - the source keeps at most one unconditional (`always`) edge — its router
+ *   fallback: the first outgoing edge is that fallback, and any additional
+ *   edge is born conditional with {@link AUTO_CONVERTED_CONDITION} —
+ *   `convertedEdgeId` (the new edge's id) tells the caller to announce it
  */
 export function checkConnect(doc: CanvasDocument, params: ConnectParams): ConnectCheck {
   const sourceNode = doc.nodes.find((node) => node.id === params.source);
@@ -75,7 +80,7 @@ export function checkConnect(doc: CanvasDocument, params: ConnectParams): Connec
   }
 
   const id = canvasEdgeId(params.source, params.target);
-  const existingAlways = doc.edges.find(
+  const hasFallback = doc.edges.some(
     (edge) => edge.source === params.source && isUnconditionalEdge(edge.data),
   );
 
@@ -85,25 +90,23 @@ export function checkConnect(doc: CanvasDocument, params: ConnectParams): Connec
       id,
       source: params.source,
       target: params.target,
-      data: { condition: { type: "always" } },
+      data: { condition: hasFallback ? AUTO_CONVERTED_CONDITION : { type: "always" } },
     },
-    ...(existingAlways === undefined ? {} : { convertedEdgeId: existingAlways.id }),
+    ...(hasFallback ? { convertedEdgeId: id } : {}),
   };
 }
 
-/** Applies a successful {@link checkConnect}: adds the edge (+ conversion). */
+/**
+ * Applies a successful {@link checkConnect}: appends the edge exactly as
+ * built — a conditional newcomer already carries its placeholder condition,
+ * and the source's existing edges (including its `always` fallback) are
+ * untouched.
+ */
 export function applyConnect(
   doc: CanvasDocument,
   check: { ok: true; edge: CanvasEdge } & { convertedEdgeId?: string },
 ): CanvasDocument {
-  const edges = check.convertedEdgeId
-    ? doc.edges.map((edge) =>
-        edge.id === check.convertedEdgeId
-          ? { ...edge, data: { ...edge.data, condition: AUTO_CONVERTED_CONDITION } }
-          : edge,
-      )
-    : doc.edges;
-  return { nodes: doc.nodes, edges: [...edges, check.edge] };
+  return { nodes: doc.nodes, edges: [...doc.edges, check.edge] };
 }
 
 export interface DeleteCheck {
