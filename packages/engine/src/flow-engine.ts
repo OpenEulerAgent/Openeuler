@@ -1,11 +1,12 @@
 import { randomUUID } from "node:crypto";
-import { renderPromptTemplate } from "@openeuler/core";
+import { graphToLinear, renderPromptTemplate } from "@openeuler/core";
 import type {
   ExitCondition,
   LoopBack,
   LoopVerdict,
   Run,
   RunStatus,
+  Step,
   StepRun,
 } from "@openeuler/core";
 import type { Db } from "@openeuler/db";
@@ -84,6 +85,13 @@ export interface FlowEngine {
    * log around the driver events. Never throws: every failure lands in the
    * run row (`failed` + error).
    *
+   * Runs pinned to a graph revision (`workflowRevisionId`, #44) resolve
+   * their steps from the immutable snapshot: until the graph engine lands
+   * (#45), a shim translates chain+loop graphs back to steps + loopBack
+   * (identical to migrated legacy workflows); richer graphs fail the run
+   * fast with an actionable error. Unpinned workflow runs and ad-hoc runs
+   * execute the legacy path unchanged.
+   *
    * Resumable: when the run already has StepRun rows (a run re-queued after
    * an interruption), execution continues from the first non-successful step
    * in the latest iteration — restarting it with its recorded sessionId,
@@ -112,6 +120,20 @@ interface RunPlan {
 const TERMINAL_STATUSES = new Set<RunStatus>(["success", "failed", "aborted", "interrupted"]);
 
 const isTerminal = (status: RunStatus): boolean => TERMINAL_STATUSES.has(status);
+
+/** Maps a workflow step (legacy or translated from a graph node) to a plan step. */
+function toStepDefinition(step: Step): StepDefinition {
+  return {
+    stepId: step.id,
+    stepName: step.name,
+    driver: step.driver,
+    promptTemplate: step.promptTemplate,
+    ...(step.model === undefined ? {} : { model: step.model }),
+    ...(step.agent === undefined ? {} : { agent: step.agent }),
+    mode: step.mode,
+    continueSession: step.continueSession,
+  };
+}
 
 const describeError = (err: unknown): string => (err instanceof Error ? err.message : String(err));
 
@@ -284,21 +306,35 @@ export function createFlowEngine(options: FlowEngineOptions): FlowEngine {
 
   function resolvePlan(run: Run, opts: ExecuteRunOptions | undefined): RunPlan {
     if (run.workflowId) {
+      // Graph-revision runs (#44): execute the pinned snapshot. Until the
+      // graph engine lands (#45), a shim converts the graph back to legacy
+      // steps + loopBack — which works exactly for chain+single-loop graphs
+      // (what the legacy migration produces). Anything richer fails fast
+      // with an actionable error instead of running incorrectly.
+      if (run.workflowRevisionId !== undefined) {
+        const revision = db.workflowRevisions.get(run.workflowRevisionId);
+        if (!revision) {
+          throw new Error(
+            `workflow revision ${run.workflowRevisionId} pinned by run ${run.id} not found`,
+          );
+        }
+        const linear = graphToLinear(revision.graph);
+        if (!linear.ok) {
+          throw new Error(
+            `workflow graph (revision ${revision.number}) cannot be executed by the linear engine: ${linear.reason}. The graph execution engine lands in issue #45; until then only chain+loop graphs (e.g. migrated legacy workflows) can run.`,
+          );
+        }
+        return {
+          steps: linear.steps.map(toStepDefinition),
+          loopBack: linear.loopBack,
+        };
+      }
       const workflow = db.workflows.get(run.workflowId);
       if (!workflow) {
         throw new Error(`workflow ${run.workflowId} not found for run ${run.id}`);
       }
       return {
-        steps: workflow.steps.map((step) => ({
-          stepId: step.id,
-          stepName: step.name,
-          driver: step.driver,
-          promptTemplate: step.promptTemplate,
-          ...(step.model === undefined ? {} : { model: step.model }),
-          ...(step.agent === undefined ? {} : { agent: step.agent }),
-          mode: step.mode,
-          continueSession: step.continueSession,
-        })),
+        steps: workflow.steps.map(toStepDefinition),
         loopBack: workflow.loopBack,
       };
     }

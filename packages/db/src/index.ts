@@ -11,8 +11,16 @@ import {
   createRunRepo,
   createStepRunRepo,
   createWorkflowRepo,
+  createWorkflowRevisionRepo,
 } from "./repos.js";
-import type { EventRepo, ProjectRepo, RunRepo, StepRunRepo, WorkflowRepo } from "./repos.js";
+import type {
+  EventRepo,
+  ProjectRepo,
+  RunRepo,
+  StepRunRepo,
+  WorkflowRepo,
+  WorkflowRevisionRepo,
+} from "./repos.js";
 
 export * from "./schema.js";
 export type {
@@ -21,8 +29,12 @@ export type {
   RunPatch,
   StepRunPatch,
   WorkflowPatch,
+  WorkflowRevision,
+  WorkflowRevisionRepo,
 } from "./repos.js";
 export type { EventRepo, ProjectRepo, RunRepo, StepRunRepo, WorkflowRepo } from "./repos.js";
+export { migrateLinearWorkflowsToGraphs } from "./migrate.js";
+export type { LinearMigrationResult } from "./migrate.js";
 
 export const PACKAGE_NAME = "@openeuler/db";
 
@@ -33,6 +45,7 @@ export interface Db {
   readonly sqlite: Database.Database;
   readonly projects: ProjectRepo;
   readonly workflows: WorkflowRepo;
+  readonly workflowRevisions: WorkflowRevisionRepo;
   readonly runs: RunRepo;
   readonly stepRuns: StepRunRepo;
   readonly events: EventRepo;
@@ -84,6 +97,7 @@ export function createDatabase(opts: CreateDatabaseOptions = {}): Db {
     sqlite,
     projects: createProjectRepo(db),
     workflows: createWorkflowRepo(db),
+    workflowRevisions: createWorkflowRevisionRepo(db),
     runs: createRunRepo(db),
     stepRuns: createStepRunRepo(db),
     events: createEventRepo(db),

@@ -2,10 +2,12 @@ import { z } from "zod";
 import { idSchema } from "./common.js";
 import { isValidRegex } from "./regex.js";
 
-/** A single, fully user-defined agent invocation inside a workflow. */
-export const StepSchema = z.strictObject({
-  id: idSchema,
-  name: z.string().min(1, "step name must be a non-empty string"),
+/**
+ * Invocation config shared by linear steps and graph nodes: which driver
+ * (optionally model/agent) to talk to, in which mode, with what prompt
+ * template and session-chaining behavior.
+ */
+export const StepConfigSchema = z.strictObject({
   /** Agent driver id, e.g. "opencode" or "claude". */
   driver: z.string().min(1, "driver must be a non-empty string"),
   model: z.string().min(1).optional(),
@@ -13,6 +15,14 @@ export const StepSchema = z.strictObject({
   mode: z.enum(["auto", "ask"]),
   promptTemplate: z.string().min(1, "promptTemplate must be a non-empty string"),
   continueSession: z.boolean(),
+});
+
+export type StepConfig = z.infer<typeof StepConfigSchema>;
+
+/** A single, fully user-defined agent invocation inside a workflow. */
+export const StepSchema = StepConfigSchema.extend({
+  id: idSchema,
+  name: z.string().min(1, "step name must be a non-empty string"),
 });
 
 export type Step = z.infer<typeof StepSchema>;
@@ -98,7 +108,16 @@ export function loopBackToStepIndexIssue(workflow: {
   return undefined;
 }
 
-export const WorkflowSchema = WorkflowShapeSchema.superRefine((workflow, ctx) => {
+/**
+ * A workflow as persisted: the legacy linear mirror (`steps` + optional
+ * `loopBack`) plus the latest graph revision number, when the workflow has
+ * revisions. The graph itself is immutable per revision
+ * (`workflow_revisions`); this mirror is what pre-graph consumers (the web
+ * builder) keep editing.
+ */
+export const WorkflowSchema = WorkflowShapeSchema.extend({
+  latestRevisionNumber: z.number().int().min(1).optional(),
+}).superRefine((workflow, ctx) => {
   const issue = loopBackToStepIndexIssue(workflow);
   if (issue !== undefined) {
     ctx.addIssue({ code: "custom", path: ["loopBack", "toStepIndex"], message: issue });

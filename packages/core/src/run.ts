@@ -28,6 +28,12 @@ export const RunSchema = z.strictObject({
   projectId: idSchema,
   /** Set for workflow runs; absent for ad-hoc runs driven by `task`. */
   workflowId: idSchema.optional(),
+  /**
+   * Graph revision snapshot this run is pinned to (set at creation); edits to
+   * the workflow afterwards never affect the run. Absent for ad-hoc runs and
+   * pre-graph legacy runs.
+   */
+  workflowRevisionId: idSchema.optional(),
   status: RunStatusSchema,
   branch: z.string().min(1, "branch must be a non-empty string"),
   /** Current loop iteration, 0-based (`0` on the first pass). */

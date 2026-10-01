@@ -1,5 +1,5 @@
 import { index, integer, sqliteTable, text, uniqueIndex } from "drizzle-orm/sqlite-core";
-import type { LoopBack, Step } from "@openeuler/core";
+import type { LoopBack, Step, WorkflowGraph } from "@openeuler/core";
 
 /**
  * Physical schema. Domain validation lives in `@openeuler/core` zod schemas;
@@ -28,8 +28,36 @@ export const workflows = sqliteTable(
     name: text("name").notNull(),
     steps: text("steps", { mode: "json" }).$type<Step[]>().notNull(),
     loopBack: text("loop_back", { mode: "json" }).$type<LoopBack | null>(),
+    /**
+     * Latest graph revision number (NULL for pre-graph legacy rows until the
+     * boot migration snapshots them). Kept in sync by the revision repo.
+     */
+    latestRevisionNumber: integer("latest_revision_number"),
   },
   (table) => [index("workflows_project_id_idx").on(table.projectId)],
+);
+
+/**
+ * Immutable graph snapshots. Every save creates a new revision with the next
+ * per-workflow number; runs pin the revision they started with, so editing a
+ * workflow can never mutate a running run or its history.
+ */
+export const workflowRevisions = sqliteTable(
+  "workflow_revisions",
+  {
+    id: text("id").primaryKey(),
+    workflowId: text("workflow_id")
+      .notNull()
+      .references(() => workflows.id),
+    /** Per-workflow auto-increment, starting at 1. */
+    number: integer("number").notNull(),
+    graph: text("graph", { mode: "json" }).$type<WorkflowGraph>().notNull(),
+    createdAt: text("created_at").notNull(),
+  },
+  (table) => [
+    uniqueIndex("workflow_revisions_workflow_id_number_unique").on(table.workflowId, table.number),
+    index("workflow_revisions_workflow_id_idx").on(table.workflowId),
+  ],
 );
 
 export const runs = sqliteTable(
@@ -41,6 +69,8 @@ export const runs = sqliteTable(
       .references(() => projects.id),
     /** Null when absent (ad-hoc runs); stored as NULL, not the string "null". */
     workflowId: text("workflow_id").references(() => workflows.id),
+    /** Graph revision snapshot the run is pinned to; NULL for ad-hoc/legacy runs. */
+    workflowRevisionId: text("workflow_revision_id").references(() => workflowRevisions.id),
     status: text("status").notNull(),
     branch: text("branch").notNull(),
     iteration: integer("iteration").notNull(),

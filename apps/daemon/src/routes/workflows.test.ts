@@ -552,3 +552,280 @@ describe("POST /api/workflows/:id/runs", () => {
     expect(detail.iterations.map((group) => group.iteration)).toEqual([1, 2, 3]);
   });
 });
+
+describe("graph revisions (PUT /:id/graph, GET /:id/revisions)", () => {
+  const makeGraph = (over: Record<string, unknown> = {}): Record<string, unknown> => ({
+    entryNodeId: "n1",
+    nodes: [
+      {
+        id: "n1",
+        type: "agent",
+        name: "implement",
+        position: { x: 0, y: 0 },
+        config: {
+          driver: "first",
+          mode: "auto",
+          promptTemplate: "{{task}}",
+          continueSession: false,
+        },
+      },
+      {
+        id: "n2",
+        type: "agent",
+        name: "review",
+        position: { x: 280, y: 0 },
+        config: {
+          driver: "second",
+          mode: "auto",
+          promptTemplate: "review: {{prevOutput}}",
+          continueSession: true,
+        },
+      },
+      { id: "exit", type: "exit", name: "Exit", position: { x: 560, y: 0 } },
+    ],
+    edges: [
+      { id: "e1", source: "n1", target: "n2" },
+      { id: "e2", source: "n2", target: "exit" },
+    ],
+    ...over,
+  });
+
+  const putGraph = (h: ApiHarness, id: string, graph: unknown): Promise<Response> =>
+    h.request(`/api/workflows/${id}/graph`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ graph }),
+    });
+
+  it("creates a workflow from a graph (revision 1) and mirrors steps", async () => {
+    const h = setup();
+    const res = await postWorkflow(h, {
+      projectId: h.projectId,
+      name: "canvas",
+      graph: makeGraph(),
+    });
+    expect(res.status).toBe(201);
+    const body = (await res.json()) as {
+      workflow: Workflow & {
+        latestRevision?: { id: string; number: number };
+        graph?: { entryNodeId: string; nodes: unknown[] };
+      };
+      revision: { id: string; number: number };
+    };
+    expect(body.revision).toEqual({ id: expect.any(String), number: 1 });
+    expect(body.workflow.latestRevision).toEqual(body.revision);
+    expect(body.workflow.graph?.entryNodeId).toBe("n1");
+    // The legacy steps mirror round-trips the chain.
+    expect(body.workflow.steps.map((step) => step.id)).toEqual(["n1", "n2"]);
+
+    // GET detail carries the same latest revision + graph.
+    const got = (await (await h.request(`/api/workflows/${body.workflow.id}`)).json()) as {
+      workflow: typeof body.workflow;
+    };
+    expect(got.workflow.latestRevision).toEqual(body.revision);
+    expect(got.workflow.graph?.nodes).toHaveLength(3);
+  });
+
+  it("accepts {{output:<nodeId>}} graphs; the steps mirror degrades to the entry node", async () => {
+    const h = setup();
+    const graph = makeGraph();
+    const nodes = graph["nodes"] as Array<Record<string, unknown>>;
+    const review = nodes[1]?.["config"] as Record<string, unknown>;
+    review["promptTemplate"] = "review: {{output:n1}}";
+    const res = await postWorkflow(h, { projectId: h.projectId, name: "outputs", graph });
+    expect(res.status).toBe(201);
+    const body = (await res.json()) as { workflow: Workflow; revision: { number: number } };
+    expect(body.revision.number).toBe(1);
+    // Round the graph itself: the snapshot keeps the {{output:n1}} template.
+    expect(
+      h.db.workflowRevisions.latest(body.workflow.id)?.graph.nodes.find((node) => node.id === "n2"),
+    ).toMatchObject({ config: { promptTemplate: "review: {{output:n1}}" } });
+    // Not round-trippable → placeholder mirror (entry node only).
+    expect(body.workflow.steps.map((step) => step.id)).toEqual(["n1"]);
+  });
+
+  it("saves graphs as new revisions (1→2→3) with 422 node/edge-attributed details", async () => {
+    const h = setup();
+    const workflow = await createWorkflow(h, {
+      projectId: h.projectId,
+      name: "v1",
+      steps: h.makeSteps("first"),
+    });
+    expect(h.db.workflows.get(workflow.id)?.latestRevisionNumber).toBe(1);
+
+    const save1 = await putGraph(h, workflow.id, makeGraph());
+    expect(save1.status).toBe(200);
+    const save1Body = (await save1.json()) as {
+      revision: { number: number };
+      workflow: Workflow;
+    };
+    expect(save1Body.revision.number).toBe(2);
+    expect(save1Body.workflow.latestRevisionNumber).toBe(2);
+
+    // A second, different save creates revision 3.
+    const renamed = makeGraph();
+    const nodes = renamed["nodes"] as Array<Record<string, unknown>>;
+    for (const node of nodes) {
+      if (typeof node["name"] === "string") node["name"] = `${node["name"]}-v2`;
+    }
+    const save2 = await putGraph(h, workflow.id, renamed);
+    expect(((await save2.json()) as { revision: { number: number } }).revision.number).toBe(3);
+
+    // Validation failures carry node/edge-attributed paths.
+    const bad = await putGraph(h, workflow.id, {
+      entryNodeId: "n1",
+      nodes: [
+        {
+          id: "n1",
+          type: "agent",
+          name: "one",
+          position: { x: 0, y: 0 },
+          config: {
+            driver: "first",
+            mode: "auto",
+            promptTemplate: "{{task}}",
+            continueSession: false,
+          },
+        },
+        {
+          id: "n2",
+          type: "agent",
+          name: "two",
+          position: { x: 280, y: 0 },
+          config: {
+            driver: "second",
+            mode: "auto",
+            promptTemplate: "review: {{output:ghost}}",
+            continueSession: true,
+          },
+        },
+      ],
+      edges: [
+        { id: "e1", source: "n1", target: "n2" },
+        { id: "e2", source: "n2", target: "n1" },
+      ],
+    });
+    expect(bad.status).toBe(422);
+    const error = (
+      (await bad.json()) as {
+        error: { code: string; details: Array<{ path: string; message: string }> };
+      }
+    ).error;
+    expect(error.code).toBe("VALIDATION_ERROR");
+    const cycle = error.details?.find((detail) => detail.message.includes("unconditional cycle"));
+    expect(cycle?.path).toContain("edges");
+    const nonUpstream = error.details?.find((detail) => detail.path.includes("promptTemplate"));
+    expect(nonUpstream?.message).toContain("not an upstream node");
+
+    const missing = await h.request(`/api/workflows/${crypto.randomUUID()}/graph`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ graph: makeGraph() }),
+    });
+    expect(missing.status).toBe(404);
+  });
+
+  it("lists revisions without graph blobs and serves full snapshots", async () => {
+    const h = setup();
+    const workflow = await createWorkflow(h, {
+      projectId: h.projectId,
+      name: "hist",
+      steps: h.makeSteps("first"),
+    });
+    await putGraph(h, workflow.id, makeGraph());
+
+    const list = (await (await h.request(`/api/workflows/${workflow.id}/revisions`)).json()) as {
+      revisions: Array<{ id: string; number: number; createdAt: string }>;
+    };
+    expect(list.revisions.map((r) => r.number)).toEqual([1, 2]);
+    expect(list.revisions[0]?.createdAt).toEqual(expect.any(String));
+    expect(JSON.stringify(list)).not.toContain("promptTemplate");
+
+    const snapshot = (await (
+      await h.request(`/api/workflows/${workflow.id}/revisions/2`)
+    ).json()) as { revision: { number: number; graph: { nodes: unknown[] } } };
+    expect(snapshot.revision.number).toBe(2);
+    expect(snapshot.revision.graph.nodes).toHaveLength(3);
+
+    expect((await h.request(`/api/workflows/${workflow.id}/revisions/9`)).status).toBe(404);
+    expect((await h.request(`/api/workflows/${workflow.id}/revisions/0`)).status).toBe(422);
+  });
+});
+
+describe("revision pinning on runs", () => {
+  it("pins each run to the revision latest at creation; later saves never mutate it", async () => {
+    const h = setup();
+    const workflow = await createWorkflow(h, {
+      projectId: h.projectId,
+      name: "pinned",
+      steps: h.makeSteps("first", "second"),
+    });
+
+    const runBefore = await h.request(`/api/workflows/${workflow.id}/runs`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ task: "before the edit" }),
+    });
+    expect(runBefore.status).toBe(202);
+    const runBeforeBody = (await runBefore.json()) as {
+      run: Run & { workflowRevision: { id: string; number: number } };
+    };
+    expect(runBeforeBody.run.workflowRevision).toMatchObject({ number: 1 });
+    const pinnedId = runBeforeBody.run.workflowRevision.id;
+
+    // Save a different graph: revision 2 becomes latest, the old snapshot is
+    // untouched and the run created before still resolves revision 1.
+    const saved = await h.request(`/api/workflows/${workflow.id}/graph`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        graph: {
+          entryNodeId: "solo",
+          nodes: [
+            {
+              id: "solo",
+              type: "agent",
+              name: "solo",
+              position: { x: 0, y: 0 },
+              config: {
+                driver: "first",
+                mode: "auto",
+                promptTemplate: "just {{task}}",
+                continueSession: false,
+              },
+            },
+            { id: "exit", type: "exit", name: "Exit", position: { x: 280, y: 0 } },
+          ],
+          edges: [{ id: "e1", source: "solo", target: "exit" }],
+        },
+      }),
+    });
+    expect(((await saved.json()) as { revision: { number: number } }).revision.number).toBe(2);
+
+    const stored = h.db.runs.get(runBeforeBody.run.id);
+    expect(stored?.workflowRevisionId).toBe(pinnedId);
+    expect(h.db.workflowRevisions.get(pinnedId)?.number).toBe(1);
+    expect(h.db.workflowRevisions.get(pinnedId)?.graph.nodes.map((node) => node.id)).toEqual([
+      "s1",
+      "s2",
+      "exit",
+    ]);
+
+    // New runs pin the new latest revision.
+    const runAfter = await h.request(`/api/workflows/${workflow.id}/runs`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ task: "after the edit" }),
+    });
+    const runAfterBody = (await runAfter.json()) as {
+      run: Run & { workflowRevision: { id: string; number: number } };
+    };
+    expect(runAfterBody.run.workflowRevision.number).toBe(2);
+
+    // Run detail responses expose the pinned revision.
+    const detail = (await (await h.request(`/api/runs/${runBeforeBody.run.id}`)).json()) as {
+      run: Run & { workflowRevision?: { id: string; number: number } };
+    };
+    expect(detail.run.workflowRevision).toEqual({ id: pinnedId, number: 1 });
+  });
+});
