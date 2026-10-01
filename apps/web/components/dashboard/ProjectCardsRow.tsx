@@ -82,10 +82,10 @@ export function ProjectCardsRow() {
             description="Open a local git working copy to browse its files, build workflows and run the agent against it."
             action={
               <Link
-                href="/projects"
+                href="/welcome"
                 className="inline-flex items-center rounded-md bg-accent px-3 py-1.5 text-sm font-medium text-accent-fg transition-colors hover:bg-accent-hover focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent focus-visible:ring-offset-2 focus-visible:ring-offset-surface"
               >
-                Open your first project…
+                Run the setup wizard…
               </Link>
             }
           />
@@ -124,7 +124,10 @@ export function ProjectCardsRow() {
                   </span>
                 </Link>
                 {activeCount > 0 ? (
-                  <Badge variant="info" title={`${counts?.running ?? 0} running · ${counts?.queued ?? 0} queued`}>
+                  <Badge
+                    variant="info"
+                    title={`${counts?.running ?? 0} running · ${counts?.queued ?? 0} queued`}
+                  >
                     <span aria-hidden className="size-1.5 animate-pulse rounded-full bg-current" />
                     {counts?.running ?? 0} running
                     {(counts?.queued ?? 0) > 0 ? ` · ${counts?.queued} queued` : ""}
