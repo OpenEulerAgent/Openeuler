@@ -1,16 +1,22 @@
 "use client";
 
 import { formatUptime, useHealth, type HealthState } from "@/lib/health";
+import { cn } from "@/lib/cn";
 
+/** Daemon health pill for the top bar (issue #50). */
 export function HealthPill() {
   const health = useHealth();
   return (
     <span
       role="status"
       aria-live="polite"
-      className={`inline-flex items-center gap-2 rounded-full border px-3 py-1 text-sm font-medium ${pillClassName(health)}`}
+      title={health.status === "degraded" ? health.message : undefined}
+      className={cn(
+        "inline-flex items-center gap-2 rounded-full border px-2.5 py-1 text-xs font-medium",
+        pillClassName(health),
+      )}
     >
-      <span aria-hidden className={`size-2 rounded-full ${dotClassName(health)}`} />
+      <span aria-hidden className={cn("size-2 rounded-full", dotClassName(health))} />
       {pillLabel(health)}
     </span>
   );
@@ -19,29 +25,29 @@ export function HealthPill() {
 function pillClassName(health: HealthState): string {
   switch (health.status) {
     case "healthy":
-      return "border-emerald-200 bg-emerald-50 text-emerald-700";
+      return "border-success/40 bg-success-subtle text-success";
     case "degraded":
-      return "border-red-200 bg-red-50 text-red-700";
+      return "border-danger/40 bg-danger-subtle text-danger";
     default:
-      return "border-slate-200 bg-slate-50 text-slate-600";
+      return "border-border bg-elevated text-muted-fg";
   }
 }
 
 function dotClassName(health: HealthState): string {
   switch (health.status) {
     case "healthy":
-      return "bg-emerald-500";
+      return "bg-success";
     case "degraded":
-      return "bg-red-500";
+      return "bg-danger";
     default:
-      return "animate-pulse bg-slate-400";
+      return "animate-pulse bg-muted-fg";
   }
 }
 
 function pillLabel(health: HealthState): string {
   switch (health.status) {
     case "healthy":
-      return `Daemon healthy · v${health.version} · up ${formatUptime(health.uptime)}`;
+      return `Daemon v${health.version} · up ${formatUptime(health.uptime)}`;
     case "degraded":
       return "Daemon unreachable";
     default:

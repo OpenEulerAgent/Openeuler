@@ -2,7 +2,7 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { FileContent } from "@openeuler/core";
-import { Button } from "@/components/Button";
+import { Button } from "@/components/ui/button";
 import { ApiError } from "@/lib/api";
 import { fetchFileContent, fileViewerModel, formatBytes } from "@/lib/workspace";
 
@@ -95,8 +95,8 @@ export function FileViewer({
   }, [loadFile]);
 
   return (
-    <section className="flex min-h-0 flex-col rounded-xl border border-slate-200 bg-white shadow-sm">
-      <header className="flex items-center gap-2 border-b border-slate-100 px-3 py-2">
+    <section className="flex min-h-0 flex-col rounded-xl border border-border bg-surface shadow-1">
+      <header className="flex items-center gap-2 border-b border-border px-3 py-2">
         <NavArrow direction="back" disabled={!canBack} label="Previous file" onClick={onBack} />
         <NavArrow
           direction="forward"
@@ -105,28 +105,28 @@ export function FileViewer({
           onClick={onForward}
         />
         <span
-          className="min-w-0 flex-1 truncate font-mono text-sm text-slate-700"
+          className="min-w-0 flex-1 truncate font-mono text-sm text-fg"
           title={path ?? undefined}
         >
           {path ?? "No file selected"}
         </span>
         {load.phase === "ready" ? (
-          <span className="shrink-0 text-xs text-slate-400">{formatBytes(load.file.size)}</span>
+          <span className="shrink-0 text-xs text-muted-fg">{formatBytes(load.file.size)}</span>
         ) : null}
       </header>
 
       <div className="min-h-0 flex-1 overflow-auto">
         {load.phase === "idle" ? (
-          <p className="p-6 text-sm text-slate-400">
+          <p className="p-6 text-sm text-muted-fg">
             Select a file in the tree to view its contents.
           </p>
         ) : load.phase === "loading" ? (
-          <p className="p-6 text-sm text-slate-400" role="status">
+          <p className="p-6 text-sm text-muted-fg" role="status">
             Loading {load.path}…
           </p>
         ) : load.phase === "error" ? (
           <div className="flex flex-col items-start gap-3 p-6 text-sm">
-            <p className="text-red-600">{load.message}</p>
+            <p className="text-danger">{load.message}</p>
             <Button variant="secondary" onClick={() => void loadFile()}>
               Retry
             </Button>
@@ -146,22 +146,22 @@ function FileBody({ file }: { file: FileContent }) {
       {model.notice ? (
         <p
           role="note"
-          className="border-b border-amber-100 bg-amber-50 px-3 py-1.5 text-xs text-amber-700"
+          className="border-b border-warning/40 bg-warning-subtle px-3 py-1.5 text-xs text-warning"
         >
           {model.notice}
         </p>
       ) : null}
       {model.mode === "binary" ? (
-        <p className="p-6 text-sm text-slate-400">Nothing to show for a binary file.</p>
+        <p className="p-6 text-sm text-muted-fg">Nothing to show for a binary file.</p>
       ) : (
         <table className="w-full border-collapse font-mono text-xs leading-5">
           <tbody>
             {model.lines.map((line, index) => (
-              <tr key={index} className="hover:bg-slate-50">
-                <td className="w-12 select-none border-r border-slate-100 pr-2 text-right align-top text-slate-400">
+              <tr key={index} className="hover:bg-elevated/60">
+                <td className="w-12 select-none border-r border-border pr-2 text-right align-top text-muted-fg">
                   {index + 1}
                 </td>
-                <td className="whitespace-pre px-3 align-top text-slate-800">{line}</td>
+                <td className="whitespace-pre px-3 align-top text-fg">{line}</td>
               </tr>
             ))}
           </tbody>
