@@ -65,7 +65,11 @@ export function useModalBehavior(
 export interface DialogProps {
   open: boolean;
   onClose: () => void;
-  /** Elements rendered inside the overlay, before the panel (e.g. portal guard). */
+  /**
+   * While true, overlay-click and Escape no longer close the dialog (used to
+   * guard in-flight submissions, e.g. RunWorkflowModal).
+   */
+  disableClose?: boolean;
   label: string;
   className?: string;
   children: ReactNode;
@@ -73,17 +77,28 @@ export interface DialogProps {
 
 /**
  * Centered modal dialog: focus-trapped, Escape-closable, overlay-click
- * closable. Rendered in a portal so it stacks above the app shell.
+ * closable (both suppressible via `disableClose`). Rendered in a portal so it
+ * stacks above the app shell.
  */
-export function Dialog({ open, onClose, label, className, children }: DialogProps) {
-  const { containerRef, onKeyDown } = useModalBehavior(open, onClose);
+export function Dialog({
+  open,
+  onClose,
+  disableClose = false,
+  label,
+  className,
+  children,
+}: DialogProps) {
+  const requestClose = useCallback(() => {
+    if (!disableClose) onClose();
+  }, [disableClose, onClose]);
+  const { containerRef, onKeyDown } = useModalBehavior(open, requestClose);
 
   if (!open || typeof document === "undefined") return null;
 
   return createPortal(
     <div
       className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 px-4"
-      onClick={onClose}
+      onClick={requestClose}
     >
       <div
         ref={containerRef}

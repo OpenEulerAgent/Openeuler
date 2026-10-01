@@ -1,9 +1,14 @@
 /**
  * Sidebar collapse persistence (issue #50): the collapsed/expanded choice is
  * stored under {@link SIDEBAR_STORAGE_KEY} and restored on load. Expanded is
- * the default; invalid values fall back to it.
+ * the default; invalid values fall back to it. Like the theme, the choice is
+ * re-applied before first paint by {@link SIDEBAR_INIT_SCRIPT} (inlined into
+ * <head> by the root layout) writing `data-sidebar` on <html>, which the
+ * sidebar's CSS keys off — no flash of the expanded sidebar.
+ *
+ * Pure logic only (no React) so the server layout can import the init script
+ * constant; the hook lives in components/shell/sidebar-preference.ts.
  */
-import { useEffect, useState } from "react";
 
 export type SidebarPreference = "expanded" | "collapsed";
 
@@ -38,17 +43,19 @@ export function toggleSidebarPreference(pref: SidebarPreference): SidebarPrefere
   return pref === "expanded" ? "collapsed" : "expanded";
 }
 
-export function useSidebarPreference(): [SidebarPreference, (next: SidebarPreference) => void] {
-  const [pref, setPrefState] = useState<SidebarPreference>("expanded");
-
-  useEffect(() => {
-    setPrefState(resolveSidebarPreference(window.localStorage.getItem(SIDEBAR_STORAGE_KEY)));
-  }, []);
-
-  const setPref = (next: SidebarPreference): void => {
-    setPrefState(next);
-    persistSidebar(window.localStorage, next);
-  };
-
-  return [pref, setPref];
+/** Minimal document surface for testability (mirrors lib/theme.ts). */
+export interface SidebarDocument {
+  documentElement: { dataset: Record<string, string | undefined> };
 }
+
+export function applySidebarPreference(document: SidebarDocument, pref: SidebarPreference): void {
+  document.documentElement.dataset.sidebar = pref;
+}
+
+/**
+ * Inlined verbatim into <head> by the root layout: applies the persisted
+ * sidebar preference to <html data-sidebar=…> before first paint so the
+ * collapsed rail renders without an expanded flash (the Sidebar CSS keys off
+ * the attribute; the hook only mirrors it for aria/behavior).
+ */
+export const SIDEBAR_INIT_SCRIPT = `(function(){try{var s=localStorage.getItem(${JSON.stringify(SIDEBAR_STORAGE_KEY)});document.documentElement.dataset.sidebar=s==="collapsed"?"collapsed":"expanded";}catch(e){}})();`;

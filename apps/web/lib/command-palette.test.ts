@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import {
   clampSelection,
+  confirmOutcome,
   filterPaletteItems,
   groupPaletteItems,
   INITIAL_PALETTE_STATE,
@@ -8,6 +9,7 @@ import {
   selectedPaletteItem,
   type PaletteContext,
   type PaletteItem,
+  type PaletteState,
 } from "./command-palette";
 
 function navItem(id: string, label: string, path: string): PaletteItem {
@@ -40,36 +42,47 @@ function mockContext(overrides: Partial<PaletteContext> = {}): PaletteContext {
 
 describe("paletteReducer state machine", () => {
   it("starts closed", () => {
-    expect(INITIAL_PALETTE_STATE).toEqual({ open: false, query: "", selectedIndex: 0 });
+    expect(INITIAL_PALETTE_STATE).toEqual({
+      open: false,
+      query: "",
+      selectedIndex: 0,
+      confirmId: null,
+    });
   });
 
-  it("open → open with reset query/selection", () => {
-    const state = paletteReducer({ open: false, query: "old", selectedIndex: 3 }, { type: "open" });
-    expect(state).toEqual({ open: true, query: "", selectedIndex: 0 });
+  it("open → open with reset query/selection/confirm", () => {
+    const state = paletteReducer(
+      { open: false, query: "old", selectedIndex: 3, confirmId: "stop-run-1" },
+      { type: "open" },
+    );
+    expect(state).toEqual({ open: true, query: "", selectedIndex: 0, confirmId: null });
   });
 
-  it("close keeps query but closes", () => {
-    const state = paletteReducer({ open: true, query: "x", selectedIndex: 1 }, { type: "close" });
-    expect(state).toEqual({ open: false, query: "x", selectedIndex: 1 });
+  it("close keeps query but closes (and cancels confirm)", () => {
+    const state = paletteReducer(
+      { open: true, query: "x", selectedIndex: 1, confirmId: "stop-run-1" },
+      { type: "close" },
+    );
+    expect(state).toEqual({ open: false, query: "x", selectedIndex: 1, confirmId: null });
   });
 
   it("toggle flips and resets", () => {
     const opened = paletteReducer(INITIAL_PALETTE_STATE, { type: "toggle" });
     expect(opened.open).toBe(true);
     const closed = paletteReducer({ ...opened, query: "q" }, { type: "toggle" });
-    expect(closed).toEqual({ open: false, query: "", selectedIndex: 0 });
+    expect(closed).toEqual({ open: false, query: "", selectedIndex: 0, confirmId: null });
   });
 
   it("typing a query resets selection to the top", () => {
     const state = paletteReducer(
-      { open: true, query: "", selectedIndex: 2 },
+      { open: true, query: "", selectedIndex: 2, confirmId: null },
       { type: "query", value: "ru" },
     );
-    expect(state).toEqual({ open: true, query: "ru", selectedIndex: 0 });
+    expect(state).toEqual({ open: true, query: "ru", selectedIndex: 0, confirmId: null });
   });
 
   it("move navigates with wrap-around in both directions", () => {
-    let state = { open: true, query: "", selectedIndex: 0 };
+    let state: PaletteState = { open: true, query: "", selectedIndex: 0, confirmId: null };
     state = paletteReducer(state, { type: "move", delta: 1, count: 3 });
     expect(state.selectedIndex).toBe(1);
     state = paletteReducer(state, { type: "move", delta: 1, count: 3 });
@@ -84,15 +97,70 @@ describe("paletteReducer state machine", () => {
 
   it("move is a no-op while closed or with no items", () => {
     const closed = paletteReducer(
-      { open: false, query: "", selectedIndex: 0 },
+      { open: false, query: "", selectedIndex: 0, confirmId: null },
       { type: "move", delta: 1, count: 3 },
     );
     expect(closed.open).toBe(false);
     const empty = paletteReducer(
-      { open: true, query: "", selectedIndex: 0 },
+      { open: true, query: "", selectedIndex: 0, confirmId: null },
       { type: "move", delta: 1, count: 0 },
     );
     expect(empty.selectedIndex).toBe(0);
+  });
+});
+
+describe("two-step stop confirm (state machine)", () => {
+  const open: Parameters<typeof paletteReducer>[0] = {
+    open: true,
+    query: "",
+    selectedIndex: 0,
+    confirmId: null,
+  };
+
+  it("arm marks the destructive item and a second arm-free activation fires", () => {
+    const armed = paletteReducer(open, { type: "arm", id: "stop-run-1" });
+    expect(armed.confirmId).toBe("stop-run-1");
+    const stopItem: PaletteItem = {
+      id: "stop-run-1",
+      group: "Runs",
+      label: "Stop feature/auth",
+      requiresConfirm: true,
+      run: (context) => {
+        context.stopRun("run-1");
+        context.close();
+      },
+    };
+    expect(confirmOutcome(stopItem, open.confirmId)).toBe("arm");
+    expect(confirmOutcome(stopItem, armed.confirmId)).toBe("run");
+  });
+
+  it("arming one stop item does not confirm a different one", () => {
+    const armed = paletteReducer(open, { type: "arm", id: "stop-run-1" });
+    const other: PaletteItem = {
+      id: "stop-run-2",
+      group: "Runs",
+      label: "Stop other",
+      requiresConfirm: true,
+      run: () => undefined,
+    };
+    expect(confirmOutcome(other, armed.confirmId)).toBe("arm");
+  });
+
+  it("non-destructive items fire without arming", () => {
+    expect(confirmOutcome(items[0]!, null)).toBe("run");
+  });
+
+  it("any other key resets the confirm (query, move, close, toggle)", () => {
+    const armed = { ...open, confirmId: "stop-run-1" };
+    expect(paletteReducer(armed, { type: "query", value: "s" }).confirmId).toBeNull();
+    expect(paletteReducer(armed, { type: "move", delta: 1, count: 3 }).confirmId).toBeNull();
+    expect(paletteReducer(armed, { type: "close" }).confirmId).toBeNull();
+    expect(paletteReducer(armed, { type: "toggle" }).confirmId).toBeNull();
+  });
+
+  it("arm is ignored while closed", () => {
+    const closed = paletteReducer({ ...open, open: false }, { type: "arm", id: "stop-run-1" });
+    expect(closed.confirmId).toBeNull();
   });
 });
 
@@ -143,7 +211,7 @@ describe("selection + dispatch", () => {
   });
 
   it("selectedPaletteItem resolves the highlighted item (enter action)", () => {
-    let state = { open: true, query: "", selectedIndex: 0 };
+    let state: PaletteState = { open: true, query: "", selectedIndex: 0, confirmId: null };
     expect(selectedPaletteItem(state, items)!.id).toBe("dashboard");
     state = paletteReducer(state, { type: "move", delta: 2, count: items.length });
     expect(selectedPaletteItem(state, items)!.id).toBe("runs");
@@ -153,7 +221,7 @@ describe("selection + dispatch", () => {
 
   it("returns null when nothing matches", () => {
     const state = paletteReducer(
-      { open: true, query: "zzz", selectedIndex: 0 },
+      { open: true, query: "zzz", selectedIndex: 0, confirmId: null },
       { type: "query", value: "zzz" },
     );
     expect(selectedPaletteItem(state, items)).toBeNull();
@@ -161,22 +229,28 @@ describe("selection + dispatch", () => {
 
   it("running a navigate item pushes the route and closes (mocked router)", () => {
     const context = mockContext();
-    selectedPaletteItem({ open: true, query: "ru", selectedIndex: 0 }, items)!.run(context);
+    selectedPaletteItem({ open: true, query: "ru", selectedIndex: 0, confirmId: null }, items)!.run(
+      context,
+    );
     expect(context.router.push).toHaveBeenCalledWith("/runs");
     expect(context.close).toHaveBeenCalledTimes(1);
   });
 
-  it("running a stop item calls stopRun with the run id", () => {
+  it("running a stop item fires stopRun only after the second activation", () => {
     const stopItem: PaletteItem = {
       id: "stop-run-1",
       group: "Runs",
       label: "Stop feature/auth",
+      requiresConfirm: true,
       run: (context) => {
         context.stopRun("run-1");
         context.close();
       },
     };
     const context = mockContext();
+    expect(confirmOutcome(stopItem, null)).toBe("arm");
+    expect(context.stopRun).not.toHaveBeenCalled();
+    expect(confirmOutcome(stopItem, "stop-run-1")).toBe("run");
     stopItem.run(context);
     expect(context.stopRun).toHaveBeenCalledWith("run-1");
     expect(context.close).toHaveBeenCalledTimes(1);

@@ -33,6 +33,8 @@ export interface PaletteItem {
   hint?: string;
   /** Extra fuzzy-match targets beyond label + hint. */
   keywords?: string;
+  /** Destructive items (stop run): first activation arms, second fires. */
+  requiresConfirm?: boolean;
   /** Execute the item; receives the mockable context. */
   run: (context: PaletteContext) => void;
 }
@@ -41,6 +43,8 @@ export interface PaletteState {
   open: boolean;
   query: string;
   selectedIndex: number;
+  /** Id of the item awaiting its second activation (two-step confirm). */
+  confirmId: string | null;
 }
 
 export type PaletteAction =
@@ -48,35 +52,47 @@ export type PaletteAction =
   | { type: "close" }
   | { type: "toggle" }
   | { type: "query"; value: string }
-  | { type: "move"; delta: number; count: number };
+  | { type: "move"; delta: number; count: number }
+  | { type: "arm"; id: string };
 
 export const INITIAL_PALETTE_STATE: PaletteState = {
   open: false,
   query: "",
   selectedIndex: 0,
+  confirmId: null,
 };
 
 /**
  * State machine: open/toggle flip visibility (and reset query+selection);
- * typing resets selection to the top; move wraps in both directions.
+ * typing resets selection to the top; move wraps in both directions. `arm`
+ * starts the two-step confirm for a destructive item; every other action
+ * (including typing and moving — "any other key") cancels it.
  */
 export function paletteReducer(state: PaletteState, action: PaletteAction): PaletteState {
   switch (action.type) {
     case "open":
-      return { open: true, query: "", selectedIndex: 0 };
+      return { open: true, query: "", selectedIndex: 0, confirmId: null };
     case "close":
-      return { ...state, open: false };
+      return { ...state, open: false, confirmId: null };
     case "toggle":
-      return { ...state, open: !state.open, query: "", selectedIndex: 0 };
+      return { ...state, open: !state.open, query: "", selectedIndex: 0, confirmId: null };
     case "query":
-      return { ...state, query: action.value, selectedIndex: 0 };
+      return { ...state, query: action.value, selectedIndex: 0, confirmId: null };
     case "move": {
       if (!state.open || action.count <= 0) return state;
       // Wrap in both directions so ArrowUp from the top reaches the bottom.
       const next = (state.selectedIndex + action.delta + action.count) % action.count;
-      return { ...state, selectedIndex: next };
+      return { ...state, selectedIndex: next, confirmId: null };
     }
+    case "arm":
+      if (!state.open) return state;
+      return { ...state, confirmId: action.id };
   }
+}
+
+/** Two-step confirm decision for activating an item: arm first or fire. */
+export function confirmOutcome(item: PaletteItem, confirmId: string | null): "arm" | "run" {
+  return item.requiresConfirm && confirmId !== item.id ? "arm" : "run";
 }
 
 /** Fuzzy-match one item against the query using label + hint + keywords. */

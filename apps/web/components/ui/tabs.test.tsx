@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { nextTabId, type TabItem } from "./tabs.js";
+import { nextTabId, tabId, tabPanelId, tabPanelProps, type TabItem } from "./tabs.js";
 
 const tabs: ReadonlyArray<TabItem<string>> = [
   { id: "files", label: "Files" },
@@ -26,5 +26,21 @@ describe("nextTabId (Tabs keyboard navigation)", () => {
   it("ignores unrelated keys and unknown current ids", () => {
     expect(nextTabId("Enter", tabs, "files")).toBeNull();
     expect(nextTabId("ArrowRight", tabs, "nope")).toBeNull();
+  });
+});
+
+describe("tab ↔ panel id wiring", () => {
+  it("tabPanelProps pairs the panel with its tab via id/aria-labelledby", () => {
+    expect(tabPanelProps("files")).toEqual({
+      id: "tab-panel-files",
+      role: "tabpanel",
+      "aria-labelledby": "tab-files",
+      tabIndex: 0,
+    });
+  });
+
+  it("derives matching tab and panel ids from the same tab id", () => {
+    expect(tabId("runs")).toBe("tab-runs");
+    expect(tabPanelId("runs")).toBe("tab-panel-runs");
   });
 });

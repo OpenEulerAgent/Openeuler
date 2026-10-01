@@ -1,9 +1,14 @@
 "use client";
 
+import dynamic from "next/dynamic";
 import { useCallback, useEffect, useState, type ReactNode } from "react";
-import { CommandPalette } from "./CommandPalette";
 import { Sidebar } from "./Sidebar";
 import { TopBar } from "./TopBar";
+
+// The palette is only needed on ⌘K — keep it out of the first-load bundle.
+const CommandPalette = dynamic(() => import("./CommandPalette").then((mod) => mod.CommandPalette), {
+  ssr: false,
+});
 
 /**
  * App shell (issue #50): collapsible left sidebar + top bar (project context,

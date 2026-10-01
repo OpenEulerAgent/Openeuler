@@ -6,6 +6,7 @@ import type { Project } from "@openeuler/core";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { SkeletonLines } from "@/components/ui/skeleton";
+import { tabPanelProps } from "@/components/ui/tabs";
 import { RunsList } from "@/components/RunsList";
 import { WorkflowsList } from "@/components/workflows/WorkflowsList";
 import { apiFetch, ApiError } from "@/lib/api";
@@ -151,7 +152,10 @@ export function WorkspaceView({ projectId }: { projectId: string }) {
       <WorkspaceTabs active={tab} onChange={setTab} />
 
       {tab === "files" ? (
-        <div className="grid min-h-[28rem] gap-4 lg:grid-cols-[280px_minmax(0,1fr)]">
+        <div
+          className="grid min-h-[28rem] gap-4 lg:grid-cols-[280px_minmax(0,1fr)]"
+          {...tabPanelProps("files")}
+        >
           <div className="min-h-48 lg:min-h-0">
             <FileTree projectId={project.id} onOpenFile={openFile} />
           </div>
@@ -167,15 +171,21 @@ export function WorkspaceView({ projectId }: { projectId: string }) {
       ) : null}
 
       {tab === "runs" ? (
-        <RunsList
-          projectId={project.id}
-          title="Project runs"
-          description={`Runs executed against ${project.name}, newest first.`}
-          emptyText="No runs for this project yet — start one with the New run button above."
-        />
+        <div {...tabPanelProps("runs")}>
+          <RunsList
+            projectId={project.id}
+            title="Project runs"
+            description={`Runs executed against ${project.name}, newest first.`}
+            emptyText="No runs for this project yet — start one with the New run button above."
+          />
+        </div>
       ) : null}
 
-      {tab === "workflows" ? <WorkflowsList projectId={project.id} /> : null}
+      {tab === "workflows" ? (
+        <div {...tabPanelProps("workflows")}>
+          <WorkflowsList projectId={project.id} />
+        </div>
+      ) : null}
 
       {showNewRun ? (
         <NewRunModal projectId={project.id} onClose={() => setShowNewRun(false)} />

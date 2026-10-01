@@ -40,7 +40,7 @@ export function RunWorkflowModal({
   };
 
   return (
-    <Dialog open onClose={onClose} label={`Run ${workflow.name}`}>
+    <Dialog open onClose={onClose} disableClose={submitting} label={`Run ${workflow.name}`}>
       <h2 className="text-title font-semibold text-fg">Run “{workflow.name}”</h2>
       <p className="mt-0.5 text-sm text-muted-fg">
         Describe the task for this run. It is passed to the workflow as{" "}

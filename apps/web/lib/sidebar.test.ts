@@ -1,8 +1,10 @@
 import { describe, expect, it, vi } from "vitest";
 import {
+  applySidebarPreference,
   persistSidebar,
   readStoredSidebar,
   resolveSidebarPreference,
+  SIDEBAR_INIT_SCRIPT,
   SIDEBAR_STORAGE_KEY,
   toggleSidebarPreference,
 } from "./sidebar";
@@ -72,3 +74,45 @@ describe("toggleSidebarPreference", () => {
     expect(toggleSidebarPreference("collapsed")).toBe("expanded");
   });
 });
+
+describe("applySidebarPreference", () => {
+  it("sets data-sidebar on the document element (pre-paint script mirrors this)", () => {
+    const doc = { documentElement: { dataset: { sidebar: "expanded" } } };
+    applySidebarPreference(doc, "collapsed");
+    expect(doc.documentElement.dataset.sidebar).toBe("collapsed");
+    applySidebarPreference(doc, "expanded");
+    expect(doc.documentElement.dataset.sidebar).toBe("expanded");
+  });
+});
+
+describe("SIDEBAR_INIT_SCRIPT (pre-paint, no expanded flash)", () => {
+  it("applies the stored collapsed preference to <html data-sidebar>", () => {
+    const documentElement = { dataset: {} as Record<string, string> };
+    runInitScript({ "openeuler-sidebar": "collapsed" }, documentElement);
+    expect(documentElement.dataset.sidebar).toBe("collapsed");
+  });
+
+  it("defaults to expanded for missing or invalid stored values", () => {
+    for (const stored of [null, "junk"]) {
+      const documentElement = { dataset: {} as Record<string, string> };
+      runInitScript({ "openeuler-sidebar": stored }, documentElement);
+      expect(documentElement.dataset.sidebar).toBe("expanded");
+    }
+  });
+
+  it("never throws when localStorage is unavailable", () => {
+    expect(() => runInitScript(null, { dataset: {} })).not.toThrow();
+  });
+});
+
+/** Execute the raw init script with stubbed localStorage/documentElement. */
+function runInitScript(
+  storage: Record<string, string | null> | null,
+  documentElement: { dataset: Record<string, string> },
+): void {
+  const win = {
+    localStorage: storage === null ? undefined : { getItem: (key: string) => storage[key] ?? null },
+    document: { documentElement },
+  };
+  new Function(`with (this) { ${SIDEBAR_INIT_SCRIPT} }`).call(win);
+}

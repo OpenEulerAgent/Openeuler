@@ -1,7 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { RunStatus } from "@openeuler/core";
 import { statusMeta, STATUS_META, type BadgeStatus } from "@/components/ui/badge";
-import { StatusBadge } from "./StatusBadge.js";
 
 const RUN_STATUSES: RunStatus[] = [
   "queued",
@@ -48,10 +47,12 @@ describe("statusMeta (StatusBadge mapping)", () => {
       );
     }
   });
-});
 
-describe("StatusBadge wrapper", () => {
-  it("is importable and a function component", () => {
-    expect(typeof StatusBadge).toBe("function");
+  it("maps every status exactly once (no collisions, no gaps)", () => {
+    const keys = Object.keys(STATUS_META);
+    expect(new Set(keys).size).toBe(keys.length);
+    for (const status of [...RUN_STATUSES, "neutral"] as BadgeStatus[]) {
+      expect(keys).toContain(status);
+    }
   });
 });

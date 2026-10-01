@@ -8,6 +8,7 @@ import { useToast } from "@/components/ui/toast";
 import { apiFetch, ApiError } from "@/lib/api";
 import {
   clampSelection,
+  confirmOutcome,
   filterPaletteItems,
   groupPaletteItems,
   INITIAL_PALETTE_STATE,
@@ -16,6 +17,7 @@ import {
   type PaletteItem,
 } from "@/lib/command-palette";
 import { projectIdFromPathname } from "./TopBar";
+import { SkeletonLines } from "@/components/ui/skeleton";
 import { DashboardIcon, FolderIcon, PlayIcon, SearchIcon, SlidersIcon, StopIcon } from "./icons";
 import { cn } from "@/lib/cn";
 
@@ -37,11 +39,13 @@ export function CommandPalette({ open, onClose }: { open: boolean; onClose: () =
   const [state, dispatch] = useReducer(paletteReducer, INITIAL_PALETTE_STATE);
   const [projects, setProjects] = useState<Project[]>([]);
   const [runs, setRuns] = useState<Run[]>([]);
+  const [loading, setLoading] = useState(false);
 
   // Reset query/selection each time the palette opens; refresh dynamic data.
   useEffect(() => {
     if (!open) return;
     dispatch({ type: "open" });
+    setLoading(true);
     let cancelled = false;
     void Promise.allSettled([
       apiFetch<{ projects: Project[] }>("/api/projects"),
@@ -52,6 +56,7 @@ export function CommandPalette({ open, onClose }: { open: boolean; onClose: () =
         setProjects(projectsResult.value.projects.slice(0, 8));
       if (runsResult.status === "fulfilled")
         setRuns(runsResult.value.runs.filter(isLiveRun).slice(0, 8));
+      setLoading(false);
     });
     return () => {
       cancelled = true;
@@ -167,6 +172,7 @@ export function CommandPalette({ open, onClose }: { open: boolean; onClose: () =
           label: `Stop ${run.branch}`,
           hint: run.status,
           keywords: "abort stop cancel kill running",
+          requiresConfirm: true,
           run: (context) => {
             context.stopRun(run.id);
             context.close();
@@ -205,9 +211,14 @@ export function CommandPalette({ open, onClose }: { open: boolean; onClose: () =
     [onClose, projectId, router, toast],
   );
 
-  const runSelected = (): void => {
-    const item = filtered[selectedIndex];
-    if (item) item.run(context);
+  // Two-step confirm: destructive items arm on first activation (Enter/click)
+  // and only fire once re-armed; any other key/move resets via the reducer.
+  const activate = (item: PaletteItem): void => {
+    if (confirmOutcome(item, state.confirmId) === "arm") {
+      dispatch({ type: "arm", id: item.id });
+      return;
+    }
+    item.run(context);
   };
 
   return (
@@ -235,7 +246,8 @@ export function CommandPalette({ open, onClose }: { open: boolean; onClose: () =
               dispatch({ type: "move", delta: -1, count: filtered.length });
             } else if (event.key === "Enter") {
               event.preventDefault();
-              runSelected();
+              const item = filtered[selectedIndex];
+              if (item) activate(item);
             }
           }}
           className="w-full bg-transparent py-3 text-sm text-fg outline-none placeholder:text-muted-fg"
@@ -254,7 +266,7 @@ export function CommandPalette({ open, onClose }: { open: boolean; onClose: () =
         aria-label="Commands"
         className="max-h-80 overflow-y-auto p-2"
       >
-        {filtered.length === 0 ? (
+        {filtered.length === 0 && !loading ? (
           <p className="px-3 py-8 text-center text-sm text-muted-fg">
             No results for “{state.query}”.
           </p>
@@ -267,6 +279,7 @@ export function CommandPalette({ open, onClose }: { open: boolean; onClose: () =
               {section.items.map((item) => {
                 const index = filtered.indexOf(item);
                 const selected = index === selectedIndex;
+                const armed = item.requiresConfirm && state.confirmId === item.id;
                 return (
                   <div
                     key={item.id}
@@ -274,7 +287,7 @@ export function CommandPalette({ open, onClose }: { open: boolean; onClose: () =
                     role="option"
                     aria-selected={selected}
                     tabIndex={-1}
-                    onClick={() => item.run(context)}
+                    onClick={() => activate(item)}
                     onMouseEnter={() =>
                       dispatch({
                         type: "move",
@@ -305,7 +318,14 @@ export function CommandPalette({ open, onClose }: { open: boolean; onClose: () =
                       )}
                     </span>
                     <span className="min-w-0 flex-1 truncate">{item.label}</span>
-                    {item.hint ? (
+                    {armed ? (
+                      <span
+                        aria-live="assertive"
+                        className="max-w-45 shrink-0 truncate text-xs font-medium"
+                      >
+                        Press Enter again to stop
+                      </span>
+                    ) : item.hint ? (
                       <span
                         className={cn(
                           "max-w-45 truncate font-mono text-xs",
@@ -321,6 +341,14 @@ export function CommandPalette({ open, onClose }: { open: boolean; onClose: () =
             </div>
           ))
         )}
+        {loading ? (
+          <div className="mb-1 px-3">
+            <p className="pb-1 pt-2 text-small font-medium uppercase tracking-wide text-muted-fg">
+              Loading projects &amp; runs…
+            </p>
+            <SkeletonLines rows={3} />
+          </div>
+        ) : null}
       </div>
     </Dialog>
   );

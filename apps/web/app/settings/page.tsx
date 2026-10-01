@@ -4,8 +4,9 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/com
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { useThemeContext } from "@/components/ThemeProvider";
+import { useSidebarPreference } from "@/components/shell/sidebar-preference";
 import { daemonBaseUrl } from "@/lib/api";
-import { toggleSidebarPreference, useSidebarPreference } from "@/lib/sidebar";
+import { toggleSidebarPreference } from "@/lib/sidebar";
 
 /**
  * Settings shell (issue #50): theme toggle, sidebar preference and the daemon

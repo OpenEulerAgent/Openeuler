@@ -7,7 +7,7 @@ import {
   useEffect,
   useMemo,
   useReducer,
-  useState,
+  useRef,
   type ReactNode,
 } from "react";
 import { cn } from "@/lib/cn";
@@ -15,7 +15,8 @@ import { cn } from "@/lib/cn";
 /**
  * Toast system (issue #50): provider + `useToast()` hook + fixed viewport.
  * All logic flows through the pure {@link toastReducer}; the provider only
- * wires timers for auto-dismiss (with cleanup) and renders the viewport.
+ * wires auto-dismiss timers through the {@link ToastTimers} controller and
+ * renders the viewport.
  */
 
 export type ToastVariant = "info" | "success" | "danger";
@@ -27,8 +28,7 @@ export interface ToastItem {
   variant: ToastVariant;
 }
 
-export type ToastAction =
-  { type: "push"; toast: Omit<ToastItem, "id"> } | { type: "dismiss"; id: number };
+export type ToastAction = { type: "push"; toast: ToastItem } | { type: "dismiss"; id: number };
 
 /** Never show more than this many stacked toasts (oldest dropped). */
 export const TOAST_LIMIT = 5;
@@ -38,12 +38,81 @@ export const DEFAULT_TOAST_DURATION_MS = 5000;
 export function toastReducer(state: ToastItem[], action: ToastAction): ToastItem[] {
   switch (action.type) {
     case "push": {
-      const id = state.reduce((max, toast) => Math.max(max, toast.id), 0) + 1;
-      const next = [...state, { ...action.toast, id }];
+      if (state.some((toast) => toast.id === action.toast.id)) return state;
+      const next = [...state, action.toast];
       return next.length > TOAST_LIMIT ? next.slice(next.length - TOAST_LIMIT) : next;
     }
     case "dismiss":
       return state.filter((toast) => toast.id !== action.id);
+  }
+}
+
+export interface ToastScheduler {
+  set: (callback: () => void, durationMs: number) => unknown;
+  clear: (handle: unknown) => void;
+}
+
+const DEFAULT_SCHEDULER: ToastScheduler = {
+  set: (callback, durationMs) => setTimeout(callback, durationMs),
+  clear: (handle) => clearTimeout(handle as ReturnType<typeof setTimeout>),
+};
+
+/**
+ * One timeout per toast id (ids come from a provider-side counter): `sync`
+ * creates timers for toasts lacking one and clears the ones that left the
+ * stack, `dismiss` clears a single toast's timer, `dispose` clears all
+ * (unmount). Duration <= 0 means "never auto-dismiss".
+ */
+export class ToastTimers {
+  private handles = new Map<number, unknown>();
+  private durations = new Map<number, number>();
+
+  constructor(private scheduler: ToastScheduler = DEFAULT_SCHEDULER) {}
+
+  setDuration(id: number, durationMs: number): void {
+    this.durations.set(id, durationMs);
+  }
+
+  sync(toasts: ReadonlyArray<Pick<ToastItem, "id">>, onExpire: (id: number) => void): void {
+    for (const toast of toasts) {
+      if (this.handles.has(toast.id)) continue;
+      const durationMs = this.durations.get(toast.id) ?? DEFAULT_TOAST_DURATION_MS;
+      const handle =
+        durationMs > 0
+          ? this.scheduler.set(() => {
+              this.handles.delete(toast.id);
+              this.durations.delete(toast.id);
+              onExpire(toast.id);
+            }, durationMs)
+          : null;
+      this.handles.set(toast.id, handle);
+    }
+    const live = new Set(toasts.map((toast) => toast.id));
+    for (const id of [...this.handles.keys()]) {
+      if (!live.has(id)) this.clear(id);
+    }
+  }
+
+  /** Manual dismiss: stop the auto-dismiss timer for one toast. */
+  dismiss(id: number): void {
+    this.clear(id);
+    this.durations.delete(id);
+  }
+
+  /** Clear every pending timer (provider unmount). */
+  dispose(): void {
+    for (const id of [...this.handles.keys()]) this.clear(id);
+  }
+
+  pending(): number[] {
+    return [...this.handles.keys()];
+  }
+
+  private clear(id: number): void {
+    const handle = this.handles.get(id);
+    if (handle !== null && handle !== undefined) this.scheduler.clear(handle);
+    this.handles.delete(id);
+    this.durations.delete(id);
   }
 }
 
@@ -61,43 +130,27 @@ export function useToast(): ToastContextValue {
 
 export function ToastProvider({ children }: { children: ReactNode }) {
   const [toasts, dispatch] = useReducer(toastReducer, []);
-  const [timers, setTimers] = useState<Map<number, ReturnType<typeof setTimeout>>>(new Map());
-
-  const clearTimer = useCallback((id: number) => {
-    setTimers((current) => {
-      const timer = current.get(id);
-      if (timer) clearTimeout(timer);
-      const next = new Map(current);
-      next.delete(id);
-      return next;
-    });
-  }, []);
+  const timersRef = useRef<ToastTimers | null>(null);
+  if (timersRef.current === null) timersRef.current = new ToastTimers();
+  const nextIdRef = useRef(0);
 
   const toast = useCallback(
     (toastInput: Omit<ToastItem, "id">, durationMs: number = DEFAULT_TOAST_DURATION_MS) => {
-      const before = toasts.reduce((max, toastItem) => Math.max(max, toastItem.id), 0) + 1;
-      dispatch({ type: "push", toast: toastInput });
-      if (durationMs <= 0) return;
-      const timer = setTimeout(() => {
-        dispatch({ type: "dismiss", id: before });
-        setTimers((current) => {
-          const next = new Map(current);
-          next.delete(before);
-          return next;
-        });
-      }, durationMs);
-      setTimers((current) => new Map(current).set(before, timer));
+      nextIdRef.current += 1;
+      const id = nextIdRef.current;
+      timersRef.current?.setDuration(id, durationMs);
+      dispatch({ type: "push", toast: { ...toastInput, id } });
     },
-    [toasts],
+    [],
   );
 
-  // Cleanup all pending timers on unmount.
+  // Single owner of the timer map: schedule what's new, stop what's gone.
   useEffect(() => {
-    const pending = timers;
-    return () => {
-      for (const timer of pending.values()) clearTimeout(timer);
-    };
-  }, [timers]);
+    timersRef.current?.sync(toasts, (id) => dispatch({ type: "dismiss", id }));
+  }, [toasts]);
+
+  // Clear all pending timers on unmount.
+  useEffect(() => () => timersRef.current?.dispose(), []);
 
   const value = useMemo(() => ({ toast }), [toast]);
 
@@ -130,7 +183,7 @@ export function ToastProvider({ children }: { children: ReactNode }) {
               type="button"
               aria-label="Dismiss notification"
               onClick={() => {
-                clearTimer(toastItem.id);
+                timersRef.current?.dismiss(toastItem.id);
                 dispatch({ type: "dismiss", id: toastItem.id });
               }}
               className="rounded p-0.5 text-current opacity-60 transition-opacity hover:opacity-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
