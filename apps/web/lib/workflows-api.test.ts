@@ -2,18 +2,11 @@ import { describe, expect, it, vi } from "vitest";
 import type { Run, Workflow } from "@openeuler/core";
 import { ApiError } from "./api";
 import {
-  createLoopDraft,
-  createStepDraft,
-  createWorkflowDraft,
-  draftReducer,
-} from "./workflow-builder";
-import {
   deleteWorkflow,
   fetchDriverIds,
   fetchWorkflow,
   fetchWorkflowForEditor,
   fetchWorkflows,
-  saveWorkflowDraft,
   startWorkflowRun,
   type WorkflowFetcher,
 } from "./workflows-api";
@@ -123,103 +116,6 @@ describe("fetchDriverIds", () => {
   });
 });
 
-describe("saveWorkflowDraft", () => {
-  const draft = draftReducer(createWorkflowDraft(), {
-    type: "rename",
-    name: "saved",
-  });
-
-  it("POSTs a create body with projectId", async () => {
-    const fetcher = vi.fn().mockResolvedValue({ workflow: fixtureWorkflow() });
-    const workflow = await saveWorkflowDraft({
-      projectId: "p-1",
-      draft,
-      fetcher: fetcher as unknown as WorkflowFetcher,
-    });
-    expect(workflow.id).toBe("w-1");
-    expect(fetcher).toHaveBeenCalledWith("/api/workflows", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: expect.any(String),
-    });
-    const body = JSON.parse((fetcher.mock.calls[0]?.[1] as RequestInit).body as string) as {
-      projectId: string;
-      name: string;
-    };
-    expect(body).toMatchObject({ projectId: "p-1", name: "saved" });
-    expect("loopBack" in body && body.loopBack === null).toBe(false); // omitted, not null
-  });
-
-  it("PATCHes with loopBack null when the loop is disabled", async () => {
-    const fetcher = vi.fn().mockResolvedValue({ workflow: fixtureWorkflow() });
-    await saveWorkflowDraft({
-      projectId: "p-1",
-      draft,
-      workflowId: "w-1",
-      fetcher: fetcher as unknown as WorkflowFetcher,
-    });
-    expect(fetcher).toHaveBeenCalledWith("/api/workflows/w-1", {
-      method: "PATCH",
-      headers: { "Content-Type": "application/json" },
-      body: expect.any(String),
-    });
-    const body = JSON.parse((fetcher.mock.calls[0]?.[1] as RequestInit).body as string) as {
-      loopBack: unknown;
-    };
-    expect(body.loopBack).toBeNull();
-  });
-
-  it("PATCHes the enabled loopBack config", async () => {
-    let enabled = createWorkflowDraft();
-    enabled = draftReducer(enabled, { type: "rename", name: "looped" });
-    enabled = draftReducer(enabled, { type: "add-step" }); // loop needs a target after step 1
-    enabled = draftReducer(enabled, {
-      type: "patch-loop",
-      patch: { conditionType: "outputNotContains", pattern: "LGTM" },
-    });
-    enabled = draftReducer(enabled, { type: "set-loop-enabled", enabled: true });
-
-    const fetcher = vi.fn().mockResolvedValue({ workflow: fixtureWorkflow() });
-    await saveWorkflowDraft({
-      projectId: "p-1",
-      draft: enabled,
-      workflowId: "w-1",
-      fetcher: fetcher as unknown as WorkflowFetcher,
-    });
-    const body = JSON.parse((fetcher.mock.calls[0]?.[1] as RequestInit).body as string) as {
-      loopBack: { when: { type: string } };
-    };
-    expect(body.loopBack).toMatchObject({
-      toStepIndex: createLoopDraft().toStepIndex,
-      when: { type: "outputNotContains", pattern: "LGTM" },
-      maxIterations: createLoopDraft().maxIterations,
-    });
-  });
-
-  it("exposes server 422 zod details via ApiError", async () => {
-    const fetcher = vi.fn().mockRejectedValue(
-      new ApiError("VALIDATION_ERROR", "maxIterations must be an integer >= 1", 422, {
-        details: [
-          { path: "loopBack.maxIterations", message: "maxIterations must be an integer >= 1" },
-        ],
-      }),
-    );
-    try {
-      await saveWorkflowDraft({
-        projectId: "p-1",
-        draft,
-        fetcher: fetcher as unknown as WorkflowFetcher,
-      });
-      throw new Error("expected rejection");
-    } catch (error) {
-      expect(error).toBeInstanceOf(ApiError);
-      expect((error as ApiError).details).toEqual([
-        { path: "loopBack.maxIterations", message: "maxIterations must be an integer >= 1" },
-      ]);
-    }
-  });
-});
-
 describe("deleteWorkflow", () => {
   it("sends DELETE and tolerates the empty 204 body", async () => {
     const fetcher = vi.fn().mockResolvedValue(undefined);
@@ -280,11 +176,5 @@ describe("startWorkflowRun (run-modal submit flow)", () => {
     const error = caught as ApiError;
     expect(error.status).toBe(422);
     expect(error.details?.[0]?.path).toBe("task");
-  });
-});
-
-describe("createStepDraft driver default", () => {
-  it("defaults to the opencode driver for new steps", () => {
-    expect(createStepDraft().driver).toBe("opencode");
   });
 });

@@ -1,9 +1,14 @@
-import type { Run, Workflow } from "@openeuler/core";
+import type { Run, Workflow, WorkflowGraph } from "@openeuler/core";
 import { ApiError, apiFetch } from "./api";
-import { DEFAULT_DRIVER_IDS, draftToPayload, type WorkflowDraft } from "./workflow-builder";
 
 /** Injectable transport so submit flows are testable without a browser. */
 export type WorkflowFetcher = typeof apiFetch;
+
+/** A workflow row plus the latest-revision graph the daemon serves with it. */
+export type WorkflowWithGraph = Workflow & {
+  latestRevision?: { id: string; number: number };
+  graph?: WorkflowGraph;
+};
 
 export async function fetchWorkflows(
   projectId: string,
@@ -18,8 +23,8 @@ export async function fetchWorkflows(
 export async function fetchWorkflow(
   workflowId: string,
   fetcher: WorkflowFetcher = apiFetch,
-): Promise<Workflow> {
-  const body = await fetcher<{ workflow: Workflow }>(
+): Promise<WorkflowWithGraph> {
+  const body = await fetcher<{ workflow: WorkflowWithGraph }>(
     `/api/workflows/${encodeURIComponent(workflowId)}`,
   );
   return body.workflow;
@@ -27,7 +32,7 @@ export async function fetchWorkflow(
 
 /** Editor load state for one workflow: every failure collapses to a phase. */
 export type WorkflowLoad =
-  | { phase: "ready"; workflow: Workflow }
+  | { phase: "ready"; workflow: WorkflowWithGraph }
   | { phase: "notfound" }
   | { phase: "error"; message: string };
 
@@ -47,6 +52,9 @@ export async function fetchWorkflowForEditor(
   }
 }
 
+/** Driver dropdown fallback when `GET /api/drivers` is unreachable or empty. */
+const DEFAULT_DRIVER_IDS: readonly string[] = ["opencode"];
+
 /**
  * Registered driver ids for the step dropdown, from `GET /api/drivers`.
  * Falls back to the static default list when the daemon is unreachable or
@@ -61,40 +69,54 @@ export async function fetchDriverIds(fetcher: WorkflowFetcher = apiFetch): Promi
   }
 }
 
-/**
- * Save a draft: POST to create, PATCH to update. The PATCH always sends
- * name + steps and `loopBack: null` when the loop is disabled, so a stored
- * loop is cleared by disabling it in the editor.
- */
-export async function saveWorkflowDraft(options: {
-  projectId: string;
-  draft: WorkflowDraft;
-  /** Present → PATCH this workflow; absent → POST a new one. */
-  workflowId?: string;
-  fetcher?: WorkflowFetcher;
-}): Promise<Workflow> {
-  const { projectId, draft, workflowId, fetcher = apiFetch } = options;
-  const payload = draftToPayload(draft);
-  const body = workflowId
-    ? { ...payload, loopBack: payload.loopBack ?? null }
-    : { ...payload, projectId };
-
-  const response = await fetcher<{ workflow: Workflow }>(
-    workflowId ? `/api/workflows/${encodeURIComponent(workflowId)}` : "/api/workflows",
-    {
-      method: workflowId ? "PATCH" : "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-    },
-  );
-  return response.workflow;
-}
-
 export async function deleteWorkflow(
   workflowId: string,
   fetcher: WorkflowFetcher = apiFetch,
 ): Promise<void> {
   await fetcher<void>(`/api/workflows/${encodeURIComponent(workflowId)}`, { method: "DELETE" });
+}
+
+/** Save outcome for the canvas editor: the new immutable revision number. */
+export interface SavedGraph {
+  workflow: WorkflowWithGraph;
+  revision: { id: string; number: number };
+}
+
+/**
+ * Canvas save (#46): `PUT /api/workflows/:id/graph` — validates server-side
+ * (422 details carry node/edge paths) and snapshots the graph as the next
+ * immutable revision.
+ */
+export async function saveWorkflowGraph(options: {
+  workflowId: string;
+  graph: unknown;
+  fetcher?: WorkflowFetcher;
+}): Promise<SavedGraph> {
+  const { workflowId, graph, fetcher = apiFetch } = options;
+  return fetcher<SavedGraph>(`/api/workflows/${encodeURIComponent(workflowId)}/graph`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ graph }),
+  });
+}
+
+/**
+ * Create a workflow from a graph (canvas "new workflow" flow): POSTs
+ * `{projectId, name, graph}` — revision 1 snapshots the graph — and returns
+ * the created workflow plus its revision pointer.
+ */
+export async function createWorkflowWithGraph(options: {
+  projectId: string;
+  name: string;
+  graph: unknown;
+  fetcher?: WorkflowFetcher;
+}): Promise<SavedGraph> {
+  const { projectId, name, graph, fetcher = apiFetch } = options;
+  return fetcher<SavedGraph>("/api/workflows", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ projectId, name, graph }),
+  });
 }
 
 /**

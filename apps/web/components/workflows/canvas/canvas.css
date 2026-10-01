@@ -1,0 +1,60 @@
+/*
+ * Canvas editor theming (#46): React Flow base styles are imported from
+ * @xyflow/react; these layer the app's design tokens onto the canvas
+ * (background, handles, controls, attribution) and animate node position
+ * transitions while auto-layout runs.
+ */
+
+.canvas-layout-animating .react-flow__node {
+  transition: transform 320ms ease;
+}
+
+.react-flow__handle {
+  width: 9px;
+  height: 9px;
+  border-radius: 9999px;
+  border: 2px solid var(--surface);
+}
+
+.react-flow__handle-left {
+  left: -5px;
+}
+
+.react-flow__handle-right {
+  right: -5px;
+}
+
+.react-flow__controls {
+  border-radius: 0.5rem;
+  overflow: hidden;
+  box-shadow: var(--elevation-2);
+}
+
+.react-flow__controls-button {
+  background-color: var(--surface);
+  border-bottom: 1px solid var(--border);
+  color: var(--muted-fg);
+}
+
+.react-flow__controls-button:hover {
+  background-color: var(--elevated);
+  color: var(--fg);
+}
+
+.react-flow__controls-button svg {
+  fill: currentColor;
+}
+
+.react-flow__attribution {
+  background-color: transparent;
+  color: var(--muted-fg);
+}
+
+.react-flow__edge.selected .react-flow__edge-path {
+  stroke: var(--accent);
+}
+
+.react-flow__selection {
+  background-color: color-mix(in srgb, var(--accent) 12%, transparent);
+  border: 1px solid var(--accent);
+}

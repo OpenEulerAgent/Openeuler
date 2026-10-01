@@ -136,5 +136,5 @@ The full contract (lifecycle, event-stream and abort semantics, error codes) liv
 - **The fake driver is the seam** — engine/daemon/web tests script agent behavior with `createFakeDriver({ events, outputs, delayMs, failOnAbort })` instead of a real agent. Per-start `outputs` (cycling by call count) drive loop-exit tests.
 - **Temp repos for git code** — worktree/daemon tests build throwaway git repos in temp dirs (init → commit) and point `OPENEULER_WORKTREES`/db paths at temp stores; nothing touches the developer's checkout.
 - **Real binaries are opt-in** — `opencode.e2e.test.ts` skips unless `AGENT_E2E=1`; CI never runs it.
-- Web UI logic (workflow-builder, run feed, diff parsing) is extracted into pure `lib/*.ts` modules unit-tested without a browser; page components render-markup assertions cover the rest.
+- Web UI logic (graph canvas ops, run feed, diff parsing) is extracted into pure `lib/*.ts` modules unit-tested without a browser; page components render-markup assertions cover the rest.
 - Lint/format/typecheck: `pnpm lint` (eslint), `pnpm format:check` (prettier), `pnpm typecheck` (tsc per package).

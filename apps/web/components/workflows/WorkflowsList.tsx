@@ -36,8 +36,8 @@ export function loopBadge(workflow: Workflow): string | null {
 
 /**
  * Workflow list for a project: name, step count, loop badge, run/edit/delete.
- * Used both in the workspace tab and on the dedicated workflows page; the
- * editor itself opens on `/projects/[id]/workflows/[workflowId]`.
+ * Used both in the workspace tab and on the dedicated workflows page; "edit"
+ * opens the graph canvas at `/projects/[id]/workflows/[workflowId]/edit`.
  */
 export function WorkflowsList({ projectId }: { projectId: string }) {
   const router = useRouter();
@@ -124,7 +124,7 @@ export function WorkflowsList({ projectId }: { projectId: string }) {
                 <li key={workflow.id} className="py-3">
                   <div className="flex flex-wrap items-center justify-between gap-2">
                     <Link
-                      href={`${basePath}/${encodeURIComponent(workflow.id)}`}
+                      href={`${basePath}/${encodeURIComponent(workflow.id)}/edit`}
                       className="min-w-0 rounded-sm transition-colors hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
                     >
                       <span className="block truncate text-sm font-medium text-fg">
@@ -145,7 +145,7 @@ export function WorkflowsList({ projectId }: { projectId: string }) {
                         variant="secondary"
                         size="sm"
                         onClick={() =>
-                          router.push(`${basePath}/${encodeURIComponent(workflow.id)}`)
+                          router.push(`${basePath}/${encodeURIComponent(workflow.id)}/edit`)
                         }
                       >
                         Edit

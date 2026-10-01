@@ -2,6 +2,8 @@
 
 import dynamic from "next/dynamic";
 import { useCallback, useEffect, useState, type ReactNode } from "react";
+import { usePathname } from "next/navigation";
+import { cn } from "@/lib/cn";
 import { Sidebar } from "./Sidebar";
 import { TopBar } from "./TopBar";
 
@@ -17,6 +19,7 @@ const CommandPalette = dynamic(() => import("./CommandPalette").then((mod) => mo
  */
 export function AppShell({ children }: { children: ReactNode }) {
   const [paletteOpen, setPaletteOpen] = useState(false);
+  const pathname = usePathname();
 
   const openPalette = useCallback(() => setPaletteOpen(true), []);
   const closePalette = useCallback(() => setPaletteOpen(false), []);
@@ -45,7 +48,13 @@ export function AppShell({ children }: { children: ReactNode }) {
         <TopBar onOpenPalette={openPalette} />
         <main
           id="main-content"
-          className="mx-auto w-full max-w-6xl flex-1 px-4 py-6 md:px-6 md:py-8"
+          className={cn(
+            "mx-auto w-full flex-1",
+            // The graph canvas wants the full viewport width and height.
+            isCanvasEditorRoute(pathname)
+              ? "max-w-none px-0 py-0"
+              : "max-w-6xl px-4 py-6 md:px-6 md:py-8",
+          )}
         >
           {children}
         </main>
@@ -53,4 +62,9 @@ export function AppShell({ children }: { children: ReactNode }) {
       <CommandPalette open={paletteOpen} onClose={closePalette} />
     </div>
   );
+}
+
+/** Routes that get the full-bleed layout (the graph canvas editor, #46). */
+export function isCanvasEditorRoute(pathname: string): boolean {
+  return /^\/projects\/[^/]+\/workflows\/[^/]+\/edit$/.test(pathname);
 }
