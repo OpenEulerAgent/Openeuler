@@ -1,4 +1,4 @@
-import { and, eq, sql } from "drizzle-orm";
+import { and, eq, inArray, sql } from "drizzle-orm";
 import type { BetterSQLite3Database } from "drizzle-orm/better-sqlite3";
 import { z } from "zod";
 import {
@@ -62,6 +62,8 @@ export type StepRunPatch = {
 export interface ProjectRepo {
   create(project: Project): Project;
   get(id: string): Project | undefined;
+  /** Bulk `get`: every existing row for the ids, in one query (#62). */
+  getMany(ids: string[]): Project[];
   list(): Project[];
   /** Deletes the project; returns true when a row was removed. */
   delete(id: string): boolean;
@@ -77,6 +79,8 @@ export type WorkflowPatch = {
 export interface WorkflowRepo {
   create(workflow: Workflow): Workflow;
   get(id: string): Workflow | undefined;
+  /** Bulk `get`: every existing row for the ids, in one query (#62). */
+  getMany(ids: string[]): Workflow[];
   /** Workflows for a project, ordered by name. */
   list(projectId?: string): Workflow[];
   /** Patches mutable fields; returns undefined when the row does not exist. */
@@ -104,6 +108,8 @@ export interface WorkflowRevisionRepo {
    */
   create(workflowId: string, graph: unknown): WorkflowRevision;
   get(id: string): WorkflowRevision | undefined;
+  /** Bulk `get`: every existing row for the ids, in one query (#62). */
+  getMany(ids: string[]): WorkflowRevision[];
   getByNumber(workflowId: string, number: number): WorkflowRevision | undefined;
   /** Revisions of a workflow, oldest first. */
   list(workflowId: string): WorkflowRevision[];
@@ -167,6 +173,32 @@ export interface EventRepo {
   lastRunStatus(runId: string): RunStatusEvent | undefined;
 }
 
+/** One dashboard activity feed row (#51). */
+export interface ActivityRow {
+  id: number;
+  type: string;
+  projectId?: string;
+  runId?: string;
+  workflowId?: string;
+  payload?: Record<string, unknown>;
+  createdAt: string;
+}
+
+/** Values of an activity row the repository assigns itself. */
+export type ActivityInput = Omit<ActivityRow, "id" | "createdAt">;
+
+export interface ActivityRepo {
+  /** Appends a feed row; mints `id` (auto-increment) and `createdAt`. */
+  append(entry: ActivityInput): ActivityRow;
+  /**
+   * Feed page, newest first: rows with `id < beforeId` (all rows when
+   * omitted), at most `limit`. The stable cursor is the last returned `id`.
+   */
+  list(options?: { beforeId?: number; limit?: number }): ActivityRow[];
+  /** Most recent feed row referencing the run, if any. */
+  latestForRun(runId: string): ActivityRow | undefined;
+}
+
 export function createProjectRepo(db: Db): ProjectRepo {
   const toDomain = (row: typeof schema.projects.$inferSelect): Project =>
     ProjectSchema.parse({
@@ -198,6 +230,11 @@ export function createProjectRepo(db: Db): ProjectRepo {
     get(id) {
       const row = db.select().from(schema.projects).where(eq(schema.projects.id, id)).get();
       return row ? toDomain(row) : undefined;
+    },
+    getMany(ids) {
+      if (ids.length === 0) return [];
+      const rows = db.select().from(schema.projects).where(inArray(schema.projects.id, ids)).all();
+      return rows.map(toDomain);
     },
     list() {
       const rows = db.select().from(schema.projects).orderBy(schema.projects.createdAt).all();
@@ -240,6 +277,15 @@ export function createWorkflowRepo(db: Db): WorkflowRepo {
     get(id) {
       const row = db.select().from(schema.workflows).where(eq(schema.workflows.id, id)).get();
       return row ? toDomain(row) : undefined;
+    },
+    getMany(ids) {
+      if (ids.length === 0) return [];
+      const rows = db
+        .select()
+        .from(schema.workflows)
+        .where(inArray(schema.workflows.id, ids))
+        .all();
+      return rows.map(toDomain);
     },
     list(projectId) {
       const rows = db
@@ -331,6 +377,15 @@ export function createWorkflowRevisionRepo(db: Db): WorkflowRevisionRepo {
         .where(eq(schema.workflowRevisions.id, id))
         .get();
       return row ? toDomain(row) : undefined;
+    },
+    getMany(ids) {
+      if (ids.length === 0) return [];
+      const rows = db
+        .select()
+        .from(schema.workflowRevisions)
+        .where(inArray(schema.workflowRevisions.id, ids))
+        .all();
+      return rows.map(toDomain);
     },
     getByNumber(workflowId, number) {
       const row = db
@@ -672,6 +727,65 @@ export function createEventRepo(db: Db): EventRepo {
       return row
         ? RunStatusEventSchema.parse({ ...JSON.parse(row.payload), seq: row.seq })
         : undefined;
+    },
+  };
+}
+
+export function createActivityRepo(db: Db): ActivityRepo {
+  const toDomain = (row: typeof schema.activity.$inferSelect): ActivityRow => ({
+    id: row.id,
+    type: row.type,
+    ...(row.projectId === null ? {} : { projectId: row.projectId }),
+    ...(row.runId === null ? {} : { runId: row.runId }),
+    ...(row.workflowId === null ? {} : { workflowId: row.workflowId }),
+    ...(row.payload === null ? {} : { payload: row.payload }),
+    createdAt: row.createdAt,
+  });
+
+  const DEFAULT_LIMIT = 20;
+  const MAX_LIMIT = 100;
+
+  return {
+    append(entry) {
+      const createdAt = new Date().toISOString();
+      const row = db
+        .insert(schema.activity)
+        .values({
+          type: entry.type,
+          projectId: entry.projectId ?? null,
+          runId: entry.runId ?? null,
+          workflowId: entry.workflowId ?? null,
+          payload: entry.payload ?? null,
+          createdAt,
+        })
+        .returning()
+        .get();
+      return toDomain(row);
+    },
+    list(options) {
+      const limit = Math.min(Math.max(options?.limit ?? DEFAULT_LIMIT, 1), MAX_LIMIT);
+      const rows = db
+        .select()
+        .from(schema.activity)
+        .where(
+          options?.beforeId === undefined
+            ? undefined
+            : sql`${schema.activity.id} < ${options.beforeId}`,
+        )
+        .orderBy(sql`${schema.activity.id} desc`)
+        .limit(limit)
+        .all();
+      return rows.map(toDomain);
+    },
+    latestForRun(runId) {
+      const row = db
+        .select()
+        .from(schema.activity)
+        .where(eq(schema.activity.runId, runId))
+        .orderBy(sql`${schema.activity.id} desc`)
+        .limit(1)
+        .get();
+      return row === undefined ? undefined : toDomain(row);
     },
   };
 }

@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import type { AgentEvent, Run, RunStatus, StepRun } from "@openeuler/core";
+import { linearToGraph } from "@openeuler/core";
 import type { Db } from "@openeuler/db";
 import { createDatabase } from "@openeuler/db";
 import type { FakeDriverOptions } from "@openeuler/drivers";
@@ -36,6 +37,7 @@ interface RunDetailBody {
 
 interface RunListBody {
   runs: Array<Run & { queuePosition?: number }>;
+  nextCursor?: string;
 }
 
 interface RunStatsBody {
@@ -120,6 +122,21 @@ const postRun = (h: ApiHarness, body: Record<string, unknown>): Promise<Response
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
   });
+
+/** Seeds finished run rows straight into the db (deterministic list order). */
+const seedRuns = (h: ApiHarness, count: number, extra: Partial<Run> = {}): Run[] =>
+  Array.from({ length: count }, (_, index) =>
+    h.db.runs.create({
+      id: crypto.randomUUID(),
+      projectId: h.projectId,
+      status: "success",
+      branch: `run/seed-${index}`,
+      iteration: 0,
+      createdAt: new Date(Date.now() - (count - index) * 60_000).toISOString(),
+      updatedAt: new Date().toISOString(),
+      ...extra,
+    }),
+  );
 
 const getRun = async (h: ApiHarness, runId: string): Promise<RunDetailBody> => {
   const res = await h.request(`/api/runs/${runId}`);
@@ -287,6 +304,115 @@ describe("GET /api/runs", () => {
     const res = await h.request("/api/runs?status=exploded");
     expect(res.status).toBe(422);
     expect(((await res.json()) as ErrorResponseBody).error.code).toBe("INVALID_STATUS");
+  });
+
+  it("bounds the list: default limit, clamped limit, invalid limit 422", async () => {
+    const h = setup({ events: script });
+    const seed = seedRuns(h, 3);
+
+    // No limit → the daemon default page.
+    const def = (await (await h.request("/api/runs")).json()) as RunListBody;
+    expect(def.runs).toHaveLength(3);
+    expect(def.nextCursor).toBeUndefined();
+
+    // ?limit=0 and a negative limit clamp to 1.
+    const zero = (await (await h.request("/api/runs?limit=0")).json()) as RunListBody;
+    expect(zero.runs).toHaveLength(1);
+    const negative = (await (await h.request("/api/runs?limit=-7")).json()) as RunListBody;
+    expect(negative.runs).toHaveLength(1);
+
+    // Huge limits clamp to the max page (200) rather than erroring.
+    const capped = (await (await h.request("/api/runs?limit=100000")).json()) as RunListBody;
+    expect(capped.runs).toHaveLength(seed.length);
+
+    const bad = await h.request("/api/runs?limit=many");
+    expect(bad.status).toBe(422);
+    expect(((await bad.json()) as ErrorResponseBody).error.code).toBe("INVALID_LIMIT");
+  });
+
+  it("cursor-paginates newest-first with no duplicates or gaps", async () => {
+    const h = setup({ events: script });
+    const seed = seedRuns(h, 5);
+
+    const collected: Run[] = [];
+    const seenCursors = new Set<string>();
+    let query = "/api/runs?limit=2";
+    for (;;) {
+      const page = (await (await h.request(query)).json()) as RunListBody;
+      expect(page.runs.length).toBeLessThanOrEqual(2);
+      collected.push(...page.runs);
+      if (page.nextCursor === undefined) break;
+      expect(seenCursors.has(page.nextCursor)).toBe(false);
+      seenCursors.add(page.nextCursor);
+      query = `/api/runs?limit=2&before=${encodeURIComponent(page.nextCursor)}`;
+    }
+
+    expect(collected.map((run) => run.id)).toEqual([...seed].reverse().map((run) => run.id));
+    // A cursor past the oldest row is an empty page with no nextCursor.
+    const oldest = collected[collected.length - 1] as Run;
+    const past = (await (
+      await h.request(`/api/runs?before=${encodeURIComponent(`${oldest.createdAt},${oldest.id}`)}`)
+    ).json()) as RunListBody;
+    expect(past).toEqual({ runs: [] });
+
+    const malformed = await h.request("/api/runs?before=oops");
+    expect(malformed.status).toBe(422);
+    expect(((await malformed.json()) as ErrorResponseBody).error.code).toBe("INVALID_CURSOR");
+  });
+
+  it("decorates every row on a full page (batched names + revision)", async () => {
+    const h = setup({ events: script });
+    const workflow = h.db.workflows.create({
+      id: crypto.randomUUID(),
+      projectId: h.projectId,
+      name: "named workflow",
+      steps: [
+        {
+          id: "s1",
+          name: "do",
+          driver: "fake",
+          promptTemplate: "{{task}}",
+          mode: "auto",
+          continueSession: false,
+        },
+      ],
+    });
+    const revision = h.db.workflowRevisions.create(
+      workflow.id,
+      linearToGraph({
+        steps: [
+          {
+            id: "s1",
+            name: "do",
+            driver: "fake",
+            promptTemplate: "{{task}}",
+            mode: "auto",
+            continueSession: false,
+          },
+        ],
+      }),
+    );
+    const seed = seedRuns(h, 3, { workflowId: workflow.id, workflowRevisionId: revision.id });
+
+    const page = (await (await h.request(`/api/runs?limit=2`)).json()) as {
+      runs: Array<
+        Run & {
+          project?: { id: string; name: string };
+          workflow?: { id: string; name: string };
+          workflowRevision?: { id: string; number: number };
+        }
+      >;
+      nextCursor?: string;
+    };
+    expect(page.runs).toHaveLength(2);
+    const ids = new Set(seed.map((run) => run.id));
+    for (const run of page.runs) {
+      expect(ids.has(run.id)).toBe(true);
+      expect(run.project).toMatchObject({ id: h.projectId, name: "repo" });
+      expect(run.workflow).toMatchObject({ id: workflow.id, name: "named workflow" });
+      expect(run.workflowRevision).toMatchObject({ id: revision.id, number: 1 });
+    }
+    expect(page.nextCursor).toBeDefined();
   });
 
   it("returns 404 for unknown run ids", async () => {

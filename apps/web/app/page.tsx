@@ -1,6 +1,11 @@
-import { ActiveRunsCard } from "@/components/ActiveRunsCard";
-import { RecentProjectsCard } from "@/components/RecentProjectsCard";
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
+import { Suspense } from "react";
+import { ActivityFeed } from "@/components/dashboard/ActivityFeed";
+import { DashboardRunsTable } from "@/components/dashboard/DashboardRunsTable";
+import { ProjectCardsRow } from "@/components/dashboard/ProjectCardsRow";
+import { SkeletonLines } from "@/components/ui/skeleton";
+
+/** Dashboard 2.0 (#51): project cards on top, activity feed + live runs table. */
+export const dynamic = "force-dynamic";
 
 export default function DashboardPage() {
   return (
@@ -8,36 +13,19 @@ export default function DashboardPage() {
       <div>
         <h1 className="text-display font-semibold text-fg">Dashboard</h1>
         <p className="mt-1 text-sm text-muted-fg">
-          Overview of your Openeuler daemon, projects and runs.
+          Your projects, live runs and everything that happened lately.
         </p>
       </div>
 
-      <div className="grid gap-6 md:grid-cols-2">
-        <Card>
-          <CardHeader>
-            <div>
-              <CardTitle>Recent projects</CardTitle>
-              <CardDescription>Repositories registered with the daemon.</CardDescription>
-            </div>
-          </CardHeader>
-          <CardContent>
-            <RecentProjectsCard />
-          </CardContent>
-        </Card>
+      <section aria-label="Projects">
+        <ProjectCardsRow />
+      </section>
 
-        <Card>
-          <CardHeader>
-            <div>
-              <CardTitle>Active runs</CardTitle>
-              <CardDescription>
-                Workflow runs currently queued or executing, polled from /api/runs/stats.
-              </CardDescription>
-            </div>
-          </CardHeader>
-          <CardContent>
-            <ActiveRunsCard />
-          </CardContent>
-        </Card>
+      <div className="grid items-start gap-6 xl:grid-cols-[minmax(320px,2fr)_3fr]">
+        <ActivityFeed />
+        <Suspense fallback={<SkeletonLines rows={8} />}>
+          <DashboardRunsTable />
+        </Suspense>
       </div>
     </div>
   );

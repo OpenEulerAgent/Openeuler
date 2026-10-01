@@ -5,7 +5,7 @@ import { usePathname } from "next/navigation";
 import { useCallback, useEffect, useState } from "react";
 import type { Project } from "@openeuler/core";
 import { apiFetch } from "@/lib/api";
-import { useRunStats } from "@/lib/runs-stats";
+import { activeRunsCounts, useActiveRuns } from "@/lib/active-runs";
 import { useThemeContext } from "@/components/ThemeProvider";
 import { HealthPill } from "@/components/HealthPill";
 import { MoonIcon, SearchIcon, SunIcon } from "./icons";
@@ -37,11 +37,11 @@ function useProjectContext(projectId: string | null): { name: string | null } {
   return { name };
 }
 
-/** Live running/queued counts; click through to /runs. */
+/** Live running/queued counts off the global run-status stream; click through to /runs. */
 function RunningRunsIndicator() {
-  const state = useRunStats();
-  if (state.status !== "ready") return null;
-  const { queued, running } = state.stats;
+  const { status, runs } = useActiveRuns();
+  if (status !== "ready") return null;
+  const { queued, running } = activeRunsCounts(runs);
   if (queued === 0 && running === 0) return null;
   return (
     <Link

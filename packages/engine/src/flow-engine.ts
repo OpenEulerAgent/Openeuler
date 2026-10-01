@@ -79,6 +79,14 @@ export interface FlowEngineOptions {
   worktrees: WorktreeManager;
   drivers: DriverRegistry;
   logger?: FlowLogger;
+  /**
+   * Invoked after every persisted `run.status` event (run started, terminal
+   * transitions — both linear and graph paths funnel through one emission
+   * point). The run row already carries the new status when it fires. The
+   * daemon uses this for the activity feed + global run-status stream (#51);
+   * hook failures are logged and never break execution.
+   */
+  onRunStatus?: (runId: string, status: RunStatus) => void;
 }
 
 export interface FlowEngine {
@@ -178,6 +186,13 @@ export function createFlowEngine(options: FlowEngineOptions): FlowEngine {
       status,
       ...(error === undefined ? {} : { error }),
     });
+    if (options.onRunStatus !== undefined) {
+      try {
+        options.onRunStatus(runId, status);
+      } catch (err) {
+        log.error({ err, runId, status }, "onRunStatus hook failed");
+      }
+    }
   }
 
   /** Moves queued/live step runs to a terminal status (run-level failure). */

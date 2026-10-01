@@ -14,6 +14,7 @@ import { branchForRun } from "@openeuler/engine";
 import { Hono, type Context } from "hono";
 import { z } from "zod";
 import type { AppEnv } from "../app.js";
+import { recordWorkflowCreatedActivity } from "../activity.js";
 import type { Executor } from "../executor.js";
 import { HttpError } from "../errors.js";
 
@@ -239,6 +240,7 @@ export function createWorkflowsRouter(): Hono<AppEnv> {
       { workflowId: workflow.id, projectId: project.id, revision: revision.number },
       "workflow created",
     );
+    recordWorkflowCreatedActivity(db, workflow);
     return c.json(
       {
         workflow: workflowBody(db, db.workflows.get(workflow.id) as Workflow),
