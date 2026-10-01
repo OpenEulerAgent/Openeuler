@@ -70,7 +70,7 @@ export interface EventStreamOptions {
 export interface GlobalStreamOptions {
   /** Idle heartbeat (`: ping` comment) interval. Default 15s. */
   heartbeatMs?: number;
-  /** Max concurrent global streams before 429. Default 10. */
+  /** Max concurrent global streams before 429. Default 20. */
   maxStreams?: number;
 }
 
@@ -82,7 +82,7 @@ const DEFAULT_EVENT_STREAM: Required<EventStreamOptions> = {
 
 const DEFAULT_GLOBAL_STREAM: Required<GlobalStreamOptions> = {
   heartbeatMs: 15_000,
-  maxStreams: 10,
+  maxStreams: 20,
 };
 
 /** Serializes one global run-status transition as an SSE frame (#51). */
@@ -105,6 +105,56 @@ export interface RunDetailBody {
 /** Run list payload: runs plus computed queue metadata for queued rows. */
 export interface RunListBody {
   runs: RunApiBody[];
+  /**
+   * Keyset cursor (`<createdAt>,<id>` of the last row) while another page may
+   * exist — pass back as `?before=` (#62).
+   */
+  nextCursor?: string;
+}
+
+/** Page size bounds for `GET /api/runs`: responses stay bounded (#62). */
+export const DEFAULT_RUNS_LIMIT = 50;
+export const MAX_RUNS_LIMIT = 200;
+
+/** Parses + clamps `?limit=` for the run list; default 50, clamped to 1..200. */
+export function parseRunsLimit(raw: string | undefined): number {
+  if (raw === undefined || raw === "") return DEFAULT_RUNS_LIMIT;
+  const parsed = z.coerce.number().int().safeParse(raw);
+  if (!parsed.success) {
+    throw new HttpError(
+      422,
+      "INVALID_LIMIT",
+      `limit must be an integer, got ${JSON.stringify(raw)}`,
+    );
+  }
+  return Math.min(Math.max(parsed.data, 1), MAX_RUNS_LIMIT);
+}
+
+/**
+ * Parses the run list's keyset cursor `?before=<createdAt>,<id>`: the last
+ * row of the previous page, in the list's `(createdAt desc, id asc)` order.
+ */
+export function parseRunsCursor(
+  raw: string | undefined,
+): { createdAt: string; id: string } | undefined {
+  if (raw === undefined || raw === "") return undefined;
+  const parts = raw.split(",");
+  const createdAt = parts[0];
+  const id = parts[1];
+  if (
+    parts.length !== 2 ||
+    createdAt === undefined ||
+    id === undefined ||
+    createdAt === "" ||
+    id === ""
+  ) {
+    throw new HttpError(
+      422,
+      "INVALID_CURSOR",
+      `before must be "<createdAt>,<id>" of a run row, got ${JSON.stringify(raw)}`,
+    );
+  }
+  return { createdAt, id };
 }
 
 /** Queue summary for dashboards: how many runs are queued vs executing. */
@@ -147,28 +197,57 @@ function queuePositionsByRunId(db: Db): Map<string, number> {
 
 /** Attaches resolved names + revision/queue metadata to a run row. */
 function decorateRun(db: Db, run: Run, positions?: Map<string, number>): RunApiBody {
-  let body: RunApiBody = run;
-  const project = db.projects.get(run.projectId);
-  if (project !== undefined) {
-    body = { ...body, project: { id: project.id, name: project.name } };
-  }
-  if (run.workflowId !== undefined) {
-    const workflow = db.workflows.get(run.workflowId);
-    if (workflow !== undefined) {
-      body = { ...body, workflow: { id: workflow.id, name: workflow.name } };
+  return decorateRuns(db, [run], positions)[0] as RunApiBody;
+}
+
+/**
+ * Bulk {@link decorateRun} for list pages (#62): projects, workflows and
+ * revisions are resolved with one query per kind over the page's unique
+ * ids instead of per row.
+ */
+function decorateRuns(db: Db, rows: readonly Run[], positions?: Map<string, number>): RunApiBody[] {
+  const unique = (ids: Array<string | undefined>): string[] => [
+    ...new Set(ids.filter((id): id is string => id !== undefined)),
+  ];
+  const projects = new Map(
+    db.projects
+      .getMany(unique(rows.map((run) => run.projectId)))
+      .map((project) => [project.id, project]),
+  );
+  const workflows = new Map(
+    db.workflows
+      .getMany(unique(rows.map((run) => run.workflowId)))
+      .map((workflow) => [workflow.id, workflow]),
+  );
+  const revisions = new Map(
+    db.workflowRevisions
+      .getMany(unique(rows.map((run) => run.workflowRevisionId)))
+      .map((revision) => [revision.id, revision]),
+  );
+  return rows.map((run) => {
+    let body: RunApiBody = run;
+    const project = projects.get(run.projectId);
+    if (project !== undefined) {
+      body = { ...body, project: { id: project.id, name: project.name } };
     }
-  }
-  if (run.workflowRevisionId !== undefined) {
-    const revision = db.workflowRevisions.get(run.workflowRevisionId);
-    if (revision !== undefined) {
-      body = { ...body, workflowRevision: { id: revision.id, number: revision.number } };
+    if (run.workflowId !== undefined) {
+      const workflow = workflows.get(run.workflowId);
+      if (workflow !== undefined) {
+        body = { ...body, workflow: { id: workflow.id, name: workflow.name } };
+      }
     }
-  }
-  if (run.status === "queued" && positions !== undefined) {
-    const queuePosition = positions.get(run.id);
-    if (queuePosition !== undefined) body = { ...body, queuePosition };
-  }
-  return body;
+    if (run.workflowRevisionId !== undefined) {
+      const revision = revisions.get(run.workflowRevisionId);
+      if (revision !== undefined) {
+        body = { ...body, workflowRevision: { id: revision.id, number: revision.number } };
+      }
+    }
+    if (run.status === "queued" && positions !== undefined) {
+      const queuePosition = positions.get(run.id);
+      if (queuePosition !== undefined) body = { ...body, queuePosition };
+    }
+    return body;
+  });
 }
 
 function requireDb(c: Context<AppEnv>): Db {
@@ -396,8 +475,24 @@ export function createRunsRouter(options: CreateRunsRouterOptions = {}): Hono<Ap
     const all = db.runs.list(c.req.query("projectId") || undefined);
     const filtered =
       statuses === undefined ? all : all.filter((run) => statuses.includes(run.status));
+    const limit = parseRunsLimit(c.req.query("limit"));
+    const before = parseRunsCursor(c.req.query("before"));
+    // `all` is `(createdAt desc, id asc)`; the cursor keeps that order
+    // stable across pages (no offset drift as new runs arrive).
+    const afterCursor = filtered.filter(
+      (run) =>
+        before === undefined ||
+        run.createdAt < before.createdAt ||
+        (run.createdAt === before.createdAt && run.id > before.id),
+    );
+    const hasMore = afterCursor.length > limit;
+    const page = hasMore ? afterCursor.slice(0, limit) : afterCursor;
+    const last = page[page.length - 1];
     const positions = queuePositionsByRunId(db);
-    const body: RunListBody = { runs: filtered.map((run) => decorateRun(db, run, positions)) };
+    const body: RunListBody = {
+      runs: decorateRuns(db, page, positions),
+      ...(hasMore && last !== undefined ? { nextCursor: `${last.createdAt},${last.id}` } : {}),
+    };
     return c.json(body);
   });
 

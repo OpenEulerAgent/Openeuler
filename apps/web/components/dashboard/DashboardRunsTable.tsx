@@ -44,16 +44,14 @@ function useNow(intervalMs = 30_000): number {
   return now;
 }
 
-type LoadState =
-  | { phase: "loading" }
-  | { phase: "ready" }
-  | { phase: "error"; message: string };
+type LoadState = { phase: "loading" } | { phase: "ready" } | { phase: "error"; message: string };
 
 /** Iterations column: graph runs count completed node executions, else the loop pass. */
 function iterationCount(run: RunsApiRow): number {
   const breadcrumb = Array.isArray(run.breadcrumb) ? run.breadcrumb : [];
   const nodes = breadcrumb.filter(
-    (entry) => typeof entry === "object" && entry !== null && (entry as { kind?: string }).kind === "node",
+    (entry) =>
+      typeof entry === "object" && entry !== null && (entry as { kind?: string }).kind === "node",
   ).length;
   return nodes > 0 ? nodes : run.iteration;
 }
@@ -82,9 +80,12 @@ function StopCell({
     );
   }
   return (
-    <span className="inline-flex items-center gap-1.5" onKeyDown={(event) => {
-      if (event.key === "Escape" && state !== "stopping") onCancel();
-    }}>
+    <span
+      className="inline-flex items-center gap-1.5"
+      onKeyDown={(event) => {
+        if (event.key === "Escape" && state !== "stopping") onCancel();
+      }}
+    >
       <Button variant="danger" size="sm" loading={state === "stopping"} onClick={onConfirm}>
         {state === "stopping" ? "Stopping…" : "Confirm stop"}
       </Button>
@@ -114,6 +115,8 @@ export function DashboardRunsTable() {
 
   const [rows, dispatch] = useReducer(runsTableReducer, [] as RunsApiRow[]);
   const [loadState, setLoadState] = useState<LoadState>({ phase: "loading" });
+  const [nextCursor, setNextCursor] = useState<string | undefined>(undefined);
+  const [loadingMore, setLoadingMore] = useState(false);
   const [projects, setProjects] = useState<Project[]>([]);
   const [stop, setStop] = useState<{ runId: string; state: StopConfirmState } | null>(null);
   const retryingRef = useRef(new Set<string>());
@@ -144,11 +147,12 @@ export function DashboardRunsTable() {
   const loadRuns = useCallback(async (): Promise<void> => {
     setLoadState((current) => (current.phase === "ready" ? current : { phase: "loading" }));
     try {
-      const runs = await fetchRuns({
+      const page = await fetchRuns({
         projectId: filters.projectId,
         statuses: filters.statuses.length > 0 ? filters.statuses : undefined,
       });
-      dispatch({ type: "rowsLoaded", rows: runs });
+      dispatch({ type: "rowsLoaded", rows: page.rows });
+      setNextCursor(page.nextCursor);
       setLoadState({ phase: "ready" });
     } catch (cause: unknown) {
       setLoadState({
@@ -161,6 +165,25 @@ export function DashboardRunsTable() {
   useEffect(() => {
     void loadRuns();
   }, [loadRuns]);
+
+  /** Load-more: appends the next (older) page behind the current rows. */
+  const loadMore = useCallback(async (): Promise<void> => {
+    if (nextCursor === undefined) return;
+    setLoadingMore(true);
+    try {
+      const page = await fetchRuns({
+        projectId: filters.projectId,
+        statuses: filters.statuses.length > 0 ? filters.statuses : undefined,
+        before: nextCursor,
+      });
+      dispatch({ type: "rowsAppended", rows: page.rows });
+      setNextCursor(page.nextCursor);
+    } catch {
+      // Keep the current page; the next Load-more click retries.
+    } finally {
+      setLoadingMore(false);
+    }
+  }, [filters, nextCursor]);
 
   useEffect(() => {
     let cancelled = false;
@@ -178,6 +201,12 @@ export function DashboardRunsTable() {
 
   // Live patches: known rows update in place; unknown ids mean a new run —
   // refetch (debounced) so its project/workflow columns render correctly.
+  // `useRunStatusStream` dispatches through the CURRENT render's handlers
+  // (latest-ref), and the known-check reads a row mirror so events landing
+  // between renders never see a stale table; the patch itself is functional
+  // (reducer dispatch), never a captured `rows` array.
+  const rowsRef = useRef(rows);
+  rowsRef.current = rows;
   const refetchTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const scheduleRefetch = useCallback((): void => {
     if (refetchTimer.current !== null) return;
@@ -189,8 +218,7 @@ export function DashboardRunsTable() {
 
   useRunStatusStream({
     onEvent: (event) => {
-      const known = rows.some((row) => row.id === event.runId);
-      if (known) {
+      if (rowsRef.current.some((row) => row.id === event.runId)) {
         dispatch({ type: "streamEvent", event });
       } else {
         scheduleRefetch();
@@ -283,7 +311,11 @@ export function DashboardRunsTable() {
       </CardHeader>
       <CardContent>
         <div className="mb-4 flex flex-wrap items-center gap-3">
-          <div className="flex flex-wrap items-center gap-1.5" role="group" aria-label="Filter by status">
+          <div
+            className="flex flex-wrap items-center gap-1.5"
+            role="group"
+            aria-label="Filter by status"
+          >
             {RUNS_FILTER_STATUSES.map((status) => {
               const active = filters.statuses.includes(status);
               return (
@@ -318,7 +350,9 @@ export function DashboardRunsTable() {
             <select
               value={filters.projectId ?? ""}
               onChange={(event) =>
-                setFilters({ projectId: event.target.value === "" ? undefined : event.target.value })
+                setFilters({
+                  projectId: event.target.value === "" ? undefined : event.target.value,
+                })
               }
               className="rounded-md border border-border bg-surface px-2 py-1 text-xs text-fg focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
             >
@@ -435,7 +469,9 @@ export function DashboardRunsTable() {
                       {action === "stop" ? (
                         <StopCell
                           state={stop?.runId === run.id ? stop.state : "idle"}
-                          onArm={() => setStop({ runId: run.id, state: nextStopConfirmState("idle", "click") })}
+                          onArm={() =>
+                            setStop({ runId: run.id, state: nextStopConfirmState("idle", "click") })
+                          }
                           onConfirm={() => void confirmStop(run)}
                           onCancel={() => setStop({ runId: run.id, state: "idle" })}
                         />
@@ -451,6 +487,17 @@ export function DashboardRunsTable() {
             </TableBody>
           </Table>
         )}
+        {loadState.phase === "ready" && nextCursor !== undefined ? (
+          <Button
+            variant="secondary"
+            size="sm"
+            className="mt-4"
+            loading={loadingMore}
+            onClick={() => void loadMore()}
+          >
+            Load more
+          </Button>
+        ) : null}
       </CardContent>
     </Card>
   );

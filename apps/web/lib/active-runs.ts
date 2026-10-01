@@ -3,13 +3,14 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { RunStatus } from "@openeuler/core";
 import { apiFetch } from "./api";
-import { connectRunStatusStream } from "./runs-stream";
+import { useRunStatusStream } from "./runs-stream";
 
 /**
  * Shared live snapshot of every non-terminal run (#51): seeded from the runs
  * table (queued + running lists), then kept current by the global
- * run-status stream. One subscription powers the TopBar indicator, the
- * dashboard project cards' active-run counts, and can seed tables.
+ * run-status stream. Every consumer shares ONE page-wide stream
+ * subscription (#62) — this hook, the TopBar indicator and the dashboard
+ * runs table all fan out of the same `EventSource`.
  */
 
 export interface ActiveRunInfo {
@@ -113,17 +114,17 @@ export function useActiveRuns(): UseActiveRunsResult {
 
   useEffect(() => {
     void seed();
-    const handle = connectRunStatusStream({
-      onEvent: (event) => {
-        mapRef.current = mergeRunStatusIntoMap(mapRef.current, event);
-        setState({ status: "ready", runs: [...mapRef.current.values()] });
-      },
-      onOpen: () => {
-        void seed();
-      },
-    });
-    return () => handle.close();
   }, [seed]);
+
+  useRunStatusStream({
+    onEvent: (event) => {
+      mapRef.current = mergeRunStatusIntoMap(mapRef.current, event);
+      setState({ status: "ready", runs: [...mapRef.current.values()] });
+    },
+    onOpen: () => {
+      void seed();
+    },
+  });
 
   return state;
 }

@@ -287,7 +287,7 @@ describe("GET /api/runs/stream (global run-status SSE)", () => {
     expect(quiet.pings.every((ping) => ping.startsWith(": ping"))).toBe(true);
     expect(quiet.frames).toHaveLength(0);
 
-    // Slot cleanup on disconnect: cap the stream at the daemon default of 10
+    // Slot cleanup on disconnect: cap the stream at the daemon default of 20
     // is too heavy for a unit test, so prove reuse differently — a second
     // stream opens fine after the first disconnects and still receives
     // transitions, while the disconnected one receives nothing further.

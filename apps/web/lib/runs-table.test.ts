@@ -86,15 +86,23 @@ describe("runsTableReducer", () => {
     expect(next[1]).toBe(rows[1]);
   });
 
-  it("ignores stream events for unknown rows (same reference, no refetch churn)", () => {
+  it("ignores stream events for unknown rows (same array + row references, no churn)", () => {
     const rows = [row()];
     const next = runsTableReducer(rows, {
       type: "streamEvent",
       event: event("nope", "success" as RunStatus),
     });
-    expect(next).toEqual(rows);
-    expect(next).not.toBe(rows);
+    expect(next).toBe(rows);
     expect(next[0]).toBe(rows[0]);
+  });
+
+  it("appends a Load-more page, skipping ids already present", () => {
+    const rows = [row({ id: "older-2" })];
+    const appended = runsTableReducer(rows, {
+      type: "rowsAppended",
+      rows: [row({ id: "older-1" }), rows[0] as RunsApiRow, row({ id: "older-0" })],
+    });
+    expect(appended.map((r) => r.id)).toEqual(["older-2", "older-1", "older-0"]);
   });
 
   it("stop: flips the row optimistically and reverts on failure", () => {
@@ -130,6 +138,29 @@ describe("runsTableReducer", () => {
 
     const failed = runsTableReducer(optimistic, { type: "retryFailed", tempId: "temp-1" });
     expect(failed.map((r) => r.id)).toEqual(["run-1"]);
+  });
+
+  it("retry: a real id that already landed (refetch race) is replaced in place, not duplicated", () => {
+    const source = row({ status: "failed", task: "do it" });
+    const optimistic = runsTableReducer([source], {
+      type: "retryQueued",
+      tempId: "temp-1",
+      from: source,
+    });
+    // The stream-triggered refetch already inserted the real row while the
+    // retry POST was in flight.
+    const raced = runsTableReducer(optimistic, {
+      type: "rowsAppended",
+      rows: [row({ id: "real-1", status: "queued" })],
+    });
+    const real = row({ id: "real-1", status: "queued", task: "do it" });
+    const resolved = runsTableReducer(raced, {
+      type: "retryResolved",
+      tempId: "temp-1",
+      run: real,
+    });
+    expect(resolved.map((r) => r.id)).toEqual(["run-1", "real-1"]);
+    expect(resolved[1]).toBe(real);
   });
 });
 

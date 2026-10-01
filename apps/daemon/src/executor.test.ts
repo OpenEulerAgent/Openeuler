@@ -355,6 +355,35 @@ describe("createExecutor", () => {
     await waitForStatus(h, runId, "success");
     expect(h.driver.calls).toHaveLength(1);
   });
+
+  it("emits each run-status transition once (stalled-driver abort race deduped)", async () => {
+    const h = setup({
+      events: [
+        { type: "message-delta", seq: 1, delta: "a" },
+        { type: "message-delta", seq: 2, delta: "b" },
+        { type: "message-delta", seq: 3, delta: "c" },
+      ],
+      delayMs: 40,
+    });
+    const published: Array<{ runId: string; status: RunStatus }> = [];
+    h.executor.onRunStatus((event) => published.push(event));
+
+    const { runId } = h.enqueue();
+    h.executor.startRun(runId);
+    await waitForStatus(h, runId, "running");
+    await waitUntil(() => h.driver.calls.length > 0, "driver started");
+
+    // The abort terminalizes the row in the executor; the engine's own
+    // closing event follows — the bus must not carry the identical
+    // `aborted` frame twice.
+    await expect(h.executor.abortRun(runId)).resolves.toEqual({ outcome: "aborted" });
+    await waitForStatus(h, runId, "aborted");
+    await waitForIdle(h);
+
+    expect(published.filter((event) => event.runId === runId).map((event) => event.status)).toEqual(
+      ["queued", "running", "aborted"],
+    );
+  });
 });
 
 const TERMINAL = new Set<RunStatus>(["success", "failed", "aborted", "interrupted"]);

@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect } from "react";
+import { useEffect, useRef } from "react";
 import type { RunStatus } from "@openeuler/core";
 import { apiFetch, daemonBaseUrl } from "./api";
 
@@ -141,23 +141,100 @@ export function connectRunStatusStream(options: RunStatusStreamOptions): RunStat
   };
 }
 
-/**
- * Hook flavor: runs one subscription for the component's lifetime, re-fires
- * `onOpen` on reconnects. `onEvent`/`onOpen` may change between renders; the
- * stream itself is opened once.
- */
-export function useRunStatusStream(handlers: {
+// ---------------------------------------------------------------------------
+// Shared subscription (#62): the TopBar indicator, the dashboard project
+// cards and the runs table all listen to the SAME daemon stream — one
+// `EventSource` for the whole page tree instead of three against the
+// daemon's global-stream cap.
+
+/** The handler slice every stream consumer supplies. */
+export interface RunStatusStreamHandlers {
   onEvent: (event: RunStatusStreamEvent) => void;
+  /** Fired on every (re)connect — the moment to re-seed state from the API. */
   onOpen?: () => void;
-}): void {
-  const { onEvent, onOpen } = handlers;
-  useEffect(() => {
-    const handle = connectRunStatusStream({
-      onEvent,
-      ...(onOpen === undefined ? {} : { onOpen }),
+}
+
+/**
+ * Ref-counted fan-out hub over one `EventSource`. The first subscriber
+ * opens the connection, the last one out closes it; a subscriber joining
+ * an already-open stream gets `onOpen` immediately (it missed the open
+ * event and still needs its snapshot seed).
+ */
+class SharedRunStatusStream {
+  private readonly listeners = new Set<RunStatusStreamHandlers>();
+  private opened = false;
+  private readonly source: StatusStreamSource;
+
+  constructor(
+    private readonly factory: StatusStreamSourceFactory,
+    private readonly release: (stream: SharedRunStatusStream) => void,
+  ) {
+    this.source = new factory(runsStreamUrl());
+    this.source.addEventListener("open", () => {
+      this.opened = true;
+      this.forEachListener((listener) => listener.onOpen?.());
     });
-    return () => handle.close();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+    this.source.addEventListener("run.status", (event) => {
+      if (typeof event.data !== "string") return;
+      const parsed = parseRunStatusStreamEvent(event.data);
+      if (parsed === null) return;
+      this.forEachListener((listener) => listener.onEvent(parsed));
+    });
+  }
+
+  /** One throwing consumer must not starve the others (#62). */
+  private forEachListener(emit: (listener: RunStatusStreamHandlers) => void): void {
+    for (const listener of [...this.listeners]) {
+      try {
+        emit(listener);
+      } catch {
+        // Isolated to this consumer; the next frame still reaches everyone.
+      }
+    }
+  }
+
+  subscribe(handlers: RunStatusStreamHandlers): () => void {
+    this.listeners.add(handlers);
+    if (this.opened) handlers.onOpen?.();
+    return () => {
+      this.listeners.delete(handlers);
+      if (this.listeners.size === 0) {
+        this.source.close();
+        this.release(this);
+      }
+    };
+  }
+}
+
+/** One hub per source factory: the default browser factory is a singleton. */
+const sharedStreams = new WeakMap<StatusStreamSourceFactory, SharedRunStatusStream>();
+
+function sharedRunStatusStream(factory: StatusStreamSourceFactory): SharedRunStatusStream {
+  let stream = sharedStreams.get(factory);
+  if (stream === undefined) {
+    stream = new SharedRunStatusStream(factory, (closed) => {
+      if (sharedStreams.get(factory) === closed) sharedStreams.delete(factory);
+    });
+    sharedStreams.set(factory, stream);
+  }
+  return stream;
+}
+
+/**
+ * Hook flavor: shares the page-wide stream subscription for the component's
+ * lifetime. Latest-ref semantics — the connection outlives re-renders but
+ * every frame is dispatched through the CURRENT render's handlers, so
+ * handler closures (rows, filters, …) are never frozen at mount time.
+ */
+export function useRunStatusStream(handlers: RunStatusStreamHandlers): void {
+  const handlersRef = useRef(handlers);
+  handlersRef.current = handlers;
+  useEffect(() => {
+    const unsubscribe = sharedRunStatusStream(BrowserStatusStreamSource).subscribe({
+      onEvent: (event) => handlersRef.current.onEvent(event),
+      onOpen: () => handlersRef.current.onOpen?.(),
+    });
+    return unsubscribe;
   }, []);
 }
 
@@ -187,7 +264,7 @@ export interface RunsApiRow {
  * output rows, which is what the reducer tests pin down.
  */
 export function applyRunStatusEvent<T extends { id: string; status: RunStatus }>(
-  rows: T[],
+  rows: readonly T[],
   event: RunStatusStreamEvent,
 ): T[] {
   let changed = false;
@@ -198,19 +275,35 @@ export function applyRunStatusEvent<T extends { id: string; status: RunStatus }>
     delete patched.queuePosition;
     return patched as T;
   });
-  return changed ? next : rows;
+  // Same reference when nothing changed — callers skip pointless re-renders.
+  return changed ? next : (rows as T[]);
 }
 
-/** Fetches one page of runs (server-side status/project filtering). */
+/** Page size the dashboard requests (`GET /api/runs` is bounded, #62). */
+export const RUNS_PAGE_SIZE = 50;
+
+/** Fetches one bounded page of runs (server-side status/project filtering). */
 export async function fetchRuns(
-  query: { projectId?: string; statuses?: RunStatus[] } = {},
-): Promise<RunsApiRow[]> {
+  query: {
+    projectId?: string;
+    statuses?: RunStatus[];
+    limit?: number;
+    /** `nextCursor` of the previous page — fetches the next older page. */
+    before?: string;
+  } = {},
+): Promise<{ rows: RunsApiRow[]; nextCursor?: string }> {
   const params = new URLSearchParams();
   if (query.projectId !== undefined) params.set("projectId", query.projectId);
   if (query.statuses !== undefined && query.statuses.length > 0) {
     params.set("status", query.statuses.join(","));
   }
-  const suffix = params.size > 0 ? `?${params.toString()}` : "";
-  const body = await apiFetch<{ runs: RunsApiRow[] }>(`/api/runs${suffix}`);
-  return body.runs;
+  params.set("limit", String(query.limit ?? RUNS_PAGE_SIZE));
+  if (query.before !== undefined) params.set("before", query.before);
+  const body = await apiFetch<{ runs: RunsApiRow[]; nextCursor?: string }>(
+    `/api/runs?${params.toString()}`,
+  );
+  return {
+    rows: body.runs,
+    ...(body.nextCursor === undefined ? {} : { nextCursor: body.nextCursor }),
+  };
 }

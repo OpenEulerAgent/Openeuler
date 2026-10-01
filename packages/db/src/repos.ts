@@ -1,4 +1,4 @@
-import { and, eq, sql } from "drizzle-orm";
+import { and, eq, inArray, sql } from "drizzle-orm";
 import type { BetterSQLite3Database } from "drizzle-orm/better-sqlite3";
 import { z } from "zod";
 import {
@@ -62,6 +62,8 @@ export type StepRunPatch = {
 export interface ProjectRepo {
   create(project: Project): Project;
   get(id: string): Project | undefined;
+  /** Bulk `get`: every existing row for the ids, in one query (#62). */
+  getMany(ids: string[]): Project[];
   list(): Project[];
   /** Deletes the project; returns true when a row was removed. */
   delete(id: string): boolean;
@@ -77,6 +79,8 @@ export type WorkflowPatch = {
 export interface WorkflowRepo {
   create(workflow: Workflow): Workflow;
   get(id: string): Workflow | undefined;
+  /** Bulk `get`: every existing row for the ids, in one query (#62). */
+  getMany(ids: string[]): Workflow[];
   /** Workflows for a project, ordered by name. */
   list(projectId?: string): Workflow[];
   /** Patches mutable fields; returns undefined when the row does not exist. */
@@ -104,6 +108,8 @@ export interface WorkflowRevisionRepo {
    */
   create(workflowId: string, graph: unknown): WorkflowRevision;
   get(id: string): WorkflowRevision | undefined;
+  /** Bulk `get`: every existing row for the ids, in one query (#62). */
+  getMany(ids: string[]): WorkflowRevision[];
   getByNumber(workflowId: string, number: number): WorkflowRevision | undefined;
   /** Revisions of a workflow, oldest first. */
   list(workflowId: string): WorkflowRevision[];
@@ -225,6 +231,11 @@ export function createProjectRepo(db: Db): ProjectRepo {
       const row = db.select().from(schema.projects).where(eq(schema.projects.id, id)).get();
       return row ? toDomain(row) : undefined;
     },
+    getMany(ids) {
+      if (ids.length === 0) return [];
+      const rows = db.select().from(schema.projects).where(inArray(schema.projects.id, ids)).all();
+      return rows.map(toDomain);
+    },
     list() {
       const rows = db.select().from(schema.projects).orderBy(schema.projects.createdAt).all();
       return rows.map(toDomain);
@@ -266,6 +277,15 @@ export function createWorkflowRepo(db: Db): WorkflowRepo {
     get(id) {
       const row = db.select().from(schema.workflows).where(eq(schema.workflows.id, id)).get();
       return row ? toDomain(row) : undefined;
+    },
+    getMany(ids) {
+      if (ids.length === 0) return [];
+      const rows = db
+        .select()
+        .from(schema.workflows)
+        .where(inArray(schema.workflows.id, ids))
+        .all();
+      return rows.map(toDomain);
     },
     list(projectId) {
       const rows = db
@@ -357,6 +377,15 @@ export function createWorkflowRevisionRepo(db: Db): WorkflowRevisionRepo {
         .where(eq(schema.workflowRevisions.id, id))
         .get();
       return row ? toDomain(row) : undefined;
+    },
+    getMany(ids) {
+      if (ids.length === 0) return [];
+      const rows = db
+        .select()
+        .from(schema.workflowRevisions)
+        .where(inArray(schema.workflowRevisions.id, ids))
+        .all();
+      return rows.map(toDomain);
     },
     getByNumber(workflowId, number) {
       const row = db

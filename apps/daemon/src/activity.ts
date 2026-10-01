@@ -77,14 +77,32 @@ export function recordRunStatusActivity(db: Db, runId: string, status: RunStatus
   }
 }
 
+/**
+ * Records the project registration. Never throws into the caller (same
+ * guard as {@link recordRunStatusActivity}): a failed append is a lost feed
+ * entry, not a lost project.
+ */
 export function recordProjectCreatedActivity(db: Db, project: Project): void {
-  db.activity.append({ type: "project.created", projectId: project.id });
+  try {
+    db.activity.append({ type: "project.created", projectId: project.id });
+  } catch {
+    // Feed appends must never break the registration itself.
+  }
 }
 
+/**
+ * Records the workflow creation. Never throws into the caller (same guard
+ * as {@link recordRunStatusActivity}): a failed append is a lost feed
+ * entry, not a lost workflow.
+ */
 export function recordWorkflowCreatedActivity(db: Db, workflow: Workflow): void {
-  db.activity.append({
-    type: "workflow.created",
-    projectId: workflow.projectId,
-    workflowId: workflow.id,
-  });
+  try {
+    db.activity.append({
+      type: "workflow.created",
+      projectId: workflow.projectId,
+      workflowId: workflow.id,
+    });
+  } catch {
+    // Feed appends must never break the workflow creation itself.
+  }
 }

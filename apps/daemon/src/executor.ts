@@ -160,12 +160,22 @@ export function createExecutor(options: ExecutorOptions): Executor {
   const shutdownSettleMs = options.shutdownSettleMs ?? 2_000;
   const active = new Map<string, ActiveRun>();
   const runStatusListeners = new Set<RunStatusListener>();
+  /**
+   * Last status broadcast per run id: the stalled-driver abort race
+   * terminalizes the row both in the executor and (later) in the engine,
+   * and identical consecutive frames would leak to every stream client —
+   * the same dedupe the activity writer gets from `latestForRun`.
+   */
+  const lastPublishedStatus = new Map<string, RunStatus>();
 
   /**
    * Broadcasts one transition on the bus (never throws into callers; a dead
-   * listener is dropped, not fatal).
+   * listener is dropped, not fatal). Identical consecutive per-run frames
+   * are suppressed.
    */
   function publishRunStatus(event: RunStatusNotification): void {
+    if (lastPublishedStatus.get(event.runId) === event.status) return;
+    lastPublishedStatus.set(event.runId, event.status);
     for (const listener of [...runStatusListeners]) {
       try {
         listener(event);

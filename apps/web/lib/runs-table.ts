@@ -1,5 +1,5 @@
 import type { RunStatus } from "@openeuler/core";
-import type { RunStatusStreamEvent, RunsApiRow } from "./runs-stream";
+import { applyRunStatusEvent, type RunStatusStreamEvent, type RunsApiRow } from "./runs-stream";
 
 /**
  * Dashboard runs table logic (#51): URL-state filter codec + the pure table
@@ -73,6 +73,8 @@ export function filterRuns(rows: readonly RunsApiRow[], filters: RunsFilters): R
 
 export type RunsTableAction =
   | { type: "rowsLoaded"; rows: RunsApiRow[] }
+  /** Load-more page appended (older rows); ids already present are skipped. */
+  | { type: "rowsAppended"; rows: RunsApiRow[] }
   | { type: "streamEvent"; event: RunStatusStreamEvent }
   /** Stop clicked + confirmed: row flips to `aborted` before the POST resolves. */
   | { type: "stopOptimistic"; runId: string }
@@ -116,17 +118,14 @@ export function runsTableReducer(
   switch (action.type) {
     case "rowsLoaded":
       return action.rows;
-    case "streamEvent": {
-      let changed = false;
-      const next = rows.map((row) => {
-        if (row.id !== action.event.runId || row.status === action.event.status) return row;
-        changed = true;
-        const patched: RunsApiRow = { ...row, status: action.event.status };
-        delete patched.queuePosition;
-        return patched;
-      });
-      return changed ? next : [...rows];
+    case "rowsAppended": {
+      const seen = new Set(rows.map((row) => row.id));
+      return [...rows, ...action.rows.filter((row) => !seen.has(row.id))];
     }
+    case "streamEvent":
+      // Delegates to the shared stream→row reducer (#62): unknown ids and
+      // no-op transitions return the SAME array — no re-render churn.
+      return applyRunStatusEvent(rows, action.event);
     case "stopOptimistic":
       return rows.map((row) => (row.id === action.runId ? { ...row, status: "aborted" } : row));
     case "stopFailed":
@@ -135,8 +134,18 @@ export function runsTableReducer(
       );
     case "retryQueued":
       return [optimisticRetryRow(action.tempId, action.from), ...rows];
-    case "retryResolved":
+    case "retryResolved": {
+      // Replace-or-prepend: a refetch may have already added the real row
+      // while the retry POST was in flight — replace it in place instead of
+      // stacking a duplicate id (and its duplicate React key).
+      const exists = rows.some((row) => row.id === action.run.id);
+      if (exists) {
+        return rows
+          .map((row) => (row.id === action.run.id ? action.run : row))
+          .filter((row) => row.id !== action.tempId);
+      }
       return [action.run, ...rows.filter((row) => row.id !== action.tempId)];
+    }
     case "retryFailed":
       return rows.filter((row) => row.id !== action.tempId);
   }
