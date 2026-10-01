@@ -123,6 +123,13 @@ The full contract (lifecycle, event-stream and abort semantics, error codes) liv
 4. **Test it** — unit tests with a stub binary (see `opencode.test.ts`'s PATH-augmented stub) or pure parser fixtures in `src/fixtures/`; gate any real-binary smoke test behind `AGENT_E2E=1`.
 5. **Smoke it** — `curl localhost:8787/api/drivers`, then run a one-step workflow with `driver: "<id>"`.
 
+## Web design system (issue #50)
+
+- **Tokens** — semantic CSS variables in `apps/web/app/globals.css` (`bg/surface/elevated/border/fg/muted-fg/accent(+hover/-fg)/link` + `success/warning/danger/info` each with a `-subtle` bg, plus typography scale `display/title/body/small/mono`, `--radius-*`, `--shadow-1/2/3`). Tailwind v4 `@theme inline` maps them to utilities (`bg-surface`, `text-muted-fg`, `shadow-1`…). Never use raw palette classes (`slate-*`, `red-*`…) in app code — only semantic tokens.
+- **Theming** — dark is the default (`:root`); light opts in via `<html data-theme="light">`. The persisted choice (`localStorage["openeuler-theme"]`, see `lib/theme.ts`) is applied before first paint by an inline script in the root layout, so there is no flash and no hydration mismatch. `lib/contrast.test.ts` hardcodes the token RGBs and asserts WCAG AA (≥4.5:1) for the core pairs in both themes — keep it in sync with globals.css.
+- **Primitives** — `components/ui/*` (Button, Card, Badge + status map, Dialog, Drawer, Tabs, Table, Toast, Skeleton, EmptyState, Input/Field). `components/StatusBadge.tsx` is a thin wrapper over `ui/badge` mapping every run/step/node status; modals (NewRunModal, RunWorkflowModal, ⌘K palette) build on the Dialog primitive's focus trap.
+- **App shell** — `components/shell/` (Sidebar, TopBar, CommandPalette, icons) replaces the old TopNav in the root layout. Sidebar collapse (`localStorage["openeuler-sidebar"]`) and the ⌘K palette state machine (`lib/command-palette.ts`, fuzzy scoring in `lib/fuzzy.ts`) are pure modules unit-tested without a browser.
+
 ## Testing conventions
 
 - **Vitest per package** (`pnpm -r test`; `pnpm test` from the root runs all). Colocated `*.test.ts` next to sources; no separate test tree.

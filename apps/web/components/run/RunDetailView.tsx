@@ -2,8 +2,10 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { Project, Run, StepRun, TerminalRunStatus } from "@openeuler/core";
-import { Button } from "@/components/Button";
-import { Card } from "@/components/Card";
+import { Button } from "@/components/ui/button";
+import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
+import { Tabs, type TabItem } from "@/components/ui/tabs";
+import { SkeletonLines } from "@/components/ui/skeleton";
 import { apiFetch, ApiError } from "@/lib/api";
 import { connectRunEvents, type RunStreamEvent, type RunStreamState } from "@/lib/run-events";
 import {
@@ -136,37 +138,61 @@ export function RunDetailView({ runId }: { runId: string }) {
 
   if (load.phase === "loading") {
     return (
-      <Card title="Loading run…" description={`Fetching run ${runId} from the daemon.`}>
-        <p className="py-6 text-sm text-slate-400">This should only take a moment.</p>
+      <Card>
+        <CardHeader>
+          <div>
+            <CardTitle>Loading run…</CardTitle>
+            <CardDescription>Fetching run {runId} from the daemon.</CardDescription>
+          </div>
+        </CardHeader>
+        <CardContent>
+          <SkeletonLines rows={3} />
+        </CardContent>
       </Card>
     );
   }
 
   if (load.phase === "notfound") {
     return (
-      <Card title="Run not found" description="The daemon has no record of this run.">
-        <div className="flex flex-col items-start gap-3 py-4 text-sm text-slate-500">
-          <p>
-            Run <span className="font-mono text-slate-700">{runId}</span> does not exist — it may
-            have been removed, or the link is stale.
-          </p>
-          <Button variant="secondary" onClick={() => void refresh()}>
-            Try again
-          </Button>
-        </div>
+      <Card>
+        <CardHeader>
+          <div>
+            <CardTitle>Run not found</CardTitle>
+            <CardDescription>The daemon has no record of this run.</CardDescription>
+          </div>
+        </CardHeader>
+        <CardContent>
+          <div className="flex flex-col items-start gap-3 py-2 text-sm text-muted-fg">
+            <p>
+              Run <span className="font-mono text-fg">{runId}</span> does not exist — it may have
+              been removed, or the link is stale.
+            </p>
+            <Button variant="secondary" onClick={() => void refresh()}>
+              Try again
+            </Button>
+          </div>
+        </CardContent>
       </Card>
     );
   }
 
   if (load.phase === "error") {
     return (
-      <Card title="Could not load run" description="The daemon did not answer as expected.">
-        <div className="flex flex-col items-start gap-3 py-4 text-sm text-slate-500">
-          <p className="text-red-600">{load.message}</p>
-          <Button variant="secondary" onClick={() => void refresh()}>
-            Retry
-          </Button>
-        </div>
+      <Card>
+        <CardHeader>
+          <div>
+            <CardTitle>Could not load run</CardTitle>
+            <CardDescription>The daemon did not answer as expected.</CardDescription>
+          </div>
+        </CardHeader>
+        <CardContent>
+          <div className="flex flex-col items-start gap-3 py-2 text-sm">
+            <p className="text-danger">{load.message}</p>
+            <Button variant="secondary" onClick={() => void refresh()}>
+              Retry
+            </Button>
+          </div>
+        </CardContent>
       </Card>
     );
   }
@@ -187,6 +213,10 @@ export function RunDetailView({ runId }: { runId: string }) {
     ...(output.length > 0 ? (["output"] as const) : []),
     "diffs",
   ];
+  const resultsTabs: ReadonlyArray<TabItem<ResultsTab>> = availableTabs.map((name) => ({
+    id: name,
+    label: name === "output" ? "Output" : "Diffs",
+  }));
   const activeTab: ResultsTab =
     resultsTab !== null && availableTabs.includes(resultsTab)
       ? resultsTab
@@ -211,37 +241,30 @@ export function RunDetailView({ runId }: { runId: string }) {
       />
 
       {showPanels ? (
-        <Card
-          title="Run results"
-          description={
-            hasDiff
-              ? "Final output and file changes made by this run."
-              : "Final output of this run."
-          }
-        >
-          <div className="flex gap-1 border-b border-slate-200">
-            {availableTabs.map((name) => (
-              <button
-                key={name}
-                type="button"
-                onClick={() => setResultsTab(name)}
-                className={`-mb-px rounded-t-md border-b-2 px-3 py-1.5 text-sm font-medium transition-colors ${
-                  activeTab === name
-                    ? "border-slate-900 text-slate-900"
-                    : "border-transparent text-slate-500 hover:text-slate-700"
-                }`}
-              >
-                {name === "output" ? "Output" : "Diffs"}
-              </button>
-            ))}
-          </div>
-          <div className="mt-4">
+        <Card>
+          <CardHeader>
+            <div>
+              <CardTitle>Run results</CardTitle>
+              <CardDescription>
+                {hasDiff
+                  ? "Final output and file changes made by this run."
+                  : "Final output of this run."}
+              </CardDescription>
+            </div>
+            <Tabs
+              tabs={resultsTabs}
+              active={activeTab}
+              onChange={setResultsTab}
+              label="Run results"
+            />
+          </CardHeader>
+          <CardContent>
             {activeTab === "output" ? (
               <OutputPanel output={output} />
             ) : (
               <DiffsTab runId={detail.run.id} steps={steps} />
             )}
-          </div>
+          </CardContent>
         </Card>
       ) : null}
     </div>

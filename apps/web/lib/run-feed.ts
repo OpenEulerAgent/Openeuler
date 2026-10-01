@@ -139,12 +139,12 @@ export const TERMINAL_STATUS_STYLES: Record<
 > = {
   success: {
     label: "Run finished: success",
-    className: "border-emerald-200 bg-emerald-50 text-emerald-700",
+    className: "border-success/40 bg-success-subtle text-success",
   },
-  failed: { label: "Run failed", className: "border-red-200 bg-red-50 text-red-700" },
-  aborted: { label: "Run aborted", className: "border-amber-200 bg-amber-50 text-amber-700" },
+  failed: { label: "Run failed", className: "border-danger/40 bg-danger-subtle text-danger" },
+  aborted: { label: "Run aborted", className: "border-warning/40 bg-warning-subtle text-warning" },
   interrupted: {
     label: "Run interrupted",
-    className: "border-violet-200 bg-violet-50 text-violet-700",
+    className: "border-warning/40 bg-warning-subtle text-warning",
   },
 };

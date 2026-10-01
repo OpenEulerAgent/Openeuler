@@ -9,15 +9,14 @@ import {
   type StepDraft,
   type StepMode,
 } from "@/lib/workflow-builder";
+import { Button } from "@/components/ui/button";
+import { Input, Select, Textarea } from "@/components/ui/input";
 import { cn } from "@/lib/cn";
-
-const inputClass =
-  "rounded-md border border-slate-300 px-2 py-1.5 text-sm text-slate-900 shadow-sm focus:border-slate-500 focus:outline-none";
 
 function FieldError({ message }: { message?: string }) {
   if (!message) return null;
   return (
-    <p className="text-xs text-red-600" role="alert">
+    <p className="text-xs text-danger" role="alert">
       {message}
     </p>
   );
@@ -75,63 +74,69 @@ export function StepCard({
   return (
     <section
       aria-label={`Step ${index + 1}${step.name ? `: ${step.name}` : ""}`}
-      className="rounded-lg border border-slate-200 bg-slate-50/60 p-4"
+      className="rounded-lg border border-border bg-elevated/40 p-4"
     >
       <header className="flex flex-wrap items-center justify-between gap-2">
-        <h3 className="text-sm font-semibold text-slate-900">
-          <span className="mr-2 inline-flex size-5 items-center justify-center rounded-full bg-slate-900 font-mono text-xs text-white">
+        <h3 className="text-sm font-semibold text-fg">
+          <span className="mr-2 inline-flex size-5 items-center justify-center rounded-full bg-accent font-mono text-xs text-accent-fg">
             {index + 1}
           </span>
-          {step.name || <span className="text-slate-400">Untitled step</span>}
+          {step.name || <span className="text-muted-fg">Untitled step</span>}
         </h3>
         <div className="flex items-center gap-1">
-          <Buttonish
+          <Button
+            variant="ghost"
+            size="sm"
             onClick={() => onMove(-1)}
             disabled={index === 0}
-            label="Move up"
             aria-label={`Move step ${index + 1} up`}
+            title="Move up"
           >
             ↑
-          </Buttonish>
-          <Buttonish
+          </Button>
+          <Button
+            variant="ghost"
+            size="sm"
             onClick={() => onMove(1)}
             disabled={index === total - 1}
-            label="Move down"
             aria-label={`Move step ${index + 1} down`}
+            title="Move down"
           >
             ↓
-          </Buttonish>
-          <Buttonish
+          </Button>
+          <Button
+            variant="ghost"
+            size="sm"
+            className="text-danger hover:bg-danger-subtle hover:text-danger"
             onClick={onRemove}
             disabled={total <= 1}
-            label="Remove step"
             aria-label={`Remove step ${index + 1}`}
-            danger
+            title="Remove step"
           >
             Remove
-          </Buttonish>
+          </Button>
         </div>
       </header>
 
       <div className="mt-3 grid gap-3 md:grid-cols-2">
-        <label className="flex flex-col gap-1 text-sm font-medium text-slate-700">
+        <label className="flex flex-col gap-1 text-sm font-medium text-fg">
           Name
-          <input
+          <Input
             type="text"
             value={step.name}
+            invalid={error("name") !== undefined}
             onChange={(event) => onPatch({ name: event.target.value })}
             placeholder="e.g. implement"
-            className={cn(inputClass, error("name") && "border-red-400")}
           />
           <FieldError message={error("name")} />
         </label>
 
-        <label className="flex flex-col gap-1 text-sm font-medium text-slate-700">
+        <label className="flex flex-col gap-1 text-sm font-medium text-fg">
           Driver
-          <select
+          <Select
             value={step.driver}
+            invalid={error("driver") !== undefined}
             onChange={(event) => onPatch({ driver: event.target.value })}
-            className={cn(inputClass, error("driver") && "border-red-400")}
           >
             {[...new Set(drivers.includes(step.driver) ? drivers : [step.driver, ...drivers])].map(
               (id) => (
@@ -140,24 +145,27 @@ export function StepCard({
                 </option>
               ),
             )}
-          </select>
+          </Select>
           <FieldError message={error("driver")} />
         </label>
 
-        <label className="flex flex-col gap-1 text-sm font-medium text-slate-700">
-          Model <span className="font-normal text-slate-400">(optional)</span>
-          <input
+        <label className="flex flex-col gap-1 text-sm font-medium text-fg">
+          Model <span className="font-normal text-muted-fg">(optional)</span>
+          <Input
             type="text"
             value={step.model}
             onChange={(event) => onPatch({ model: event.target.value })}
             placeholder="provider/model"
-            className={inputClass}
           />
         </label>
 
-        <div className="flex flex-col gap-1 text-sm font-medium text-slate-700">
+        <div className="flex flex-col gap-1 text-sm font-medium text-fg">
           Mode
-          <div className="flex overflow-hidden rounded-md border border-slate-300 shadow-sm">
+          <div
+            role="group"
+            aria-label="Step mode"
+            className="flex overflow-hidden rounded-md border border-border shadow-1"
+          >
             {(["auto", "ask"] as const).map((mode: StepMode) => (
               <button
                 key={mode}
@@ -165,10 +173,10 @@ export function StepCard({
                 aria-pressed={step.mode === mode}
                 onClick={() => onPatch({ mode })}
                 className={cn(
-                  "flex-1 px-3 py-1.5 text-sm font-medium transition-colors",
+                  "flex-1 px-3 py-1.5 text-sm font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent",
                   step.mode === mode
-                    ? "bg-slate-900 text-white"
-                    : "bg-white text-slate-600 hover:bg-slate-100",
+                    ? "bg-accent text-accent-fg"
+                    : "bg-surface text-muted-fg hover:bg-elevated hover:text-fg",
                 )}
               >
                 {mode === "auto" ? "auto (yolo)" : "ask"}
@@ -177,23 +185,22 @@ export function StepCard({
           </div>
         </div>
 
-        <label className="flex flex-col gap-1 text-sm font-medium text-slate-700">
-          Agent <span className="font-normal text-slate-400">(optional)</span>
-          <input
+        <label className="flex flex-col gap-1 text-sm font-medium text-fg">
+          Agent <span className="font-normal text-muted-fg">(optional)</span>
+          <Input
             type="text"
             value={step.agent}
             onChange={(event) => onPatch({ agent: event.target.value })}
             placeholder="e.g. build"
-            className={inputClass}
           />
         </label>
 
-        <label className="flex items-center gap-2 self-end pb-1.5 text-sm font-medium text-slate-700">
+        <label className="flex items-center gap-2 self-end pb-1.5 text-sm font-medium text-fg">
           <input
             type="checkbox"
             checked={step.continueSession}
             onChange={(event) => onPatch({ continueSession: event.target.checked })}
-            className="size-4 rounded border-slate-300"
+            className="size-4 rounded border-border accent-[var(--accent)]"
           />
           Continue previous session
         </label>
@@ -201,14 +208,14 @@ export function StepCard({
 
       <div className="mt-3 flex flex-col gap-1">
         <div className="flex flex-wrap items-center justify-between gap-2">
-          <span className="text-sm font-medium text-slate-700">Prompt template</span>
+          <span className="text-sm font-medium text-fg">Prompt template</span>
           <div className="flex flex-wrap items-center gap-1">
             {TEMPLATE_VARIABLE_TOKENS.map((token) => (
               <button
                 key={token}
                 type="button"
                 onClick={() => insertVariable(token)}
-                className="rounded border border-slate-300 bg-white px-1.5 py-0.5 font-mono text-xs text-slate-600 hover:bg-slate-100"
+                className="rounded border border-border bg-surface px-1.5 py-0.5 font-mono text-xs text-muted-fg transition-colors hover:bg-elevated hover:text-fg focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
               >
                 {token}
               </button>
@@ -217,77 +224,43 @@ export function StepCard({
               type="button"
               aria-expanded={showPreview}
               onClick={() => setShowPreview((value) => !value)}
-              className="rounded px-1.5 py-0.5 text-xs font-medium text-slate-600 hover:bg-slate-100"
+              className="rounded px-1.5 py-0.5 text-xs font-medium text-muted-fg transition-colors hover:bg-elevated hover:text-fg focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
             >
               {showPreview ? "Hide preview" : "Preview"}
             </button>
           </div>
         </div>
-        <textarea
+        <Textarea
           ref={promptRef}
           rows={4}
           value={step.promptTemplate}
           onChange={(event) => onPatch({ promptTemplate: event.target.value })}
           placeholder={`e.g. Implement this task:\n{{task}}`}
-          className={cn(
-            "rounded-md border border-slate-300 p-2 font-mono text-sm text-slate-900 shadow-sm focus:border-slate-500 focus:outline-none",
-            error("promptTemplate") && "border-red-400",
-          )}
+          className={cn("font-mono", error("promptTemplate") !== undefined && "border-danger")}
         />
         <FieldError message={error("promptTemplate")} />
       </div>
 
       {showPreview ? (
         <div
-          className="mt-3 rounded-md border border-slate-200 bg-white p-3"
+          className="mt-3 rounded-md border border-border bg-surface p-3"
           data-testid="prompt-preview"
         >
-          <p className="text-xs font-medium uppercase tracking-wide text-slate-400">Sample task</p>
-          <p className="mt-0.5 text-sm text-slate-700">
-            {sampleTask || <span className="text-slate-400">(empty)</span>}
+          <p className="text-xs font-medium uppercase tracking-wide text-muted-fg">Sample task</p>
+          <p className="mt-0.5 text-sm text-fg">
+            {sampleTask || <span className="text-muted-fg">(empty)</span>}
           </p>
           {preview?.error ? (
-            <p className="mt-2 text-xs text-red-600" role="alert">
+            <p className="mt-2 text-xs text-danger" role="alert">
               {preview.error}
             </p>
           ) : (
-            <pre className="mt-2 overflow-x-auto whitespace-pre-wrap rounded bg-slate-50 p-2 font-mono text-xs text-slate-700">
+            <pre className="mt-2 overflow-x-auto whitespace-pre-wrap rounded bg-elevated p-2 font-mono text-xs text-fg">
               {preview?.text}
             </pre>
           )}
         </div>
       ) : null}
     </section>
-  );
-}
-
-function Buttonish({
-  onClick,
-  disabled,
-  label,
-  danger,
-  children,
-  ...aria
-}: {
-  onClick: () => void;
-  disabled?: boolean;
-  label: string;
-  danger?: boolean;
-  children: React.ReactNode;
-} & Record<"aria-label", string>) {
-  return (
-    <button
-      type="button"
-      title={label}
-      onClick={onClick}
-      disabled={disabled}
-      className={cn(
-        "rounded-md px-2 py-1 text-xs font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-40",
-        danger ? "text-red-600 hover:bg-red-50" : "text-slate-600 hover:bg-slate-100",
-      )}
-      {...aria}
-    >
-      {children}
-    </button>
   );
 }

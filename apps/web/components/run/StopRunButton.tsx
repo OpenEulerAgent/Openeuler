@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useRef, useState, type KeyboardEvent } from "react";
-import { Button } from "@/components/Button";
+import { Button } from "@/components/ui/button";
 import { apiFetch, ApiError } from "@/lib/api";
 
 /**
@@ -46,7 +46,7 @@ export function StopRunButton({ runId, onAborted }: { runId: string; onAborted: 
     return (
       <Button
         variant="secondary"
-        className="border-red-200 text-red-600 hover:bg-red-50"
+        className="border-danger/40 text-danger hover:bg-danger-subtle"
         onClick={() => setConfirming(true)}
       >
         Stop run
@@ -56,19 +56,14 @@ export function StopRunButton({ runId, onAborted }: { runId: string; onAborted: 
 
   return (
     <div className="flex items-center gap-2" onKeyDown={handleKeyDown}>
-      <span className="text-sm text-slate-600">Stop this run?</span>
-      <Button
-        ref={confirmRef}
-        onClick={() => void abort()}
-        disabled={aborting}
-        className="bg-red-600 hover:bg-red-500"
-      >
+      <span className="text-sm text-muted-fg">Stop this run?</span>
+      <Button ref={confirmRef} variant="danger" onClick={() => void abort()} loading={aborting}>
         {aborting ? "Stopping…" : "Confirm stop"}
       </Button>
       <Button variant="ghost" onClick={() => setConfirming(false)} disabled={aborting}>
         Cancel
       </Button>
-      {error ? <span className="text-xs text-red-600">{error}</span> : null}
+      {error ? <span className="text-xs text-danger">{error}</span> : null}
     </div>
   );
 }

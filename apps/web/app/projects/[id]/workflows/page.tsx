@@ -15,7 +15,7 @@ export default async function ProjectWorkflowsPage({
       <div>
         <Link
           href={`/projects/${encodeURIComponent(id)}`}
-          className="text-sm font-medium text-slate-500 hover:text-slate-700"
+          className="text-sm font-medium text-muted-fg transition-colors hover:text-fg focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
         >
           ← Back to workspace
         </Link>

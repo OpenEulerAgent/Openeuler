@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
-import { Button } from "@/components/Button";
+import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/cn";
 import {
   FEED_FILTERS,
@@ -19,11 +19,11 @@ import { FeedItem } from "./FeedItem";
 const NEAR_BOTTOM_PX = 48;
 
 const STREAM_STATE_STYLES: Record<RunStreamState, { label: string; className: string }> = {
-  connecting: { label: "Connecting…", className: "bg-amber-50 text-amber-700" },
-  open: { label: "Live", className: "bg-emerald-50 text-emerald-700" },
-  reconnecting: { label: "Reconnecting…", className: "bg-amber-50 text-amber-700" },
-  error: { label: "Stream error", className: "bg-red-50 text-red-700" },
-  closed: { label: "Stream closed", className: "bg-slate-100 text-slate-500" },
+  connecting: { label: "Connecting…", className: "bg-warning-subtle text-warning" },
+  open: { label: "Live", className: "bg-success-subtle text-success" },
+  reconnecting: { label: "Reconnecting…", className: "bg-warning-subtle text-warning" },
+  error: { label: "Stream error", className: "bg-danger-subtle text-danger" },
+  closed: { label: "Stream closed", className: "bg-elevated text-muted-fg" },
 };
 
 /**
@@ -98,10 +98,10 @@ export function EventFeed({
   const streamStyle = STREAM_STATE_STYLES[streamState];
 
   return (
-    <section className="rounded-xl border border-slate-200 bg-white shadow-sm">
-      <header className="flex flex-wrap items-center justify-between gap-3 border-b border-slate-200 px-5 py-3">
+    <section className="rounded-xl border border-border bg-surface shadow-1">
+      <header className="flex flex-wrap items-center justify-between gap-3 border-b border-border px-5 py-3">
         <div className="flex items-center gap-2">
-          <h2 className="text-base font-semibold text-slate-900">Events</h2>
+          <h2 className="text-title font-semibold text-fg">Events</h2>
           <span
             className={cn(
               "inline-flex items-center gap-1.5 rounded-full px-2 py-0.5 text-xs font-medium",
@@ -112,7 +112,7 @@ export function EventFeed({
               aria-hidden
               className={cn(
                 "size-1.5 rounded-full",
-                streamState === "open" ? "animate-pulse bg-emerald-500" : "bg-current",
+                streamState === "open" ? "animate-pulse bg-success" : "bg-current",
               )}
             />
             {streamStyle.label}
@@ -127,13 +127,14 @@ export function EventFeed({
               onClick={() => setFilter(id)}
               className={cn(
                 "rounded-md px-2.5 py-1 text-xs font-medium transition-colors",
+                "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent",
                 filter === id
-                  ? "bg-slate-900 text-white"
-                  : "text-slate-600 hover:bg-slate-100 hover:text-slate-900",
+                  ? "bg-accent text-accent-fg"
+                  : "text-muted-fg hover:bg-elevated hover:text-fg",
               )}
             >
               {label}
-              <span className={cn("ml-1", filter === id ? "text-slate-300" : "text-slate-400")}>
+              <span className={cn("ml-1", filter === id ? "text-accent-fg/70" : "text-muted-fg")}>
                 {counts[id]}
               </span>
             </button>
@@ -142,12 +143,13 @@ export function EventFeed({
       </header>
 
       {streamState === "error" ? (
-        <div className="flex items-center justify-between gap-3 border-b border-red-200 bg-red-50 px-5 py-2.5">
-          <p className="text-sm text-red-700">Stream connection lost — events may be incomplete.</p>
+        <div className="flex items-center justify-between gap-3 border-b border-danger/40 bg-danger-subtle px-5 py-2.5">
+          <p className="text-sm text-danger">Stream connection lost — events may be incomplete.</p>
           <Button
             variant="secondary"
+            size="sm"
             onClick={onReconnect}
-            className="border-red-200 text-red-700 hover:bg-red-100"
+            className="border-danger/40 bg-surface text-danger hover:bg-danger-subtle"
           >
             Reconnect
           </Button>
@@ -164,7 +166,7 @@ export function EventFeed({
             <button
               type="button"
               onClick={loadEarlier}
-              className="mx-auto rounded-md border border-slate-200 bg-slate-50 px-3 py-1.5 text-xs font-medium text-slate-600 hover:bg-slate-100"
+              className="mx-auto rounded-md border border-border bg-elevated px-3 py-1.5 text-xs font-medium text-muted-fg transition-colors hover:text-fg focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
             >
               Showing last {visible.length} of {filtered.length} — load earlier
             </button>
@@ -175,7 +177,7 @@ export function EventFeed({
           ))}
 
           {visible.length === 0 ? (
-            <p className="py-8 text-center text-sm text-slate-400">
+            <p className="py-8 text-center text-sm text-muted-fg">
               {filter === "all" ? "No events yet." : `No ${filter} yet.`}
             </p>
           ) : null}
@@ -184,8 +186,9 @@ export function EventFeed({
         {!atBottom ? (
           <Button
             variant="secondary"
+            size="sm"
             onClick={jumpToLatest}
-            className="absolute bottom-3 left-1/2 -translate-x-1/2 shadow-md"
+            className="absolute bottom-3 left-1/2 -translate-x-1/2 shadow-2"
           >
             Jump to latest
           </Button>
