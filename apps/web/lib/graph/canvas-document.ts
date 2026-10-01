@@ -32,6 +32,13 @@ export interface AgentNodeData extends Record<string, unknown> {
   config: StepConfig;
   /** Canvas-only: marks the node `entryNodeId` points at. */
   isEntry: boolean;
+  /**
+   * Preset the node was created from (#49): provenance for the inspector
+   * badge and the explicit "Update from preset" action. The node always
+   * keeps its own config copy. Absent for plain/detached nodes; a presetId
+   * that no longer resolves is treated as detached client-side.
+   */
+  presetId?: string;
 }
 
 /** Exit terminal marker payload. */
@@ -134,6 +141,44 @@ export function createExitNode(
   };
 }
 
+/** Structural slice of an {@link AgentPreset} the canvas needs to build a node. */
+export type PresetSource = {
+  id: string;
+  name: string;
+  config: StepConfig;
+};
+
+export interface CreatePresetAgentNodeOptions {
+  preset: PresetSource;
+  position?: GraphNodePosition;
+  /** Taken node names, so the preset name gets a unique suffix on clashes. */
+  takenNames?: ReadonlySet<string>;
+}
+
+/**
+ * A fresh agent node preconfigured from a preset (#49): name = the preset's
+ * name (uniquified against `takenNames`), config a deep copy of the preset's
+ * config, and `presetId` carried for the inspector badge. Later preset edits
+ * never reach this node unless the user clicks "Update from preset".
+ */
+export function createPresetAgentNode(options: CreatePresetAgentNodeOptions): CanvasNode {
+  const { preset } = options;
+  return {
+    id: newCanvasNodeId(),
+    type: "agent",
+    position: options.position ?? { x: 0, y: 0 },
+    data: {
+      kind: "agent",
+      name: options.takenNames
+        ? uniqueNodeName(preset.name, options.takenNames)
+        : preset.name,
+      isEntry: false,
+      config: structuredClone(preset.config),
+      presetId: preset.id,
+    },
+  };
+}
+
 /** Unique node name: `base`, `base 2`, `base 3`, … against the taken set. */
 export function uniqueNodeName(base: string, taken: ReadonlySet<string>): string {
   if (!taken.has(base)) return base;
@@ -161,6 +206,7 @@ export function toCanvasDocument(graph: WorkflowGraph): CanvasDocument {
           name: agent.name,
           config: agent.config,
           isEntry: agent.id === graph.entryNodeId,
+          ...(agent.presetId === undefined ? {} : { presetId: agent.presetId }),
         },
       };
     }
@@ -199,6 +245,7 @@ export function fromCanvasDocument(doc: CanvasDocument): WorkflowGraph {
         name: node.data.name,
         position: node.position,
         config: node.data.config,
+        ...(node.data.presetId === undefined ? {} : { presetId: node.data.presetId }),
       };
     }
     return {

@@ -8,6 +8,7 @@ import { z } from "zod";
 import type { AppEnv } from "../app.js";
 import { HttpError } from "../errors.js";
 import { GitError, gitExec } from "../git.js";
+import { seedBuiltinPresets } from "./presets.js";
 
 export const NO_COMMITS_WARNING =
   "repository has no commits yet; branch creation will fail until an initial commit exists";
@@ -150,6 +151,9 @@ export function createProjectsRouter(): Hono<AppEnv> {
       createdAt: new Date().toISOString(),
     };
     db.projects.create(project);
+    // Fresh roster: seed the builtin agent presets (ordinary rows — the
+    // user can rename, edit, or delete them like any preset).
+    seedBuiltinPresets(db, project.id);
     c.get("logger").info({ projectId: project.id, path: project.path }, "project registered");
     return c.json({ project, warnings: snapshot.warnings }, 201);
   });
@@ -170,7 +174,14 @@ export function createProjectsRouter(): Hono<AppEnv> {
 
   projects.delete("/:id", (c) => {
     const db = requireDb(c);
-    if (!db.projects.delete(c.req.param("id"))) {
+    const id = c.req.param("id");
+    if (!db.projects.get(c.req.param("id"))) {
+      throw new HttpError(404, "PROJECT_NOT_FOUND", `no project with id ${c.req.param("id")}`);
+    }
+    // Presets are owned metadata (nodes keep config copies), so they go with
+    // the project instead of blocking the delete via the FK.
+    db.agentPresets.deleteAllForProject(id);
+    if (!db.projects.delete(id)) {
       throw new HttpError(404, "PROJECT_NOT_FOUND", `no project with id ${c.req.param("id")}`);
     }
     return c.body(null, 204);

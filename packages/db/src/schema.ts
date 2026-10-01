@@ -1,6 +1,6 @@
 import { index, integer, sqliteTable, text, uniqueIndex } from "drizzle-orm/sqlite-core";
 import { sql } from "drizzle-orm";
-import type { BreadcrumbEntry, LoopBack, Step, WorkflowGraph } from "@openeuler/core";
+import type { BreadcrumbEntry, LoopBack, Step, StepConfig, WorkflowGraph } from "@openeuler/core";
 
 /**
  * Physical schema. Domain validation lives in `@openeuler/core` zod schemas;
@@ -59,6 +59,30 @@ export const workflowRevisions = sqliteTable(
     uniqueIndex("workflow_revisions_workflow_id_number_unique").on(table.workflowId, table.number),
     index("workflow_revisions_workflow_id_idx").on(table.workflowId),
   ],
+);
+
+/**
+ * Reusable named agent presets ("your team", #49): a saved StepConfig nodes
+ * are created from. Project-scoped in v0.1; `builtin` flags presets seeded
+ * on project creation (they are deletable like any other). Nodes always
+ * keep their own config copy — presets are never referenced at run time.
+ */
+export const agentPresets = sqliteTable(
+  "agent_presets",
+  {
+    id: text("id").primaryKey(),
+    projectId: text("project_id")
+      .notNull()
+      .references(() => projects.id),
+    name: text("name").notNull(),
+    description: text("description").notNull(),
+    icon: text("icon"),
+    config: text("config", { mode: "json" }).$type<StepConfig>().notNull(),
+    builtin: integer("builtin", { mode: "boolean" }).notNull().default(false),
+    createdAt: text("created_at").notNull(),
+    updatedAt: text("updated_at").notNull(),
+  },
+  (table) => [index("agent_presets_project_id_idx").on(table.projectId)],
 );
 
 export const runs = sqliteTable(

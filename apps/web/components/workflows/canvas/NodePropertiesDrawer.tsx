@@ -4,6 +4,7 @@ import { useMemo, useRef, useState, type ComponentProps } from "react";
 import type { StepConfig } from "@openeuler/core";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { Dialog } from "@/components/ui/dialog";
 import { Drawer } from "@/components/ui/drawer";
 import { Field, Input, Textarea } from "@/components/ui/input";
 import type { AgentNodeData, CanvasDocument, CanvasNode } from "@/lib/graph/canvas-document";
@@ -25,6 +26,13 @@ import { cn } from "@/lib/cn";
  * sample-data prompt preview and inline zod field errors. Patches apply to
  * the document live (the canvas card updates without save); the editor
  * debounces them into undo entries and settles them on field blur / close.
+ *
+ * Preset provenance (#49): nodes created from a preset show a
+ * "from preset: X" badge with an explicit **Detach** button (drops the link,
+ * keeps the config copy) and **Update from preset** (copies the preset's
+ * CURRENT config + name in). A "Save as preset…" action turns the node's
+ * current config into a new roster entry. When the badge is absent the
+ * node is plain — including stale presetIds whose preset was deleted.
  */
 export function NodePropertiesDrawer({
   node,
@@ -35,6 +43,10 @@ export function NodePropertiesDrawer({
   onCommitEdit,
   onDelete,
   onClose,
+  preset,
+  onDetachPreset,
+  onUpdateFromPreset,
+  onSaveAsPreset,
 }: {
   node: CanvasNode;
   doc: CanvasDocument;
@@ -45,11 +57,18 @@ export function NodePropertiesDrawer({
   onCommitEdit: () => void;
   onDelete: () => void;
   onClose: () => void;
+  /** The preset this node came from; undefined = plain/detached/stale. */
+  preset?: { name: string } | undefined;
+  onDetachPreset?: () => void;
+  onUpdateFromPreset?: () => void;
+  /** Saves the node's current config as a new preset. */
+  onSaveAsPreset?: (name: string, description: string) => Promise<void> | void;
 }) {
   const fieldErrors = useMemo(() => inspectorFieldErrors(doc, node.id), [doc, node.id]);
   const nodeIssues = issuesForNode(issues, node.id).filter(
     (issue) => !(issue.field ?? "").startsWith("config.") && issue.field !== "name",
   );
+  const [saveAsOpen, setSaveAsOpen] = useState(false);
 
   return (
     <Drawer open onClose={onClose} label={`Edit ${node.data.name || "node"}`} className="max-w-sm">
@@ -63,6 +82,23 @@ export function NodePropertiesDrawer({
               <Badge variant="accent" className="mt-1">
                 entry · pinned
               </Badge>
+            ) : null}
+            {preset !== undefined ? (
+              <span className="mt-1.5 flex flex-wrap items-center gap-1.5">
+                <Badge variant="outline" data-preset-badge>
+                  from preset: {preset.name}
+                </Badge>
+                {onDetachPreset ? (
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    onClick={onDetachPreset}
+                    title="Keep this node's config copy, but stop tracking the preset"
+                  >
+                    Detach
+                  </Button>
+                ) : null}
+              </span>
             ) : null}
           </div>
           <Button variant="ghost" size="sm" onClick={onClose}>
@@ -102,6 +138,37 @@ export function NodePropertiesDrawer({
           </div>
         ) : null}
 
+        {node.data.kind === "agent" && (onSaveAsPreset !== undefined || preset !== undefined) ? (
+          <div className="flex flex-col gap-2 rounded-lg border border-border bg-elevated/40 p-3">
+            {preset !== undefined && onUpdateFromPreset !== undefined ? (
+              <>
+                <p className="text-xs text-muted-fg">
+                  Preset edits never change this node automatically — update pulls the current
+                  preset config and name in.
+                </p>
+                <Button
+                  variant="secondary"
+                  size="sm"
+                  onClick={onUpdateFromPreset}
+                  data-update-from-preset
+                >
+                  Update from preset
+                </Button>
+              </>
+            ) : null}
+            {onSaveAsPreset !== undefined ? (
+              <Button
+                variant="secondary"
+                size="sm"
+                onClick={() => setSaveAsOpen(true)}
+                data-save-as-preset
+              >
+                Save as preset…
+              </Button>
+            ) : null}
+          </div>
+        ) : null}
+
         <div className="mt-auto flex justify-end pt-2">
           {node.data.kind === "agent" && node.data.isEntry ? (
             <p className="text-xs text-muted-fg">The entry node cannot be deleted.</p>
@@ -112,7 +179,89 @@ export function NodePropertiesDrawer({
           )}
         </div>
       </div>
+
+      {saveAsOpen && onSaveAsPreset !== undefined ? (
+        <SaveAsPresetDialog
+          defaultName={node.data.kind === "agent" ? node.data.name : ""}
+          onClose={() => setSaveAsOpen(false)}
+          onSave={onSaveAsPreset}
+        />
+      ) : null}
     </Drawer>
+  );
+}
+
+/** Name/description prompt for turning the inspected node into a preset. */
+function SaveAsPresetDialog({
+  defaultName,
+  onClose,
+  onSave,
+}: {
+  defaultName: string;
+  onClose: () => void;
+  onSave: (name: string, description: string) => Promise<void> | void;
+}) {
+  const [name, setName] = useState(defaultName);
+  const [description, setDescription] = useState("");
+  const [saving, setSaving] = useState(false);
+
+  const submit = async () => {
+    const trimmed = name.trim();
+    if (trimmed.length === 0) return;
+    setSaving(true);
+    try {
+      await onSave(trimmed, description.trim());
+      onClose();
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <Dialog
+      open
+      onClose={() => {
+        if (!saving) onClose();
+      }}
+      disableClose={saving}
+      label="Save node as preset"
+      className="max-w-sm"
+    >
+      <h2 className="text-title font-semibold text-fg">Save node as preset</h2>
+      <p className="mt-1 text-sm text-muted-fg">
+        Adds the current config to “Your team”. Existing nodes are untouched — presets are
+        templates, not links.
+      </p>
+      <div className="mt-4 flex flex-col gap-3">
+        <Field label="Preset name" htmlFor="preset-name">
+          <Input
+            id="preset-name"
+            value={name}
+            autoFocus
+            invalid={name.trim().length === 0}
+            onChange={(event) => setName(event.target.value)}
+            placeholder="e.g. Senior Reviewer"
+          />
+        </Field>
+        <Field label="Description" hint="(optional)" htmlFor="preset-description">
+          <Textarea
+            id="preset-description"
+            rows={2}
+            value={description}
+            onChange={(event) => setDescription(event.target.value)}
+            placeholder="What this agent does"
+          />
+        </Field>
+      </div>
+      <div className="mt-4 flex justify-end gap-2">
+        <Button variant="secondary" onClick={onClose} disabled={saving}>
+          Cancel
+        </Button>
+        <Button onClick={() => void submit()} loading={saving} disabled={name.trim().length === 0}>
+          Save preset
+        </Button>
+      </div>
+    </Dialog>
   );
 }
 

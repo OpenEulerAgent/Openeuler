@@ -16,6 +16,7 @@ import type { ShutdownHook, ShutdownRegistryOptions } from "./shutdown.js";
 import { createProjectsRouter } from "./routes/projects.js";
 import { createDriversRouter } from "./routes/drivers.js";
 import { createFilesRouter } from "./routes/files.js";
+import { createPresetsRouter } from "./routes/presets.js";
 import type { EventStreamOptions } from "./routes/runs.js";
 import { createRunsRouter } from "./routes/runs.js";
 import { createWorkflowsRouter } from "./routes/workflows.js";
@@ -109,6 +110,7 @@ export function createApp(options: CreateAppOptions = {}): DaemonApp {
 
   app.route("/api/projects", createProjectsRouter());
   app.route("/api/projects", createFilesRouter());
+  app.route("/api/projects", createPresetsRouter());
   app.route("/api/drivers", createDriversRouter(options.drivers));
   app.route("/api/workflows", createWorkflowsRouter());
   app.route("/api/runs", createRunsRouter({ eventStream: options.eventStream, worktrees }));

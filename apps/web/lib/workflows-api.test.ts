@@ -1,13 +1,17 @@
 import { describe, expect, it, vi } from "vitest";
-import type { Run, Workflow } from "@openeuler/core";
+import type { AgentPreset, Run, Workflow } from "@openeuler/core";
 import { ApiError } from "./api";
 import {
+  createAgentPreset,
+  deleteAgentPreset,
   deleteWorkflow,
+  fetchAgentPresets,
   fetchDriverIds,
   fetchWorkflow,
   fetchWorkflowForEditor,
   fetchWorkflows,
   startWorkflowRun,
+  updateAgentPreset,
   type WorkflowFetcher,
 } from "./workflows-api";
 
@@ -123,6 +127,108 @@ describe("deleteWorkflow", () => {
       deleteWorkflow("w-1", fetcher as unknown as WorkflowFetcher),
     ).resolves.toBeUndefined();
     expect(fetcher).toHaveBeenCalledWith("/api/workflows/w-1", { method: "DELETE" });
+  });
+});
+
+describe("agent presets api (#49)", () => {
+  const config = {
+    driver: "opencode",
+    mode: "auto" as const,
+    promptTemplate: "Review {{task}}",
+    continueSession: false,
+  };
+
+  const fixturePreset: AgentPreset = {
+    id: "preset-1",
+    projectId: "p-1",
+    name: "Senior Reviewer",
+    description: "Reviews everything twice.",
+    icon: "🔍",
+    config,
+    builtin: true,
+    createdAt: "2026-10-01T09:00:00.000Z",
+    updatedAt: "2026-10-01T09:00:00.000Z",
+  };
+
+  it("fetchAgentPresets lists the project roster", async () => {
+    const fetcher = vi.fn().mockResolvedValue({ presets: [fixturePreset] });
+    const presets = await fetchAgentPresets("p-1", fetcher as unknown as WorkflowFetcher);
+    expect(presets).toEqual([fixturePreset]);
+    expect(fetcher).toHaveBeenCalledWith("/api/projects/p-1/presets");
+  });
+
+  it("createAgentPreset posts name/description/icon/config and returns the preset", async () => {
+    const fetcher = vi.fn().mockResolvedValue({ preset: fixturePreset });
+    const created = await createAgentPreset({
+      projectId: "p-1",
+      name: "Senior Reviewer",
+      description: "Reviews everything twice.",
+      icon: "🔍",
+      config,
+      fetcher: fetcher as unknown as WorkflowFetcher,
+    });
+    expect(created).toEqual(fixturePreset);
+    expect(fetcher).toHaveBeenCalledWith("/api/projects/p-1/presets", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name: "Senior Reviewer", description: "Reviews everything twice.", icon: "🔍", config }),
+    });
+  });
+
+  it("createAgentPreset omits optional fields entirely", async () => {
+    const fetcher = vi.fn().mockResolvedValue({ preset: fixturePreset });
+    await createAgentPreset({
+      projectId: "p-1",
+      name: "Bare",
+      config,
+      fetcher: fetcher as unknown as WorkflowFetcher,
+    });
+    expect(JSON.parse(vi.mocked(fetcher).mock.calls[0]?.[1]?.body as string)).toEqual({
+      name: "Bare",
+      config,
+    });
+  });
+
+  it("updateAgentPreset patches and returns the preset (icon: null clears)", async () => {
+    const fetcher = vi.fn().mockResolvedValue({ preset: fixturePreset });
+    const updated = await updateAgentPreset({
+      projectId: "p-1",
+      presetId: "preset-1",
+      patch: { name: "Principal Reviewer", icon: null },
+      fetcher: fetcher as unknown as WorkflowFetcher,
+    });
+    expect(updated).toEqual(fixturePreset);
+    expect(fetcher).toHaveBeenCalledWith("/api/projects/p-1/presets/preset-1", {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name: "Principal Reviewer", icon: null }),
+    });
+  });
+
+  it("deleteAgentPreset sends DELETE to the scoped path", async () => {
+    const fetcher = vi.fn().mockResolvedValue(undefined);
+    await deleteAgentPreset({
+      projectId: "p-1",
+      presetId: "preset-1",
+      fetcher: fetcher as unknown as WorkflowFetcher,
+    });
+    expect(fetcher).toHaveBeenCalledWith("/api/projects/p-1/presets/preset-1", {
+      method: "DELETE",
+    });
+  });
+
+  it("propagates daemon 422s (invalid config)", async () => {
+    const fetcher = vi.fn().mockRejectedValue(
+      new ApiError("VALIDATION_ERROR", "promptTemplate must be a non-empty string", 422),
+    );
+    await expect(
+      createAgentPreset({
+        projectId: "p-1",
+        name: "bad",
+        config: { ...config, promptTemplate: "" },
+        fetcher: fetcher as unknown as WorkflowFetcher,
+      }),
+    ).rejects.toBeInstanceOf(ApiError);
   });
 });
 
