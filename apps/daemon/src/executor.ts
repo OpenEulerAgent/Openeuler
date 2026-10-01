@@ -175,7 +175,12 @@ export function createExecutor(options: ExecutorOptions): Executor {
    */
   function publishRunStatus(event: RunStatusNotification): void {
     if (lastPublishedStatus.get(event.runId) === event.status) return;
+    lastPublishedStatus.delete(event.runId);
     lastPublishedStatus.set(event.runId, event.status);
+    if (lastPublishedStatus.size > 4_096) {
+      const oldest = lastPublishedStatus.keys().next().value;
+      if (oldest !== undefined) lastPublishedStatus.delete(oldest);
+    }
     for (const listener of [...runStatusListeners]) {
       try {
         listener(event);
