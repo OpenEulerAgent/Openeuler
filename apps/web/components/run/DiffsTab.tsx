@@ -31,14 +31,40 @@ const sectionId = (index: number): string => `diff-file-${index}`;
  * per-step with iteration), a file sidebar parsed from the patch (+/- counts,
  * click to jump), side-by-side syntax-highlighted rendering, and a
  * truncation banner for server-capped huge diffs.
+ *
+ * `initialStepRunId` (#52) honors the node drawer's deep link
+ * (`?tab=diff&stepRunId=…`): the tab starts on — and switches to — that
+ * step run's scope whenever the link target changes.
  */
-export function DiffsTab({ runId, steps }: { runId: string; steps: readonly StepRun[] }) {
+export function DiffsTab({
+  runId,
+  steps,
+  initialStepRunId = null,
+}: {
+  runId: string;
+  steps: readonly StepRun[];
+  initialStepRunId?: string | null;
+}) {
   const { theme } = useThemeContext();
-  const [scope, setScope] = useState<DiffScope>({ kind: "cumulative" });
+  const [scope, setScope] = useState<DiffScope>(() =>
+    initialStepRunId === null
+      ? { kind: "cumulative" }
+      : { kind: "step", stepRunId: initialStepRunId },
+  );
   const [state, dispatch] = useReducer(diffLoadReducer, { phase: "idle" } as DiffLoadState);
   const [split, setSplit] = useState(true);
 
   const stepOptions = useMemo(() => stepScopeOptions(steps), [steps]);
+
+  // Deep-link target changed (another drawer link): follow it.
+  useEffect(() => {
+    if (initialStepRunId === null) return;
+    setScope((current) =>
+      current.kind === "step" && current.stepRunId === initialStepRunId
+        ? current
+        : { kind: "step", stepRunId: initialStepRunId },
+    );
+  }, [initialStepRunId]);
 
   useEffect(() => {
     let cancelled = false;
