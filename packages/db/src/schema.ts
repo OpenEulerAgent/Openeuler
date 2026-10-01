@@ -1,5 +1,6 @@
 import { index, integer, sqliteTable, text, uniqueIndex } from "drizzle-orm/sqlite-core";
-import type { LoopBack, Step, WorkflowGraph } from "@openeuler/core";
+import { sql } from "drizzle-orm";
+import type { BreadcrumbEntry, LoopBack, Step, WorkflowGraph } from "@openeuler/core";
 
 /**
  * Physical schema. Domain validation lives in `@openeuler/core` zod schemas;
@@ -77,6 +78,15 @@ export const runs = sqliteTable(
     task: text("task"),
     output: text("output"),
     error: text("error"),
+    /**
+     * Ordered execution breadcrumb for graph-revision runs (#45): completed
+     * node executions and taken edges, appended as execution proceeds.
+     * Empty array for legacy/ad-hoc runs.
+     */
+    breadcrumb: text("breadcrumb", { mode: "json" })
+      .$type<BreadcrumbEntry[]>()
+      .notNull()
+      .default(sql`'[]'`),
     createdAt: text("created_at").notNull(),
     updatedAt: text("updated_at").notNull(),
   },

@@ -15,6 +15,11 @@ export const RUN_EVENT_TYPES = [
   "step.started",
   "step.completed",
   "loop.iteration",
+  "node.queued",
+  "node.started",
+  "node.completed",
+  "edge.taken",
+  "edge.cap-reached",
 ] as const;
 
 /** One frame off the wire: a driver event or an engine (run/step) event. */
