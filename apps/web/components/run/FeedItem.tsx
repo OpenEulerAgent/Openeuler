@@ -2,7 +2,12 @@ import { cn } from "@/lib/cn";
 import type {
   AgentToolCallEvent,
   AgentToolOutputEvent,
+  EdgeCapReachedEvent,
+  EdgeTakenEvent,
   LoopIterationEvent,
+  NodeCompletedEvent,
+  NodeQueuedEvent,
+  NodeStartedEvent,
   RunStatusEvent,
 } from "@openeuler/core";
 import type { ReactNode } from "react";
@@ -10,20 +15,20 @@ import type { StepCompletedEvent, StepStartedEvent } from "@openeuler/core";
 import { TERMINAL_STATUS_STYLES, isTerminalRunStatus, type FeedEntry } from "@/lib/run-feed";
 
 function SystemLine({ children }: { children: ReactNode }) {
-  return <p className="px-1 py-0.5 font-mono text-xs text-slate-400">{children}</p>;
+  return <p className="px-1 py-0.5 font-mono text-xs text-muted-fg">{children}</p>;
 }
 
 function ToolCallItem({ event }: { event: AgentToolCallEvent }) {
   return (
-    <details className="rounded-lg border border-slate-200 bg-white">
-      <summary className="flex cursor-pointer select-none list-none items-center gap-2 px-3 py-2 text-sm text-slate-700 [&::-webkit-details-marker]:hidden">
-        <span aria-hidden className="text-xs text-slate-400">
+    <details className="rounded-lg border border-border bg-surface">
+      <summary className="flex cursor-pointer select-none list-none items-center gap-2 px-3 py-2 text-sm text-fg [&::-webkit-details-marker]:hidden">
+        <span aria-hidden className="text-xs text-muted-fg">
           ▸
         </span>
-        <span className="font-mono text-xs font-semibold text-slate-800">{event.tool}</span>
-        <span className="text-xs text-slate-400">tool call</span>
+        <span className="font-mono text-xs font-semibold text-fg">{event.tool}</span>
+        <span className="text-xs text-muted-fg">tool call</span>
       </summary>
-      <pre className="mx-3 mb-3 overflow-auto rounded-md bg-slate-50 p-2 font-mono text-xs text-slate-700">
+      <pre className="mx-3 mb-3 overflow-auto rounded-md bg-elevated p-2 font-mono text-xs text-fg">
         {JSON.stringify(event.input ?? {}, null, 2)}
       </pre>
     </details>
@@ -32,14 +37,14 @@ function ToolCallItem({ event }: { event: AgentToolCallEvent }) {
 
 function ToolOutputItem({ event }: { event: AgentToolOutputEvent }) {
   return (
-    <details className="rounded-lg border border-slate-200 bg-slate-50">
-      <summary className="flex cursor-pointer select-none list-none items-center gap-2 px-3 py-2 text-sm text-slate-600 [&::-webkit-details-marker]:hidden">
-        <span aria-hidden className="text-xs text-slate-400">
+    <details className="rounded-lg border border-border bg-elevated">
+      <summary className="flex cursor-pointer select-none list-none items-center gap-2 px-3 py-2 text-sm text-muted-fg [&::-webkit-details-marker]:hidden">
+        <span aria-hidden className="text-xs text-muted-fg">
           ▸
         </span>
-        <span className="text-xs text-slate-500">tool output</span>
+        <span className="text-xs text-muted-fg">tool output</span>
       </summary>
-      <pre className="mx-3 mb-3 max-h-64 overflow-auto whitespace-pre-wrap rounded-md bg-slate-100 p-2 font-mono text-xs text-slate-700">
+      <pre className="mx-3 mb-3 max-h-64 overflow-auto whitespace-pre-wrap rounded-md bg-surface p-2 font-mono text-xs text-fg">
         {event.output}
       </pre>
     </details>
@@ -72,7 +77,7 @@ function StepCompletedItem({ event }: { event: StepCompletedEvent }) {
   const failed = event.status !== "success";
   return (
     <SystemLine>
-      <span className={failed ? "text-red-500" : undefined}>
+      <span className={failed ? "text-danger" : undefined}>
         step {event.stepName} {event.status}
       </span>
     </SystemLine>
@@ -96,13 +101,66 @@ function LoopIterationItem({ event }: { event: LoopIterationEvent }) {
   );
 }
 
+// --- graph events (#45): minimal system-line rendering; the full live
+// graph view lands in #52. ---
+
+function NodeQueuedItem({ event }: { event: NodeQueuedEvent }) {
+  return (
+    <SystemLine>
+      node {event.nodeName} queued (pass {event.iteration})
+    </SystemLine>
+  );
+}
+
+function NodeStartedItem({ event }: { event: NodeStartedEvent }) {
+  return (
+    <SystemLine>
+      node {event.nodeName} started (pass {event.iteration})
+    </SystemLine>
+  );
+}
+
+function NodeCompletedItem({ event }: { event: NodeCompletedEvent }) {
+  const failed = event.status !== "success";
+  const detail =
+    event.status === "success"
+      ? `${event.durationMs}ms`
+      : `${event.status}${event.error === undefined ? "" : `: ${event.error}`}`;
+  return (
+    <SystemLine>
+      <span className={failed ? "text-danger" : undefined}>
+        node {event.nodeName} {event.status}
+      </span>{" "}
+      ({detail})
+    </SystemLine>
+  );
+}
+
+function EdgeTakenItem({ event }: { event: EdgeTakenEvent }) {
+  return (
+    <SystemLine>
+      route {event.source} → {event.target} ({event.matchedCondition})
+    </SystemLine>
+  );
+}
+
+function EdgeCapReachedItem({ event }: { event: EdgeCapReachedEvent }) {
+  return (
+    <SystemLine>
+      <span className="text-warning">
+        edge {event.edgeId} hit its iteration cap ({event.taken}/{event.maxIterations})
+      </span>
+    </SystemLine>
+  );
+}
+
 /** Render one feed row, styled per event type. */
 export function FeedItem({ entry }: { entry: FeedEntry }) {
   if (entry.kind === "message") {
     return (
-      <div className="rounded-lg border border-slate-200 bg-white p-3">
-        <p className="text-xs font-medium text-slate-500">assistant</p>
-        <p className="mt-1 whitespace-pre-wrap font-mono text-sm leading-relaxed text-slate-800">
+      <div className="rounded-lg border border-border bg-surface p-3">
+        <p className="text-xs font-medium text-muted-fg">assistant</p>
+        <p className="mt-1 whitespace-pre-wrap font-mono text-sm leading-relaxed text-fg">
           {entry.text}
         </p>
       </div>
@@ -123,11 +181,11 @@ export function FeedItem({ entry }: { entry: FeedEntry }) {
       return <SystemLine>agent finished</SystemLine>;
     case "error":
       return (
-        <div className="rounded-lg border border-red-200 bg-red-50 p-3">
-          <p className="text-xs font-semibold uppercase tracking-wide text-red-600">
+        <div className="rounded-lg border border-danger/40 bg-danger-subtle p-3">
+          <p className="text-xs font-semibold uppercase tracking-wide text-danger">
             error{event.code === undefined ? "" : ` (${event.code})`}
           </p>
-          <p className="mt-1 font-mono text-sm text-red-700">{event.message}</p>
+          <p className="mt-1 font-mono text-sm text-danger">{event.message}</p>
         </div>
       );
     case "run.status":
@@ -138,5 +196,15 @@ export function FeedItem({ entry }: { entry: FeedEntry }) {
       return <StepCompletedItem event={event} />;
     case "loop.iteration":
       return <LoopIterationItem event={event} />;
+    case "node.queued":
+      return <NodeQueuedItem event={event} />;
+    case "node.started":
+      return <NodeStartedItem event={event} />;
+    case "node.completed":
+      return <NodeCompletedItem event={event} />;
+    case "edge.taken":
+      return <EdgeTakenItem event={event} />;
+    case "edge.cap-reached":
+      return <EdgeCapReachedItem event={event} />;
   }
 }

@@ -1,9 +1,12 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
+import { usePathname, useRouter, useSearchParams } from "next/navigation";
 import type { Project, Run, StepRun, TerminalRunStatus } from "@openeuler/core";
-import { Button } from "@/components/Button";
-import { Card } from "@/components/Card";
+import { Button } from "@/components/ui/button";
+import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
+import { Tabs, type TabItem } from "@/components/ui/tabs";
+import { SkeletonLines } from "@/components/ui/skeleton";
 import { apiFetch, ApiError } from "@/lib/api";
 import { connectRunEvents, type RunStreamEvent, type RunStreamState } from "@/lib/run-events";
 import {
@@ -13,28 +16,38 @@ import {
   terminalEndMs,
   type FeedEntry,
 } from "@/lib/run-feed";
+import { EMPTY_RUN_GRAPH_STATE, type RunGraphFoldState } from "@/lib/run-graph/fold";
+import { RunGraphFoldBatcher } from "@/lib/run-graph/batcher";
+import { resolveRunGraphDocument, type RunGraphDocument } from "@/lib/run-graph/document";
+import { fetchWorkflow } from "@/lib/workflows-api";
+import {
+  parseRunDetailQuery,
+  runDetailQuery,
+  RUN_DETAIL_TABS,
+  type RunDetailTab,
+} from "@/lib/run-detail-query";
 import { DiffsTab } from "./DiffsTab";
 import { EventFeed } from "./EventFeed";
 import { InterruptedRunBanner } from "./InterruptedRunBanner";
 import { OutputPanel } from "./OutputPanel";
+import { RetryRunButton } from "./RetryRunButton";
 import { RunHeader } from "./RunHeader";
+import { RunGraphTab } from "./graph/RunGraphTab";
+import { TimelineTab } from "./TimelineTab";
 
 interface RunDetail {
-  run: Run;
+  run: Run & { workflowRevision?: { id: string; number: number } };
   steps: StepRun[];
   summary: { eventCount: number };
 }
 
 type LoadState =
   | { phase: "loading" }
-  | { phase: "ready"; detail: RunDetail; project: Project | null }
+  | { phase: "ready"; detail: RunDetail; project: Project | null; graph: RunGraphDocument }
   | { phase: "notfound" }
   | { phase: "error"; message: string };
 
-/** Bottom-panel tabs; Output only appears when the run produced one. */
-type ResultsTab = "output" | "diffs";
-
-/** Fetch the run detail (and its project); every failure collapses to a LoadState. */
+/** Fetch the run detail, its project and the graph document to render. */
 async function fetchRunDetail(runId: string): Promise<LoadState> {
   try {
     const detail = await apiFetch<RunDetail>(`/api/runs/${encodeURIComponent(runId)}`);
@@ -48,7 +61,10 @@ async function fetchRunDetail(runId: string): Promise<LoadState> {
     } catch {
       // Project name is cosmetic; a missing project must not break the page.
     }
-    return { phase: "ready", detail, project };
+    const graph = await resolveRunGraphDocument(detail.run, (workflowId) =>
+      fetchWorkflow(workflowId),
+    );
+    return { phase: "ready", detail, project, graph };
   } catch (cause) {
     if (cause instanceof ApiError && cause.status === 404) return { phase: "notfound" };
     return {
@@ -59,48 +75,62 @@ async function fetchRunDetail(runId: string): Promise<LoadState> {
 }
 
 /**
- * The run detail surface: header (project/branch/status/elapsed/stop), the
- * live SSE event feed (with full replay for completed runs), final output and
- * diff panels. All daemon traffic and the SSE lifecycle live here so the feed
- * components stay purely presentational.
+ * The run detail surface, 2.0 (#52): header (status, executions, duration,
+ * Stop/Retry) over tabs **Graph | Events | Diff | Timeline**. All daemon
+ * traffic and the SSE lifecycle live here; the fold batches graph-state
+ * updates (≤1 per interval window) so event bursts never thrash the canvas,
+ * while the fold itself stays an idempotent reducer — an SSE replay rebuilds
+ * the identical graph state.
  */
 export function RunDetailView({ runId }: { runId: string }) {
+  const router = useRouter();
+  const pathname = usePathname();
+  const searchParams = useSearchParams();
+  const query = parseRunDetailQuery(searchParams.toString());
+
   const [load, setLoad] = useState<LoadState>({ phase: "loading" });
   const [entries, setEntries] = useState<FeedEntry[]>([]);
+  const [foldState, setFoldState] = useState<RunGraphFoldState>(EMPTY_RUN_GRAPH_STATE);
   const [streamState, setStreamState] = useState<RunStreamState>("connecting");
   const [terminalStatus, setTerminalStatus] = useState<TerminalRunStatus | null>(null);
   const [endedMs, setEndedMs] = useState<number | null>(null);
   const [nowMs, setNowMs] = useState(() => Date.now());
-  const [resultsTab, setResultsTab] = useState<ResultsTab | null>(null);
+  const [graphVisited, setGraphVisited] = useState(false);
   const runRef = useRef<Run | null>(null);
 
   const refresh = useCallback(async (): Promise<void> => {
     setLoad(await fetchRunDetail(runId));
   }, [runId]);
 
-  // Load on mount / run switch; reset per-run feed state so client-side
-  // navigation between runs never shows the previous run's events.
+  // Load on mount / run switch; reset per-run state so client-side
+  // navigation between runs never shows the previous run's data.
   useEffect(() => {
     setLoad({ phase: "loading" });
     setEntries([]);
+    setFoldState(EMPTY_RUN_GRAPH_STATE);
     setTerminalStatus(null);
     setEndedMs(null);
+    setGraphVisited(false);
     setStreamState("connecting");
     void refresh();
   }, [refresh]);
 
   // Live stream: connects for every run — for terminal runs the daemon
   // replays persisted events through the terminal run.status and closes.
+  // Graph state folds through a throttled batcher (#52 performance).
   const streamRunId = load.phase === "ready" ? load.detail.run.id : null;
   const streamHandleRef = useRef<ReturnType<typeof connectRunEvents> | null>(null);
   useEffect(() => {
     if (!streamRunId) return;
+    const batcher = new RunGraphFoldBatcher({ onState: setFoldState });
     const handle = connectRunEvents({
       runId: streamRunId,
       onEvent: (event: RunStreamEvent) => {
         setEntries((prev) => appendFeedEvent(prev, event));
+        batcher.push(event);
         if (event.type === "run.status" && isTerminalRunStatus(event.status)) {
           setTerminalStatus(event.status);
+          batcher.flush();
           // A run row that is already terminal carries the authoritative end
           // time; Date.now() only approximates a live→terminal transition
           // observed before the row was refetched.
@@ -113,6 +143,7 @@ export function RunDetailView({ runId }: { runId: string }) {
     return () => {
       streamHandleRef.current = null;
       handle.close();
+      batcher.dispose();
     };
   }, [streamRunId]);
 
@@ -136,61 +167,93 @@ export function RunDetailView({ runId }: { runId: string }) {
 
   if (load.phase === "loading") {
     return (
-      <Card title="Loading run…" description={`Fetching run ${runId} from the daemon.`}>
-        <p className="py-6 text-sm text-slate-400">This should only take a moment.</p>
+      <Card>
+        <CardHeader>
+          <div>
+            <CardTitle>Loading run…</CardTitle>
+            <CardDescription>Fetching run {runId} from the daemon.</CardDescription>
+          </div>
+        </CardHeader>
+        <CardContent>
+          <SkeletonLines rows={3} />
+        </CardContent>
       </Card>
     );
   }
 
   if (load.phase === "notfound") {
     return (
-      <Card title="Run not found" description="The daemon has no record of this run.">
-        <div className="flex flex-col items-start gap-3 py-4 text-sm text-slate-500">
-          <p>
-            Run <span className="font-mono text-slate-700">{runId}</span> does not exist — it may
-            have been removed, or the link is stale.
-          </p>
-          <Button variant="secondary" onClick={() => void refresh()}>
-            Try again
-          </Button>
-        </div>
+      <Card>
+        <CardHeader>
+          <div>
+            <CardTitle>Run not found</CardTitle>
+            <CardDescription>The daemon has no record of this run.</CardDescription>
+          </div>
+        </CardHeader>
+        <CardContent>
+          <div className="flex flex-col items-start gap-3 py-2 text-sm text-muted-fg">
+            <p>
+              Run <span className="font-mono text-fg">{runId}</span> does not exist — it may have
+              been removed, or the link is stale.
+            </p>
+            <Button variant="secondary" onClick={() => void refresh()}>
+              Try again
+            </Button>
+          </div>
+        </CardContent>
       </Card>
     );
   }
 
   if (load.phase === "error") {
     return (
-      <Card title="Could not load run" description="The daemon did not answer as expected.">
-        <div className="flex flex-col items-start gap-3 py-4 text-sm text-slate-500">
-          <p className="text-red-600">{load.message}</p>
-          <Button variant="secondary" onClick={() => void refresh()}>
-            Retry
-          </Button>
-        </div>
+      <Card>
+        <CardHeader>
+          <div>
+            <CardTitle>Could not load run</CardTitle>
+            <CardDescription>The daemon did not answer as expected.</CardDescription>
+          </div>
+        </CardHeader>
+        <CardContent>
+          <div className="flex flex-col items-start gap-3 py-2 text-sm">
+            <p className="text-danger">{load.message}</p>
+            <Button variant="secondary" onClick={() => void refresh()}>
+              Retry
+            </Button>
+          </div>
+        </CardContent>
       </Card>
     );
   }
 
-  const { detail, project } = load;
+  const { detail, project, graph } = load;
   const steps = detail.steps;
   const lastOutput = steps.length > 0 ? (steps[steps.length - 1]?.output ?? "") : "";
   const output = lastOutput.length > 0 ? lastOutput : (detail.run.output ?? "");
-  const hasDiff = steps.some((step) => (step.diff ?? "").length > 0);
   const showPanels = effectiveStatus !== undefined && !live;
   const shownRun: Run =
     terminalStatus !== null ? { ...detail.run, status: terminalStatus } : detail.run;
 
-  // Bottom tabs: Output (when there is one) | Diffs (issue #20). Diffs stay
-  // reachable even without stored step diffs — the cumulative scope may still
-  // compute something live from the worktree.
-  const availableTabs: ResultsTab[] = [
-    ...(output.length > 0 ? (["output"] as const) : []),
-    "diffs",
-  ];
-  const activeTab: ResultsTab =
-    resultsTab !== null && availableTabs.includes(resultsTab)
-      ? resultsTab
-      : (availableTabs[0] as ResultsTab);
+  // Tabs: Graph leads whenever the run has a workflow behind it (pinned
+  // revision or legacy chain); ad-hoc task runs start on Events. The URL is
+  // the source of truth (`?tab=` deep links; `?stepRunId=` scopes Diff).
+  const graphAvailable = detail.run.workflowId !== undefined;
+  const defaultTab: RunDetailTab = graphAvailable ? "graph" : "events";
+  // Guard: `?tab=graph` on an ad-hoc run (no workflow) falls back to Events.
+  const activeTab: RunDetailTab =
+    query.tab === null || (query.tab === "graph" && !graphAvailable) ? defaultTab : query.tab;
+  const tabs: ReadonlyArray<TabItem<RunDetailTab>> = RUN_DETAIL_TABS.filter((tab) =>
+    tab.id === "graph" ? graphAvailable : true,
+  );
+
+  const selectTab = (tab: RunDetailTab, stepRunId?: string): void => {
+    const nextStepRunId = tab === "diff" ? (stepRunId ?? null) : null;
+    const href = `${pathname}${runDetailQuery({ tab, stepRunId: nextStepRunId })}`;
+    if (tab === "graph") setGraphVisited(true);
+    router.replace(href, { scroll: false });
+  };
+
+  const graphMounted = graphVisited || activeTab === "graph";
 
   return (
     <div className="flex flex-col gap-6">
@@ -199,51 +262,51 @@ export function RunDetailView({ runId }: { runId: string }) {
         projectName={project?.name ?? null}
         nowMs={nowMs}
         endedMs={endedMs}
+        executions={foldState.totalExecutions}
+        extraActions={
+          !live && shownRun.status !== "success" ? <RetryRunButton runId={shownRun.id} /> : null
+        }
         onAborted={() => void refresh()}
       />
 
       <InterruptedRunBanner run={shownRun} steps={steps} onChanged={() => void refresh()} />
 
-      <EventFeed
-        entries={entries}
-        streamState={streamState}
-        onReconnect={() => streamHandleRef.current?.reconnect()}
-      />
+      <div className="flex flex-col gap-4" data-run-tabs>
+        <Tabs
+          tabs={tabs}
+          active={activeTab}
+          onChange={(tab) => selectTab(tab)}
+          label="Run detail"
+        />
 
-      {showPanels ? (
-        <Card
-          title="Run results"
-          description={
-            hasDiff
-              ? "Final output and file changes made by this run."
-              : "Final output of this run."
-          }
-        >
-          <div className="flex gap-1 border-b border-slate-200">
-            {availableTabs.map((name) => (
-              <button
-                key={name}
-                type="button"
-                onClick={() => setResultsTab(name)}
-                className={`-mb-px rounded-t-md border-b-2 px-3 py-1.5 text-sm font-medium transition-colors ${
-                  activeTab === name
-                    ? "border-slate-900 text-slate-900"
-                    : "border-transparent text-slate-500 hover:text-slate-700"
-                }`}
-              >
-                {name === "output" ? "Output" : "Diffs"}
-              </button>
-            ))}
+        {graphAvailable && graphMounted ? (
+          <div className={activeTab === "graph" ? "" : "hidden"}>
+            <RunGraphTab
+              graph={graph}
+              state={foldState}
+              live={live}
+              steps={steps}
+              onOpenDiff={(stepRunId) => selectTab("diff", stepRunId)}
+            />
           </div>
-          <div className="mt-4">
-            {activeTab === "output" ? (
-              <OutputPanel output={output} />
-            ) : (
-              <DiffsTab runId={detail.run.id} steps={steps} />
-            )}
-          </div>
-        </Card>
-      ) : null}
+        ) : null}
+
+        {activeTab === "events" ? (
+          <EventFeed
+            entries={entries}
+            streamState={streamState}
+            onReconnect={() => streamHandleRef.current?.reconnect()}
+          />
+        ) : null}
+
+        {activeTab === "diff" ? (
+          <DiffsTab runId={detail.run.id} steps={steps} initialStepRunId={query.stepRunId} />
+        ) : null}
+
+        {activeTab === "timeline" ? <TimelineTab state={foldState} /> : null}
+      </div>
+
+      {showPanels && output.length > 0 ? <OutputPanel output={output} /> : null}
     </div>
   );
 }

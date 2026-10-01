@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import type { LoopBack, Project, Run, RunStatus, Step, StepRun, Workflow } from "@openeuler/core";
+import { WorkflowGraphSchema, linearToGraph } from "@openeuler/core";
 import { createDatabase } from "@openeuler/db";
 import type { Db } from "@openeuler/db";
 import { createDriverRegistry, createFakeDriver } from "@openeuler/drivers";
@@ -24,6 +25,8 @@ interface Harness {
   drivers: { impl: FakeDriver; rev: FakeDriver; ship: FakeDriver; boom: FakeDriver };
   makeWorkflow(steps: Workflow["steps"], loopBack?: LoopBack): Workflow;
   enqueueRun(workflowId?: string, task?: string): Run;
+  /** Like {@link enqueueRun} but pinned to a graph revision snapshot. */
+  enqueueRevisionRun(workflowId: string, revisionId: string, task?: string): Run;
 }
 
 const git = (cwd: string, ...args: string[]): void => {
@@ -106,6 +109,22 @@ const setup = (): Harness => {
         id: runId,
         projectId: project.id,
         ...(workflowId === undefined ? {} : { workflowId }),
+        status: "queued",
+        branch: `agentloop/${runId}`,
+        iteration: 0,
+        task,
+        createdAt: now,
+        updatedAt: now,
+      });
+    },
+    enqueueRevisionRun(workflowId, revisionId, task = "fix the docs") {
+      const runId = crypto.randomUUID();
+      const now = new Date().toISOString();
+      return db.runs.create({
+        id: runId,
+        projectId: project.id,
+        workflowId,
+        workflowRevisionId: revisionId,
         status: "queued",
         branch: `agentloop/${runId}`,
         iteration: 0,
@@ -1071,5 +1090,182 @@ describe("createFlowEngine (abort vs worktree lifecycle)", () => {
       encoding: "utf8",
     });
     expect(branches.trim()).toBe("");
+  });
+});
+
+describe("createFlowEngine (graph revision runs — dispatch to the graph engine)", () => {
+  /** StepRun rows flattened for equivalence comparisons, iteration-major. */
+  const stepRunTrace = (h: Harness, runId: string): string[] =>
+    h.db.stepRuns
+      .listByRun(runId)
+      .sort((a, b) =>
+        a.iteration === b.iteration ? a.stepId.localeCompare(b.stepId) : a.iteration - b.iteration,
+      )
+      .map((row) => `it${row.iteration}#${row.stepId}:${row.status}:${row.output}`);
+
+  /** The graph run's routing trail: `edgeId ->` per taken edge, in order. */
+  const edgeTrail = (h: Harness, runId: string): string[] =>
+    h.db.events
+      .getSince(runId)
+      .filter((event) => event.type === "edge.taken")
+      .map((event) => (event.type === "edge.taken" ? `${event.edgeId} ->` : ""));
+
+  it("executes a pinned chain+loop revision equivalently to the legacy workflow", async () => {
+    const h = setup();
+    // One cycler driver shared by both runs: its `outputs` cycle by call
+    // count with modulo, so run 2 replays the same sequence as run 1.
+    const cycler = createFakeDriver({
+      id: "cycler",
+      events: [{ type: "session", seq: 1, sessionId: "s-cycler" }],
+      outputs: ["WIP", "WIP", "ALL CLEAR"],
+    });
+    h.registry.registerDriver(cycler);
+
+    const workflow = h.makeWorkflow(
+      [
+        {
+          id: "s1",
+          name: "implement",
+          driver: "impl",
+          mode: "auto",
+          promptTemplate: "Task: {{task}}",
+          continueSession: false,
+        },
+        {
+          id: "s2",
+          name: "review",
+          driver: "rev",
+          mode: "auto",
+          promptTemplate: "Rev: {{prevOutput}} (pass {{iterations}})",
+          continueSession: true,
+        },
+        {
+          id: "s3",
+          name: "verify",
+          driver: "cycler",
+          mode: "auto",
+          promptTemplate: "Verify: {{prevOutput}}",
+          continueSession: true,
+        },
+      ],
+      {
+        toStepIndex: 1,
+        when: { type: "outputContains", pattern: "ALL CLEAR" },
+        maxIterations: 4,
+      },
+    );
+    // Snapshot the workflow as a graph revision (what the migration does).
+    const revision = h.db.workflowRevisions.create(
+      workflow.id,
+      linearToGraph({ steps: workflow.steps, loopBack: workflow.loopBack }),
+    );
+
+    const legacyRun = h.enqueueRun(workflow.id);
+    await h.engine.executeRun(legacyRun.id, noAbort);
+    await awaitStatus(h, legacyRun.id, "success");
+
+    const graphRun = h.enqueueRevisionRun(workflow.id, revision.id);
+    await h.engine.executeRun(graphRun.id, noAbort);
+    await awaitStatus(h, graphRun.id, "success");
+
+    // Same StepRun sequence (node ids, execution numbers, statuses, outputs):
+    // per-node execution numbers coincide with the legacy pass numbers on
+    // the chain+loop shape, so the traces match exactly.
+    expect(stepRunTrace(h, graphRun.id)).toEqual(stepRunTrace(h, legacyRun.id));
+    // ...same final run state, same prompts (node iteration numbers and
+    // prevOutput flow match the legacy passes).
+    expect(h.db.runs.get(graphRun.id)).toMatchObject({
+      status: "success",
+      output: "ALL CLEAR",
+      iteration: 2,
+      workflowRevisionId: revision.id,
+    });
+    expect(h.drivers.rev.calls.slice(0, 2).map((call) => call.prompt)).toEqual([
+      "Rev: IMPL-OUT (pass 1)",
+      "Rev: WIP (pass 2)",
+    ]);
+    // The graph engine emits edge.taken instead of loop.iteration events;
+    // the full routing trail (always chain edges included) mirrors the
+    // legacy loop verdicts (loop twice, then exit when the condition turns
+    // met).
+    expect(loopEvents(h, graphRun.id)).toEqual([]);
+    expect(edgeTrail(h, graphRun.id)).toEqual([
+      "e-s1-s2 ->",
+      "e-s2-s3 ->",
+      "e-loop-s3-s2 ->",
+      "e-s2-s3 ->",
+      "e-loop-s3-s2 ->",
+      "e-s2-s3 ->",
+      "e-exit-s3 ->",
+    ]);
+  });
+
+  it("dispatches router graphs to the graph engine (no more shim fail-fast)", async () => {
+    const h = setup();
+    const workflow = h.makeWorkflow([step({ id: "s1", driver: "impl" })]);
+    const routerGraph = WorkflowGraphSchema.parse({
+      entryNodeId: "triage",
+      nodes: [
+        {
+          id: "triage",
+          type: "agent",
+          name: "triage",
+          position: { x: 0, y: 0 },
+          config: {
+            driver: "impl",
+            mode: "auto",
+            promptTemplate: "{{task}}",
+            continueSession: false,
+          },
+        },
+        {
+          id: "fix",
+          type: "agent",
+          name: "fix",
+          position: { x: 280, y: 0 },
+          config: {
+            driver: "rev",
+            mode: "auto",
+            promptTemplate: "fix {{prevOutput}}",
+            continueSession: false,
+          },
+        },
+        {
+          id: "escalate",
+          type: "agent",
+          name: "escalate",
+          position: { x: 280, y: 200 },
+          config: {
+            driver: "ship",
+            mode: "auto",
+            promptTemplate: "escalate {{prevOutput}}",
+            continueSession: false,
+          },
+        },
+        { id: "exit", type: "exit", name: "Exit", position: { x: 560, y: 100 } },
+      ],
+      edges: [
+        {
+          id: "e1",
+          source: "triage",
+          target: "fix",
+          condition: { type: "outputContains", pattern: "bug" },
+        },
+        { id: "e2", source: "triage", target: "escalate" },
+        { id: "e3", source: "fix", target: "exit" },
+        { id: "e4", source: "escalate", target: "exit" },
+      ],
+    });
+    const revision = h.db.workflowRevisions.create(workflow.id, routerGraph);
+    const run = h.enqueueRevisionRun(workflow.id, revision.id);
+
+    await h.engine.executeRun(run.id, noAbort);
+    await awaitStatus(h, run.id, "success");
+
+    // "IMPL-OUT" contains no "bug": the always fallback routed to escalate.
+    expect(edgeTrail(h, run.id)).toEqual(["e2 ->", "e4 ->"]);
+    expect(h.drivers.rev.calls).toHaveLength(0);
+    expect(h.drivers.ship.calls[0]?.prompt).toBe("escalate IMPL-OUT");
+    expect(h.db.runs.get(run.id)).toMatchObject({ status: "success", output: "SHIP-OUT" });
   });
 });

@@ -15,6 +15,34 @@
       "when": 1790775567692,
       "tag": "0001_project_metadata",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "6",
+      "when": 1790819114316,
+      "tag": "0002_workflow_graph_revisions",
+      "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "6",
+      "when": 1790821796644,
+      "tag": "0003_faithful_red_shift",
+      "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "6",
+      "when": 1790838126057,
+      "tag": "0004_giant_freak",
+      "breakpoints": true
+    },
+    {
+      "idx": 5,
+      "version": "6",
+      "when": 1790841066201,
+      "tag": "0005_demonic_maverick",
+      "breakpoints": true
     }
   ]
 }

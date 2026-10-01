@@ -31,7 +31,7 @@ function Chevron({ open }: { open: boolean }) {
     <svg
       aria-hidden
       viewBox="0 0 16 16"
-      className={cn("size-3.5 shrink-0 text-slate-400 transition-transform", open && "rotate-90")}
+      className={cn("size-3.5 shrink-0 text-muted-fg transition-transform", open && "rotate-90")}
       fill="currentColor"
     >
       <path d="M6 4l4 4-4 4z" />
@@ -44,7 +44,7 @@ function DirIcon({ open }: { open: boolean }) {
     <svg
       aria-hidden
       viewBox="0 0 16 16"
-      className="size-4 shrink-0 text-slate-500"
+      className="size-4 shrink-0 text-muted-fg"
       fill="currentColor"
     >
       <path d="M1.5 3A1.5 1.5 0 0 1 3 1.5h3.086a1.5 1.5 0 0 1 1.06.44l.915.914a.5.5 0 0 0 .353.146H13A1.5 1.5 0 0 1 14.5 4.5V6H1.5z" />
@@ -54,7 +54,7 @@ function DirIcon({ open }: { open: boolean }) {
     <svg
       aria-hidden
       viewBox="0 0 16 16"
-      className="size-4 shrink-0 text-slate-500"
+      className="size-4 shrink-0 text-muted-fg"
       fill="currentColor"
     >
       <path d="M1.5 3A1.5 1.5 0 0 1 3 1.5h3.086a1.5 1.5 0 0 1 1.06.44l.915.914a.5.5 0 0 0 .353.146H13A1.5 1.5 0 0 1 14.5 4.5v8A1.5 1.5 0 0 1 13 14H3a1.5 1.5 0 0 1-1.5-1.5z" />
@@ -67,7 +67,7 @@ function FileIcon() {
     <svg
       aria-hidden
       viewBox="0 0 16 16"
-      className="size-4 shrink-0 text-slate-400"
+      className="size-4 shrink-0 text-muted-fg"
       fill="currentColor"
     >
       <path d="M4 1.5A1.5 1.5 0 0 0 2.5 3v10A1.5 1.5 0 0 0 4 14.5h8A1.5 1.5 0 0 0 13.5 13V5.914a1.5 1.5 0 0 0-.44-1.06l-2.914-2.915a1.5 1.5 0 0 0-1.06-.439zm6 1.121L12.379 5H10z" />
@@ -166,25 +166,25 @@ export function FileTree({
       aria-label="Project files"
       tabIndex={0}
       onKeyDown={onKeyDown}
-      className="h-full overflow-auto rounded-xl border border-slate-200 bg-white p-2 font-mono text-sm text-slate-700 shadow-sm outline-none focus-visible:ring-2 focus-visible:ring-slate-400"
+      className="h-full overflow-auto rounded-xl border border-border bg-surface p-2 font-mono text-sm text-fg shadow-1 outline-none focus-visible:ring-2 focus-visible:ring-accent"
     >
       {root.status === "idle" || root.status === "loading" ? (
-        <p className="px-2 py-4 text-sm text-slate-400" role="status">
+        <p className="px-2 py-4 text-sm text-muted-fg" role="status">
           Loading files…
         </p>
       ) : root.status === "error" ? (
         <div className="flex flex-col items-start gap-2 px-2 py-4 text-sm">
-          <p className="text-red-600">{root.error}</p>
+          <p className="text-danger">{root.error}</p>
           <button
             type="button"
             onClick={() => apply({ type: "retry", path: ROOT_DIR })}
-            className="rounded-md border border-slate-300 px-2 py-1 text-xs text-slate-600 hover:bg-slate-100"
+            className="rounded-md border border-border px-2 py-1 text-xs text-muted-fg transition-colors hover:bg-elevated hover:text-fg focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
           >
             Retry
           </button>
         </div>
       ) : root.entries.length === 0 ? (
-        <p className="px-2 py-4 text-sm text-slate-400">
+        <p className="px-2 py-4 text-sm text-muted-fg">
           This repository is empty — no files to browse.
         </p>
       ) : (
@@ -242,7 +242,7 @@ function TreeRow({
         onClick={onClick}
         className={cn(
           "flex cursor-pointer select-none items-center gap-1 rounded-md px-1 py-1",
-          selected ? "bg-slate-900 text-white" : "hover:bg-slate-100",
+          selected ? "bg-accent text-accent-fg" : "text-fg hover:bg-elevated",
         )}
         style={{ paddingLeft: `${node.depth * 14 + 4}px` }}
       >
@@ -257,7 +257,7 @@ function TreeRow({
       {node.type === "dir" && childListing?.status === "loading" ? (
         <div
           aria-hidden
-          className="py-1 text-xs text-slate-400"
+          className="py-1 text-xs text-muted-fg"
           style={{ paddingLeft: childIndent }}
         >
           Loading…
@@ -265,7 +265,7 @@ function TreeRow({
       ) : null}
       {node.type === "dir" && childListing?.status === "error" ? (
         <div className="flex items-center gap-2 py-1 text-xs" style={{ paddingLeft: childIndent }}>
-          <span className="truncate text-red-600" title={childListing.error ?? undefined}>
+          <span className="truncate text-danger" title={childListing.error ?? undefined}>
             {childListing.error}
           </span>
           <button
@@ -274,7 +274,7 @@ function TreeRow({
               event.stopPropagation();
               onRetry();
             }}
-            className="shrink-0 rounded border border-slate-300 px-1.5 py-0.5 font-sans text-slate-600 hover:bg-slate-100"
+            className="shrink-0 rounded border border-border px-1.5 py-0.5 font-sans text-muted-fg transition-colors hover:bg-elevated hover:text-fg focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
           >
             Retry
           </button>
@@ -285,7 +285,7 @@ function TreeRow({
       childListing.entries.length === 0 ? (
         <div
           aria-hidden
-          className="py-1 text-xs text-slate-400"
+          className="py-1 text-xs text-muted-fg"
           style={{ paddingLeft: childIndent }}
         >
           (empty)

@@ -1,5 +1,12 @@
 import { randomUUID } from "node:crypto";
-import type { PersistedEvent, Run, RunStatus, StepRun, TerminalRunStatus } from "@openeuler/core";
+import type {
+  PersistedEvent,
+  Run,
+  RunStatus,
+  StepRun,
+  TerminalRunStatus,
+  Workflow,
+} from "@openeuler/core";
 import { TERMINAL_RUN_STATUSES, RunStatusSchema } from "@openeuler/core";
 import type { Db } from "@openeuler/db";
 import { DriverError } from "@openeuler/drivers";
@@ -9,8 +16,9 @@ import { Hono, type Context } from "hono";
 import { streamSSE } from "hono/streaming";
 import { z } from "zod";
 import type { AppEnv } from "../app.js";
-import type { Executor } from "../executor.js";
+import type { Executor, RunStatusNotification } from "../executor.js";
 import { HttpError } from "../errors.js";
+import { ensureLatestRevision } from "./workflows.js";
 
 /**
  * StepRun `stepId` backing ad-hoc runs (no workflow); defined by the engine,
@@ -58,11 +66,29 @@ export interface EventStreamOptions {
   maxStreamsPerRun?: number;
 }
 
+/** Tunables for the global `GET /api/runs/stream`; overridable for tests. */
+export interface GlobalStreamOptions {
+  /** Idle heartbeat (`: ping` comment) interval. Default 15s. */
+  heartbeatMs?: number;
+  /** Max concurrent global streams before 429. Default 20. */
+  maxStreams?: number;
+}
+
 const DEFAULT_EVENT_STREAM: Required<EventStreamOptions> = {
   pollIntervalMs: 100,
   heartbeatMs: 15_000,
   maxStreamsPerRun: 5,
 };
+
+const DEFAULT_GLOBAL_STREAM: Required<GlobalStreamOptions> = {
+  heartbeatMs: 15_000,
+  maxStreams: 20,
+};
+
+/** Serializes one global run-status transition as an SSE frame (#51). */
+function globalRunStatusFrame(event: RunStatusNotification): string {
+  return `event: run.status\ndata: ${JSON.stringify(event)}\n\n`;
+}
 
 const isTerminalRunStatus = (status: RunStatus): status is TerminalRunStatus =>
   (TERMINAL_RUN_STATUSES as readonly string[]).includes(status);
@@ -79,20 +105,80 @@ export interface RunDetailBody {
 /** Run list payload: runs plus computed queue metadata for queued rows. */
 export interface RunListBody {
   runs: RunApiBody[];
+  /**
+   * Keyset cursor (`<createdAt>,<id>` of the last row) while another page may
+   * exist — pass back as `?before=` (#62).
+   */
+  nextCursor?: string;
+}
+
+/** Page size bounds for `GET /api/runs`: responses stay bounded (#62). */
+export const DEFAULT_RUNS_LIMIT = 50;
+export const MAX_RUNS_LIMIT = 200;
+
+/** Parses + clamps `?limit=` for the run list; default 50, clamped to 1..200. */
+export function parseRunsLimit(raw: string | undefined): number {
+  if (raw === undefined || raw === "") return DEFAULT_RUNS_LIMIT;
+  const parsed = z.coerce.number().int().safeParse(raw);
+  if (!parsed.success) {
+    throw new HttpError(
+      422,
+      "INVALID_LIMIT",
+      `limit must be an integer, got ${JSON.stringify(raw)}`,
+    );
+  }
+  return Math.min(Math.max(parsed.data, 1), MAX_RUNS_LIMIT);
+}
+
+/**
+ * Parses the run list's keyset cursor `?before=<createdAt>,<id>`: the last
+ * row of the previous page, in the list's `(createdAt desc, id asc)` order.
+ */
+export function parseRunsCursor(
+  raw: string | undefined,
+): { createdAt: string; id: string } | undefined {
+  if (raw === undefined || raw === "") return undefined;
+  const parts = raw.split(",");
+  const createdAt = parts[0];
+  const id = parts[1];
+  if (
+    parts.length !== 2 ||
+    createdAt === undefined ||
+    id === undefined ||
+    createdAt === "" ||
+    id === ""
+  ) {
+    throw new HttpError(
+      422,
+      "INVALID_CURSOR",
+      `before must be "<createdAt>,<id>" of a run row, got ${JSON.stringify(raw)}`,
+    );
+  }
+  return { createdAt, id };
 }
 
 /** Queue summary for dashboards: how many runs are queued vs executing. */
 export interface RunStatsBody {
   queued: number;
   running: number;
+  /** Echoed when `?projectId=` scopes the counts to one project (#51). */
+  projectId?: string;
 }
 
 /**
  * A run as returned by the API: the core `Run` plus `queuePosition`, a
- * computed field present only while the run sits in the global queue. It is
- * deliberately NOT part of the persisted core Run schema.
+ * computed field present only while the run sits in the global queue, and
+ * `workflowRevision` `{ id, number }`, resolved for runs pinned to a graph
+ * revision snapshot. `project`/`workflow` carry resolved names for table
+ * rendering (#51). All are deliberately NOT part of the persisted core
+ * Run schema.
  */
-export type RunApiBody = Run & { queuePosition?: number };
+export type RunApiBody = Run & {
+  queuePosition?: number;
+  workflowRevision?: { id: string; number: number };
+  project?: { id: string; name: string };
+  workflow?: { id: string; name: string };
+};
 
 /**
  * `queuePosition` per queued run id: how many queued runs were created
@@ -109,11 +195,59 @@ function queuePositionsByRunId(db: Db): Map<string, number> {
   return positions;
 }
 
-/** Attaches `queuePosition` to queued rows (others pass through untouched). */
-function withQueuePosition(run: Run, positions: Map<string, number>): RunApiBody {
-  if (run.status !== "queued") return run;
-  const queuePosition = positions.get(run.id);
-  return queuePosition === undefined ? run : { ...run, queuePosition };
+/** Attaches resolved names + revision/queue metadata to a run row. */
+function decorateRun(db: Db, run: Run, positions?: Map<string, number>): RunApiBody {
+  return decorateRuns(db, [run], positions)[0] as RunApiBody;
+}
+
+/**
+ * Bulk {@link decorateRun} for list pages (#62): projects, workflows and
+ * revisions are resolved with one query per kind over the page's unique
+ * ids instead of per row.
+ */
+function decorateRuns(db: Db, rows: readonly Run[], positions?: Map<string, number>): RunApiBody[] {
+  const unique = (ids: Array<string | undefined>): string[] => [
+    ...new Set(ids.filter((id): id is string => id !== undefined)),
+  ];
+  const projects = new Map(
+    db.projects
+      .getMany(unique(rows.map((run) => run.projectId)))
+      .map((project) => [project.id, project]),
+  );
+  const workflows = new Map(
+    db.workflows
+      .getMany(unique(rows.map((run) => run.workflowId)))
+      .map((workflow) => [workflow.id, workflow]),
+  );
+  const revisions = new Map(
+    db.workflowRevisions
+      .getMany(unique(rows.map((run) => run.workflowRevisionId)))
+      .map((revision) => [revision.id, revision]),
+  );
+  return rows.map((run) => {
+    let body: RunApiBody = run;
+    const project = projects.get(run.projectId);
+    if (project !== undefined) {
+      body = { ...body, project: { id: project.id, name: project.name } };
+    }
+    if (run.workflowId !== undefined) {
+      const workflow = workflows.get(run.workflowId);
+      if (workflow !== undefined) {
+        body = { ...body, workflow: { id: workflow.id, name: workflow.name } };
+      }
+    }
+    if (run.workflowRevisionId !== undefined) {
+      const revision = revisions.get(run.workflowRevisionId);
+      if (revision !== undefined) {
+        body = { ...body, workflowRevision: { id: revision.id, number: revision.number } };
+      }
+    }
+    if (run.status === "queued" && positions !== undefined) {
+      const queuePosition = positions.get(run.id);
+      if (queuePosition !== undefined) body = { ...body, queuePosition };
+    }
+    return body;
+  });
 }
 
 function requireDb(c: Context<AppEnv>): Db {
@@ -252,6 +386,8 @@ export function capPatchLines(patch: string): {
 export interface CreateRunsRouterOptions {
   /** SSE tuning for `GET /api/runs/:id/events` (tests shrink the timers). */
   eventStream?: EventStreamOptions;
+  /** SSE tuning for the global `GET /api/runs/stream` (tests shrink the timers). */
+  globalStream?: GlobalStreamOptions;
   /**
    * Worktree manager for `GET /api/runs/:id/diff?scope=cumulative` (computed
    * live in the run's worktree). Absent → that scope answers 503; the
@@ -266,8 +402,14 @@ export function createRunsRouter(options: CreateRunsRouterOptions = {}): Hono<Ap
     ...DEFAULT_EVENT_STREAM,
     ...options.eventStream,
   };
+  const globalStreamOptions: Required<GlobalStreamOptions> = {
+    ...DEFAULT_GLOBAL_STREAM,
+    ...options.globalStream,
+  };
   /** Active SSE stream count per run id; guards the concurrent-stream cap. */
   const activeStreams = new Map<string, number>();
+  /** Active global stream count; guards the global-stream cap. */
+  const activeGlobalStreams = { count: 0 };
 
   runs.post("/", async (c) => {
     const db = requireDb(c);
@@ -311,33 +453,145 @@ export function createRunsRouter(options: CreateRunsRouterOptions = {}): Hono<Ap
 
   runs.get("/", (c) => {
     const db = requireDb(c);
+    // `status` accepts a comma-separated list (dashboard multi-select, #51):
+    // every value must be a valid status; an empty segment is rejected.
     const statusRaw = c.req.query("status");
-    let status: Run["status"] | undefined;
-    if (statusRaw !== undefined) {
-      const parsed = RunStatusSchema.safeParse(statusRaw);
-      if (!parsed.success) {
+    let statuses: RunStatus[] | undefined;
+    if (statusRaw !== undefined && statusRaw !== "") {
+      const parsed = statusRaw.split(",").map((value) => RunStatusSchema.safeParse(value));
+      const invalid = parsed.findIndex((result) => !result.success);
+      if (invalid !== -1) {
         throw new HttpError(
           422,
           "INVALID_STATUS",
-          `status must be one of queued|running|success|failed|aborted|interrupted, got ${JSON.stringify(statusRaw)}`,
+          `status must be one of queued|running|success|failed|aborted|interrupted, got ${JSON.stringify(statusRaw.split(",")[invalid])}`,
         );
       }
-      status = parsed.data;
+      statuses = parsed.map((result) => {
+        if (!result.success) throw new Error("unreachable");
+        return result.data;
+      });
     }
-    const runs = db.runs.list(c.req.query("projectId") || undefined, status);
+    const all = db.runs.list(c.req.query("projectId") || undefined);
+    const filtered =
+      statuses === undefined ? all : all.filter((run) => statuses.includes(run.status));
+    const limit = parseRunsLimit(c.req.query("limit"));
+    const before = parseRunsCursor(c.req.query("before"));
+    // `all` is `(createdAt desc, id asc)`; the cursor keeps that order
+    // stable across pages (no offset drift as new runs arrive).
+    const afterCursor = filtered.filter(
+      (run) =>
+        before === undefined ||
+        run.createdAt < before.createdAt ||
+        (run.createdAt === before.createdAt && run.id > before.id),
+    );
+    const hasMore = afterCursor.length > limit;
+    const page = hasMore ? afterCursor.slice(0, limit) : afterCursor;
+    const last = page[page.length - 1];
     const positions = queuePositionsByRunId(db);
-    const body: RunListBody = { runs: runs.map((run) => withQueuePosition(run, positions)) };
+    const body: RunListBody = {
+      runs: decorateRuns(db, page, positions),
+      ...(hasMore && last !== undefined ? { nextCursor: `${last.createdAt},${last.id}` } : {}),
+    };
     return c.json(body);
   });
 
   // Registered before `/:id` so "stats" is not captured as a run id.
   runs.get("/stats", (c) => {
     const db = requireDb(c);
+    const projectId = c.req.query("projectId") || undefined;
     const body: RunStatsBody = {
-      queued: db.runs.list(undefined, "queued").length,
-      running: db.runs.list(undefined, "running").length,
+      queued: db.runs.list(projectId, "queued").length,
+      running: db.runs.list(projectId, "running").length,
+      ...(projectId === undefined ? {} : { projectId }),
     };
     return c.json(body);
+  });
+
+  // Global run-status stream (#51): one subscription covers every run on the
+  // daemon. Pushes a `run.status` frame whenever ANY run transitions
+  // (queued admission, running start, terminal) — live-only, no replay:
+  // latest state comes from the runs table, the stream is for changes.
+  // Quiet connections get `: ping` heartbeats so proxies do not reap them.
+  runs.get("/stream", (c) => {
+    const executor = requireExecutor(c);
+
+    const active = activeGlobalStreams;
+    if (active.count >= globalStreamOptions.maxStreams) {
+      throw new HttpError(
+        429,
+        "TOO_MANY_STREAMS",
+        `the daemon already has ${active.count} global run streams (max ${globalStreamOptions.maxStreams})`,
+      );
+    }
+    active.count += 1;
+
+    return streamSSE(c, async (stream) => {
+      let released = false;
+      const release = (): void => {
+        if (released) return;
+        released = true;
+        active.count -= 1;
+      };
+
+      let stopped = false;
+      const stop = (): void => {
+        stopped = true;
+      };
+      let wake: (() => void) | null = null;
+      const notified = new Promise<void>((resolve) => {
+        wake = resolve;
+      });
+      stream.onAbort(() => {
+        stop();
+        wake?.();
+      });
+      const signal = c.req.raw.signal;
+      const onSignalAbort = (): void => {
+        stop();
+        wake?.();
+      };
+      if (signal.aborted) onSignalAbort();
+      else signal.addEventListener("abort", onSignalAbort, { once: true });
+
+      // Frames land in a queue from the listener (sync), and the loop below
+      // is the only writer — frames never interleave mid-write.
+      const frames: string[] = [];
+      let onEvent: (() => void) | null = null;
+      const unsubscribe = executor.onRunStatus((event) => {
+        frames.push(globalRunStatusFrame(event));
+        onEvent?.();
+      });
+
+      try {
+        for (;;) {
+          while (frames.length > 0) {
+            const frame = frames.shift() as string;
+            if (stopped) return;
+            await stream.write(frame);
+          }
+          if (stopped) return;
+
+          const pulse = delay(globalStreamOptions.heartbeatMs);
+          const eventGate = new Promise<void>((resolve) => {
+            onEvent = resolve;
+          });
+          try {
+            await Promise.race([pulse.promise, eventGate, notified]);
+          } finally {
+            pulse.cancel();
+          }
+          if (stopped) return;
+          if (frames.length === 0) {
+            await stream.write(": ping\n\n");
+          }
+        }
+      } finally {
+        unsubscribe();
+        signal.removeEventListener("abort", onSignalAbort);
+        release();
+      }
+    });
   });
 
   runs.get("/:id", (c) => {
@@ -359,7 +613,7 @@ export function createRunsRouter(options: CreateRunsRouterOptions = {}): Hono<Ap
       return ai === bi ? a.stepId.localeCompare(b.stepId) : ai - bi;
     });
     const body: RunDetailBody = {
-      run: withQueuePosition(run, queuePositionsByRunId(db)),
+      run: decorateRun(db, run, queuePositionsByRunId(db)),
       steps: sorted,
       iterations: groupByIteration(sorted),
       summary: { eventCount: db.events.count(run.id) },
@@ -604,7 +858,7 @@ export function createRunsRouter(options: CreateRunsRouterOptions = {}): Hono<Ap
         `run ${id} already finished with status ${result.status}`,
       );
     }
-    return c.json({ run: db.runs.get(id) });
+    return c.json({ run: decorateRun(db, db.runs.get(id) as Run) });
   });
 
   // Resume an interrupted run in place: the engine continues from the current
@@ -637,7 +891,7 @@ export function createRunsRouter(options: CreateRunsRouterOptions = {}): Hono<Ap
     db.runs.updateStatus(id, "queued");
     c.get("logger").info({ runId: id }, "run resumed after interruption");
     executor.startRun(id);
-    return c.json({ run: db.runs.get(id) }, 202);
+    return c.json({ run: decorateRun(db, db.runs.get(id) as Run) }, 202);
   });
 
   // Retry any finished (terminal or interrupted) run as a NEW run: same
@@ -673,10 +927,18 @@ export function createRunsRouter(options: CreateRunsRouterOptions = {}): Hono<Ap
 
     const runId = randomUUID();
     const now = new Date().toISOString();
+    // A retried workflow run pins the workflow's CURRENT latest revision
+    // (same rule as a fresh run creation), not the original run's snapshot.
+    let pinnedRevisionId: string | undefined;
+    if (run.workflowId !== undefined) {
+      const workflow = db.workflows.get(run.workflowId) as Workflow;
+      pinnedRevisionId = ensureLatestRevision(db, workflow).id;
+    }
     const retry: Run = {
       id: runId,
       projectId: run.projectId,
       ...(run.workflowId === undefined ? {} : { workflowId: run.workflowId }),
+      ...(pinnedRevisionId === undefined ? {} : { workflowRevisionId: pinnedRevisionId }),
       status: "queued",
       branch: branchForRun(runId),
       iteration: 0,
@@ -687,7 +949,7 @@ export function createRunsRouter(options: CreateRunsRouterOptions = {}): Hono<Ap
     db.runs.create(retry);
     c.get("logger").info({ runId, sourceRunId: id }, "run retried as a new run");
     executor.startRun(runId);
-    return c.json({ run: db.runs.get(runId) }, 202);
+    return c.json({ run: decorateRun(db, db.runs.get(runId) as Run) }, 202);
   });
 
   return runs;

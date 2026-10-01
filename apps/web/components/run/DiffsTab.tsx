@@ -3,6 +3,9 @@
 import nextDynamic from "next/dynamic";
 import { useCallback, useEffect, useMemo, useReducer, useState } from "react";
 import type { StepRun } from "@openeuler/core";
+import { useThemeContext } from "@/components/ThemeProvider";
+import { Button } from "@/components/ui/button";
+import { Select } from "@/components/ui/input";
 import { parsePatch } from "@/lib/diff-parse";
 import {
   diffLoadReducer,
@@ -18,7 +21,7 @@ import {
  */
 const DiffFileView = nextDynamic(() => import("./DiffFileView"), {
   ssr: false,
-  loading: () => <p className="px-4 py-3 text-xs text-slate-400">Loading diff viewer…</p>,
+  loading: () => <p className="px-4 py-3 text-xs text-muted-fg">Loading diff viewer…</p>,
 });
 
 const sectionId = (index: number): string => `diff-file-${index}`;
@@ -28,13 +31,40 @@ const sectionId = (index: number): string => `diff-file-${index}`;
  * per-step with iteration), a file sidebar parsed from the patch (+/- counts,
  * click to jump), side-by-side syntax-highlighted rendering, and a
  * truncation banner for server-capped huge diffs.
+ *
+ * `initialStepRunId` (#52) honors the node drawer's deep link
+ * (`?tab=diff&stepRunId=…`): the tab starts on — and switches to — that
+ * step run's scope whenever the link target changes.
  */
-export function DiffsTab({ runId, steps }: { runId: string; steps: readonly StepRun[] }) {
-  const [scope, setScope] = useState<DiffScope>({ kind: "cumulative" });
+export function DiffsTab({
+  runId,
+  steps,
+  initialStepRunId = null,
+}: {
+  runId: string;
+  steps: readonly StepRun[];
+  initialStepRunId?: string | null;
+}) {
+  const { theme } = useThemeContext();
+  const [scope, setScope] = useState<DiffScope>(() =>
+    initialStepRunId === null
+      ? { kind: "cumulative" }
+      : { kind: "step", stepRunId: initialStepRunId },
+  );
   const [state, dispatch] = useReducer(diffLoadReducer, { phase: "idle" } as DiffLoadState);
   const [split, setSplit] = useState(true);
 
   const stepOptions = useMemo(() => stepScopeOptions(steps), [steps]);
+
+  // Deep-link target changed (another drawer link): follow it.
+  useEffect(() => {
+    if (initialStepRunId === null) return;
+    setScope((current) =>
+      current.kind === "step" && current.stepRunId === initialStepRunId
+        ? current
+        : { kind: "step", stepRunId: initialStepRunId },
+    );
+  }, [initialStepRunId]);
 
   useEffect(() => {
     let cancelled = false;
@@ -77,12 +107,12 @@ export function DiffsTab({ runId, steps }: { runId: string; steps: readonly Step
     <div className="flex flex-col gap-3">
       {/* Scope switch + view mode */}
       <div className="flex flex-wrap items-center gap-2">
-        <label className="text-xs font-medium text-slate-500" htmlFor="diff-scope">
+        <label className="text-xs font-medium text-muted-fg" htmlFor="diff-scope">
           Scope
         </label>
-        <select
+        <Select
           id="diff-scope"
-          className="rounded-md border border-slate-300 bg-white px-2 py-1 text-xs text-slate-700"
+          className="py-1 text-xs"
           value={scope.kind === "cumulative" ? "cumulative" : scope.stepRunId}
           onChange={(event) => {
             const value = event.target.value;
@@ -98,31 +128,27 @@ export function DiffsTab({ runId, steps }: { runId: string; steps: readonly Step
               {option.hasDiff ? "" : " (no diff)"}
             </option>
           ))}
-        </select>
-        <button
-          type="button"
-          className="rounded-md border border-slate-300 bg-white px-2 py-1 text-xs font-medium text-slate-600 hover:bg-slate-100"
-          onClick={() => setSplit((prev) => !prev)}
-        >
+        </Select>
+        <Button variant="secondary" size="sm" onClick={() => setSplit((prev) => !prev)}>
           {split ? "Side-by-side" : "Unified"}
-        </button>
+        </Button>
         {state.phase === "ready" ? (
-          <span className="text-xs text-slate-400">
+          <span className="text-xs text-muted-fg">
             {entries.length} file{entries.length === 1 ? "" : "s"}
           </span>
         ) : null}
       </div>
 
       {state.phase === "loading" ? (
-        <p className="py-6 text-sm text-slate-400">Loading diff…</p>
+        <p className="py-6 text-sm text-muted-fg">Loading diff…</p>
       ) : null}
 
       {state.phase === "error" ? (
-        <div className="rounded-lg border border-red-200 bg-red-50 p-4 text-sm text-red-700">
+        <div className="rounded-lg border border-danger/40 bg-danger-subtle p-4 text-sm text-danger">
           <p>{state.message}</p>
           <button
             type="button"
-            className="mt-2 text-xs font-medium underline"
+            className="mt-2 rounded-sm text-xs font-medium underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
             onClick={() => setScope({ ...scope })}
           >
             Retry
@@ -131,7 +157,7 @@ export function DiffsTab({ runId, steps }: { runId: string; steps: readonly Step
       ) : null}
 
       {state.phase === "gone" ? (
-        <div className="rounded-lg border border-amber-200 bg-amber-50 p-4 text-sm text-amber-800">
+        <div className="rounded-lg border border-warning/40 bg-warning-subtle p-4 text-sm text-warning">
           <p>
             The run&apos;s worktree no longer exists, so the cumulative diff cannot be computed.
             Per-step diffs remain available — pick a step from the scope switch above.
@@ -141,7 +167,7 @@ export function DiffsTab({ runId, steps }: { runId: string; steps: readonly Step
 
       {state.phase === "ready" ? (
         state.diff.patch.length === 0 ? (
-          <p className="py-6 text-sm text-slate-400">
+          <p className="py-6 text-sm text-muted-fg">
             No changes recorded for this scope
             {state.diff.scope === "step" ? " (step made no file changes)" : ""}.
           </p>
@@ -149,7 +175,7 @@ export function DiffsTab({ runId, steps }: { runId: string; steps: readonly Step
           <>
             {state.diff.truncated ? (
               <div
-                className="rounded-lg border border-amber-200 bg-amber-50 px-4 py-2 text-xs text-amber-800"
+                className="rounded-lg border border-warning/40 bg-warning-subtle px-4 py-2 text-xs text-warning"
                 data-testid="diff-truncated-banner"
               >
                 Showing the first {state.diff.maxLines.toLocaleString()} of{" "}
@@ -162,7 +188,7 @@ export function DiffsTab({ runId, steps }: { runId: string; steps: readonly Step
               {/* File sidebar */}
               <nav
                 aria-label="Changed files"
-                className="w-full shrink-0 rounded-lg border border-slate-200 bg-slate-50 p-2 lg:max-h-[40rem] lg:w-72 lg:overflow-y-auto"
+                className="w-full shrink-0 rounded-lg border border-border bg-elevated p-2 lg:max-h-[40rem] lg:w-72 lg:overflow-y-auto"
               >
                 <ul className="flex flex-col gap-0.5">
                   {entries.map((entry, index) => (
@@ -170,13 +196,13 @@ export function DiffsTab({ runId, steps }: { runId: string; steps: readonly Step
                       <button
                         type="button"
                         onClick={() => jumpTo(index)}
-                        className="flex w-full items-center justify-between gap-2 rounded px-2 py-1 text-left font-mono text-xs text-slate-700 hover:bg-slate-200"
+                        className="flex w-full items-center justify-between gap-2 rounded px-2 py-1 text-left font-mono text-xs text-fg transition-colors hover:bg-surface focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
                         title={entry.path}
                       >
                         <span className="truncate">{entry.path}</span>
                         <span className="shrink-0 tabular-nums">
-                          <span className="text-emerald-600">+{entry.additions}</span>{" "}
-                          <span className="text-red-500">−{entry.deletions}</span>
+                          <span className="text-success">+{entry.additions}</span>{" "}
+                          <span className="text-danger">−{entry.deletions}</span>
                         </span>
                       </button>
                     </li>
@@ -189,19 +215,19 @@ export function DiffsTab({ runId, steps }: { runId: string; steps: readonly Step
                   <section
                     key={entry.key}
                     id={sectionId(index)}
-                    className="scroll-mt-4 overflow-hidden rounded-lg border border-slate-200 bg-white"
+                    className="scroll-mt-4 overflow-hidden rounded-lg border border-border bg-surface"
                   >
-                    <header className="flex items-center justify-between gap-2 border-b border-slate-200 bg-slate-50 px-4 py-2">
-                      <span className="truncate font-mono text-xs font-semibold text-slate-800">
+                    <header className="flex items-center justify-between gap-2 border-b border-border bg-elevated px-4 py-2">
+                      <span className="truncate font-mono text-xs font-semibold text-fg">
                         {entry.isNew ? "A " : entry.isDeleted ? "D " : entry.isRename ? "R " : "M "}
                         {entry.path}
                       </span>
                       <span className="shrink-0 font-mono text-xs tabular-nums">
-                        <span className="text-emerald-600">+{entry.additions}</span>{" "}
-                        <span className="text-red-500">−{entry.deletions}</span>
+                        <span className="text-success">+{entry.additions}</span>{" "}
+                        <span className="text-danger">−{entry.deletions}</span>
                       </span>
                     </header>
-                    <DiffFileView entry={entry} split={split} useDarkTheme={false} />
+                    <DiffFileView entry={entry} split={split} useDarkTheme={theme === "dark"} />
                   </section>
                 ))}
               </div>

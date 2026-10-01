@@ -1,37 +1,34 @@
-import { Button } from "@/components/Button";
-import { Card } from "@/components/Card";
-import { ActiveRunsCard } from "@/components/ActiveRunsCard";
-import { HealthPill } from "@/components/HealthPill";
+import { Suspense } from "react";
+import { ActivityFeed } from "@/components/dashboard/ActivityFeed";
+import { DashboardRunsTable } from "@/components/dashboard/DashboardRunsTable";
+import { FreshInstallWizardRedirect } from "@/components/dashboard/FreshInstallWizardRedirect";
+import { ProjectCardsRow } from "@/components/dashboard/ProjectCardsRow";
+import { SkeletonLines } from "@/components/ui/skeleton";
+
+/** Dashboard 2.0 (#51): project cards on top, activity feed + live runs table. */
+export const dynamic = "force-dynamic";
 
 export default function DashboardPage() {
   return (
     <div className="flex flex-col gap-6">
-      <div className="flex flex-wrap items-center justify-between gap-3">
-        <div>
-          <h1 className="text-2xl font-semibold text-slate-900">Dashboard</h1>
-          <p className="mt-1 text-sm text-slate-500">
-            Overview of your Openeuler daemon, projects and runs.
-          </p>
-        </div>
-        <HealthPill />
+      {/* Fresh install (no projects, no workflows): straight to the wizard (#53). */}
+      <FreshInstallWizardRedirect />
+      <div>
+        <h1 className="text-display font-semibold text-fg">Dashboard</h1>
+        <p className="mt-1 text-sm text-muted-fg">
+          Your projects, live runs and everything that happened lately.
+        </p>
       </div>
 
-      <div className="grid gap-6 md:grid-cols-2">
-        <Card title="Recent projects" description="Repositories registered with the daemon.">
-          <div className="flex flex-col items-start gap-3 py-6 text-sm text-slate-500">
-            <p>No projects yet.</p>
-            <Button disabled title="Projects API is coming soon (#6)">
-              Open a project…
-            </Button>
-          </div>
-        </Card>
+      <section aria-label="Projects">
+        <ProjectCardsRow />
+      </section>
 
-        <Card
-          title="Active runs"
-          description="Workflow runs currently queued or executing, polled from /api/runs/stats."
-        >
-          <ActiveRunsCard />
-        </Card>
+      <div className="grid items-start gap-6 xl:grid-cols-[minmax(320px,2fr)_3fr]">
+        <ActivityFeed />
+        <Suspense fallback={<SkeletonLines rows={8} />}>
+          <DashboardRunsTable />
+        </Suspense>
       </div>
     </div>
   );

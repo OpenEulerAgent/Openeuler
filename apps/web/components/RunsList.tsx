@@ -3,9 +3,20 @@
 import { useCallback, useEffect, useState } from "react";
 import type { Run } from "@openeuler/core";
 import Link from "next/link";
-import { Button } from "@/components/Button";
-import { Card } from "@/components/Card";
 import { StatusBadge } from "@/components/StatusBadge";
+import { Button } from "@/components/ui/button";
+import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
+import { EmptyState } from "@/components/ui/empty-state";
+import { SkeletonLines } from "@/components/ui/skeleton";
+import {
+  Table,
+  TableBody,
+  TableCell,
+  TableHead,
+  TableHeader,
+  TableRow,
+} from "@/components/ui/table";
+import { PlayIcon } from "@/components/shell/icons";
 import { apiFetch, ApiError } from "@/lib/api";
 import { useRunStats } from "@/lib/runs-stats";
 
@@ -42,7 +53,7 @@ function RunCountBadges() {
   );
 }
 
-/** Run history list (newest first): status badge, branch, task, created time. */
+/** Run history table (newest first): status, branch, task, created time. */
 export function RunsList({
   projectId,
   title = "Runs",
@@ -65,61 +76,81 @@ export function RunsList({
   }, [load]);
 
   return (
-    <Card
-      title={title}
-      description={description ?? "Every run known to the daemon, newest first."}
-      action={
+    <Card>
+      <CardHeader>
+        <div>
+          <CardTitle>{title}</CardTitle>
+          <CardDescription>
+            {description ?? "Every run known to the daemon, newest first."}
+          </CardDescription>
+        </div>
         <span className="flex items-center gap-3">
           {projectId === undefined ? <RunCountBadges /> : null}
-          <Button variant="secondary" onClick={() => void load()}>
+          <Button variant="secondary" size="sm" onClick={() => void load()}>
             Refresh
           </Button>
         </span>
-      }
-    >
-      {state.phase === "loading" ? (
-        <p className="py-6 text-sm text-slate-400">Loading runs…</p>
-      ) : state.phase === "error" ? (
-        <div className="flex flex-col items-start gap-3 py-4 text-sm">
-          <p className="text-red-600">{state.message}</p>
-          <Button variant="secondary" onClick={() => void load()}>
-            Retry
-          </Button>
-        </div>
-      ) : state.runs.length === 0 ? (
-        <p className="py-6 text-sm text-slate-400">{emptyText}</p>
-      ) : (
-        <ul className="divide-y divide-slate-100">
-          {state.runs.map((run) => (
-            <li key={run.id}>
-              <Link
-                href={`/runs/${run.id}`}
-                className="flex flex-wrap items-center justify-between gap-2 py-3 hover:bg-slate-50"
-              >
-                <span className="min-w-0">
-                  <span className="block truncate font-mono text-sm text-slate-900">
-                    {run.branch}
-                  </span>
-                  {run.task ? (
-                    <span className="mt-0.5 block max-w-xl truncate text-xs text-slate-500">
-                      {run.task}
+      </CardHeader>
+      <CardContent>
+        {state.phase === "loading" ? (
+          <SkeletonLines rows={4} />
+        ) : state.phase === "error" ? (
+          <div className="flex flex-col items-start gap-3 py-2 text-sm">
+            <p className="text-danger">{state.message}</p>
+            <Button variant="secondary" size="sm" onClick={() => void load()}>
+              Retry
+            </Button>
+          </div>
+        ) : state.runs.length === 0 ? (
+          <EmptyState
+            icon={<PlayIcon className="size-5" />}
+            title="No runs"
+            description={emptyText}
+          />
+        ) : (
+          <Table>
+            <TableHeader>
+              <TableRow>
+                <TableHead>Branch / task</TableHead>
+                <TableHead className="w-44 text-right">Created</TableHead>
+                <TableHead className="w-28 text-right">Status</TableHead>
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              {state.runs.map((run) => (
+                <TableRow key={run.id}>
+                  <TableCell>
+                    <Link
+                      href={`/runs/${run.id}`}
+                      className="block min-w-0 rounded-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
+                    >
+                      <span className="block truncate font-mono text-sm text-fg">{run.branch}</span>
+                      {run.task ? (
+                        <span className="mt-0.5 block max-w-xl truncate text-xs text-muted-fg">
+                          {run.task}
+                        </span>
+                      ) : null}
+                    </Link>
+                  </TableCell>
+                  <TableCell className="text-right align-top">
+                    {run.status === "queued" && run.queuePosition !== undefined ? (
+                      <span className="block text-xs text-muted-fg">
+                        #{run.queuePosition} in queue
+                      </span>
+                    ) : null}
+                    <span className="text-xs text-muted-fg">
+                      {new Date(run.createdAt).toLocaleString()}
                     </span>
-                  ) : null}
-                </span>
-                <span className="flex items-center gap-3">
-                  {run.status === "queued" && run.queuePosition !== undefined ? (
-                    <span className="text-xs text-slate-400">#{run.queuePosition} in queue</span>
-                  ) : null}
-                  <span className="text-xs text-slate-400">
-                    {new Date(run.createdAt).toLocaleString()}
-                  </span>
-                  <StatusBadge status={run.status} />
-                </span>
-              </Link>
-            </li>
-          ))}
-        </ul>
-      )}
+                  </TableCell>
+                  <TableCell className="text-right align-top">
+                    <StatusBadge status={run.status} />
+                  </TableCell>
+                </TableRow>
+              ))}
+            </TableBody>
+          </Table>
+        )}
+      </CardContent>
     </Card>
   );
 }

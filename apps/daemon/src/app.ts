@@ -16,9 +16,13 @@ import type { ShutdownHook, ShutdownRegistryOptions } from "./shutdown.js";
 import { createProjectsRouter } from "./routes/projects.js";
 import { createDriversRouter } from "./routes/drivers.js";
 import { createFilesRouter } from "./routes/files.js";
-import type { EventStreamOptions } from "./routes/runs.js";
+import { createPresetsRouter } from "./routes/presets.js";
+import type { EventStreamOptions, GlobalStreamOptions } from "./routes/runs.js";
 import { createRunsRouter } from "./routes/runs.js";
+import type { SystemRouterOptions } from "./routes/system.js";
+import { createSystemRouter } from "./routes/system.js";
 import { createWorkflowsRouter } from "./routes/workflows.js";
+import { createActivityRouter } from "./routes/activity.js";
 
 export const DEFAULT_CORS_ORIGIN = "http://localhost:3000";
 
@@ -44,6 +48,13 @@ export interface CreateAppOptions {
   shutdown?: ShutdownRegistryOptions;
   /** SSE tuning for `GET /api/runs/:id/events`; tests shrink the timers. */
   eventStream?: EventStreamOptions;
+  /** SSE tuning for the global `GET /api/runs/stream`; tests shrink the timers. */
+  globalStream?: GlobalStreamOptions;
+  /**
+   * `GET /api/system/check` tuning (#53): probe binaries, timeouts and cache
+   * TTL. Defaults probe `git` / `opencode` from PATH and cache for 30s.
+   */
+  system?: SystemRouterOptions;
   /**
    * Concurrency cap reported by `/health`. Defaults to
    * `$MAX_CONCURRENT_RUNS` (integer >= 1), then 2; the executor applies the
@@ -109,9 +120,20 @@ export function createApp(options: CreateAppOptions = {}): DaemonApp {
 
   app.route("/api/projects", createProjectsRouter());
   app.route("/api/projects", createFilesRouter());
+  app.route("/api/projects", createPresetsRouter());
   app.route("/api/drivers", createDriversRouter(options.drivers));
+  // The system router reads the worktree store root from the context.
+  app.route("/api/system", createSystemRouter(options.system));
   app.route("/api/workflows", createWorkflowsRouter());
-  app.route("/api/runs", createRunsRouter({ eventStream: options.eventStream, worktrees }));
+  app.route(
+    "/api/runs",
+    createRunsRouter({
+      eventStream: options.eventStream,
+      globalStream: options.globalStream,
+      worktrees,
+    }),
+  );
+  app.route("/api/activity", createActivityRouter());
 
   app.onError((err, c) => {
     if (err instanceof HttpError) {

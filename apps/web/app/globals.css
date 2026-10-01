@@ -1,1 +1,143 @@
 @import "tailwindcss";
+
+/*
+ * Openeuler design tokens (issue #50).
+ *
+ * Theming strategy: dark is the DEFAULT theme; the light theme is applied by
+ * setting `data-theme="light"` on <html> (see lib/theme.ts + the inline script
+ * in app/layout.tsx, which applies the persisted choice before first paint).
+ * Both the toggle and the inline script only ever write `documentElement
+ * .dataset.theme`, so `:root` (dark) is the single source of default values.
+ *
+ * Token inventory (CSS vars below, referenced via @theme inline so utilities
+ * like `bg-surface` resolve per-theme at the use site):
+ *   bg / surface / elevated / border / fg / muted-fg
+ *   accent / accent-hover / accent-fg / link
+ *   success(+subtle) / warning(+subtle) / danger(+subtle) / info(+subtle)
+ *
+ * NOTE: lib/contrast.test.ts hardcodes the same RGB values to assert WCAG AA
+ * contrast — keep the two in sync when changing a color.
+ */
+
+/* --- Semantic colors (theme-dependent; inline so they resolve at use site) --- */
+@theme inline {
+  --color-bg: var(--bg);
+  --color-surface: var(--surface);
+  --color-elevated: var(--elevated);
+  --color-border: var(--border);
+  --color-fg: var(--fg);
+  --color-muted-fg: var(--muted-fg);
+  --color-accent: var(--accent);
+  --color-accent-hover: var(--accent-hover);
+  --color-accent-fg: var(--accent-fg);
+  --color-link: var(--link);
+  --color-success: var(--success);
+  --color-success-subtle: var(--success-subtle);
+  --color-warning: var(--warning);
+  --color-warning-subtle: var(--warning-subtle);
+  --color-danger: var(--danger);
+  --color-danger-subtle: var(--danger-subtle);
+  --color-danger-strong: var(--danger-strong);
+  --color-info: var(--info);
+  --color-info-subtle: var(--info-subtle);
+
+  /* Elevation (theme-dependent: dark shadows are deeper) */
+  --shadow-1: var(--elevation-1);
+  --shadow-2: var(--elevation-2);
+  --shadow-3: var(--elevation-3);
+}
+
+/* --- Static tokens (identical in both themes) --- */
+@theme {
+  /* System font stack + mono pairing — defined once, used everywhere. */
+  --font-sans:
+    ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial,
+    "Noto Sans", sans-serif;
+  --font-mono:
+    ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+
+  /* Typography scale */
+  --text-display: 1.875rem;
+  --text-display--line-height: 2.25rem;
+  --text-display--letter-spacing: -0.01em;
+  --text-title: 1.125rem;
+  --text-title--line-height: 1.625rem;
+  --text-body: 0.875rem;
+  --text-body--line-height: 1.25rem;
+  --text-small: 0.75rem;
+  --text-small--line-height: 1rem;
+  --text-mono: 0.8125rem;
+  --text-mono--line-height: 1.25rem;
+
+  /* Radius scale */
+  --radius-sm: 0.25rem;
+  --radius-md: 0.375rem;
+  --radius-lg: 0.5rem;
+  --radius-xl: 0.75rem;
+}
+
+/* --- Dark theme (default) --- */
+:root {
+  color-scheme: dark;
+  --bg: #0b0f14;
+  --surface: #11161d;
+  --elevated: #171e26;
+  --border: #263041;
+  --fg: #e6edf3;
+  --muted-fg: #94a3b8;
+  --accent: #2563eb;
+  --accent-hover: #1d4ed8;
+  --accent-fg: #ffffff;
+  --link: #8ab4ff;
+  --success: #3fb950;
+  --success-subtle: #0f2b1c;
+  --warning: #e3b341;
+  --warning-subtle: #2b2410;
+  --danger: #f85149;
+  --danger-strong: #cf222e;
+  --danger-subtle: #3a1518;
+  --info: #58a6ff;
+  --info-subtle: #12253f;
+  --elevation-1: 0 1px 2px rgb(1 4 9 / 0.6);
+  --elevation-2: 0 3px 8px rgb(1 4 9 / 0.55);
+  --elevation-3: 0 8px 24px rgb(1 4 9 / 0.7);
+}
+
+/* --- Light theme (opt-in via <html data-theme="light">) --- */
+:root[data-theme="light"] {
+  color-scheme: light;
+  --bg: #f6f8fa;
+  --surface: #ffffff;
+  --elevated: #ffffff;
+  --border: #d0d7de;
+  --fg: #1f2328;
+  --muted-fg: #59636e;
+  --accent: #0969da;
+  --accent-hover: #0860c8;
+  --accent-fg: #ffffff;
+  --link: #0969da;
+  --success: #116329;
+  --success-subtle: #dafbe1;
+  --warning: #9a6700;
+  --warning-subtle: #fff8c5;
+  --danger: #a40e26;
+  --danger-strong: #a40e26;
+  --danger-subtle: #ffebe9;
+  --info: #0969da;
+  --info-subtle: #ddf4ff;
+  --elevation-1: 0 1px 2px rgb(31 35 40 / 0.08);
+  --elevation-2: 0 3px 8px rgb(31 35 40 / 0.1);
+  --elevation-3: 0 8px 24px rgb(31 35 40 / 0.16);
+}
+
+@layer base {
+  body {
+    background-color: var(--bg);
+    color: var(--fg);
+  }
+
+  ::selection {
+    background-color: var(--info-subtle);
+    color: var(--fg);
+  }
+}

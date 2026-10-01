@@ -4,8 +4,12 @@ import { useCallback, useEffect, useState } from "react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import type { Workflow } from "@openeuler/core";
-import { Button } from "@/components/Button";
-import { Card } from "@/components/Card";
+import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
+import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
+import { EmptyState } from "@/components/ui/empty-state";
+import { SkeletonLines } from "@/components/ui/skeleton";
+import { FolderIcon } from "@/components/shell/icons";
 import { apiFetch, ApiError } from "@/lib/api";
 import { fetchWorkflows } from "@/lib/workflows-api";
 import { RunWorkflowModal } from "./RunWorkflowModal";
@@ -32,8 +36,8 @@ export function loopBadge(workflow: Workflow): string | null {
 
 /**
  * Workflow list for a project: name, step count, loop badge, run/edit/delete.
- * Used both in the workspace tab and on the dedicated workflows page; the
- * editor itself opens on `/projects/[id]/workflows/[workflowId]`.
+ * Used both in the workspace tab and on the dedicated workflows page; "edit"
+ * opens the graph canvas at `/projects/[id]/workflows/[workflowId]/edit`.
  */
 export function WorkflowsList({ projectId }: { projectId: string }) {
   const router = useRouter();
@@ -75,117 +79,124 @@ export function WorkflowsList({ projectId }: { projectId: string }) {
   const basePath = `/projects/${encodeURIComponent(projectId)}/workflows`;
 
   return (
-    <Card
-      title="Workflows"
-      description="Repeatable multi-step pipelines for this project."
-      action={
+    <Card>
+      <CardHeader>
+        <div>
+          <CardTitle>Workflows</CardTitle>
+          <CardDescription>Repeatable multi-step pipelines for this project.</CardDescription>
+        </div>
         <div className="flex gap-2">
-          <Button variant="secondary" onClick={() => void load()}>
+          <Button variant="secondary" size="sm" onClick={() => void load()}>
             Refresh
           </Button>
-          <Link
-            href={`${basePath}/new`}
-            className="inline-flex items-center rounded-md bg-slate-900 px-3 py-1.5 text-sm font-medium text-white hover:bg-slate-700"
-          >
+          <Button size="sm" onClick={() => router.push(`${basePath}/new`)}>
             New workflow
-          </Link>
-        </div>
-      }
-    >
-      {state.phase === "loading" ? (
-        <p className="py-6 text-sm text-slate-400">Loading workflows…</p>
-      ) : state.phase === "error" ? (
-        <div className="flex flex-col items-start gap-3 py-4 text-sm">
-          <p className="text-red-600">{state.message}</p>
-          <Button variant="secondary" onClick={() => void load()}>
-            Retry
           </Button>
         </div>
-      ) : state.workflows.length === 0 ? (
-        <p className="py-6 text-sm text-slate-400">
-          No workflows yet — create one to chain agent steps (with optional loops).
-        </p>
-      ) : (
-        <ul className="divide-y divide-slate-100" data-testid="workflow-list">
-          {state.workflows.map((workflow) => {
-            const loop = loopBadge(workflow);
-            const deletingThis = confirmDelete === workflow.id && deleting;
-            return (
-              <li key={workflow.id} className="py-3">
-                <div className="flex flex-wrap items-center justify-between gap-2">
-                  <Link
-                    href={`${basePath}/${encodeURIComponent(workflow.id)}`}
-                    className="min-w-0 hover:underline"
-                  >
-                    <span className="block truncate text-sm font-medium text-slate-900">
-                      {workflow.name}
-                    </span>
-                    <span className="mt-0.5 flex flex-wrap items-center gap-2 text-xs text-slate-500">
-                      <span>
-                        {workflow.steps.length} step{workflow.steps.length === 1 ? "" : "s"}
+      </CardHeader>
+      <CardContent>
+        {state.phase === "loading" ? (
+          <SkeletonLines rows={3} />
+        ) : state.phase === "error" ? (
+          <div className="flex flex-col items-start gap-3 py-2 text-sm">
+            <p className="text-danger">{state.message}</p>
+            <Button variant="secondary" size="sm" onClick={() => void load()}>
+              Retry
+            </Button>
+          </div>
+        ) : state.workflows.length === 0 ? (
+          <EmptyState
+            icon={<FolderIcon className="size-5" />}
+            title="No workflows yet"
+            description="Create one to chain agent steps (with optional loops)."
+            action={
+              <Button size="sm" onClick={() => router.push(`${basePath}/new`)}>
+                New workflow
+              </Button>
+            }
+          />
+        ) : (
+          <ul className="divide-y divide-border" data-testid="workflow-list">
+            {state.workflows.map((workflow) => {
+              const loop = loopBadge(workflow);
+              const deletingThis = confirmDelete === workflow.id && deleting;
+              return (
+                <li key={workflow.id} className="py-3">
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <Link
+                      href={`${basePath}/${encodeURIComponent(workflow.id)}/edit`}
+                      className="min-w-0 rounded-sm transition-colors hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
+                    >
+                      <span className="block truncate text-sm font-medium text-fg">
+                        {workflow.name}
                       </span>
-                      {loop ? (
-                        <span className="rounded-full bg-violet-100 px-2 py-0.5 font-medium text-violet-700">
-                          loop {loop}
+                      <span className="mt-0.5 flex flex-wrap items-center gap-2 text-xs text-muted-fg">
+                        <span>
+                          {workflow.steps.length} step{workflow.steps.length === 1 ? "" : "s"}
                         </span>
+                        {loop ? <Badge variant="accent">loop {loop}</Badge> : <Badge>linear</Badge>}
+                      </span>
+                    </Link>
+                    <span className="flex items-center gap-2">
+                      <Button size="sm" onClick={() => setRunTarget(workflow)}>
+                        Run
+                      </Button>
+                      <Button
+                        variant="secondary"
+                        size="sm"
+                        onClick={() =>
+                          router.push(`${basePath}/${encodeURIComponent(workflow.id)}/edit`)
+                        }
+                      >
+                        Edit
+                      </Button>
+                      {confirmDelete === workflow.id ? (
+                        <>
+                          <Button
+                            variant="secondary"
+                            size="sm"
+                            disabled={deleting}
+                            onClick={() => setConfirmDelete(null)}
+                          >
+                            Keep
+                          </Button>
+                          <Button
+                            variant="danger"
+                            size="sm"
+                            loading={deletingThis}
+                            onClick={() => void doDelete(workflow.id)}
+                          >
+                            {deletingThis ? "Deleting…" : "Confirm delete"}
+                          </Button>
+                        </>
                       ) : (
-                        <span className="rounded-full bg-slate-100 px-2 py-0.5 text-slate-500">
-                          linear
-                        </span>
+                        <Button
+                          variant="ghost"
+                          size="sm"
+                          onClick={() => {
+                            setConfirmDelete(workflow.id);
+                            setActionError(null);
+                          }}
+                        >
+                          Delete
+                        </Button>
                       )}
                     </span>
-                  </Link>
-                  <span className="flex items-center gap-2">
-                    <Button onClick={() => setRunTarget(workflow)}>Run</Button>
-                    <Button
-                      variant="secondary"
-                      onClick={() => router.push(`${basePath}/${encodeURIComponent(workflow.id)}`)}
-                    >
-                      Edit
-                    </Button>
-                    {confirmDelete === workflow.id ? (
-                      <>
-                        <Button
-                          variant="secondary"
-                          disabled={deleting}
-                          onClick={() => setConfirmDelete(null)}
-                        >
-                          Keep
-                        </Button>
-                        <Button
-                          className="bg-red-600 hover:bg-red-500"
-                          disabled={deletingThis}
-                          onClick={() => void doDelete(workflow.id)}
-                        >
-                          {deletingThis ? "Deleting…" : "Confirm delete"}
-                        </Button>
-                      </>
-                    ) : (
-                      <Button
-                        variant="ghost"
-                        onClick={() => {
-                          setConfirmDelete(workflow.id);
-                          setActionError(null);
-                        }}
-                      >
-                        Delete
-                      </Button>
-                    )}
-                  </span>
-                </div>
-              </li>
-            );
-          })}
-        </ul>
-      )}
-      {actionError ? (
-        <p className="mt-3 text-sm text-red-600" role="alert">
-          {actionError}
-        </p>
-      ) : null}
-      {runTarget ? (
-        <RunWorkflowModal workflow={runTarget} onClose={() => setRunTarget(null)} />
-      ) : null}
+                  </div>
+                </li>
+              );
+            })}
+          </ul>
+        )}
+        {actionError ? (
+          <p className="mt-3 text-sm text-danger" role="alert">
+            {actionError}
+          </p>
+        ) : null}
+        {runTarget ? (
+          <RunWorkflowModal workflow={runTarget} onClose={() => setRunTarget(null)} />
+        ) : null}
+      </CardContent>
     </Card>
   );
 }

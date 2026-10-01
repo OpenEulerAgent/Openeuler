@@ -6,23 +6,50 @@ import { drizzle } from "drizzle-orm/better-sqlite3";
 import { migrate } from "drizzle-orm/better-sqlite3/migrator";
 import * as schema from "./schema.js";
 import {
+  createActivityRepo,
+  createAgentPresetRepo,
   createEventRepo,
   createProjectRepo,
   createRunRepo,
   createStepRunRepo,
   createWorkflowRepo,
+  createWorkflowRevisionRepo,
 } from "./repos.js";
-import type { EventRepo, ProjectRepo, RunRepo, StepRunRepo, WorkflowRepo } from "./repos.js";
+import type {
+  ActivityRepo,
+  AgentPresetRepo,
+  EventRepo,
+  ProjectRepo,
+  RunRepo,
+  StepRunRepo,
+  WorkflowRepo,
+  WorkflowRevisionRepo,
+} from "./repos.js";
 
 export * from "./schema.js";
 export type {
+  ActivityInput,
+  ActivityRow,
   AgentEventInput,
+  AgentPresetPatch,
   EventInput,
   RunPatch,
   StepRunPatch,
   WorkflowPatch,
+  WorkflowRevision,
+  WorkflowRevisionRepo,
 } from "./repos.js";
-export type { EventRepo, ProjectRepo, RunRepo, StepRunRepo, WorkflowRepo } from "./repos.js";
+export type {
+  ActivityRepo,
+  AgentPresetRepo,
+  EventRepo,
+  ProjectRepo,
+  RunRepo,
+  StepRunRepo,
+  WorkflowRepo,
+} from "./repos.js";
+export { migrateLinearWorkflowsToGraphs } from "./migrate.js";
+export type { LinearMigrationResult } from "./migrate.js";
 
 export const PACKAGE_NAME = "@openeuler/db";
 
@@ -32,10 +59,13 @@ export interface Db {
   /** Raw better-sqlite3 handle (synchronous); use repos for typed access. */
   readonly sqlite: Database.Database;
   readonly projects: ProjectRepo;
+  readonly agentPresets: AgentPresetRepo;
   readonly workflows: WorkflowRepo;
+  readonly workflowRevisions: WorkflowRevisionRepo;
   readonly runs: RunRepo;
   readonly stepRuns: StepRunRepo;
   readonly events: EventRepo;
+  readonly activity: ActivityRepo;
   close(): void;
 }
 
@@ -83,10 +113,13 @@ export function createDatabase(opts: CreateDatabaseOptions = {}): Db {
     path,
     sqlite,
     projects: createProjectRepo(db),
+    agentPresets: createAgentPresetRepo(db),
     workflows: createWorkflowRepo(db),
+    workflowRevisions: createWorkflowRevisionRepo(db),
     runs: createRunRepo(db),
     stepRuns: createStepRunRepo(db),
     events: createEventRepo(db),
+    activity: createActivityRepo(db),
     close() {
       sqlite.close();
     },

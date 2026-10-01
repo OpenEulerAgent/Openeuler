@@ -28,7 +28,7 @@ export function DiffFileView({
 
   if (entry.isBinary) {
     return (
-      <p className="px-4 py-3 font-mono text-xs text-slate-500">
+      <p className="px-4 py-3 font-mono text-xs text-muted-fg">
         Binary file ({entry.isDeleted ? "deleted" : entry.isNew ? "added" : "changed"}) — content
         not shown.
       </p>
@@ -48,8 +48,8 @@ export function DiffFileView({
         {...(language === undefined ? {} : { highlightLanguage: language })}
         styles={{
           variables: {
-            light: { codeFoldGutterBackground: "#f8fafc", codeFoldBackground: "#f8fafc" },
-            dark: { codeFoldGutterBackground: "#0f172a", codeFoldBackground: "#0f172a" },
+            light: { codeFoldGutterBackground: "#f6f8fa", codeFoldBackground: "#f6f8fa" },
+            dark: { codeFoldGutterBackground: "#11161d", codeFoldBackground: "#11161d" },
           },
         }}
       />

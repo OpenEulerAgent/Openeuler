@@ -1,0 +1,52 @@
+/*
+ * Run graph execution view (#52): React Flow base styles come from
+ * @xyflow/react (imported by the canvas component); these layer the
+ * execution-state animations on top of the app's design tokens —
+ * the running node's pulsing accent ring and the marching dashes on the
+ * edge most recently taken (plus the warning flash on cap-reached edges).
+ */
+
+@keyframes run-node-pulse {
+  0%,
+  100% {
+    box-shadow:
+      0 0 0 0 color-mix(in srgb, var(--accent) 55%, transparent),
+      var(--elevation-2);
+  }
+  50% {
+    box-shadow:
+      0 0 0 6px color-mix(in srgb, var(--accent) 18%, transparent),
+      var(--elevation-2);
+  }
+}
+
+.run-node-running {
+  border-color: var(--accent);
+  animation: run-node-pulse 1.6s ease-in-out infinite;
+}
+
+@keyframes run-edge-march {
+  to {
+    stroke-dashoffset: -28;
+  }
+}
+
+.react-flow__edge.run-edge-active .react-flow__edge-path {
+  stroke-dasharray: 8 6;
+  animation: run-edge-march 0.8s linear infinite;
+}
+
+@keyframes run-edge-cap-flash {
+  0%,
+  100% {
+    stroke-opacity: 1;
+  }
+  50% {
+    stroke-opacity: 0.45;
+  }
+}
+
+.react-flow__edge.run-edge-cap .react-flow__edge-path {
+  stroke-dasharray: 6 4;
+  animation: run-edge-cap-flash 1.2s ease-in-out infinite;
+}

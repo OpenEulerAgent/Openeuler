@@ -3,7 +3,7 @@
 import { useState } from "react";
 import { useRouter } from "next/navigation";
 import type { Run, StepRun } from "@openeuler/core";
-import { Button } from "@/components/Button";
+import { Button } from "@/components/ui/button";
 import { apiFetch, ApiError } from "@/lib/api";
 import { nextRunHref, resumeEndpoint, resumePossible, retryEndpoint } from "@/lib/run-recovery";
 
@@ -61,13 +61,13 @@ export function InterruptedRunBanner({
   return (
     <section
       role="alert"
-      className="rounded-xl border border-violet-200 bg-violet-50 px-5 py-4 text-sm text-violet-800 shadow-sm"
+      className="rounded-xl border border-warning/40 bg-warning-subtle px-5 py-4 text-sm text-warning shadow-1"
     >
       <p className="font-medium">
         This run was interrupted by a daemon restart. Its branch and recorded step history are
         preserved.
       </p>
-      <p className="mt-1 text-violet-600">
+      <p className="mt-1 opacity-80">
         {canResume
           ? "All started steps recorded their agent sessions — the run can resume in place from where it stopped."
           : "At least one started step recorded no agent session, so the run cannot resume in place. Retry it as a new run instead."}
@@ -85,7 +85,7 @@ export function InterruptedRunBanner({
         >
           {busy === "retry" ? "Retrying…" : "Retry as new run"}
         </Button>
-        {error ? <span className="text-xs text-red-600">{error}</span> : null}
+        {error ? <span className="text-xs text-danger">{error}</span> : null}
       </div>
     </section>
   );

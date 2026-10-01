@@ -94,6 +94,14 @@ describe("POST /api/projects", () => {
     expect(body.warnings).toEqual([]);
   });
 
+  it("records a project.created activity feed entry", async () => {
+    const repo = makeRepo("feed");
+    const body = await register(repo);
+    const feed = db.activity.list();
+    expect(feed).toHaveLength(1);
+    expect(feed[0]).toMatchObject({ type: "project.created", projectId: body.project.id });
+  });
+
   it("resolves the repository root when given a nested directory", async () => {
     const repo = makeRepo("nested-repo");
     const sub = join(repo, "packages", "inner");

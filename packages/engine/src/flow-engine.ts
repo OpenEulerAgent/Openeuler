@@ -1,15 +1,23 @@
 import { randomUUID } from "node:crypto";
 import { renderPromptTemplate } from "@openeuler/core";
 import type {
-  ExitCondition,
   LoopBack,
   LoopVerdict,
   Run,
   RunStatus,
+  Step,
   StepRun,
+  WorkflowGraph,
 } from "@openeuler/core";
 import type { Db } from "@openeuler/db";
 import type { AgentDriver, AgentHandle, AgentMode, DriverRegistry } from "@openeuler/drivers";
+import {
+  compileExitCondition,
+  describeCondition,
+  evaluateExitCondition,
+  type ExitEvaluator,
+} from "./conditions.js";
+import { executeGraphRun, type GraphEngineDeps } from "./graph-engine.js";
 import type { WorktreeManager } from "./worktree.js";
 
 /** Default driver id for ad-hoc runs (override per run via `OPENEULER_DRIVER`). */
@@ -71,6 +79,14 @@ export interface FlowEngineOptions {
   worktrees: WorktreeManager;
   drivers: DriverRegistry;
   logger?: FlowLogger;
+  /**
+   * Invoked after every persisted `run.status` event (run started, terminal
+   * transitions — both linear and graph paths funnel through one emission
+   * point). The run row already carries the new status when it fires. The
+   * daemon uses this for the activity feed + global run-status stream (#51);
+   * hook failures are logged and never break execution.
+   */
+  onRunStatus?: (runId: string, status: RunStatus) => void;
 }
 
 export interface FlowEngine {
@@ -84,11 +100,18 @@ export interface FlowEngine {
    * log around the driver events. Never throws: every failure lands in the
    * run row (`failed` + error).
    *
+   * Runs pinned to a graph revision (`workflowRevisionId`, #44) dispatch to
+   * the serial DAG graph engine (#45): entry-node traversal, conditional
+   * routing with cycle guards, `node.*`/`edge.*` events and the persisted
+   * breadcrumb — instead of the legacy step events. Unpinned workflow runs
+   * and ad-hoc runs execute the legacy path unchanged.
+   *
    * Resumable: when the run already has StepRun rows (a run re-queued after
    * an interruption), execution continues from the first non-successful step
    * in the latest iteration — restarting it with its recorded sessionId,
    * reusing the existing worktree, and reconstructing loop position from the
-   * rows plus the workflow config.
+   * rows plus the workflow config. Graph runs reconstruct their position
+   * from the StepRun rows plus the run's breadcrumb instead.
    */
   executeRun(runId: string, control: RunControl, opts?: ExecuteRunOptions): Promise<void>;
 }
@@ -113,74 +136,26 @@ const TERMINAL_STATUSES = new Set<RunStatus>(["success", "failed", "aborted", "i
 
 const isTerminal = (status: RunStatus): boolean => TERMINAL_STATUSES.has(status);
 
+/** Maps a workflow step (legacy or translated from a graph node) to a plan step. */
+function toStepDefinition(step: Step): StepDefinition {
+  return {
+    stepId: step.id,
+    stepName: step.name,
+    driver: step.driver,
+    promptTemplate: step.promptTemplate,
+    ...(step.model === undefined ? {} : { model: step.model }),
+    ...(step.agent === undefined ? {} : { agent: step.agent }),
+    mode: step.mode,
+    continueSession: step.continueSession,
+  };
+}
+
 const describeError = (err: unknown): string => (err instanceof Error ? err.message : String(err));
 
-/** Human-readable form of an exit condition, for event details and errors. */
-function describeCondition(when: ExitCondition): string {
-  switch (when.type) {
-    case "always":
-      return "always";
-    case "outputContains":
-      return `outputContains ${JSON.stringify(when.pattern)}`;
-    case "outputNotContains":
-      return `outputNotContains ${JSON.stringify(when.pattern)}`;
-    case "outputMatches":
-      return `outputMatches /${when.regex}/${when.flags ?? ""}`;
-  }
-}
-
 /**
- * Exit condition evaluation state, compiled once per run so `outputMatches`
- * regexes are a single `new RegExp` per execution.
+ * Exit condition evaluation, compiled once per run so `outputMatches`
+ * regexes are a single `new RegExp` per execution. See `conditions.ts`.
  */
-interface ExitEvaluator {
-  when: ExitCondition;
-  /** Pre-compiled regex for `outputMatches` conditions. */
-  regex: RegExp | undefined;
-}
-
-/**
- * Compiles a loopBack exit condition once per run. `outputMatches` regexes are
- * validated at workflow save time; a compile failure here (data that bypassed
- * the schema) is surfaced as a clear error instead of a crash.
- */
-function compileExitCondition(loopBack: LoopBack): ExitEvaluator | Error {
-  const { when } = loopBack;
-  if (when.type !== "outputMatches") {
-    return { when, regex: undefined };
-  }
-  try {
-    return { when, regex: new RegExp(when.regex, when.flags ?? "") };
-  } catch (err) {
-    return new Error(
-      `loopBack.when outputMatches regex ${describeCondition(when)} does not compile: ${describeError(err)}`,
-    );
-  }
-}
-
-/**
- * Evaluates an exit condition against the final step's output. `always` is
- * trivially true; `outputContains`/`outputNotContains` are substring checks;
- * `outputMatches` uses the pre-compiled regex (the pattern controls its own
- * anchoring via `^`/`$`/`m`). `lastIndex` is reset so `g`/`y` flags cannot
- * make repeated evaluation stateful.
- */
-function evaluateExitCondition(evaluator: ExitEvaluator, output: string): boolean {
-  switch (evaluator.when.type) {
-    case "always":
-      return true;
-    case "outputContains":
-      return output.includes(evaluator.when.pattern);
-    case "outputNotContains":
-      return !output.includes(evaluator.when.pattern);
-    case "outputMatches": {
-      const regex = evaluator.regex;
-      if (regex === undefined) return false;
-      regex.lastIndex = 0;
-      return regex.test(output);
-    }
-  }
-}
 
 /**
  * Multi-step workflow engine. Pure with respect to drivers and storage: the
@@ -211,6 +186,13 @@ export function createFlowEngine(options: FlowEngineOptions): FlowEngine {
       status,
       ...(error === undefined ? {} : { error }),
     });
+    if (options.onRunStatus !== undefined) {
+      try {
+        options.onRunStatus(runId, status);
+      } catch (err) {
+        log.error({ err, runId, status }, "onRunStatus hook failed");
+      }
+    }
   }
 
   /** Moves queued/live step runs to a terminal status (run-level failure). */
@@ -282,6 +264,18 @@ export function createFlowEngine(options: FlowEngineOptions): FlowEngine {
     }
   }
 
+  /** Resolves a graph-revision run's pinned snapshot, when it has one. */
+  function resolveGraph(run: Run): WorkflowGraph | undefined {
+    if (run.workflowId === undefined || run.workflowRevisionId === undefined) return undefined;
+    const revision = db.workflowRevisions.get(run.workflowRevisionId);
+    if (!revision) {
+      throw new Error(
+        `workflow revision ${run.workflowRevisionId} pinned by run ${run.id} not found`,
+      );
+    }
+    return revision.graph;
+  }
+
   function resolvePlan(run: Run, opts: ExecuteRunOptions | undefined): RunPlan {
     if (run.workflowId) {
       const workflow = db.workflows.get(run.workflowId);
@@ -289,16 +283,7 @@ export function createFlowEngine(options: FlowEngineOptions): FlowEngine {
         throw new Error(`workflow ${run.workflowId} not found for run ${run.id}`);
       }
       return {
-        steps: workflow.steps.map((step) => ({
-          stepId: step.id,
-          stepName: step.name,
-          driver: step.driver,
-          promptTemplate: step.promptTemplate,
-          ...(step.model === undefined ? {} : { model: step.model }),
-          ...(step.agent === undefined ? {} : { agent: step.agent }),
-          mode: step.mode,
-          continueSession: step.continueSession,
-        })),
+        steps: workflow.steps.map(toStepDefinition),
         loopBack: workflow.loopBack,
       };
     }
@@ -325,9 +310,10 @@ export function createFlowEngine(options: FlowEngineOptions): FlowEngine {
    * Reuses a pre-existing queued — or interrupted (resume) — StepRun for this
    * (step, iteration), or creates a fresh running row. Reuse keeps exactly one
    * row per (step, iteration) across a resume and preserves the recorded
-   * sessionId for the restart.
+   * sessionId for the restart. Graph runs pass `{ stepId: nodeId }` with the
+   * node's own execution number as the iteration.
    */
-  function beginStepRun(runId: string, step: StepDefinition, iteration: number): StepRun {
+  function beginStepRun(runId: string, step: { stepId: string }, iteration: number): StepRun {
     const existing = db.stepRuns
       .listByRun(runId)
       .find(
@@ -536,6 +522,19 @@ export function createFlowEngine(options: FlowEngineOptions): FlowEngine {
     return outcome;
   }
 
+  /** Shared machinery handed to the graph executor (#45). */
+  const graphDeps: GraphEngineDeps = {
+    db,
+    worktrees,
+    drivers,
+    log,
+    emitRunStatus,
+    finalizeRun,
+    abortRun,
+    captureDiff,
+    beginStepRun,
+  };
+
   async function execute(
     runId: string,
     control: RunControl,
@@ -558,15 +557,20 @@ export function createFlowEngine(options: FlowEngineOptions): FlowEngine {
     db.runs.updateStatus(runId, "running");
     emitRunStatus(runId, "running");
 
-    let plan: RunPlan;
+    // Graph-revision runs (#44 pinning) execute on the graph engine (#45);
+    // legacy (no revision) and ad-hoc runs take the linear path unchanged.
+    let graph: WorkflowGraph | undefined;
+    let plan: RunPlan | undefined;
     try {
-      plan = resolvePlan(run, opts);
+      graph = resolveGraph(run);
+      plan = graph === undefined ? resolvePlan(run, opts) : undefined;
     } catch (err) {
       finalizeRun(runId, "failed", { error: describeError(err) });
       return;
     }
 
-    const { steps, loopBack } = plan;
+    const steps = plan?.steps ?? [];
+    const loopBack = plan?.loopBack;
 
     // Defensive runtime bound (the schema already rejects this at save time,
     // but the row may predate the refinement or be written around it).
@@ -580,7 +584,7 @@ export function createFlowEngine(options: FlowEngineOptions): FlowEngine {
     // Exit condition compiled once per run.
     let exitEvaluator: ExitEvaluator | undefined;
     if (loopBack !== undefined) {
-      const compiled = compileExitCondition(loopBack);
+      const compiled = compileExitCondition(loopBack.when);
       if (compiled instanceof Error) {
         finalizeRun(runId, "failed", { error: compiled.message });
         return;
@@ -629,6 +633,13 @@ export function createFlowEngine(options: FlowEngineOptions): FlowEngine {
           log.warn({ err, runId }, "worktree cleanup after pre-start abort failed");
         }
       }
+      return;
+    }
+
+    // Graph dispatch: the serial DAG executor owns everything from here
+    // (node.* / edge.* events, per-node StepRuns, breadcrumb, resume).
+    if (graph !== undefined) {
+      await executeGraphRun(graphDeps, run, graph, worktreePath, control);
       return;
     }
 
