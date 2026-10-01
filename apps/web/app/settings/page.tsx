@@ -6,15 +6,24 @@ import { Button } from "@/components/ui/button";
 import { useThemeContext } from "@/components/ThemeProvider";
 import { useSidebarPreference } from "@/components/shell/sidebar-preference";
 import { daemonBaseUrl } from "@/lib/api";
+import { isOnboardingCompleted } from "@/lib/onboarding/wizard";
 import { toggleSidebarPreference } from "@/lib/sidebar";
+import { useEffect, useState } from "react";
+import { useRouter } from "next/navigation";
 
 /**
  * Settings shell (issue #50): theme toggle, sidebar preference and the daemon
  * URL the app talks to. More preferences land with later issues.
  */
 export default function SettingsPage() {
+  const router = useRouter();
   const { theme, setTheme } = useThemeContext();
   const [sidebarPref, setSidebarPref] = useSidebarPreference();
+  const [onboardingCompleted, setOnboardingCompleted] = useState(true);
+
+  useEffect(() => {
+    setOnboardingCompleted(isOnboardingCompleted(window.localStorage));
+  }, []);
 
   return (
     <div className="flex flex-col gap-6">
@@ -58,6 +67,25 @@ export default function SettingsPage() {
             onClick={() => setSidebarPref(toggleSidebarPreference(sidebarPref))}
           >
             Default to {sidebarPref === "expanded" ? "collapsed" : "expanded"}
+          </Button>
+        </CardContent>
+      </Card>
+
+      <Card>
+        <CardHeader>
+          <div>
+            <CardTitle>Getting started</CardTitle>
+            <CardDescription>
+              The setup wizard checks your environment, opens a project and launches a starter.
+            </CardDescription>
+          </div>
+        </CardHeader>
+        <CardContent className="flex flex-wrap items-center gap-3">
+          <Badge variant={onboardingCompleted ? "success" : "neutral"}>
+            {onboardingCompleted ? "completed" : "not completed"}
+          </Badge>
+          <Button variant="secondary" onClick={() => router.push("/welcome")}>
+            Re-run setup wizard
           </Button>
         </CardContent>
       </Card>
