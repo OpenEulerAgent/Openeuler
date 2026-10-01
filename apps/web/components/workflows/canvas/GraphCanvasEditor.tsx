@@ -59,6 +59,7 @@ import {
   type History,
 } from "@/lib/graph/history";
 import { applyLayout } from "@/lib/graph/layout";
+import { applyInspectorAction } from "@/lib/graph/inspector";
 import {
   issuesFromApiDetails,
   validateCanvasDocument,
@@ -248,6 +249,16 @@ function GraphCanvasInner({
     [clearEditTimer, updateHistory],
   );
 
+  // Settle a pending debounced inspector edit whenever the inspected target
+  // changes (drawer close, deselect, switching nodes) so the edit session
+  // lands as one undo entry instead of lingering mid-burst.
+  const selectedNodeIdRef = useRef<string | null>(selectedNodeId);
+  useEffect(() => {
+    if (selectedNodeIdRef.current === selectedNodeId) return;
+    selectedNodeIdRef.current = selectedNodeId;
+    flushPendingEdit();
+  }, [selectedNodeId, flushPendingEdit]);
+
   const pruneSelection = useCallback(
     (next: CanvasDocument) => {
       if (selectedNodeId !== null && !next.nodes.some((node) => node.id === selectedNodeId)) {
@@ -391,26 +402,18 @@ function GraphCanvasInner({
 
   const patchNodeConfig = useCallback(
     (nodeId: string, patch: Partial<StepConfig>) => {
-      patchDocDebounced((current) => ({
-        ...current,
-        nodes: current.nodes.map((node) =>
-          node.id === nodeId && node.data.kind === "agent"
-            ? { ...node, data: { ...node.data, config: { ...node.data.config, ...patch } } }
-            : node,
-        ),
-      }));
+      patchDocDebounced((current) =>
+        applyInspectorAction(current, { type: "patchConfig", nodeId, patch }),
+      );
     },
     [patchDocDebounced],
   );
 
   const patchNodeName = useCallback(
     (nodeId: string, name: string) => {
-      patchDocDebounced((current) => ({
-        ...current,
-        nodes: current.nodes.map((node) =>
-          node.id === nodeId ? { ...node, data: { ...node.data, name } } : node,
-        ),
-      }));
+      patchDocDebounced((current) =>
+        applyInspectorAction(current, { type: "patchName", nodeId, name }),
+      );
     },
     [patchDocDebounced],
   );
@@ -785,10 +788,11 @@ function GraphCanvasInner({
       {selectedNode !== null ? (
         <NodePropertiesDrawer
           node={selectedNode}
-          drivers={drivers}
+          doc={doc}
           issues={issues}
           onPatchAgent={(patch) => patchNodeConfig(selectedNode.id, patch)}
           onPatchName={(name) => patchNodeName(selectedNode.id, name)}
+          onCommitEdit={flushPendingEdit}
           onDelete={() => deleteNode(selectedNode.id)}
           onClose={() => setSelectedNodeId(null)}
         />
