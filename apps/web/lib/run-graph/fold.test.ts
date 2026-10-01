@@ -175,6 +175,16 @@ describe("fold: node state transitions", () => {
     expect(state.nodes["b"]?.status).toBe("interrupted");
   });
 
+  it("settles live executions when the run ends interrupted (node drawer)", () => {
+    const state = buildRunGraphState([
+      runStatus("running"),
+      queued("a"),
+      started("a"),
+      runStatus("interrupted"),
+    ]);
+    expect(state.nodes["a"]?.executions[0]?.status).toBe("interrupted");
+  });
+
   it("folds legacy step.started/step.completed runs identically (linear workflows)", () => {
     const state = buildRunGraphState([
       stepStarted("s1"),

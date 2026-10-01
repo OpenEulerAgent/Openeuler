@@ -189,6 +189,20 @@ function settleNodes(
     } else {
       next[id] = node;
     }
+    const liveExecution = next[id].executions.find(
+      (exec) => exec.status === "queued" || exec.status === "running",
+    );
+    if (liveExecution) {
+      next[id] = {
+        ...next[id],
+        executions: next[id].executions.map((exec) =>
+          exec.status === "queued" || exec.status === "running"
+            ? { ...exec, status }
+            : exec,
+        ),
+      };
+      changed = true;
+    }
   }
   return changed ? next : nodes;
 }
