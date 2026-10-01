@@ -2,6 +2,7 @@ import { and, eq, sql } from "drizzle-orm";
 import type { BetterSQLite3Database } from "drizzle-orm/better-sqlite3";
 import { z } from "zod";
 import {
+  AgentPresetSchema,
   BreadcrumbEntrySchema,
   PersistedEventSchema,
   ProjectSchema,
@@ -13,6 +14,7 @@ import {
   WorkflowSchema,
 } from "@openeuler/core";
 import type {
+  AgentPreset,
   BreadcrumbEntry,
   LoopBack,
   PersistedEvent,
@@ -112,6 +114,27 @@ export interface WorkflowRevisionRepo {
    * once no runs reference them). Returns how many rows were removed.
    */
   deleteAllForWorkflow(workflowId: string): number;
+}
+
+/** Fields of an agent preset that may change after creation; `null` clears `icon`. */
+export type AgentPresetPatch = {
+  name?: string;
+  description?: string;
+  icon?: string | null;
+  config?: AgentPreset["config"];
+};
+
+export interface AgentPresetRepo {
+  create(preset: AgentPreset): AgentPreset;
+  get(id: string): AgentPreset | undefined;
+  /** Presets of a project: builtins first, then by name. */
+  list(projectId: string): AgentPreset[];
+  /** Patches mutable fields (never `builtin`) and bumps `updatedAt`. */
+  update(id: string, patch: AgentPresetPatch): AgentPreset | undefined;
+  /** Deletes the preset; returns true when a row was removed. */
+  delete(id: string): boolean;
+  /** Deletes every preset of a project (project delete path). Returns rows removed. */
+  deleteAllForProject(projectId: string): number;
 }
 
 export interface RunRepo {
@@ -347,6 +370,101 @@ export function createWorkflowRevisionRepo(db: Db): WorkflowRevisionRepo {
       const result = db
         .delete(schema.workflowRevisions)
         .where(eq(schema.workflowRevisions.workflowId, workflowId))
+        .run();
+      return result.changes;
+    },
+  };
+}
+
+export function createAgentPresetRepo(db: Db): AgentPresetRepo {
+  const toDomain = (row: typeof schema.agentPresets.$inferSelect): AgentPreset =>
+    AgentPresetSchema.parse({
+      id: row.id,
+      projectId: row.projectId,
+      name: row.name,
+      description: row.description,
+      ...(row.icon === null ? {} : { icon: row.icon }),
+      config: row.config,
+      ...(row.builtin ? { builtin: true } : {}),
+      createdAt: row.createdAt,
+      updatedAt: row.updatedAt,
+    });
+
+  const toRow = (preset: AgentPreset) => ({
+    id: preset.id,
+    projectId: preset.projectId,
+    name: preset.name,
+    description: preset.description,
+    icon: preset.icon ?? null,
+    config: preset.config,
+    builtin: preset.builtin === true,
+    createdAt: preset.createdAt,
+    updatedAt: preset.updatedAt,
+  });
+
+  return {
+    create(preset) {
+      const value = AgentPresetSchema.parse(preset);
+      db.insert(schema.agentPresets).values(toRow(value)).run();
+      return value;
+    },
+    get(id) {
+      const row = db.select().from(schema.agentPresets).where(eq(schema.agentPresets.id, id)).get();
+      return row ? toDomain(row) : undefined;
+    },
+    list(projectId) {
+      const rows = db
+        .select()
+        .from(schema.agentPresets)
+        .where(eq(schema.agentPresets.projectId, projectId))
+        .orderBy(sql`${schema.agentPresets.builtin} desc`, schema.agentPresets.name)
+        .all();
+      return rows.map(toDomain);
+    },
+    update(id, patch) {
+      const current = db
+        .select()
+        .from(schema.agentPresets)
+        .where(eq(schema.agentPresets.id, id))
+        .get();
+      if (!current) return undefined;
+      const next = AgentPresetSchema.parse({
+        id: current.id,
+        projectId: current.projectId,
+        name: patch.name ?? current.name,
+        description: patch.description ?? current.description,
+        ...(patch.icon === undefined
+          ? current.icon === null
+            ? {}
+            : { icon: current.icon }
+          : patch.icon === null
+            ? {}
+            : { icon: patch.icon }),
+        config: patch.config ?? current.config,
+        ...(current.builtin ? { builtin: true } : {}),
+        createdAt: current.createdAt,
+        updatedAt: new Date().toISOString(),
+      });
+      db.update(schema.agentPresets)
+        .set({
+          name: next.name,
+          description: next.description,
+          icon: next.icon ?? null,
+          config: next.config,
+          updatedAt: next.updatedAt,
+        })
+        .where(eq(schema.agentPresets.id, id))
+        .run();
+      return next;
+    },
+    delete(id) {
+      const result = db.delete(schema.agentPresets).where(eq(schema.agentPresets.id, id)).run();
+      return result.changes > 0;
+    },
+    deleteAllForProject(projectId) {
+      const result = db
+        .delete(schema.agentPresets)
+        .where(eq(schema.agentPresets.projectId, projectId))
         .run();
       return result.changes;
     },

@@ -5,7 +5,7 @@ import {
   type PromptTemplateVars,
   type StepConfig,
 } from "@openeuler/core";
-import type { CanvasDocument, CanvasNode } from "./canvas-document";
+import type { PresetSource, CanvasDocument, CanvasNode } from "./canvas-document";
 
 /**
  * Pure logic behind the agent node inspector (#47): upstream computation for
@@ -162,7 +162,17 @@ export function inspectorFieldErrors(doc: CanvasDocument, nodeId: string): Inspe
 export type InspectorAction =
   | { type: "patchName"; nodeId: string; name: string }
   | { type: "patchConfig"; nodeId: string; patch: Partial<StepConfig> }
-  | { type: "insertVariable"; nodeId: string; token: string; at: number };
+  | { type: "insertVariable"; nodeId: string; token: string; at: number }
+  /**
+   * Detach from the preset (#49): drops `presetId`, keeps the node's config
+   * copy exactly as it is — the node becomes a plain node.
+   */
+  | { type: "detachPreset"; nodeId: string }
+  /**
+   * "Update from preset" (#49): explicit sync. Copies the preset's CURRENT
+   * config (deep) and name into the node; id, position, and edges stay.
+   */
+  | { type: "applyPreset"; nodeId: string; preset: PresetSource };
 
 /**
  * Merges a patch into a config: `undefined` values clear their key (e.g.
@@ -188,6 +198,40 @@ export function applyInspectorAction(doc: CanvasDocument, action: InspectorActio
       nodes: doc.nodes.map((candidate) =>
         candidate.id === action.nodeId
           ? { ...candidate, data: { ...candidate.data, name: action.name } }
+          : candidate,
+      ),
+    };
+  }
+
+  if (action.type === "detachPreset") {
+    if (node.data.kind !== "agent" || node.data.presetId === undefined) return doc;
+    return {
+      ...doc,
+      nodes: doc.nodes.map((candidate) => {
+        if (candidate.id !== action.nodeId || candidate.data.kind !== "agent") return candidate;
+        // Drop the provenance key, keep the config copy verbatim.
+        const data: Record<string, unknown> = { ...candidate.data };
+        delete data["presetId"];
+        return { ...candidate, data } as CanvasNode;
+      }),
+    };
+  }
+
+  if (action.type === "applyPreset") {
+    if (node.data.kind !== "agent") return doc;
+    return {
+      ...doc,
+      nodes: doc.nodes.map((candidate) =>
+        candidate.id === action.nodeId && candidate.data.kind === "agent"
+          ? {
+              ...candidate,
+              data: {
+                ...candidate.data,
+                name: action.preset.name,
+                config: structuredClone(action.preset.config),
+                presetId: action.preset.id,
+              },
+            }
           : candidate,
       ),
     };

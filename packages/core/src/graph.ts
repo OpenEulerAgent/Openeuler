@@ -27,6 +27,12 @@ export const AgentGraphNodeSchema = z.strictObject({
   /** Persisted for canvas layout; semantics-free. */
   position: GraphNodePositionSchema,
   config: StepConfigSchema,
+  /**
+   * Preset the node was created from (#49), carried for inspector
+   * provenance only: the node keeps its own config copy, and "Update from
+   * preset" is always explicit. Optional, so pre-preset graphs stay valid.
+   */
+  presetId: idSchema.optional(),
 });
 
 export type AgentGraphNode = z.infer<typeof AgentGraphNodeSchema>;

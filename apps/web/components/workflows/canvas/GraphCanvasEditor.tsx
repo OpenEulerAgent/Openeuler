@@ -19,7 +19,7 @@ import {
   type EdgeChange,
   type NodeChange,
 } from "@xyflow/react";
-import type { StepConfig } from "@openeuler/core";
+import type { AgentPreset, StepConfig } from "@openeuler/core";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Dialog } from "@/components/ui/dialog";
@@ -29,6 +29,7 @@ import {
   canvasDocsEquivalent,
   createAgentNode,
   createExitNode,
+  createPresetAgentNode,
   fromCanvasDocument,
   nextCanvasPosition,
   toCanvasDocument,
@@ -71,7 +72,16 @@ import {
   validateCanvasDocument,
   type CanvasIssue,
 } from "@/lib/graph/validation";
-import { saveWorkflowGraph, type WorkflowWithGraph } from "@/lib/workflows-api";
+import { asPresetSource, presetForNode, toPalettePreset } from "@/lib/graph/presets";
+import {
+  createAgentPreset,
+  deleteAgentPreset,
+  fetchAgentPresets,
+  saveWorkflowGraph,
+  updateAgentPreset,
+  type AgentPresetUpdatePatch,
+  type WorkflowWithGraph,
+} from "@/lib/workflows-api";
 import {
   canvasNodeTypes,
   NodeIssueCountsContext,
@@ -81,7 +91,8 @@ import {
 } from "./canvas-nodes";
 import { EdgePropertiesDrawer } from "./EdgePropertiesDrawer";
 import { NodePropertiesDrawer } from "./NodePropertiesDrawer";
-import { Palette, type PaletteNodeKind, type PaletteSection, CANVAS_NODE_MIME } from "./Palette";
+import { Palette, type PaletteNodeKind, type PaletteSection, CANVAS_NODE_MIME, CANVAS_PRESET_MIME } from "./Palette";
+import { PresetManagerDrawer } from "./PresetManagerDrawer";
 import { ShortcutsPopover } from "./ShortcutsPopover";
 import { ValidationPanel } from "./ValidationPanel";
 
@@ -207,6 +218,33 @@ function GraphCanvasInner({
     },
     [],
   );
+
+  // Preset roster ("your team", #49). Fetched for the project; the palette
+  // and the inspector share it. Nodes only ever hold config COPIES — a
+  // missing preset (deleted) just means the badge stops resolving.
+  const [presets, setPresets] = useState<AgentPreset[]>([]);
+  const [managePresetsOpen, setManagePresetsOpen] = useState(false);
+  useEffect(() => {
+    let cancelled = false;
+    void fetchAgentPresets(workflow.projectId)
+      .then((roster) => {
+        if (!cancelled) setPresets(roster);
+      })
+      .catch(() => {
+        // Older daemon or transient failure: no roster, palette shows the
+        // empty hint; creating nodes keeps working without presets.
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [workflow.projectId]);
+  const refreshPresets = useCallback(async () => {
+    try {
+      setPresets(await fetchAgentPresets(workflow.projectId));
+    } catch {
+      // keep the last known roster
+    }
+  }, [workflow.projectId]);
 
   const doc = history.present;
   const [savedDoc, setSavedDoc] = useState<CanvasDocument>(initialDoc);
@@ -400,6 +438,31 @@ function GraphCanvasInner({
     [commitDoc, drivers],
   );
 
+  /**
+   * Creates a node preconfigured from a preset (#49): name = preset name,
+   * config = deep copy, presetId carried for the badge. Position defaults
+   * to the viewport center (click-to-add); drags pass the drop point.
+   */
+  const addPresetNode = useCallback(
+    (presetId: string, position?: { x: number; y: number }) => {
+      const preset = presets.find((candidate) => candidate.id === presetId);
+      if (preset === undefined) return;
+      const current = historyRef.current.present;
+      const spot =
+        position ??
+        screenToFlowPosition({ x: window.innerWidth / 2, y: window.innerHeight / 2 });
+      const node = createPresetAgentNode({
+        preset: asPresetSource(preset),
+        position: spot,
+        takenNames: new Set(current.nodes.map((existing) => existing.data.name)),
+      });
+      commitDoc({ nodes: [...current.nodes, node], edges: current.edges });
+      setSelectedEdgeId(null);
+      setSelectedNodeId(node.id);
+    },
+    [commitDoc, presets, screenToFlowPosition],
+  );
+
   const onConnect = useCallback(
     (connection: Connection) => {
       if (connection.source === null || connection.target === null) return;
@@ -459,6 +522,64 @@ function GraphCanvasInner({
       );
     },
     [patchDocDebounced],
+  );
+
+  /** Preset provenance actions are discrete: one undo snapshot per click. */
+  const detachPreset = useCallback(
+    (nodeId: string) => {
+      commitDoc(
+        applyInspectorAction(historyRef.current.present, { type: "detachPreset", nodeId }),
+      );
+    },
+    [commitDoc],
+  );
+
+  const updateNodeFromPreset = useCallback(
+    (nodeId: string, preset: AgentPreset) => {
+      commitDoc(
+        applyInspectorAction(historyRef.current.present, {
+          type: "applyPreset",
+          nodeId,
+          preset: asPresetSource(preset),
+        }),
+      );
+    },
+    [commitDoc],
+  );
+
+  /** "Save as preset…" from the node inspector: POSTs the node's config copy. */
+  const saveNodeAsPreset = useCallback(
+    async (nodeId: string, name: string, description: string) => {
+      const node = historyRef.current.present.nodes.find((candidate) => candidate.id === nodeId);
+      if (node === undefined || node.data.kind !== "agent") return;
+      const preset = await createAgentPreset({
+        projectId: workflow.projectId,
+        name,
+        description,
+        config: node.data.config,
+      });
+      await refreshPresets();
+      toast({ variant: "success", title: `Preset “${preset.name}” saved` });
+    },
+    [refreshPresets, toast, workflow.projectId],
+  );
+
+  const patchPreset = useCallback(
+    async (presetId: string, patch: AgentPresetUpdatePatch) => {
+      await updateAgentPreset({ projectId: workflow.projectId, presetId, patch });
+      await refreshPresets();
+    },
+    [refreshPresets, workflow.projectId],
+  );
+
+  const removePreset = useCallback(
+    async (presetId: string) => {
+      await deleteAgentPreset({ projectId: workflow.projectId, presetId });
+      // Nodes referencing it keep their config copies; the badge lookup now
+      // misses, so they render as plain nodes without any doc mutation.
+      await refreshPresets();
+    },
+    [refreshPresets, workflow.projectId],
   );
 
   const patchEdge = useCallback(
@@ -754,7 +875,13 @@ function GraphCanvasInner({
       </header>
 
       <div className="flex min-h-0 flex-1">
-        <Palette sections={paletteSections} onAdd={(kind) => addNode(kind)} />
+        <Palette
+          sections={paletteSections}
+          onAdd={(kind) => addNode(kind)}
+          presets={presets.map(toPalettePreset)}
+          onAddPreset={(presetId) => addPresetNode(presetId)}
+          onManagePresets={() => setManagePresetsOpen(true)}
+        />
 
         <div
           className={
@@ -764,12 +891,17 @@ function GraphCanvasInner({
           }
           onDrop={(event) => {
             event.preventDefault();
-            const kind = event.dataTransfer.getData(CANVAS_NODE_MIME);
-            if (kind !== "agent" && kind !== "exit") return;
             const position = screenToFlowPosition({
               x: event.clientX,
               y: event.clientY,
             });
+            const presetId = event.dataTransfer.getData(CANVAS_PRESET_MIME);
+            if (presetId.length > 0) {
+              addPresetNode(presetId, position);
+              return;
+            }
+            const kind = event.dataTransfer.getData(CANVAS_NODE_MIME);
+            if (kind !== "agent" && kind !== "exit") return;
             addNode(kind, position);
           }}
           onDragOver={(event) => {
@@ -859,11 +991,84 @@ function GraphCanvasInner({
           node={selectedNode}
           doc={doc}
           issues={issues}
+          preset={
+            selectedNode.data.kind === "agent" ? presetForNode(presets, selectedNode) : undefined
+          }
           onPatchAgent={(patch) => patchNodeConfig(selectedNode.id, patch)}
           onPatchName={(name) => patchNodeName(selectedNode.id, name)}
           onCommitEdit={flushPendingEdit}
+          onDetachPreset={
+            selectedNode.data.kind === "agent" && selectedNode.data.presetId !== undefined
+              ? () => detachPreset(selectedNode.id)
+              : undefined
+          }
+          onUpdateFromPreset={
+            selectedNode.data.kind === "agent" && selectedNode.data.presetId !== undefined
+              ? () => {
+                  const preset = presetForNode(presets, selectedNode);
+                  if (preset === undefined) {
+                    toast({
+                      variant: "danger",
+                      title: "Preset is gone",
+                      description: "The preset this node came from was deleted.",
+                    });
+                    return;
+                  }
+                  updateNodeFromPreset(selectedNode.id, preset);
+                  toast({
+                    variant: "success",
+                    title: "Updated from preset",
+                    description: `Config and name now match “${preset.name}”.`,
+                  });
+                }
+              : undefined
+          }
+          onSaveAsPreset={
+            selectedNode.data.kind === "agent"
+              ? (name, description) =>
+                  saveNodeAsPreset(selectedNode.id, name, description).catch((cause) => {
+                    toast({
+                      variant: "danger",
+                      title: "Could not save preset",
+                      description:
+                        cause instanceof ApiError ? cause.message : "Unexpected error",
+                    });
+                  })
+              : undefined
+          }
           onDelete={() => deleteNode(selectedNode.id)}
           onClose={() => setSelectedNodeId(null)}
+        />
+      ) : null}
+
+      {managePresetsOpen ? (
+        <PresetManagerDrawer
+          presets={presets}
+          onClose={() => setManagePresetsOpen(false)}
+          onUpdate={(presetId, patch) =>
+            patchPreset(presetId, patch).catch((cause) => {
+              toast({
+                variant: "danger",
+                title: "Could not save preset",
+                description: cause instanceof ApiError ? cause.message : "Unexpected error",
+              });
+              throw cause;
+            })
+          }
+          onDelete={(presetId) =>
+            removePreset(presetId)
+              .then(() =>
+                toast({ variant: "success", title: "Preset deleted", description: "Nodes created from it keep their config copies." }),
+              )
+              .catch((cause) => {
+                toast({
+                  variant: "danger",
+                  title: "Could not delete preset",
+                  description: cause instanceof ApiError ? cause.message : "Unexpected error",
+                });
+                throw cause;
+              })
+          }
         />
       ) : null}
 

@@ -1,4 +1,4 @@
-import type { Run, Workflow, WorkflowGraph } from "@openeuler/core";
+import type { AgentPreset, Run, StepConfig, Workflow, WorkflowGraph } from "@openeuler/core";
 import { ApiError, apiFetch } from "./api";
 
 /** Injectable transport so submit flows are testable without a browser. */
@@ -74,6 +74,85 @@ export async function deleteWorkflow(
   fetcher: WorkflowFetcher = apiFetch,
 ): Promise<void> {
   await fetcher<void>(`/api/workflows/${encodeURIComponent(workflowId)}`, { method: "DELETE" });
+}
+
+// ---------------------------------------------------------------------------
+// Agent presets ("your team", #49). Nodes copy configs at creation time;
+// preset edits never silently mutate existing nodes.
+//
+
+/** The project's preset roster (builtins first, then by name). */
+export async function fetchAgentPresets(
+  projectId: string,
+  fetcher: WorkflowFetcher = apiFetch,
+): Promise<AgentPreset[]> {
+  const body = await fetcher<{ presets: AgentPreset[] }>(
+    `/api/projects/${encodeURIComponent(projectId)}/presets`,
+  );
+  return body.presets;
+}
+
+export async function createAgentPreset(options: {
+  projectId: string;
+  name: string;
+  description?: string;
+  icon?: string;
+  config: StepConfig;
+  fetcher?: WorkflowFetcher;
+}): Promise<AgentPreset> {
+  const { projectId, name, description, icon, config, fetcher = apiFetch } = options;
+  const body = await fetcher<{ preset: AgentPreset }>(
+    `/api/projects/${encodeURIComponent(projectId)}/presets`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        name,
+        ...(description === undefined ? {} : { description }),
+        ...(icon === undefined ? {} : { icon }),
+        config,
+      }),
+    },
+  );
+  return body.preset;
+}
+
+/** Mutable preset fields; `icon: null` clears it. */
+export interface AgentPresetUpdatePatch {
+  name?: string;
+  description?: string;
+  icon?: string | null;
+  config?: StepConfig;
+}
+
+export async function updateAgentPreset(options: {
+  projectId: string;
+  presetId: string;
+  patch: AgentPresetUpdatePatch;
+  fetcher?: WorkflowFetcher;
+}): Promise<AgentPreset> {
+  const { projectId, presetId, patch, fetcher = apiFetch } = options;
+  const body = await fetcher<{ preset: AgentPreset }>(
+    `/api/projects/${encodeURIComponent(projectId)}/presets/${encodeURIComponent(presetId)}`,
+    {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(patch),
+    },
+  );
+  return body.preset;
+}
+
+export async function deleteAgentPreset(options: {
+  projectId: string;
+  presetId: string;
+  fetcher?: WorkflowFetcher;
+}): Promise<void> {
+  const { projectId, presetId, fetcher = apiFetch } = options;
+  await fetcher<void>(
+    `/api/projects/${encodeURIComponent(projectId)}/presets/${encodeURIComponent(presetId)}`,
+    { method: "DELETE" },
+  );
 }
 
 /** Save outcome for the canvas editor: the new immutable revision number. */

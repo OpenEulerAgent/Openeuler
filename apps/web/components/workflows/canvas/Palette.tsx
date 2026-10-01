@@ -2,15 +2,21 @@
 
 import type { ReactNode } from "react";
 import { cn } from "@/lib/cn";
+import type { PalettePreset } from "@/lib/graph/presets";
 
 /**
  * Left palette inside the canvas editor (#46): draggable node sources.
  * `application/openeuler-canvas-node` carries the node kind; dropping it on
  * the canvas creates the node at the drop point. Structured as sections so
  * #49 can add a "Your team" presets section without touching the canvas.
+ *
+ * The "Your team" section (#49) lists the project's agent presets;
+ * `application/openeuler-canvas-preset` carries the preset id, and dropping
+ * it creates a node preconfigured from the preset's config copy.
  */
 
 export const CANVAS_NODE_MIME = "application/openeuler-canvas-node";
+export const CANVAS_PRESET_MIME = "application/openeuler-canvas-preset";
 
 export type PaletteNodeKind = "agent" | "exit";
 
@@ -59,6 +65,9 @@ export function ExitIcon({ className }: { className?: string }) {
   );
 }
 
+const ITEM_CLASS =
+  "flex cursor-grab items-start gap-2.5 rounded-lg border border-border bg-surface p-2.5 text-left shadow-1 transition-colors hover:border-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent active:cursor-grabbing";
+
 function PaletteItem({
   item,
   onAdd,
@@ -83,7 +92,7 @@ function PaletteItem({
         }
       }}
       aria-label={`Add ${item.title}`}
-      className="flex cursor-grab items-start gap-2.5 rounded-lg border border-border bg-surface p-2.5 text-left shadow-1 transition-colors hover:border-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent active:cursor-grabbing"
+      className={ITEM_CLASS}
     >
       <span className="mt-0.5 flex size-7 shrink-0 items-center justify-center rounded-md bg-elevated text-muted-fg">
         {item.icon}
@@ -96,13 +105,71 @@ function PaletteItem({
   );
 }
 
+function PresetItem({
+  preset,
+  onAdd,
+}: {
+  preset: PalettePreset;
+  onAdd: (presetId: string) => void;
+}) {
+  return (
+    <div
+      role="button"
+      tabIndex={0}
+      draggable
+      onDragStart={(event) => {
+        event.dataTransfer.setData(CANVAS_PRESET_MIME, preset.id);
+        event.dataTransfer.effectAllowed = "move";
+      }}
+      onClick={() => onAdd(preset.id)}
+      onKeyDown={(event) => {
+        if (event.key === "Enter" || event.key === " ") {
+          event.preventDefault();
+          onAdd(preset.id);
+        }
+      }}
+      aria-label={`Add ${preset.name} preset`}
+      data-palette-preset={preset.id}
+      className={ITEM_CLASS}
+    >
+      <span
+        aria-hidden
+        className="mt-0.5 flex size-7 shrink-0 items-center justify-center rounded-md bg-elevated text-base leading-none"
+      >
+        {preset.icon ?? <AgentIcon />}
+      </span>
+      <span className="min-w-0">
+        <span className="block truncate text-sm font-medium text-fg">
+          {preset.name}
+          {preset.builtin ? (
+            <span className="ml-1.5 align-middle text-[10px] font-normal text-muted-fg">
+              builtin
+            </span>
+          ) : null}
+        </span>
+        <span className="block text-xs text-muted-fg">
+          {preset.description.length > 0 ? preset.description : "Saved agent preset"}
+        </span>
+      </span>
+    </div>
+  );
+}
+
 export function Palette({
   sections,
   onAdd,
+  presets = [],
+  onAddPreset,
+  onManagePresets,
   className,
 }: {
   sections: readonly PaletteSection[];
   onAdd: (kind: PaletteNodeKind) => void;
+  /** The project's agent presets (#49): the "Your team" roster. */
+  presets?: readonly PalettePreset[];
+  /** Click-to-add: creates a preset node at the canvas center. */
+  onAddPreset?: (presetId: string) => void;
+  onManagePresets?: () => void;
   className?: string;
 }) {
   return (
@@ -130,6 +197,39 @@ export function Palette({
           </div>
         </section>
       ))}
+
+      <section className="flex flex-col gap-2" data-palette-section="your-team">
+        <header className="flex items-start justify-between gap-2">
+          <div>
+            <h2 className="text-xs font-semibold tracking-wide text-fg uppercase">Your team</h2>
+            <p className="mt-0.5 text-xs text-muted-fg">Reusable agent presets</p>
+          </div>
+          {onManagePresets ? (
+            <button
+              type="button"
+              onClick={onManagePresets}
+              className="shrink-0 rounded-md px-1.5 py-0.5 text-xs text-muted-fg transition-colors hover:bg-elevated hover:text-fg focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
+            >
+              Manage
+            </button>
+          ) : null}
+        </header>
+        <div className="flex flex-col gap-2">
+          {presets.length === 0 ? (
+            <p className="rounded-lg border border-dashed border-border p-2.5 text-xs text-muted-fg">
+              No presets yet — configure a node, then use “Save as preset…” in its inspector.
+            </p>
+          ) : (
+            presets.map((preset) => (
+              <PresetItem
+                key={preset.id}
+                preset={preset}
+                onAdd={onAddPreset ?? (() => undefined)}
+              />
+            ))
+          )}
+        </div>
+      </section>
     </aside>
   );
 }

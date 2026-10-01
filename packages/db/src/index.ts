@@ -6,6 +6,7 @@ import { drizzle } from "drizzle-orm/better-sqlite3";
 import { migrate } from "drizzle-orm/better-sqlite3/migrator";
 import * as schema from "./schema.js";
 import {
+  createAgentPresetRepo,
   createEventRepo,
   createProjectRepo,
   createRunRepo,
@@ -14,6 +15,7 @@ import {
   createWorkflowRevisionRepo,
 } from "./repos.js";
 import type {
+  AgentPresetRepo,
   EventRepo,
   ProjectRepo,
   RunRepo,
@@ -25,6 +27,7 @@ import type {
 export * from "./schema.js";
 export type {
   AgentEventInput,
+  AgentPresetPatch,
   EventInput,
   RunPatch,
   StepRunPatch,
@@ -32,7 +35,14 @@ export type {
   WorkflowRevision,
   WorkflowRevisionRepo,
 } from "./repos.js";
-export type { EventRepo, ProjectRepo, RunRepo, StepRunRepo, WorkflowRepo } from "./repos.js";
+export type {
+  AgentPresetRepo,
+  EventRepo,
+  ProjectRepo,
+  RunRepo,
+  StepRunRepo,
+  WorkflowRepo,
+} from "./repos.js";
 export { migrateLinearWorkflowsToGraphs } from "./migrate.js";
 export type { LinearMigrationResult } from "./migrate.js";
 
@@ -44,6 +54,7 @@ export interface Db {
   /** Raw better-sqlite3 handle (synchronous); use repos for typed access. */
   readonly sqlite: Database.Database;
   readonly projects: ProjectRepo;
+  readonly agentPresets: AgentPresetRepo;
   readonly workflows: WorkflowRepo;
   readonly workflowRevisions: WorkflowRevisionRepo;
   readonly runs: RunRepo;
@@ -96,6 +107,7 @@ export function createDatabase(opts: CreateDatabaseOptions = {}): Db {
     path,
     sqlite,
     projects: createProjectRepo(db),
+    agentPresets: createAgentPresetRepo(db),
     workflows: createWorkflowRepo(db),
     workflowRevisions: createWorkflowRevisionRepo(db),
     runs: createRunRepo(db),

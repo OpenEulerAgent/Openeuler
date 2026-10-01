@@ -9,6 +9,9 @@ export { idSchema, timestampSchema } from "./common.js";
 export { ProjectSchema } from "./project.js";
 export type { Project } from "./project.js";
 
+export { AgentPresetSchema } from "./preset.js";
+export type { AgentPreset } from "./preset.js";
+
 export { FileContentSchema, FileNodeSchema, FileTypeSchema } from "./file.js";
 export type { FileContent, FileNode, FileType } from "./file.js";
 
