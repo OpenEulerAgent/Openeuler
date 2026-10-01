@@ -7,6 +7,7 @@ import {
   RunStatusEventSchema,
   RunStatusSchema,
   StepRunSchema,
+  WorkflowGraphSchema,
   WorkflowSchema,
 } from "@openeuler/core";
 import type {
@@ -19,6 +20,7 @@ import type {
   Step,
   StepRun,
   Workflow,
+  WorkflowGraph,
 } from "@openeuler/core";
 import * as schema from "./schema.js";
 
@@ -74,6 +76,37 @@ export interface WorkflowRepo {
   update(id: string, patch: WorkflowPatch): Workflow | undefined;
   /** Deletes the workflow; returns true when a row was removed. */
   delete(id: string): boolean;
+}
+
+/** An immutable graph snapshot of a workflow. */
+export interface WorkflowRevision {
+  id: string;
+  workflowId: string;
+  /** Per-workflow sequence number, starting at 1. */
+  number: number;
+  graph: WorkflowGraph;
+  createdAt: string;
+}
+
+export interface WorkflowRevisionRepo {
+  /**
+   * Validates + normalizes `graph` (WorkflowGraphSchema), assigns the next
+   * per-workflow number, snapshots it, and bumps
+   * `workflows.latestRevisionNumber` — all in one transaction. The repo mints
+   * the revision id and createdAt.
+   */
+  create(workflowId: string, graph: unknown): WorkflowRevision;
+  get(id: string): WorkflowRevision | undefined;
+  getByNumber(workflowId: string, number: number): WorkflowRevision | undefined;
+  /** Revisions of a workflow, oldest first. */
+  list(workflowId: string): WorkflowRevision[];
+  /** Newest revision of a workflow, if any. */
+  latest(workflowId: string): WorkflowRevision | undefined;
+  /**
+   * Deletes every revision of a workflow (workflow delete path, only allowed
+   * once no runs reference them). Returns how many rows were removed.
+   */
+  deleteAllForWorkflow(workflowId: string): number;
 }
 
 export interface RunRepo {
@@ -157,6 +190,9 @@ export function createWorkflowRepo(db: Db): WorkflowRepo {
       name: row.name,
       steps: row.steps,
       ...(row.loopBack === null ? {} : { loopBack: row.loopBack }),
+      ...(row.latestRevisionNumber === null
+        ? {}
+        : { latestRevisionNumber: row.latestRevisionNumber }),
     });
 
   return {
@@ -201,6 +237,9 @@ export function createWorkflowRepo(db: Db): WorkflowRepo {
           : patch.loopBack === null
             ? {}
             : { loopBack: patch.loopBack }),
+        ...(current.latestRevisionNumber === null
+          ? {}
+          : { latestRevisionNumber: current.latestRevisionNumber }),
       });
       db.update(schema.workflows)
         .set({ name: next.name, steps: next.steps, loopBack: next.loopBack ?? null })
@@ -215,12 +254,107 @@ export function createWorkflowRepo(db: Db): WorkflowRepo {
   };
 }
 
+export function createWorkflowRevisionRepo(db: Db): WorkflowRevisionRepo {
+  const toDomain = (row: typeof schema.workflowRevisions.$inferSelect): WorkflowRevision => ({
+    id: row.id,
+    workflowId: row.workflowId,
+    number: row.number,
+    graph: WorkflowGraphSchema.parse(row.graph),
+    createdAt: row.createdAt,
+  });
+
+  return {
+    create(workflowId, graph) {
+      const parsed = WorkflowGraphSchema.parse(graph);
+      return db.transaction((tx) => {
+        const row = tx
+          .select({ maxNumber: sql<number | null>`max(${schema.workflowRevisions.number})` })
+          .from(schema.workflowRevisions)
+          .where(eq(schema.workflowRevisions.workflowId, workflowId))
+          .get();
+        const number = (row?.maxNumber ?? 0) + 1;
+        const revision: WorkflowRevision = {
+          id: crypto.randomUUID(),
+          workflowId,
+          number,
+          graph: parsed,
+          createdAt: new Date().toISOString(),
+        };
+        tx.insert(schema.workflowRevisions)
+          .values({
+            id: revision.id,
+            workflowId,
+            number,
+            graph: revision.graph,
+            createdAt: revision.createdAt,
+          })
+          .run();
+        tx.update(schema.workflows)
+          .set({ latestRevisionNumber: number })
+          .where(eq(schema.workflows.id, workflowId))
+          .run();
+        return revision;
+      });
+    },
+    get(id) {
+      const row = db
+        .select()
+        .from(schema.workflowRevisions)
+        .where(eq(schema.workflowRevisions.id, id))
+        .get();
+      return row ? toDomain(row) : undefined;
+    },
+    getByNumber(workflowId, number) {
+      const row = db
+        .select()
+        .from(schema.workflowRevisions)
+        .where(
+          and(
+            eq(schema.workflowRevisions.workflowId, workflowId),
+            eq(schema.workflowRevisions.number, number),
+          ),
+        )
+        .get();
+      return row ? toDomain(row) : undefined;
+    },
+    list(workflowId) {
+      const rows = db
+        .select()
+        .from(schema.workflowRevisions)
+        .where(eq(schema.workflowRevisions.workflowId, workflowId))
+        .orderBy(schema.workflowRevisions.number)
+        .all();
+      return rows.map(toDomain);
+    },
+    latest(workflowId) {
+      const rows = db
+        .select()
+        .from(schema.workflowRevisions)
+        .where(eq(schema.workflowRevisions.workflowId, workflowId))
+        .orderBy(sql`${schema.workflowRevisions.number} desc`)
+        .limit(1)
+        .all();
+      return rows.length > 0
+        ? toDomain(rows[0] as typeof schema.workflowRevisions.$inferSelect)
+        : undefined;
+    },
+    deleteAllForWorkflow(workflowId) {
+      const result = db
+        .delete(schema.workflowRevisions)
+        .where(eq(schema.workflowRevisions.workflowId, workflowId))
+        .run();
+      return result.changes;
+    },
+  };
+}
+
 export function createRunRepo(db: Db): RunRepo {
   const toDomain = (row: typeof schema.runs.$inferSelect): Run =>
     RunSchema.parse({
       id: row.id,
       projectId: row.projectId,
       ...(row.workflowId === null ? {} : { workflowId: row.workflowId }),
+      ...(row.workflowRevisionId === null ? {} : { workflowRevisionId: row.workflowRevisionId }),
       status: row.status,
       branch: row.branch,
       iteration: row.iteration,
@@ -235,6 +369,7 @@ export function createRunRepo(db: Db): RunRepo {
     id: run.id,
     projectId: run.projectId,
     workflowId: run.workflowId ?? null,
+    workflowRevisionId: run.workflowRevisionId ?? null,
     status: run.status,
     branch: run.branch,
     iteration: run.iteration,

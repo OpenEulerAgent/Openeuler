@@ -1,5 +1,5 @@
 import { serve } from "@hono/node-server";
-import { createDatabase } from "@openeuler/db";
+import { createDatabase, migrateLinearWorkflowsToGraphs } from "@openeuler/db";
 import { createDriverRegistry, createFakeDriver, createOpenCodeDriver } from "@openeuler/drivers";
 import { WorktreeManager } from "@openeuler/engine";
 import { createApp } from "./app.js";
@@ -29,8 +29,20 @@ export async function main(): Promise<void> {
   const worktrees = new WorktreeManager();
   const executor = createExecutor({ db, worktrees, drivers, logger });
 
-  // Startup task, before serving: settle runs orphaned by a previous daemon
-  // process (SIGKILL/crash) to `interrupted` and report orphaned worktrees.
+  // Startup task #1: snapshot legacy `steps` workflows as graph revision 1
+  // (idempotent — workflows that already have revisions are untouched), so
+  // every run can pin an immutable revision.
+  const graphMigration = migrateLinearWorkflowsToGraphs(db);
+  if (graphMigration.migrated.length > 0) {
+    logger.info(
+      { migrated: graphMigration.migrated.length, skipped: graphMigration.skipped.length },
+      "legacy workflows migrated to graph revisions",
+    );
+  }
+
+  // Startup task #2, before serving: settle runs orphaned by a previous
+  // daemon process (SIGKILL/crash) to `interrupted` and report orphaned
+  // worktrees.
   const sweep = await sweepInterruptedRuns({ db, worktrees, executor, logger });
   if (sweep.interruptedRunIds.length > 0 || sweep.orphanedWorktrees.length > 0) {
     logger.info(

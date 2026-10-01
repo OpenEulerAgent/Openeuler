@@ -23,13 +23,21 @@ Five SQLite tables (`packages/db/src/schema.ts`), all timestamps ISO-8601 TEXT:
 ```
 projects 1──* workflows 1──* runs 1──* step_runs
     └──────────────────────* runs 1──* events
+workflows 1──* workflow_revisions *──1 runs (runs.workflow_revision_id pins a snapshot)
 ```
 
 - **`projects`** — a registered local repo: `path` (repo root), `name`, `defaultBranch`, optional `remoteUrl`/`dirty` snapshot, `createdAt`.
-- **`workflows`** — `projectId` FK, `name`, `steps` (JSON array of `Step`), `loopBack` (JSON `LoopBack` or null).
-- **`runs`** — `projectId` FK, nullable `workflowId` FK (absent = ad-hoc run driven by `task`), `status` (`queued|running|success|failed|aborted|interrupted`), `branch` (always `agentloop/<runId>`), `iteration` (**0-based** current pass), optional `task`/`output`/`error`.
+- **`workflows`** — `projectId` FK, `name`, `steps` (JSON array of `Step`), `loopBack` (JSON `LoopBack` or null), `latestRevisionNumber` (nullable; maintained by the revision repo).
+- **`workflow_revisions`** — immutable graph snapshots: `workflowId` FK, per-workflow `number` (unique, starting 1), `graph` (JSON `WorkflowGraph`), `createdAt`. Every save — canvas `PUT /graph` or a legacy steps write (auto-snapshotted) — appends the next revision.
+- **`runs`** — `projectId` FK, nullable `workflowId` FK (absent = ad-hoc run driven by `task`), nullable `workflowRevisionId` FK (the snapshot the run is pinned to at creation; editing the workflow afterwards never affects it), `status` (`queued|running|success|failed|aborted|interrupted`), `branch` (always `agentloop/<runId>`), `iteration` (**0-based** current pass), optional `task`/`output`/`error`.
 - **`step_runs`** — one row per (step, pass): `runId` FK, `stepId` (`"adhoc"` for ad-hoc runs), `iteration` (**1-based**, matching `{{iterations}}`), nullable `sessionId` (agent session, recorded from the driver's `session` event), `status`, `output`, nullable `diff` (`stat\npatch`, see below).
 - **`events`** — append-only event log per run: `runId` FK, `seq`, `type`, `payload` (full event JSON without `seq`), `createdAt`.
+
+### Graph workflows & revisions
+
+The canonical workflow shape is a **graph** (`WorkflowGraph` in `core/graph.ts`): agent nodes (the existing step config) plus `exit` marker nodes, connected by edges carrying an `ExitCondition` (default `always`). A node mixing conditional edges with (at most one) `always` edge is a **router**: conditions evaluate in `order` (first match wins; #45), the `always` edge is the fallback, and no matching edge ends the run. Schema validation (`validateWorkflowGraph`, enforced at save time) rejects unknown entry/edge endpoints, unreachable nodes, unconditional cycles, multiple `always` outgoing edges, duplicate router `order`s, and `{{output:<nodeId>}}` template references to non-upstream nodes. Edge `maxIterations` is the cycle guard (default 3, normalized onto cycle edges).
+
+`steps` + `loopBack` remains the legacy mirror: `linearToGraph` translates it into an equivalent chain (one node per step, `always` edges, an `exit` node, and — for a loopBack — a conditional loop edge carrying the **negated** exit condition: `contains↔notContains` directly, `invert: true` for `outputMatches`/`always`, plus the loop's `maxIterations`), and `graphToLinear` recognizes exactly that chain+loop shape back. At boot the daemon snapshots every revision-less workflow as revision 1 (idempotent). Until the graph engine lands (#45), pinned revision runs execute through a shim that converts the graph back to steps+loopBack — identical behavior for migrated workflows; richer routers fail fast with an actionable error.
 
 ### Event log & `seq` semantics
 
@@ -53,7 +61,7 @@ Entry point: `executeRun(runId, control, opts)` — never throws; every failure 
 
 ### Prompt templating
 
-`promptTemplate` supports `{{task}}` (the run's task), `{{prevOutput}}` (previous step's output this pass), `{{iterations}}` (current pass, 1-based). Unknown variables are an error at render time. Ad-hoc runs execute a single transient step (`stepId: "adhoc"`) whose template is the literal task.
+`promptTemplate` supports `{{task}}` (the run's task), `{{prevOutput}}` (previous step's output this pass), `{{iterations}}` (current pass, 1-based), and — in graph workflows — `{{output:<nodeId>}}` (any upstream node's final output; referencing a non-upstream node is rejected at save time, a missing output is an error at render time). Unknown variables are an error at render time. Ad-hoc runs execute a single transient step (`stepId: "adhoc"`) whose template is the literal task.
 
 ### Session continuation
 
@@ -88,7 +96,15 @@ Before serving, `sweepInterruptedRuns` marks any run left `queued`/`running` by 
 ### Resume & retry
 
 - `POST /api/runs/:id/resume` — interrupted runs only, and only when **every started StepRun recorded a sessionId** (`409 RUN_RESUME_NOT_POSSIBLE` otherwise: the agent context is gone). Re-queues the run in place; the engine continues as above.
-- `POST /api/runs/:id/retry` — any finished run; creates a **new** run (fresh id → fresh `agentloop/<id>` branch and worktree) with the same workflow/task, through the normal scheduler.
+- `POST /api/runs/:id/retry` — any finished run; creates a **new** run (fresh id → fresh `agentloop/<id>` branch and worktree) with the same workflow/task, through the normal scheduler. A retried workflow run pins the workflow's **current** latest revision (same rule as a fresh run).
+
+### Workflow & revision API
+
+- `POST /api/workflows` — `{ projectId, name, graph }` (canonical; creates revision 1) or the legacy `{ projectId, name, steps, loopBack? }` (auto-snapshotted as revision 1).
+- `PATCH /api/workflows/:id` — legacy field edits; shape changes are auto-snapshotted as a new revision.
+- `PUT /api/workflows/:id/graph` — `{ graph }`; validates (422 with node/edge-attributed `details`) and snapshots the next immutable revision. Refreshes the legacy steps mirror when the graph round-trips.
+- `GET /api/workflows/:id/revisions` — list (`id`, `number`, `createdAt`; no graph blobs); `GET /api/workflows/:id/revisions/:number` — the full snapshot.
+- `POST /api/workflows/:id/runs` — pins the latest revision on the run (`runs.workflowRevisionId`; run responses carry `workflowRevision: { id, number }`).
 
 ### SSE protocol (`GET /api/runs/:id/events`)
 

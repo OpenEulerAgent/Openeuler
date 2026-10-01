@@ -1,5 +1,12 @@
 import { randomUUID } from "node:crypto";
-import type { PersistedEvent, Run, RunStatus, StepRun, TerminalRunStatus } from "@openeuler/core";
+import type {
+  PersistedEvent,
+  Run,
+  RunStatus,
+  StepRun,
+  TerminalRunStatus,
+  Workflow,
+} from "@openeuler/core";
 import { TERMINAL_RUN_STATUSES, RunStatusSchema } from "@openeuler/core";
 import type { Db } from "@openeuler/db";
 import { DriverError } from "@openeuler/drivers";
@@ -11,6 +18,7 @@ import { z } from "zod";
 import type { AppEnv } from "../app.js";
 import type { Executor } from "../executor.js";
 import { HttpError } from "../errors.js";
+import { ensureLatestRevision } from "./workflows.js";
 
 /**
  * StepRun `stepId` backing ad-hoc runs (no workflow); defined by the engine,
@@ -89,10 +97,15 @@ export interface RunStatsBody {
 
 /**
  * A run as returned by the API: the core `Run` plus `queuePosition`, a
- * computed field present only while the run sits in the global queue. It is
- * deliberately NOT part of the persisted core Run schema.
+ * computed field present only while the run sits in the global queue, and
+ * `workflowRevision` `{ id, number }`, resolved for runs pinned to a graph
+ * revision snapshot. Both are deliberately NOT part of the persisted core
+ * Run schema.
  */
-export type RunApiBody = Run & { queuePosition?: number };
+export type RunApiBody = Run & {
+  queuePosition?: number;
+  workflowRevision?: { id: string; number: number };
+};
 
 /**
  * `queuePosition` per queued run id: how many queued runs were created
@@ -109,11 +122,20 @@ function queuePositionsByRunId(db: Db): Map<string, number> {
   return positions;
 }
 
-/** Attaches `queuePosition` to queued rows (others pass through untouched). */
-function withQueuePosition(run: Run, positions: Map<string, number>): RunApiBody {
-  if (run.status !== "queued") return run;
-  const queuePosition = positions.get(run.id);
-  return queuePosition === undefined ? run : { ...run, queuePosition };
+/** Attaches `workflowRevision` (when pinned) and `queuePosition` (when queued). */
+function decorateRun(db: Db, run: Run, positions?: Map<string, number>): RunApiBody {
+  let body: RunApiBody = run;
+  if (run.workflowRevisionId !== undefined) {
+    const revision = db.workflowRevisions.get(run.workflowRevisionId);
+    if (revision !== undefined) {
+      body = { ...body, workflowRevision: { id: revision.id, number: revision.number } };
+    }
+  }
+  if (run.status === "queued" && positions !== undefined) {
+    const queuePosition = positions.get(run.id);
+    if (queuePosition !== undefined) body = { ...body, queuePosition };
+  }
+  return body;
 }
 
 function requireDb(c: Context<AppEnv>): Db {
@@ -326,7 +348,7 @@ export function createRunsRouter(options: CreateRunsRouterOptions = {}): Hono<Ap
     }
     const runs = db.runs.list(c.req.query("projectId") || undefined, status);
     const positions = queuePositionsByRunId(db);
-    const body: RunListBody = { runs: runs.map((run) => withQueuePosition(run, positions)) };
+    const body: RunListBody = { runs: runs.map((run) => decorateRun(db, run, positions)) };
     return c.json(body);
   });
 
@@ -359,7 +381,7 @@ export function createRunsRouter(options: CreateRunsRouterOptions = {}): Hono<Ap
       return ai === bi ? a.stepId.localeCompare(b.stepId) : ai - bi;
     });
     const body: RunDetailBody = {
-      run: withQueuePosition(run, queuePositionsByRunId(db)),
+      run: decorateRun(db, run, queuePositionsByRunId(db)),
       steps: sorted,
       iterations: groupByIteration(sorted),
       summary: { eventCount: db.events.count(run.id) },
@@ -604,7 +626,7 @@ export function createRunsRouter(options: CreateRunsRouterOptions = {}): Hono<Ap
         `run ${id} already finished with status ${result.status}`,
       );
     }
-    return c.json({ run: db.runs.get(id) });
+    return c.json({ run: decorateRun(db, db.runs.get(id) as Run) });
   });
 
   // Resume an interrupted run in place: the engine continues from the current
@@ -637,7 +659,7 @@ export function createRunsRouter(options: CreateRunsRouterOptions = {}): Hono<Ap
     db.runs.updateStatus(id, "queued");
     c.get("logger").info({ runId: id }, "run resumed after interruption");
     executor.startRun(id);
-    return c.json({ run: db.runs.get(id) }, 202);
+    return c.json({ run: decorateRun(db, db.runs.get(id) as Run) }, 202);
   });
 
   // Retry any finished (terminal or interrupted) run as a NEW run: same
@@ -673,10 +695,18 @@ export function createRunsRouter(options: CreateRunsRouterOptions = {}): Hono<Ap
 
     const runId = randomUUID();
     const now = new Date().toISOString();
+    // A retried workflow run pins the workflow's CURRENT latest revision
+    // (same rule as a fresh run creation), not the original run's snapshot.
+    let pinnedRevisionId: string | undefined;
+    if (run.workflowId !== undefined) {
+      const workflow = db.workflows.get(run.workflowId) as Workflow;
+      pinnedRevisionId = ensureLatestRevision(db, workflow).id;
+    }
     const retry: Run = {
       id: runId,
       projectId: run.projectId,
       ...(run.workflowId === undefined ? {} : { workflowId: run.workflowId }),
+      ...(pinnedRevisionId === undefined ? {} : { workflowRevisionId: pinnedRevisionId }),
       status: "queued",
       branch: branchForRun(runId),
       iteration: 0,
@@ -687,7 +717,7 @@ export function createRunsRouter(options: CreateRunsRouterOptions = {}): Hono<Ap
     db.runs.create(retry);
     c.get("logger").info({ runId, sourceRunId: id }, "run retried as a new run");
     executor.startRun(runId);
-    return c.json({ run: db.runs.get(runId) }, 202);
+    return c.json({ run: decorateRun(db, db.runs.get(runId) as Run) }, 202);
   });
 
   return runs;

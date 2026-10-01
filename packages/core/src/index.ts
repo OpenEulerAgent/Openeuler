@@ -19,6 +19,7 @@ export {
   OutputContainsConditionSchema,
   OutputMatchesConditionSchema,
   OutputNotContainsConditionSchema,
+  StepConfigSchema,
   StepSchema,
   WorkflowSchema,
   WorkflowShapeSchema,
@@ -32,8 +33,34 @@ export type {
   OutputMatchesCondition,
   OutputNotContainsCondition,
   Step,
+  StepConfig,
   Workflow,
 } from "./workflow.js";
+
+export {
+  AgentGraphNodeSchema,
+  DEFAULT_EDGE_MAX_ITERATIONS,
+  ExitGraphNodeSchema,
+  GraphEdgeSchema,
+  GraphNodePositionSchema,
+  GraphNodeSchema,
+  WorkflowGraphSchema,
+  WorkflowGraphShapeSchema,
+  graphToLinear,
+  linearToGraph,
+  validateWorkflowGraph,
+} from "./graph.js";
+export type {
+  AgentGraphNode,
+  ExitGraphNode,
+  GraphEdge,
+  GraphNode,
+  GraphNodePosition,
+  GraphToLinearResult,
+  GraphValidationIssue,
+  WorkflowGraph,
+  WorkflowGraphShape,
+} from "./graph.js";
 
 export {
   RunSchema,
@@ -85,7 +112,11 @@ export type {
   StepStartedEvent,
 } from "./run-event.js";
 
-export { PROMPT_TEMPLATE_VARIABLES, renderPromptTemplate } from "./prompt.js";
+export {
+  PROMPT_TEMPLATE_VARIABLES,
+  extractOutputReferences,
+  renderPromptTemplate,
+} from "./prompt.js";
 export type { PromptTemplateVariable, PromptTemplateVars } from "./prompt.js";
 
 export { isValidRegex } from "./regex.js";
