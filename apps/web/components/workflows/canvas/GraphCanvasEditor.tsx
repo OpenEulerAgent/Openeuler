@@ -847,7 +847,7 @@ function GraphCanvasInner({
           doc={doc}
           issues={issues}
           onPatch={(patch) => patchEdge(selectedEdge.id, patch)}
-          onMove={(direction) => moveEdgeOrder(selectedEdge.id, direction)}
+          onMove={moveEdgeOrder}
           onCommitEdit={flushPendingEdit}
           onDelete={() => deleteEdge(selectedEdge.id)}
           onClose={() => setSelectedEdgeId(null)}

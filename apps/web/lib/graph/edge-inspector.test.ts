@@ -183,6 +183,33 @@ describe("testCondition (live regex test box)", () => {
     expect(caseInsensitive).toEqual({ ok: true, matched: true, regions: [{ start: 0, end: 2 }] });
   });
 
+  it("reports every multiline ^/$ anchored match (m flag)", () => {
+    const sample = "no\nok\nok";
+    const result = testCondition(
+      { condition: { type: "outputMatches", regex: "^ok$", flags: "m" } },
+      sample,
+    );
+    expect(result.ok && result.matched).toBe(true);
+    expect(result.ok && result.regions).toEqual([
+      { start: 3, end: 5 },
+      { start: 6, end: 8 },
+    ]);
+  });
+
+  it("sticky (y) scans resume after a gap and report later matches", () => {
+    const sample = "x\nok\nno\nok";
+    const result = testCondition(
+      { condition: { type: "outputMatches", regex: "^ok", flags: "ym" } },
+      sample,
+    );
+    // The verdict mirrors the engine's sticky test at index 0 — no match.
+    expect(result.ok && result.matched).toBe(false);
+    expect(result.ok && result.regions).toEqual([
+      { start: 2, end: 4 },
+      { start: 8, end: 10 },
+    ]);
+  });
+
   it("zero-width regex matches report a match but highlight nothing", () => {
     const result = testCondition({ condition: { type: "outputMatches", regex: "a*" } }, "bbb");
     expect(result).toEqual({ ok: true, matched: true, regions: [] });
@@ -394,6 +421,35 @@ describe("routerRows / moveRouterEdge (evaluation order)", () => {
     expect(fallback?.data.order).toBeUndefined();
   });
 
+  it("moves the edge whose row chevron was clicked, not the selected edge", () => {
+    const doc: CanvasDocument = {
+      nodes: [
+        node("a", { isEntry: true }),
+        node("b", { position: { x: 300, y: -140 } }),
+        node("c", { position: { x: 300, y: 0 } }),
+        node("d", { position: { x: 300, y: 140 } }),
+        exit("x", { x: 620, y: 0 }),
+      ],
+      edges: [
+        // The inspected (selected) edge is row 1; row 3's up chevron
+        // dispatches with row 3's edge id.
+        {
+          ...edge("a", "b", { condition: condition({ type: "outputContains", pattern: "LGTM" }) }),
+          selected: true,
+        },
+        edge("a", "c", { condition: condition({ type: "outputNotContains", pattern: "TODO" }) }),
+        edge("a", "d", { condition: condition({ type: "outputMatches", regex: "^needs fix" }) }),
+        edge("a", "x"),
+      ],
+    };
+    const moved = edgeInspectorReducer(doc, { type: "moveEdge", edgeId: "e-a-d", direction: -1 });
+    const rows = routerRows(moved, "a").filter((row) => row.conditional);
+    expect(rows.map((row) => row.edge.id)).toEqual(["e-a-b", "e-a-d", "e-a-c"]);
+    expect(rows.map((row) => row.order)).toEqual([0, 1, 2]);
+    // Rows 2 and 3 swapped while the selection stayed on row 1.
+    expect(moved.edges.find((candidate) => candidate.id === "e-a-b")?.selected).toBe(true);
+  });
+
   it("no-ops at the ends, for the fallback edge, and for unknown edges", () => {
     const doc = routerDoc();
     expect(moveRouterEdge(doc, "e-a-b", -1)).toBe(doc);
@@ -466,6 +522,18 @@ describe("routerFallbackWarnings (missing fallback)", () => {
 
     const deadEnd: CanvasDocument = { nodes: [node("a", { isEntry: true })], edges: [] };
     expect(routerFallbackWarnings(deadEnd)).toEqual([]);
+  });
+
+  it("warns for a single-conditional router too — the drawer banner gates on the lib", () => {
+    const doc: CanvasDocument = {
+      nodes: [node("a", { isEntry: true }), exit("x")],
+      edges: [
+        edge("a", "x", { condition: condition({ type: "outputContains", pattern: "LGTM" }) }),
+      ],
+    };
+    expect(routerFallbackWarnings(doc)).toEqual([
+      { nodeId: "a", message: MISSING_FALLBACK_MESSAGE },
+    ]);
   });
 
   it("treats an inverted always edge as conditional (no fallback)", () => {

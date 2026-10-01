@@ -17,6 +17,7 @@ import {
   cyclicEdgeIds,
   edgeFieldErrors,
   needsConditionConfig,
+  routerFallbackWarnings,
   routerRows,
   testCondition,
   type ConditionMatchRegion,
@@ -48,8 +49,8 @@ export function EdgePropertiesDrawer({
   doc: CanvasDocument;
   issues: readonly CanvasIssue[];
   onPatch: (patch: Partial<CanvasEdge["data"]>) => void;
-  /** Moves the edge within its router's evaluation order. */
-  onMove: (direction: -1 | 1) => void;
+  /** Moves the given edge (a router-order row) within its evaluation order. */
+  onMove: (edgeId: string, direction: -1 | 1) => void;
   /** Settles a pending debounced edit into one history entry (field blur). */
   onCommitEdit: () => void;
   onDelete: () => void;
@@ -66,7 +67,12 @@ export function EdgePropertiesDrawer({
 
   const siblings = doc.edges.filter((candidate) => candidate.source === edge.source);
   const rows = useMemo(() => routerRows(doc, edge.source), [doc, edge.source]);
-  const hasFallback = rows.some((row) => !row.conditional);
+  // Same gate as the lib's warnings (single-conditional routers included):
+  // any router with ≥ 1 conditional edge and no always fallback.
+  const missingFallback = useMemo(
+    () => routerFallbackWarnings(doc).some((warning) => warning.nodeId === edge.source),
+    [doc, edge.source],
+  );
 
   const isCycleEdge = useMemo(() => cyclicEdgeIds(doc).has(edge.id), [doc, edge.id]);
 
@@ -245,7 +251,7 @@ export function EdgePropertiesDrawer({
           <EvaluationOrder rows={rows} nodeNames={nodeNamesOf(doc)} onMove={onMove} />
         ) : null}
 
-        {siblings.length > 1 && !hasFallback ? (
+        {missingFallback ? (
           <div
             className="rounded-lg border border-warning/50 bg-warning-subtle p-3"
             role="alert"
@@ -369,7 +375,7 @@ function EvaluationOrder({
 }: {
   rows: ReturnType<typeof routerRows>;
   nodeNames: ReadonlyMap<string, string>;
-  onMove: (direction: -1 | 1) => void;
+  onMove: (edgeId: string, direction: -1 | 1) => void;
 }) {
   const conditionalRows = rows.filter((row) => row.conditional);
   const fallbackRow = rows.find((row) => !row.conditional);
@@ -409,7 +415,7 @@ function EvaluationOrder({
                 type="button"
                 aria-label={`Evaluate via ${nodeNames.get(row.edge.target) ?? row.edge.target} earlier`}
                 disabled={index === 0}
-                onClick={() => onMove(-1)}
+                onClick={() => onMove(row.edge.id, -1)}
                 className="rounded-md border border-border p-1 text-muted-fg transition-colors hover:bg-elevated hover:text-fg focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent disabled:pointer-events-none disabled:opacity-40"
               >
                 <svg
@@ -427,7 +433,7 @@ function EvaluationOrder({
                 type="button"
                 aria-label={`Evaluate via ${nodeNames.get(row.edge.target) ?? row.edge.target} later`}
                 disabled={index === conditionalRows.length - 1}
-                onClick={() => onMove(1)}
+                onClick={() => onMove(row.edge.id, 1)}
                 className="rounded-md border border-border p-1 text-muted-fg transition-colors hover:bg-elevated hover:text-fg focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent disabled:pointer-events-none disabled:opacity-40"
               >
                 <svg

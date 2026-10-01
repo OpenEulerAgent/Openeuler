@@ -137,15 +137,26 @@ export function testCondition(
 
   const regions: ConditionMatchRegion[] = [];
   // Enumerate matches with a global view of the same pattern (the pattern
-  // keeps its own anchoring; zero-width matches highlight nothing).
+  // keeps its own anchoring; zero-width matches highlight nothing). Sticky
+  // (y) scans resume one index past a miss instead of stopping at the
+  // first gap, so every non-overlapping match is reported — multiline
+  // ^/$ anchors included.
   const scanner = new RegExp(condition.regex, (condition.flags ?? "").replaceAll("g", "") + "g");
-  for (const match of sample.matchAll(scanner)) {
+  let at = 0;
+  while (at <= sample.length) {
+    scanner.lastIndex = at;
+    const match = scanner.exec(sample);
+    if (match === null) {
+      if (!scanner.sticky) break;
+      at += 1;
+      continue;
+    }
     const start = match.index ?? 0;
     const end = start + match[0].length;
     if (end > start) regions.push({ start, end });
+    at = end > start ? end : end + 1;
     if (regions.length > 500) break;
   }
-  regex.lastIndex = 0;
   return {
     ok: true,
     matched: data.invert === true ? !regex.test(sample) : regex.test(sample),
