@@ -457,6 +457,55 @@ describe("graph engine (router if/else)", () => {
     expect(h.drivers.ship.calls).toHaveLength(0);
   });
 
+  it("flips the taken path when the router order is swapped (reorder changes first-match)", async () => {
+    // The same two mutually-matching conditionals as the test above, but
+    // with their `order` values swapped: the SECOND edge now wins. This is
+    // the engine-level counterpart of the editor's reorder (#48) — moving a
+    // conditional edge up/down renumbers its siblings the same way.
+    const build = (firstOrder: number, secondOrder: number) =>
+      WorkflowGraphSchema.parse({
+        entryNodeId: "pick",
+        nodes: [
+          agentNode("pick", "impl"),
+          agentNode("first", "rev", { promptTemplate: "first {{prevOutput}}", y: -120 }),
+          agentNode("second", "ship", { promptTemplate: "second {{prevOutput}}", y: 120 }),
+          exitNode(),
+        ],
+        edges: [
+          {
+            id: "e-first",
+            source: "pick",
+            target: "first",
+            condition: { type: "outputContains", pattern: "IMPL" },
+            order: firstOrder,
+          },
+          {
+            id: "e-second",
+            source: "pick",
+            target: "second",
+            condition: { type: "outputNotContains", pattern: "zzz" },
+            order: secondOrder,
+          },
+          { id: "e-f-exit", source: "first", target: "exit", condition: { type: "always" } },
+          { id: "e-s-exit", source: "second", target: "exit", condition: { type: "always" } },
+        ],
+      });
+
+    const h = setup();
+    const { revisionId: original } = h.pinGraph(build(1, 2));
+    const runOriginal = h.enqueueRevisionRun(original);
+    await h.engine.executeRun(runOriginal.id, noAbort);
+    await awaitStatus(h, runOriginal.id, "success");
+    expect(takenEdges(h, runOriginal.id)).toEqual(["e-first", "e-f-exit"]);
+
+    const { revisionId: swapped } = h.pinGraph(build(2, 1));
+    const runSwapped = h.enqueueRevisionRun(swapped);
+    await h.engine.executeRun(runSwapped.id, noAbort);
+    await awaitStatus(h, runSwapped.id, "success");
+    expect(takenEdges(h, runSwapped.id)).toEqual(["e-second", "e-s-exit"]);
+    expect(h.drivers.rev.calls).toHaveLength(1); // only the original run entered "first"
+  });
+
   it("negates the match result on inverted edges (invert flag)", async () => {
     const h = setup();
     const { revisionId } = h.pinGraph(

@@ -61,6 +61,12 @@ import {
 import { applyLayout } from "@/lib/graph/layout";
 import { applyInspectorAction } from "@/lib/graph/inspector";
 import {
+  applyEdgeInspectorAction,
+  conditionSummary,
+  needsConditionConfig,
+  routerFallbackWarnings,
+} from "@/lib/graph/edge-inspector";
+import {
   issuesFromApiDetails,
   validateCanvasDocument,
   type CanvasIssue,
@@ -69,10 +75,11 @@ import { saveWorkflowGraph, type WorkflowWithGraph } from "@/lib/workflows-api";
 import {
   canvasNodeTypes,
   NodeIssueCountsContext,
+  NodeWarningCountsContext,
   toFlowNodes,
   type CanvasFlowNode,
 } from "./canvas-nodes";
-import { EdgeEditorPanel, conditionSummary } from "./EdgeEditorPanel";
+import { EdgePropertiesDrawer } from "./EdgePropertiesDrawer";
 import { NodePropertiesDrawer } from "./NodePropertiesDrawer";
 import { Palette, type PaletteNodeKind, type PaletteSection, CANVAS_NODE_MIME } from "./Palette";
 import { ShortcutsPopover } from "./ShortcutsPopover";
@@ -101,30 +108,59 @@ function positionsChanged(before: CanvasDocument, after: CanvasDocument): boolea
   });
 }
 
-/** Document → React Flow edges: conditional edges dashed + labelled, issues red. */
+/**
+ * Document → React Flow edges. Condition summaries label every router and
+ * conditional edge (#48): conditional edges dashed in info blue, the
+ * `always` fallback of a router subtle and dotted, unconfigured
+ * placeholder conditions in warning amber, validation-flagged edges red.
+ * Plain chain edges (a node's single unconditional outgoing edge) stay
+ * unlabeled to keep linear graphs quiet.
+ */
 function toFlowEdges(doc: CanvasDocument, issues: readonly CanvasIssue[]): Edge<CanvasEdgeData>[] {
   const problematic = new Set(
     issues.filter((issue) => issue.edgeId !== undefined).map((issue) => issue.edgeId),
   );
+  const outgoing = new Map<string, number>();
+  for (const edge of doc.edges) {
+    outgoing.set(edge.source, (outgoing.get(edge.source) ?? 0) + 1);
+  }
   return doc.edges.map((edge): Edge<CanvasEdgeData> => {
     const conditional = !isUnconditionalEdge(edge.data);
     const invalid = problematic.has(edge.id);
+    const unconfigured = needsConditionConfig(edge.data);
+    const router = (outgoing.get(edge.source) ?? 0) > 1;
+
+    let stroke = "var(--muted-fg)";
+    let strokeWidth = 2;
+    let dash: { strokeDasharray: string } | Record<string, never> = {};
+    if (conditional) {
+      stroke = "var(--info)";
+      dash = { strokeDasharray: "6 4" };
+      if (unconfigured) {
+        stroke = "var(--warning)";
+        strokeWidth = 2.5;
+      }
+    } else if (router) {
+      strokeWidth = 1.5;
+      dash = { strokeDasharray: "2 5" };
+    }
+    if (invalid) {
+      stroke = "var(--danger)";
+      strokeWidth = 2.5;
+    }
+
     return {
       ...edge,
-      label: conditional ? conditionSummary(edge.data) : undefined,
+      label: conditional || router ? conditionSummary(edge.data) : undefined,
       labelBgStyle: { fill: "var(--surface)" },
       labelBgPadding: [6, 3] as [number, number],
       labelBgBorderRadius: 4,
-      labelStyle: { fill: invalid ? "var(--danger)" : "var(--muted-fg)", fontSize: "10px" },
-      style: {
-        stroke: invalid ? "var(--danger)" : conditional ? "var(--info)" : "var(--muted-fg)",
-        strokeWidth: invalid ? 2.5 : 2,
-        ...(conditional ? { strokeDasharray: "6 4" } : {}),
+      labelStyle: {
+        fill: invalid ? "var(--danger)" : unconfigured ? "var(--warning)" : stroke,
+        fontSize: "10px",
       },
-      markerEnd: {
-        type: MarkerType.ArrowClosed,
-        color: invalid ? "var(--danger)" : conditional ? "var(--info)" : "var(--muted-fg)",
-      },
+      style: { stroke, strokeWidth, ...dash },
+      markerEnd: { type: MarkerType.ArrowClosed, color: stroke },
     };
   });
 }
@@ -250,14 +286,21 @@ function GraphCanvasInner({
   );
 
   // Settle a pending debounced inspector edit whenever the inspected target
-  // changes (drawer close, deselect, switching nodes) so the edit session
-  // lands as one undo entry instead of lingering mid-burst.
+  // changes (drawer close, deselect, switching nodes or edges) so the edit
+  // session lands as one undo entry instead of lingering mid-burst.
   const selectedNodeIdRef = useRef<string | null>(selectedNodeId);
   useEffect(() => {
     if (selectedNodeIdRef.current === selectedNodeId) return;
     selectedNodeIdRef.current = selectedNodeId;
     flushPendingEdit();
   }, [selectedNodeId, flushPendingEdit]);
+
+  const selectedEdgeIdRef = useRef<string | null>(selectedEdgeId);
+  useEffect(() => {
+    if (selectedEdgeIdRef.current === selectedEdgeId) return;
+    selectedEdgeIdRef.current = selectedEdgeId;
+    flushPendingEdit();
+  }, [selectedEdgeId, flushPendingEdit]);
 
   const pruneSelection = useCallback(
     (next: CanvasDocument) => {
@@ -420,14 +463,25 @@ function GraphCanvasInner({
 
   const patchEdge = useCallback(
     (edgeId: string, patch: Partial<CanvasEdge["data"]>) => {
-      patchDocDebounced((current) => ({
-        ...current,
-        edges: current.edges.map((edge) =>
-          edge.id === edgeId ? { ...edge, data: { ...edge.data, ...patch } } : edge,
-        ),
-      }));
+      patchDocDebounced((current) =>
+        applyEdgeInspectorAction(current, { type: "patchEdge", edgeId, patch }),
+      );
     },
     [patchDocDebounced],
+  );
+
+  /** Reordering is a discrete action: one snapshot per click. */
+  const moveEdgeOrder = useCallback(
+    (edgeId: string, direction: -1 | 1) => {
+      commitDoc(
+        applyEdgeInspectorAction(historyRef.current.present, {
+          type: "moveEdge",
+          edgeId,
+          direction,
+        }),
+      );
+    },
+    [commitDoc],
   );
 
   const deleteNode = useCallback(
@@ -543,6 +597,16 @@ function GraphCanvasInner({
     }
     return counts;
   }, [issues]);
+  // Advisory warnings (router with no `always` fallback) are live, not
+  // save-gated — they should appear and clear as the user edits.
+  const warnings = useMemo(() => routerFallbackWarnings(doc), [doc]);
+  const warningCounts = useMemo(() => {
+    const counts = new Map<string, number>();
+    for (const warning of warnings) {
+      counts.set(warning.nodeId, (counts.get(warning.nodeId) ?? 0) + 1);
+    }
+    return counts;
+  }, [warnings]);
   const nodeNames = useMemo(
     () => new Map(doc.nodes.map((node) => [node.id, node.data.name])),
     [doc.nodes],
@@ -715,38 +779,40 @@ function GraphCanvasInner({
           data-canvas-canvas
         >
           <NodeIssueCountsContext.Provider value={issueCounts}>
-            <ReactFlow
-              nodes={nodes}
-              edges={edges}
-              nodeTypes={canvasNodeTypes}
-              onNodesChange={onNodesChange}
-              onEdgesChange={onEdgesChange}
-              onConnect={onConnect}
-              onNodeDragStart={onNodeDragStart}
-              onNodeDragStop={onNodeDragStop}
-              onNodeClick={(_, node) => {
-                setSelectedEdgeId(null);
-                setSelectedNodeId(node.id);
-              }}
-              onEdgeClick={(_, edge) => {
-                setSelectedNodeId(null);
-                setSelectedEdgeId(edge.id);
-              }}
-              onPaneClick={() => {
-                setSelectedNodeId(null);
-                setSelectedEdgeId(null);
-              }}
-              deleteKeyCode={null}
-              multiSelectionKeyCode={["Meta", "Shift"]}
-              minZoom={0.2}
-              maxZoom={2.5}
-              fitView
-              fitViewOptions={{ padding: 0.2, maxZoom: 1 }}
-              colorMode="dark"
-            >
-              <Background variant={BackgroundVariant.Dots} gap={24} size={1.5} />
-              <Controls showInteractive={false} />
-            </ReactFlow>
+            <NodeWarningCountsContext.Provider value={warningCounts}>
+              <ReactFlow
+                nodes={nodes}
+                edges={edges}
+                nodeTypes={canvasNodeTypes}
+                onNodesChange={onNodesChange}
+                onEdgesChange={onEdgesChange}
+                onConnect={onConnect}
+                onNodeDragStart={onNodeDragStart}
+                onNodeDragStop={onNodeDragStop}
+                onNodeClick={(_, node) => {
+                  setSelectedEdgeId(null);
+                  setSelectedNodeId(node.id);
+                }}
+                onEdgeClick={(_, edge) => {
+                  setSelectedNodeId(null);
+                  setSelectedEdgeId(edge.id);
+                }}
+                onPaneClick={() => {
+                  setSelectedNodeId(null);
+                  setSelectedEdgeId(null);
+                }}
+                deleteKeyCode={null}
+                multiSelectionKeyCode={["Meta", "Shift"]}
+                minZoom={0.2}
+                maxZoom={2.5}
+                fitView
+                fitViewOptions={{ padding: 0.2, maxZoom: 1 }}
+                colorMode="dark"
+              >
+                <Background variant={BackgroundVariant.Dots} gap={24} size={1.5} />
+                <Controls showInteractive={false} />
+              </ReactFlow>
+            </NodeWarningCountsContext.Provider>
           </NodeIssueCountsContext.Provider>
 
           {isEmpty ? (
@@ -759,19 +825,9 @@ function GraphCanvasInner({
             </div>
           ) : null}
 
-          {selectedEdge !== null ? (
-            <EdgeEditorPanel
-              edge={selectedEdge}
-              doc={doc}
-              issues={issues}
-              onPatch={(patch) => patchEdge(selectedEdge.id, patch)}
-              onDelete={() => deleteEdge(selectedEdge.id)}
-              onClose={() => setSelectedEdgeId(null)}
-            />
-          ) : null}
-
           <ValidationPanel
             issues={issues}
+            warnings={warnings}
             nodeNames={nodeNames}
             onFocusIssue={focusIssue}
             className="absolute bottom-3 left-3 z-10 w-[28rem] max-w-[calc(100%-1.5rem)]"
@@ -784,6 +840,19 @@ function GraphCanvasInner({
           ) : null}
         </div>
       </div>
+
+      {selectedEdge !== null ? (
+        <EdgePropertiesDrawer
+          edge={selectedEdge}
+          doc={doc}
+          issues={issues}
+          onPatch={(patch) => patchEdge(selectedEdge.id, patch)}
+          onMove={moveEdgeOrder}
+          onCommitEdit={flushPendingEdit}
+          onDelete={() => deleteEdge(selectedEdge.id)}
+          onClose={() => setSelectedEdgeId(null)}
+        />
+      ) : null}
 
       {selectedNode !== null ? (
         <NodePropertiesDrawer

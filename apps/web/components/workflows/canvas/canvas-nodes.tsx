@@ -23,6 +23,12 @@ export type CanvasFlowNode = Node<CanvasNodeData, "agent" | "exit">;
  */
 export const NodeIssueCountsContext = createContext<ReadonlyMap<string, number>>(new Map());
 
+/**
+ * Advisory warning counts per node id (e.g. a router with no `always`
+ * fallback, #48) — amber badges, never blocking a save.
+ */
+export const NodeWarningCountsContext = createContext<ReadonlyMap<string, number>>(new Map());
+
 /** Session-chaining icon (chain link glyph) shown when continueSession is on. */
 function SessionIcon({ className }: { className?: string }) {
   return (
@@ -55,6 +61,20 @@ function IssueBadge({ count }: { count: number }) {
   );
 }
 
+/** Amber "no fallback" badge for a router node with no `always` edge (#48). */
+function NoFallbackBadge() {
+  return (
+    <span
+      role="status"
+      title="Router has no always fallback edge"
+      className="absolute -bottom-2 left-3 flex items-center gap-1 rounded-full border border-warning/60 bg-warning-subtle px-1.5 py-0.5 text-[10px] font-semibold tracking-wide text-warning uppercase shadow-2"
+      data-no-fallback-badge
+    >
+      no fallback
+    </span>
+  );
+}
+
 /**
  * Agent node card: name, driver chip, model, mode badge, session icon; the
  * entry node additionally carries the pinned Entry badge and no target
@@ -62,6 +82,7 @@ function IssueBadge({ count }: { count: number }) {
  */
 function AgentNodeCard({ id, data, selected }: NodeProps<AgentFlowNode>) {
   const issueCounts = useContext(NodeIssueCountsContext);
+  const warningCounts = useContext(NodeWarningCountsContext);
   const { config } = data;
   return (
     <div
@@ -72,6 +93,7 @@ function AgentNodeCard({ id, data, selected }: NodeProps<AgentFlowNode>) {
       data-canvas-node="agent"
     >
       <IssueBadge count={issueCounts.get(id) ?? 0} />
+      {(warningCounts.get(id) ?? 0) > 0 ? <NoFallbackBadge /> : null}
       {data.isEntry ? (
         <span className="absolute -top-2.5 left-3 rounded-full border border-accent/60 bg-accent px-2 py-0.5 text-[10px] font-semibold tracking-wide text-accent-fg uppercase">
           Entry
