@@ -16,7 +16,7 @@ import { Hono, type Context } from "hono";
 import { streamSSE } from "hono/streaming";
 import { z } from "zod";
 import type { AppEnv } from "../app.js";
-import type { Executor } from "../executor.js";
+import type { Executor, RunStatusNotification } from "../executor.js";
 import { HttpError } from "../errors.js";
 import { ensureLatestRevision } from "./workflows.js";
 
@@ -66,11 +66,29 @@ export interface EventStreamOptions {
   maxStreamsPerRun?: number;
 }
 
+/** Tunables for the global `GET /api/runs/stream`; overridable for tests. */
+export interface GlobalStreamOptions {
+  /** Idle heartbeat (`: ping` comment) interval. Default 15s. */
+  heartbeatMs?: number;
+  /** Max concurrent global streams before 429. Default 10. */
+  maxStreams?: number;
+}
+
 const DEFAULT_EVENT_STREAM: Required<EventStreamOptions> = {
   pollIntervalMs: 100,
   heartbeatMs: 15_000,
   maxStreamsPerRun: 5,
 };
+
+const DEFAULT_GLOBAL_STREAM: Required<GlobalStreamOptions> = {
+  heartbeatMs: 15_000,
+  maxStreams: 10,
+};
+
+/** Serializes one global run-status transition as an SSE frame (#51). */
+function globalRunStatusFrame(event: RunStatusNotification): string {
+  return `event: run.status\ndata: ${JSON.stringify(event)}\n\n`;
+}
 
 const isTerminalRunStatus = (status: RunStatus): status is TerminalRunStatus =>
   (TERMINAL_RUN_STATUSES as readonly string[]).includes(status);
@@ -93,18 +111,23 @@ export interface RunListBody {
 export interface RunStatsBody {
   queued: number;
   running: number;
+  /** Echoed when `?projectId=` scopes the counts to one project (#51). */
+  projectId?: string;
 }
 
 /**
  * A run as returned by the API: the core `Run` plus `queuePosition`, a
  * computed field present only while the run sits in the global queue, and
  * `workflowRevision` `{ id, number }`, resolved for runs pinned to a graph
- * revision snapshot. Both are deliberately NOT part of the persisted core
+ * revision snapshot. `project`/`workflow` carry resolved names for table
+ * rendering (#51). All are deliberately NOT part of the persisted core
  * Run schema.
  */
 export type RunApiBody = Run & {
   queuePosition?: number;
   workflowRevision?: { id: string; number: number };
+  project?: { id: string; name: string };
+  workflow?: { id: string; name: string };
 };
 
 /**
@@ -122,9 +145,19 @@ function queuePositionsByRunId(db: Db): Map<string, number> {
   return positions;
 }
 
-/** Attaches `workflowRevision` (when pinned) and `queuePosition` (when queued). */
+/** Attaches resolved names + revision/queue metadata to a run row. */
 function decorateRun(db: Db, run: Run, positions?: Map<string, number>): RunApiBody {
   let body: RunApiBody = run;
+  const project = db.projects.get(run.projectId);
+  if (project !== undefined) {
+    body = { ...body, project: { id: project.id, name: project.name } };
+  }
+  if (run.workflowId !== undefined) {
+    const workflow = db.workflows.get(run.workflowId);
+    if (workflow !== undefined) {
+      body = { ...body, workflow: { id: workflow.id, name: workflow.name } };
+    }
+  }
   if (run.workflowRevisionId !== undefined) {
     const revision = db.workflowRevisions.get(run.workflowRevisionId);
     if (revision !== undefined) {
@@ -274,6 +307,8 @@ export function capPatchLines(patch: string): {
 export interface CreateRunsRouterOptions {
   /** SSE tuning for `GET /api/runs/:id/events` (tests shrink the timers). */
   eventStream?: EventStreamOptions;
+  /** SSE tuning for the global `GET /api/runs/stream` (tests shrink the timers). */
+  globalStream?: GlobalStreamOptions;
   /**
    * Worktree manager for `GET /api/runs/:id/diff?scope=cumulative` (computed
    * live in the run's worktree). Absent → that scope answers 503; the
@@ -288,8 +323,14 @@ export function createRunsRouter(options: CreateRunsRouterOptions = {}): Hono<Ap
     ...DEFAULT_EVENT_STREAM,
     ...options.eventStream,
   };
+  const globalStreamOptions: Required<GlobalStreamOptions> = {
+    ...DEFAULT_GLOBAL_STREAM,
+    ...options.globalStream,
+  };
   /** Active SSE stream count per run id; guards the concurrent-stream cap. */
   const activeStreams = new Map<string, number>();
+  /** Active global stream count; guards the global-stream cap. */
+  const activeGlobalStreams = { count: 0 };
 
   runs.post("/", async (c) => {
     const db = requireDb(c);
@@ -333,33 +374,129 @@ export function createRunsRouter(options: CreateRunsRouterOptions = {}): Hono<Ap
 
   runs.get("/", (c) => {
     const db = requireDb(c);
+    // `status` accepts a comma-separated list (dashboard multi-select, #51):
+    // every value must be a valid status; an empty segment is rejected.
     const statusRaw = c.req.query("status");
-    let status: Run["status"] | undefined;
-    if (statusRaw !== undefined) {
-      const parsed = RunStatusSchema.safeParse(statusRaw);
-      if (!parsed.success) {
+    let statuses: RunStatus[] | undefined;
+    if (statusRaw !== undefined && statusRaw !== "") {
+      const parsed = statusRaw.split(",").map((value) => RunStatusSchema.safeParse(value));
+      const invalid = parsed.findIndex((result) => !result.success);
+      if (invalid !== -1) {
         throw new HttpError(
           422,
           "INVALID_STATUS",
-          `status must be one of queued|running|success|failed|aborted|interrupted, got ${JSON.stringify(statusRaw)}`,
+          `status must be one of queued|running|success|failed|aborted|interrupted, got ${JSON.stringify(statusRaw.split(",")[invalid])}`,
         );
       }
-      status = parsed.data;
+      statuses = parsed.map((result) => {
+        if (!result.success) throw new Error("unreachable");
+        return result.data;
+      });
     }
-    const runs = db.runs.list(c.req.query("projectId") || undefined, status);
+    const all = db.runs.list(c.req.query("projectId") || undefined);
+    const filtered =
+      statuses === undefined ? all : all.filter((run) => statuses.includes(run.status));
     const positions = queuePositionsByRunId(db);
-    const body: RunListBody = { runs: runs.map((run) => decorateRun(db, run, positions)) };
+    const body: RunListBody = { runs: filtered.map((run) => decorateRun(db, run, positions)) };
     return c.json(body);
   });
 
   // Registered before `/:id` so "stats" is not captured as a run id.
   runs.get("/stats", (c) => {
     const db = requireDb(c);
+    const projectId = c.req.query("projectId") || undefined;
     const body: RunStatsBody = {
-      queued: db.runs.list(undefined, "queued").length,
-      running: db.runs.list(undefined, "running").length,
+      queued: db.runs.list(projectId, "queued").length,
+      running: db.runs.list(projectId, "running").length,
+      ...(projectId === undefined ? {} : { projectId }),
     };
     return c.json(body);
+  });
+
+  // Global run-status stream (#51): one subscription covers every run on the
+  // daemon. Pushes a `run.status` frame whenever ANY run transitions
+  // (queued admission, running start, terminal) — live-only, no replay:
+  // latest state comes from the runs table, the stream is for changes.
+  // Quiet connections get `: ping` heartbeats so proxies do not reap them.
+  runs.get("/stream", (c) => {
+    const executor = requireExecutor(c);
+
+    const active = activeGlobalStreams;
+    if (active.count >= globalStreamOptions.maxStreams) {
+      throw new HttpError(
+        429,
+        "TOO_MANY_STREAMS",
+        `the daemon already has ${active.count} global run streams (max ${globalStreamOptions.maxStreams})`,
+      );
+    }
+    active.count += 1;
+
+    return streamSSE(c, async (stream) => {
+      let released = false;
+      const release = (): void => {
+        if (released) return;
+        released = true;
+        active.count -= 1;
+      };
+
+      let stopped = false;
+      const stop = (): void => {
+        stopped = true;
+      };
+      let wake: (() => void) | null = null;
+      const notified = new Promise<void>((resolve) => {
+        wake = resolve;
+      });
+      stream.onAbort(() => {
+        stop();
+        wake?.();
+      });
+      const signal = c.req.raw.signal;
+      const onSignalAbort = (): void => {
+        stop();
+        wake?.();
+      };
+      if (signal.aborted) onSignalAbort();
+      else signal.addEventListener("abort", onSignalAbort, { once: true });
+
+      // Frames land in a queue from the listener (sync), and the loop below
+      // is the only writer — frames never interleave mid-write.
+      const frames: string[] = [];
+      let onEvent: (() => void) | null = null;
+      const unsubscribe = executor.onRunStatus((event) => {
+        frames.push(globalRunStatusFrame(event));
+        onEvent?.();
+      });
+
+      try {
+        for (;;) {
+          while (frames.length > 0) {
+            const frame = frames.shift() as string;
+            if (stopped) return;
+            await stream.write(frame);
+          }
+          if (stopped) return;
+
+          const pulse = delay(globalStreamOptions.heartbeatMs);
+          const eventGate = new Promise<void>((resolve) => {
+            onEvent = resolve;
+          });
+          try {
+            await Promise.race([pulse.promise, eventGate, notified]);
+          } finally {
+            pulse.cancel();
+          }
+          if (stopped) return;
+          if (frames.length === 0) {
+            await stream.write(": ping\n\n");
+          }
+        }
+      } finally {
+        unsubscribe();
+        signal.removeEventListener("abort", onSignalAbort);
+        release();
+      }
+    });
   });
 
   runs.get("/:id", (c) => {

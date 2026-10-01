@@ -4,11 +4,28 @@ import type { AgentHandle, DriverRegistry } from "@openeuler/drivers";
 import { createFlowEngine, DEFAULT_DRIVER_ID } from "@openeuler/engine";
 import type { WorktreeManager } from "@openeuler/engine";
 import pLimit from "p-limit";
+import { recordRunStatusActivity } from "./activity.js";
 import { DEFAULT_MAX_CONCURRENT_RUNS, resolveMaxConcurrentRuns } from "./concurrency.js";
 import type { Logger } from "./logger.js";
 
 export { DEFAULT_DRIVER_ID };
+
 export { DEFAULT_MAX_CONCURRENT_RUNS, resolveMaxConcurrentRuns };
+
+/**
+ * One global run-status transition, broadcast on the executor's listener
+ * bus (#51): pushed on `GET /api/runs/stream`, recorded into the activity
+ * feed when feed-worthy. `projectId` lets dashboards bucket without a row
+ * fetch; `workflowRevision` resolves the run's pinned graph snapshot.
+ */
+export interface RunStatusNotification {
+  runId: string;
+  status: RunStatus;
+  projectId: string;
+  workflowRevision?: { id: string; number: number };
+}
+
+export type RunStatusListener = (event: RunStatusNotification) => void;
 
 /** Extra per-run execution options not persisted on the Run row (v1). */
 export interface StartRunOptions {
@@ -39,6 +56,12 @@ export interface Executor {
   abortRun(runId: string): Promise<AbortRunResult>;
   /** Ids of runs currently executing or queued in the scheduler (in memory). */
   activeRunIds(): string[];
+  /**
+   * Subscribes to every global run-status transition (queued admission,
+   * running start, terminal) — the bus behind `GET /api/runs/stream` (#51).
+   * Returns an unsubscribe function.
+   */
+  onRunStatus(listener: RunStatusListener): () => void;
   /** Configured global concurrency cap (`MAX_CONCURRENT_RUNS`). */
   maxConcurrentRuns: number;
   /** Best-effort graceful stop: aborts active runs and waits briefly for them. */
@@ -90,6 +113,18 @@ const describeError = (err: unknown): string => (err instanceof Error ? err.mess
 
 const delay = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 
+/** `{ workflowRevision: { id, number } }` slice for a pinned run, if resolvable. */
+function revisionRef(
+  db: Db,
+  workflowRevisionId: string | undefined,
+): { workflowRevision?: { id: string; number: number } } {
+  if (workflowRevisionId === undefined) return {};
+  const revision = db.workflowRevisions.get(workflowRevisionId);
+  return revision === undefined
+    ? {}
+    : { workflowRevision: { id: revision.id, number: revision.number } };
+}
+
 /**
  * Schedules runs for background execution and owns the live-run bookkeeping
  * (abort, shutdown, duplicate-start guards) plus the concurrency scheduler:
@@ -124,7 +159,51 @@ export function createExecutor(options: ExecutorOptions): Executor {
   }
   const shutdownSettleMs = options.shutdownSettleMs ?? 2_000;
   const active = new Map<string, ActiveRun>();
-  const engine = createFlowEngine({ db, worktrees, drivers, logger });
+  const runStatusListeners = new Set<RunStatusListener>();
+
+  /**
+   * Broadcasts one transition on the bus (never throws into callers; a dead
+   * listener is dropped, not fatal).
+   */
+  function publishRunStatus(event: RunStatusNotification): void {
+    for (const listener of [...runStatusListeners]) {
+      try {
+        listener(event);
+      } catch (err) {
+        logger.error({ err, runId: event.runId }, "run-status listener failed");
+      }
+    }
+  }
+
+  /**
+   * Records the feed entry (when feed-worthy) and broadcasts the transition
+   * for a run whose row already carries the new status. Used both from the
+   * engine's `run.status` hook and the executor's own out-of-engine
+   * terminalizations (abort before start, belt-and-braces failure, shutdown).
+   */
+  function notifyRunStatus(runId: string): void {
+    try {
+      const run = db.runs.get(runId);
+      if (run === undefined) return;
+      recordRunStatusActivity(db, runId, run.status);
+      publishRunStatus({
+        runId,
+        status: run.status,
+        projectId: run.projectId,
+        ...revisionRef(db, run.workflowRevisionId),
+      });
+    } catch (err) {
+      logger.error({ err, runId }, "run-status notification failed");
+    }
+  }
+
+  const engine = createFlowEngine({
+    db,
+    worktrees,
+    drivers,
+    logger,
+    onRunStatus: (runId) => notifyRunStatus(runId),
+  });
 
   /** Global semaphore: at most `maxConcurrentRuns` runs execute at once. */
   const limit = pLimit(maxConcurrentRuns);
@@ -180,6 +259,7 @@ export function createExecutor(options: ExecutorOptions): Executor {
       const run = db.runs.get(runId);
       if (!run || isTerminal(run.status)) return;
       db.runs.update(runId, { status: "failed", error: message });
+      notifyRunStatus(runId);
     } catch (err) {
       logger.error({ err, runId }, "marking run failed failed");
     }
@@ -199,6 +279,7 @@ export function createExecutor(options: ExecutorOptions): Executor {
     cancelProjectWaiter(projectId, runId);
     db.runs.updateStatus(runId, "aborted");
     settleStepRuns(runId, "aborted");
+    notifyRunStatus(runId);
     logger.info({ runId }, "run aborted before start");
   }
 
@@ -241,6 +322,15 @@ export function createExecutor(options: ExecutorOptions): Executor {
       done: Promise.resolve(),
     };
     active.set(runId, entry);
+    // Queued admission is itself a transition the dashboard cares about
+    // (queue badges / new table rows). No feed entry: `queued` is not
+    // feed-worthy — the feed starts at run.started.
+    publishRunStatus({
+      runId,
+      status: "queued",
+      projectId: run.projectId,
+      ...revisionRef(db, run.workflowRevisionId),
+    });
     // Deferred so the HTTP response for POST /api/runs is not interleaved with
     // the engine's first (synchronous) bookkeeping steps. The run then waits
     // for its project's turn, joins the global semaphore queue, executes, and
@@ -299,6 +389,11 @@ export function createExecutor(options: ExecutorOptions): Executor {
     if (current && !isTerminal(current.status)) {
       db.runs.updateStatus(runId, "aborted");
       settleStepRuns(runId, "aborted");
+      // The engine emits (and records) the terminal transition itself when
+      // its event loop observes the abort; when the driver stalls mid-stream
+      // it may not settle within any useful window, so record here too —
+      // the activity writer dedupes an identical terminal entry.
+      notifyRunStatus(runId);
     }
     logger.info({ runId }, "run aborted");
     return { outcome: "aborted" };
@@ -317,6 +412,7 @@ export function createExecutor(options: ExecutorOptions): Executor {
           cancelProjectWaiter(entry.projectId, entry.runId);
           db.runs.updateStatus(entry.runId, "aborted");
           settleStepRuns(entry.runId, "aborted");
+          notifyRunStatus(entry.runId);
         } else {
           db.runs.updateStatus(entry.runId, "aborted");
         }
@@ -345,6 +441,12 @@ export function createExecutor(options: ExecutorOptions): Executor {
     abortRun,
     shutdown,
     activeRunIds: () => [...active.keys()],
+    onRunStatus: (listener: RunStatusListener): (() => void) => {
+      runStatusListeners.add(listener);
+      return () => {
+        runStatusListeners.delete(listener);
+      };
+    },
     maxConcurrentRuns,
   };
 }

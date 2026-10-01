@@ -167,6 +167,32 @@ export interface EventRepo {
   lastRunStatus(runId: string): RunStatusEvent | undefined;
 }
 
+/** One dashboard activity feed row (#51). */
+export interface ActivityRow {
+  id: number;
+  type: string;
+  projectId?: string;
+  runId?: string;
+  workflowId?: string;
+  payload?: Record<string, unknown>;
+  createdAt: string;
+}
+
+/** Values of an activity row the repository assigns itself. */
+export type ActivityInput = Omit<ActivityRow, "id" | "createdAt">;
+
+export interface ActivityRepo {
+  /** Appends a feed row; mints `id` (auto-increment) and `createdAt`. */
+  append(entry: ActivityInput): ActivityRow;
+  /**
+   * Feed page, newest first: rows with `id < beforeId` (all rows when
+   * omitted), at most `limit`. The stable cursor is the last returned `id`.
+   */
+  list(options?: { beforeId?: number; limit?: number }): ActivityRow[];
+  /** Most recent feed row referencing the run, if any. */
+  latestForRun(runId: string): ActivityRow | undefined;
+}
+
 export function createProjectRepo(db: Db): ProjectRepo {
   const toDomain = (row: typeof schema.projects.$inferSelect): Project =>
     ProjectSchema.parse({
@@ -672,6 +698,65 @@ export function createEventRepo(db: Db): EventRepo {
       return row
         ? RunStatusEventSchema.parse({ ...JSON.parse(row.payload), seq: row.seq })
         : undefined;
+    },
+  };
+}
+
+export function createActivityRepo(db: Db): ActivityRepo {
+  const toDomain = (row: typeof schema.activity.$inferSelect): ActivityRow => ({
+    id: row.id,
+    type: row.type,
+    ...(row.projectId === null ? {} : { projectId: row.projectId }),
+    ...(row.runId === null ? {} : { runId: row.runId }),
+    ...(row.workflowId === null ? {} : { workflowId: row.workflowId }),
+    ...(row.payload === null ? {} : { payload: row.payload }),
+    createdAt: row.createdAt,
+  });
+
+  const DEFAULT_LIMIT = 20;
+  const MAX_LIMIT = 100;
+
+  return {
+    append(entry) {
+      const createdAt = new Date().toISOString();
+      const row = db
+        .insert(schema.activity)
+        .values({
+          type: entry.type,
+          projectId: entry.projectId ?? null,
+          runId: entry.runId ?? null,
+          workflowId: entry.workflowId ?? null,
+          payload: entry.payload ?? null,
+          createdAt,
+        })
+        .returning()
+        .get();
+      return toDomain(row);
+    },
+    list(options) {
+      const limit = Math.min(Math.max(options?.limit ?? DEFAULT_LIMIT, 1), MAX_LIMIT);
+      const rows = db
+        .select()
+        .from(schema.activity)
+        .where(
+          options?.beforeId === undefined
+            ? undefined
+            : sql`${schema.activity.id} < ${options.beforeId}`,
+        )
+        .orderBy(sql`${schema.activity.id} desc`)
+        .limit(limit)
+        .all();
+      return rows.map(toDomain);
+    },
+    latestForRun(runId) {
+      const row = db
+        .select()
+        .from(schema.activity)
+        .where(eq(schema.activity.runId, runId))
+        .orderBy(sql`${schema.activity.id} desc`)
+        .limit(1)
+        .get();
+      return row === undefined ? undefined : toDomain(row);
     },
   };
 }

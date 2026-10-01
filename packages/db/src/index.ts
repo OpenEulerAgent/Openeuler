@@ -6,6 +6,7 @@ import { drizzle } from "drizzle-orm/better-sqlite3";
 import { migrate } from "drizzle-orm/better-sqlite3/migrator";
 import * as schema from "./schema.js";
 import {
+  createActivityRepo,
   createAgentPresetRepo,
   createEventRepo,
   createProjectRepo,
@@ -15,6 +16,7 @@ import {
   createWorkflowRevisionRepo,
 } from "./repos.js";
 import type {
+  ActivityRepo,
   AgentPresetRepo,
   EventRepo,
   ProjectRepo,
@@ -26,6 +28,8 @@ import type {
 
 export * from "./schema.js";
 export type {
+  ActivityInput,
+  ActivityRow,
   AgentEventInput,
   AgentPresetPatch,
   EventInput,
@@ -36,6 +40,7 @@ export type {
   WorkflowRevisionRepo,
 } from "./repos.js";
 export type {
+  ActivityRepo,
   AgentPresetRepo,
   EventRepo,
   ProjectRepo,
@@ -60,6 +65,7 @@ export interface Db {
   readonly runs: RunRepo;
   readonly stepRuns: StepRunRepo;
   readonly events: EventRepo;
+  readonly activity: ActivityRepo;
   close(): void;
 }
 
@@ -113,6 +119,7 @@ export function createDatabase(opts: CreateDatabaseOptions = {}): Db {
     runs: createRunRepo(db),
     stepRuns: createStepRunRepo(db),
     events: createEventRepo(db),
+    activity: createActivityRepo(db),
     close() {
       sqlite.close();
     },

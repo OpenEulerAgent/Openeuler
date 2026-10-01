@@ -6,6 +6,7 @@ import type { Db } from "@openeuler/db";
 import { Hono, type Context } from "hono";
 import { z } from "zod";
 import type { AppEnv } from "../app.js";
+import { recordProjectCreatedActivity } from "../activity.js";
 import { HttpError } from "../errors.js";
 import { GitError, gitExec } from "../git.js";
 import { seedBuiltinPresets } from "./presets.js";
@@ -151,6 +152,7 @@ export function createProjectsRouter(): Hono<AppEnv> {
       createdAt: new Date().toISOString(),
     };
     db.projects.create(project);
+    recordProjectCreatedActivity(db, project);
     // Fresh roster: seed the builtin agent presets (ordinary rows — the
     // user can rename, edit, or delete them like any preset).
     seedBuiltinPresets(db, project.id);

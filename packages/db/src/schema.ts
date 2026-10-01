@@ -156,3 +156,24 @@ export const events = sqliteTable(
   },
   (table) => [uniqueIndex("events_run_id_seq_unique").on(table.runId, table.seq)],
 );
+
+/**
+ * Dashboard activity feed (#51): one row per interesting cross-entity
+ * transition (project/workflow created, run started/terminal). Deliberately
+ * NOT part of the per-run `events` log: entries may reference no run at all,
+ * referenced rows may later be deleted (plain text ids, no FKs), and the
+ * auto-increment `id` doubles as the strictly-descending feed cursor.
+ */
+export const activity = sqliteTable(
+  "activity",
+  {
+    id: integer("id").primaryKey({ autoIncrement: true }),
+    type: text("type").notNull(),
+    projectId: text("project_id"),
+    runId: text("run_id"),
+    workflowId: text("workflow_id"),
+    payload: text("payload", { mode: "json" }).$type<Record<string, unknown>>(),
+    createdAt: text("created_at").notNull(),
+  },
+  (table) => [index("activity_run_id_idx").on(table.runId)],
+);

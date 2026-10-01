@@ -1,6 +1,7 @@
 import { TERMINAL_RUN_STATUSES } from "@openeuler/core";
 import type { Db } from "@openeuler/db";
 import type { WorktreeManager } from "@openeuler/engine";
+import { recordRunStatusActivity } from "./activity.js";
 import type { Executor } from "./executor.js";
 import type { Logger } from "./logger.js";
 
@@ -46,6 +47,7 @@ export async function sweepInterruptedRuns(options: SweepOptions): Promise<Sweep
         }
       }
       db.events.append(run.id, { type: "run.status", status: "interrupted" });
+      recordRunStatusActivity(db, run.id, "interrupted");
       logger.info({ runId: run.id, priorStatus: status }, "run interrupted by daemon restart");
       interruptedRunIds.push(run.id);
     }

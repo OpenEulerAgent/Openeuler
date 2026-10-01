@@ -1,13 +1,21 @@
-import type { ReactNode } from "react";
+import type { HTMLAttributes, ReactNode } from "react";
 import { cn } from "@/lib/cn";
 
 /**
  * Card primitive (issue #50): the single source of truth for panel surfaces.
  * Compose as `<Card><CardHeader>…</CardHeader><CardContent>…</CardContent></Card>`.
  */
-export function Card({ className, children }: { className?: string; children: ReactNode }) {
+
+export function Card({
+  className,
+  children,
+  ...rest
+}: HTMLAttributes<HTMLElement> & { children: ReactNode }) {
   return (
-    <section className={cn("rounded-xl border border-border bg-surface p-5 shadow-1", className)}>
+    <section
+      className={cn("rounded-xl border border-border bg-surface p-5 shadow-1", className)}
+      {...rest}
+    >
       {children}
     </section>
   );
