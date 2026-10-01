@@ -1,6 +1,8 @@
 import { and, eq, sql } from "drizzle-orm";
 import type { BetterSQLite3Database } from "drizzle-orm/better-sqlite3";
+import { z } from "zod";
 import {
+  BreadcrumbEntrySchema,
   PersistedEventSchema,
   ProjectSchema,
   RunSchema,
@@ -11,6 +13,7 @@ import {
   WorkflowSchema,
 } from "@openeuler/core";
 import type {
+  BreadcrumbEntry,
   LoopBack,
   PersistedEvent,
   Project,
@@ -42,6 +45,8 @@ export type RunPatch = {
   output?: string | null;
   error?: string | null;
   iteration?: number;
+  /** Replaces the execution breadcrumb (graph engine appends as it goes). */
+  breadcrumb?: BreadcrumbEntry[];
 };
 
 /** Fields of a step run that may change after creation; `null` clears a field. */
@@ -361,6 +366,7 @@ export function createRunRepo(db: Db): RunRepo {
       ...(row.task === null ? {} : { task: row.task }),
       ...(row.output === null ? {} : { output: row.output }),
       ...(row.error === null ? {} : { error: row.error }),
+      ...((row.breadcrumb ?? []).length === 0 ? {} : { breadcrumb: row.breadcrumb ?? [] }),
       createdAt: row.createdAt,
       updatedAt: row.updatedAt,
     });
@@ -376,6 +382,7 @@ export function createRunRepo(db: Db): RunRepo {
     task: run.task ?? null,
     output: run.output ?? null,
     error: run.error ?? null,
+    breadcrumb: run.breadcrumb ?? [],
     createdAt: run.createdAt,
     updatedAt: run.updatedAt,
   });
@@ -423,6 +430,9 @@ export function createRunRepo(db: Db): RunRepo {
           ...(patch.iteration === undefined ? {} : { iteration: patch.iteration }),
           ...(patch.output === undefined ? {} : { output: patch.output }),
           ...(patch.error === undefined ? {} : { error: patch.error }),
+          ...(patch.breadcrumb === undefined
+            ? {}
+            : { breadcrumb: z.array(BreadcrumbEntrySchema).parse(patch.breadcrumb) }),
           updatedAt: new Date().toISOString(),
         })
         .where(eq(schema.runs.id, id))

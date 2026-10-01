@@ -32,3 +32,12 @@ export {
   type RunControl,
   type StepDefinition,
 } from "./flow-engine.js";
+
+export { MAX_EDGE_ITERATIONS, executeGraphRun, type GraphEngineDeps } from "./graph-engine.js";
+
+export {
+  compileExitCondition,
+  describeCondition,
+  evaluateExitCondition,
+  type ExitEvaluator,
+} from "./conditions.js";

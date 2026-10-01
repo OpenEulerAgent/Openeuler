@@ -2,7 +2,12 @@ import { cn } from "@/lib/cn";
 import type {
   AgentToolCallEvent,
   AgentToolOutputEvent,
+  EdgeCapReachedEvent,
+  EdgeTakenEvent,
   LoopIterationEvent,
+  NodeCompletedEvent,
+  NodeQueuedEvent,
+  NodeStartedEvent,
   RunStatusEvent,
 } from "@openeuler/core";
 import type { ReactNode } from "react";
@@ -96,6 +101,59 @@ function LoopIterationItem({ event }: { event: LoopIterationEvent }) {
   );
 }
 
+// --- graph events (#45): minimal system-line rendering; the full live
+// graph view lands in #52. ---
+
+function NodeQueuedItem({ event }: { event: NodeQueuedEvent }) {
+  return (
+    <SystemLine>
+      node {event.nodeName} queued (pass {event.iteration})
+    </SystemLine>
+  );
+}
+
+function NodeStartedItem({ event }: { event: NodeStartedEvent }) {
+  return (
+    <SystemLine>
+      node {event.nodeName} started (pass {event.iteration})
+    </SystemLine>
+  );
+}
+
+function NodeCompletedItem({ event }: { event: NodeCompletedEvent }) {
+  const failed = event.status !== "success";
+  const detail =
+    event.status === "success"
+      ? `${event.durationMs}ms`
+      : `${event.status}${event.error === undefined ? "" : `: ${event.error}`}`;
+  return (
+    <SystemLine>
+      <span className={failed ? "text-red-500" : undefined}>
+        node {event.nodeName} {event.status}
+      </span>{" "}
+      ({detail})
+    </SystemLine>
+  );
+}
+
+function EdgeTakenItem({ event }: { event: EdgeTakenEvent }) {
+  return (
+    <SystemLine>
+      route {event.source} → {event.target} ({event.matchedCondition})
+    </SystemLine>
+  );
+}
+
+function EdgeCapReachedItem({ event }: { event: EdgeCapReachedEvent }) {
+  return (
+    <SystemLine>
+      <span className="text-amber-600">
+        edge {event.edgeId} hit its iteration cap ({event.taken}/{event.maxIterations})
+      </span>
+    </SystemLine>
+  );
+}
+
 /** Render one feed row, styled per event type. */
 export function FeedItem({ entry }: { entry: FeedEntry }) {
   if (entry.kind === "message") {
@@ -138,5 +196,15 @@ export function FeedItem({ entry }: { entry: FeedEntry }) {
       return <StepCompletedItem event={event} />;
     case "loop.iteration":
       return <LoopIterationItem event={event} />;
+    case "node.queued":
+      return <NodeQueuedItem event={event} />;
+    case "node.started":
+      return <NodeStartedItem event={event} />;
+    case "node.completed":
+      return <NodeCompletedItem event={event} />;
+    case "edge.taken":
+      return <EdgeTakenItem event={event} />;
+    case "edge.cap-reached":
+      return <EdgeCapReachedItem event={event} />;
   }
 }

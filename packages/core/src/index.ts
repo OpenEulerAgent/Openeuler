@@ -66,10 +66,11 @@ export {
   RunSchema,
   RunStatusSchema,
   StepRunSchema,
+  BreadcrumbEntrySchema,
   TERMINAL_RUN_STATUSES,
   TerminalRunStatusSchema,
 } from "./run.js";
-export type { Run, RunStatus, StepRun, TerminalRunStatus } from "./run.js";
+export type { Run, RunStatus, StepRun, BreadcrumbEntry, TerminalRunStatus } from "./run.js";
 
 export {
   AgentDoneEventSchema,
@@ -94,8 +95,13 @@ export type {
 } from "./agent-event.js";
 
 export {
+  EdgeCapReachedEventSchema,
+  EdgeTakenEventSchema,
   LoopIterationEventSchema,
   LoopVerdictSchema,
+  NodeCompletedEventSchema,
+  NodeQueuedEventSchema,
+  NodeStartedEventSchema,
   PersistedEventSchema,
   RunEventSchema,
   RunStatusEventSchema,
@@ -103,8 +109,13 @@ export {
   StepStartedEventSchema,
 } from "./run-event.js";
 export type {
+  EdgeCapReachedEvent,
+  EdgeTakenEvent,
   LoopIterationEvent,
   LoopVerdict,
+  NodeCompletedEvent,
+  NodeQueuedEvent,
+  NodeStartedEvent,
   PersistedEvent,
   RunEvent,
   RunStatusEvent,

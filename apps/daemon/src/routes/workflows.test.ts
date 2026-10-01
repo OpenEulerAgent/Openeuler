@@ -440,20 +440,26 @@ describe("POST /api/workflows/:id/runs", () => {
     await awaitRunStatus(h, run.id, "success");
     expect(h.db.runs.get(run.id)).toMatchObject({ status: "success", output: "SECOND-OUT" });
 
-    // Ordered log: run.status wraps step.started / driver events / step.completed.
+    // Ordered log: run.status wraps node.queued/node.started / driver
+    // events / node.completed + edge.taken (API runs pin the latest graph
+    // revision, so they execute on the graph engine, #45).
     const events = h.db.events.getSince(run.id);
     expect(
       events.map((event) => `${event.type}${"status" in event ? `:${event.status}` : ""}`),
     ).toEqual([
       "run.status:running",
-      "step.started",
+      "node.queued",
+      "node.started",
       "started",
       "session",
-      "step.completed:success",
-      "step.started",
+      "node.completed:success",
+      "edge.taken",
+      "node.queued",
+      "node.started",
       "started",
       "session",
-      "step.completed:success",
+      "node.completed:success",
+      "edge.taken",
       "run.status:success",
     ]);
 
@@ -496,7 +502,7 @@ describe("POST /api/workflows/:id/runs", () => {
     expect(missing.status).toBe(404);
   });
 
-  it("loops a workflow run until the exit condition is met, with loop.iteration events", async () => {
+  it("loops a workflow run until the exit condition is met, with edge.taken routing events", async () => {
     const h = setup();
     const workflow = await createWorkflow(h, {
       projectId: h.projectId,
@@ -533,17 +539,16 @@ describe("POST /api/workflows/:id/runs", () => {
       iteration: 2,
     });
 
-    // The event log carries one loop.iteration per pass with its verdict.
-    const loops = h.db.events.getSince(run.id).filter((event) => event.type === "loop.iteration");
-    expect(loops).toHaveLength(3);
-    if (loops[0]?.type === "loop.iteration") {
-      expect(loops[0].verdict).toBe("continue");
-      expect(loops[0].iteration).toBe(1);
-      expect(loops[0].detail).toContain('outputContains "ALL TESTS PASS" unmet');
-    }
-    if (loops[2]?.type === "loop.iteration") {
-      expect(loops[2].verdict).toBe("exit-condition-met");
-    }
+    // The graph engine routes with edge.taken events (no loop.iteration on
+    // graph runs): the loop edge twice, then the always exit edge.
+    const taken = h.db.events
+      .getSince(run.id)
+      .filter((event) => event.type === "edge.taken")
+      .map((event) => (event.type === "edge.taken" ? event.edgeId : ""));
+    expect(taken).toEqual(["e-loop-s1-s1", "e-loop-s1-s1", "e-exit-s1"]);
+    expect(h.db.events.getSince(run.id).filter((event) => event.type === "loop.iteration")).toEqual(
+      [],
+    );
 
     // Step runs: one per iteration, grouped in the run detail payload.
     const detail = (await (await h.request(`/api/runs/${run.id}`)).json()) as {

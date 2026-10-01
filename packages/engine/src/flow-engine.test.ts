@@ -1093,7 +1093,7 @@ describe("createFlowEngine (abort vs worktree lifecycle)", () => {
   });
 });
 
-describe("createFlowEngine (graph revision runs — shim until #45)", () => {
+describe("createFlowEngine (graph revision runs — dispatch to the graph engine)", () => {
   /** StepRun rows flattened for equivalence comparisons, iteration-major. */
   const stepRunTrace = (h: Harness, runId: string): string[] =>
     h.db.stepRuns
@@ -1102,6 +1102,13 @@ describe("createFlowEngine (graph revision runs — shim until #45)", () => {
         a.iteration === b.iteration ? a.stepId.localeCompare(b.stepId) : a.iteration - b.iteration,
       )
       .map((row) => `it${row.iteration}#${row.stepId}:${row.status}:${row.output}`);
+
+  /** The graph run's routing trail: `edgeId ->` per taken edge, in order. */
+  const edgeTrail = (h: Harness, runId: string): string[] =>
+    h.db.events
+      .getSince(runId)
+      .filter((event) => event.type === "edge.taken")
+      .map((event) => (event.type === "edge.taken" ? `${event.edgeId} ->` : ""));
 
   it("executes a pinned chain+loop revision equivalently to the legacy workflow", async () => {
     const h = setup();
@@ -1161,19 +1168,39 @@ describe("createFlowEngine (graph revision runs — shim until #45)", () => {
     await h.engine.executeRun(graphRun.id, noAbort);
     await awaitStatus(h, graphRun.id, "success");
 
-    // Same StepRun sequence (step ids, iterations, statuses, outputs)...
+    // Same StepRun sequence (node ids, execution numbers, statuses, outputs):
+    // per-node execution numbers coincide with the legacy pass numbers on
+    // the chain+loop shape, so the traces match exactly.
     expect(stepRunTrace(h, graphRun.id)).toEqual(stepRunTrace(h, legacyRun.id));
-    // ...same final run state and loop verdicts.
+    // ...same final run state, same prompts (node iteration numbers and
+    // prevOutput flow match the legacy passes).
     expect(h.db.runs.get(graphRun.id)).toMatchObject({
       status: "success",
       output: "ALL CLEAR",
       iteration: 2,
       workflowRevisionId: revision.id,
     });
-    expect(loopEvents(h, graphRun.id)).toEqual(loopEvents(h, legacyRun.id));
+    expect(h.drivers.rev.calls.slice(0, 2).map((call) => call.prompt)).toEqual([
+      "Rev: IMPL-OUT (pass 1)",
+      "Rev: WIP (pass 2)",
+    ]);
+    // The graph engine emits edge.taken instead of loop.iteration events;
+    // the full routing trail (always chain edges included) mirrors the
+    // legacy loop verdicts (loop twice, then exit when the condition turns
+    // met).
+    expect(loopEvents(h, graphRun.id)).toEqual([]);
+    expect(edgeTrail(h, graphRun.id)).toEqual([
+      "e-s1-s2 ->",
+      "e-s2-s3 ->",
+      "e-loop-s3-s2 ->",
+      "e-s2-s3 ->",
+      "e-loop-s3-s2 ->",
+      "e-s2-s3 ->",
+      "e-exit-s3 ->",
+    ]);
   });
 
-  it("fails fast when the pinned graph is not a simple chain+loop (router)", async () => {
+  it("dispatches router graphs to the graph engine (no more shim fail-fast)", async () => {
     const h = setup();
     const workflow = h.makeWorkflow([step({ id: "s1", driver: "impl" })]);
     const routerGraph = WorkflowGraphSchema.parse({
@@ -1197,7 +1224,7 @@ describe("createFlowEngine (graph revision runs — shim until #45)", () => {
           name: "fix",
           position: { x: 280, y: 0 },
           config: {
-            driver: "impl",
+            driver: "rev",
             mode: "auto",
             promptTemplate: "fix {{prevOutput}}",
             continueSession: false,
@@ -1209,7 +1236,7 @@ describe("createFlowEngine (graph revision runs — shim until #45)", () => {
           name: "escalate",
           position: { x: 280, y: 200 },
           config: {
-            driver: "impl",
+            driver: "ship",
             mode: "auto",
             promptTemplate: "escalate {{prevOutput}}",
             continueSession: false,
@@ -1233,13 +1260,12 @@ describe("createFlowEngine (graph revision runs — shim until #45)", () => {
     const run = h.enqueueRevisionRun(workflow.id, revision.id);
 
     await h.engine.executeRun(run.id, noAbort);
-    await awaitStatus(h, run.id, "failed");
+    await awaitStatus(h, run.id, "success");
 
-    const failed = h.db.runs.get(run.id);
-    expect(failed?.error).toContain("graph execution engine lands in issue #45");
-    expect(failed?.error).toContain("no legacy representation");
-    // Nothing executed.
-    expect(h.drivers.impl.calls).toHaveLength(0);
-    expect(h.db.stepRuns.listByRun(run.id)).toHaveLength(0);
+    // "IMPL-OUT" contains no "bug": the always fallback routed to escalate.
+    expect(edgeTrail(h, run.id)).toEqual(["e2 ->", "e4 ->"]);
+    expect(h.drivers.rev.calls).toHaveLength(0);
+    expect(h.drivers.ship.calls[0]?.prompt).toBe("escalate IMPL-OUT");
+    expect(h.db.runs.get(run.id)).toMatchObject({ status: "success", output: "SHIP-OUT" });
   });
 });

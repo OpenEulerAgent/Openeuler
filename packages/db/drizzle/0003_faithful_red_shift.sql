@@ -1,0 +1,1 @@
+ALTER TABLE `runs` ADD `breadcrumb` text DEFAULT '[]' NOT NULL;
