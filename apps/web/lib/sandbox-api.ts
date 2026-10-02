@@ -95,17 +95,31 @@ export async function fetchSandboxJob(
 
 /**
  * Polls a job until it leaves `running`. `pollMs: 0` turns this into a
- * tight loop (tests); production uses {@link JOB_POLL_INTERVAL_MS}.
+ * tight loop (tests); production uses {@link JOB_POLL_INTERVAL_MS}. The
+ * optional signal aborts the loop between polls (caller cleanup).
  */
 export async function waitForSandboxJob(
   jobId: string,
-  options: { pollMs?: number; fetcher?: SandboxFetcher } = {},
+  options: { pollMs?: number; fetcher?: SandboxFetcher; signal?: AbortSignal } = {},
 ): Promise<SandboxJob> {
   const pollMs = options.pollMs ?? JOB_POLL_INTERVAL_MS;
   for (;;) {
+    if (options.signal?.aborted) {
+      throw new DOMException("aborted", "AbortError");
+    }
     const job = await fetchSandboxJob(jobId, options.fetcher);
     if (job.status !== "running") return job;
-    await new Promise((resolve) => setTimeout(resolve, pollMs));
+    await new Promise((resolve, reject) => {
+      const timer = setTimeout(resolve, pollMs);
+      options.signal?.addEventListener(
+        "abort",
+        () => {
+          clearTimeout(timer);
+          reject(new DOMException("aborted", "AbortError"));
+        },
+        { once: true },
+      );
+    });
   }
 }
 

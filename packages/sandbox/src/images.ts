@@ -336,6 +336,12 @@ export interface SandboxImageBuildInput {
  * `docker build -` (no context directory — the stdin Dockerfile build). The
  * base image named in `FROM` is pulled by docker when missing. Rejects with
  * `SANDBOX_IMAGE_MISSING` when the base cannot be resolved.
+ *
+ * THREAT MODEL: a Dockerfile executes arbitrary code at BUILD time (RUN
+ * steps) as the daemon user. This API is intended for trusted, authenticated
+ * users of a local-first tool — it is NOT a safe surface for untrusted
+ * input. The daemon route is gated by bearer auth and rate limits when
+ * enabled.
  */
 export async function buildSandboxImage(
   input: SandboxImageBuildInput,

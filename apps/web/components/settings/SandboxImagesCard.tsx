@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
@@ -73,6 +73,16 @@ export function SandboxImagesCard() {
     setJobs((current) => current.filter((job) => job.id !== id));
   }, []);
 
+  // Aborts in-flight job polls when the card unmounts (navigating away from
+  // Settings mid-pull/build), so no setState/toast fires on a dead component.
+  const jobAbortRef = useRef<AbortController | null>(null);
+  useEffect(
+    () => () => {
+      jobAbortRef.current?.abort();
+    },
+    [],
+  );
+
   /** Starts a job, shows its inline row, polls to completion, refreshes. */
   const runJob = useCallback(
     async (
@@ -92,8 +102,10 @@ export function SandboxImagesCard() {
         return;
       }
       setJobs((current) => [...current, { id: jobId, label: label(jobId) }]);
+      const abort = new AbortController();
+      jobAbortRef.current = abort;
       try {
-        const job = await waitForSandboxJob(jobId);
+        const job = await waitForSandboxJob(jobId, { signal: abort.signal });
         if (job.status === "failed") {
           toast({
             title: `${label(jobId)} failed`,
@@ -104,12 +116,14 @@ export function SandboxImagesCard() {
           toast({ title: doneToast, variant: "success" });
         }
       } catch (err) {
+        if (abort.signal.aborted) return;
         toast({
           title: "Lost track of job",
           description: err instanceof Error ? err.message : String(err),
           variant: "danger",
         });
       } finally {
+        if (jobAbortRef.current === abort) jobAbortRef.current = null;
         dropJob(jobId);
         load();
       }

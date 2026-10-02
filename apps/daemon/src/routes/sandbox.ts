@@ -66,6 +66,8 @@ export interface SandboxRouterOptions {
   images?: SandboxImagesOptions;
   /** Cap on finished jobs kept in the registry (oldest pruned). Default 200. */
   maxFinishedJobs?: number;
+  /** Cap on concurrently-running pull/build jobs (each spawns a docker child). Default 4. */
+  maxConcurrentJobs?: number;
 }
 
 const PullBodySchema = z.strictObject({
@@ -102,6 +104,7 @@ export function createSandboxRouter(options: SandboxRouterOptions = {}): Hono<Ap
   const router = new Hono<AppEnv>();
   const imageOptions = options.images ?? {};
   const maxFinishedJobs = options.maxFinishedJobs ?? 200;
+  const maxConcurrentJobs = options.maxConcurrentJobs ?? 4;
 
   const jobs = new Map<string, SandboxJob>();
   /** running-job ids by `${kind}:${normalizedRef}` for dedupe. */
@@ -140,6 +143,16 @@ export function createSandboxRouter(options: SandboxRouterOptions = {}): Hono<Ap
     if (existingId !== undefined) {
       const existing = jobs.get(existingId);
       if (existing !== undefined && existing.status === "running") return existing;
+    }
+    // Cap CONCURRENT jobs too: each job spawns a docker pull/build child —
+    // trusted users only, but a cheap DoS guard regardless.
+    const runningCount = [...jobs.values()].filter((job) => job.status === "running").length;
+    if (runningCount >= maxConcurrentJobs) {
+      throw new HttpError(
+        429,
+        "TOO_MANY_JOBS",
+        `too many concurrent image jobs (max ${maxConcurrentJobs}); retry shortly`,
+      );
     }
     const job: SandboxJob = {
       id: randomUUID(),
