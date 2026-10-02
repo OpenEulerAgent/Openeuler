@@ -6,6 +6,7 @@ import type { Project, Run } from "@openeuler/core";
 import { Dialog } from "@/components/ui/dialog";
 import { useToast } from "@/components/ui/toast";
 import { apiFetch, ApiError } from "@/lib/api";
+import { navigateWithGuard } from "@/lib/use-unsaved-changes";
 import {
   clampSelection,
   confirmOutcome,
@@ -189,7 +190,14 @@ export function CommandPalette({ open, onClose }: { open: boolean; onClose: () =
 
   const context = useMemo<PaletteContext>(
     () => ({
-      router,
+      // Palette navigation routes through the unsaved-changes guard (#67):
+      // on guarded (dirty) pages it opens the confirm dialog instead of
+      // discarding edits; everywhere else it pushes immediately.
+      router: {
+        push: (path: string) => {
+          navigateWithGuard(() => router.push(path));
+        },
+      },
       close: onClose,
       projectId,
       stopRun: (runId: string) => {

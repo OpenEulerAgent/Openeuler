@@ -61,6 +61,7 @@ import {
 } from "@/lib/graph/history";
 import { applyLayout } from "@/lib/graph/layout";
 import { applyInspectorAction } from "@/lib/graph/inspector";
+import { useUnsavedChanges } from "@/lib/use-unsaved-changes";
 import {
   applyEdgeInspectorAction,
   conditionSummary,
@@ -253,7 +254,6 @@ function GraphCanvasInner({
   const [saving, setSaving] = useState(false);
   const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
   const [selectedEdgeId, setSelectedEdgeId] = useState<string | null>(null);
-  const [confirmLeave, setConfirmLeave] = useState(false);
   const [layoutAnimating, setLayoutAnimating] = useState(false);
 
   // Node-drag + debounced-edit undo capture.
@@ -264,6 +264,11 @@ function GraphCanvasInner({
   // Dirty via the serialized projections: React Flow runtime keys (`selected`,
   // `measured`, `dragging`, …) must never read as unsaved changes.
   const dirty = useMemo(() => !canvasDocsEquivalent(doc, savedDoc), [doc, savedDoc]);
+
+  // Route-exit guard (#67): beforeunload for real unloads, plus interception
+  // of client-side navigation (popstate Back, internal anchor clicks, and the
+  // guarded programmatic leaves below) through the shared confirm dialog.
+  const leaveGuard = useUnsavedChanges(dirty);
 
   // Live-refresh the validation overlay while issues are shown, so badges
   // clear as the user fixes things.
@@ -648,17 +653,6 @@ function GraphCanvasInner({
     return () => window.removeEventListener("keydown", onKeyDown);
   }, [deleteSelection, doRedo, doUndo, save]);
 
-  // Dirty-state guard: browser-level.
-  useEffect(() => {
-    if (!dirty) return;
-    const onBeforeUnload = (event: BeforeUnloadEvent): void => {
-      event.preventDefault();
-      event.returnValue = "";
-    };
-    window.addEventListener("beforeunload", onBeforeUnload);
-    return () => window.removeEventListener("beforeunload", onBeforeUnload);
-  }, [dirty]);
-
   const onNodesChange = useCallback(
     (changes: NodeChange<CanvasFlowNode>[]) => {
       // Position/selection only: removals run through the editor's own
@@ -796,10 +790,7 @@ function GraphCanvasInner({
     },
   ];
 
-  const requestBack = () => {
-    if (dirty) setConfirmLeave(true);
-    else router.push(basePath);
-  };
+  const requestBack = () => leaveGuard.requestLeave(() => router.push(basePath));
 
   const focusIssue = (issue: CanvasIssue) => {
     if (issue.nodeId !== undefined) {
@@ -1072,16 +1063,16 @@ function GraphCanvasInner({
         />
       ) : null}
 
-      <Dialog open={confirmLeave} onClose={() => setConfirmLeave(false)} label="Unsaved changes">
+      <Dialog open={leaveGuard.confirmOpen} onClose={leaveGuard.stay} label="Unsaved changes">
         <h2 className="text-title font-semibold text-fg">Leave with unsaved changes?</h2>
         <p className="mt-1 text-sm text-muted-fg">
           Your canvas edits have not been saved as a revision yet. Leaving discards them.
         </p>
         <div className="mt-4 flex justify-end gap-2">
-          <Button variant="secondary" onClick={() => setConfirmLeave(false)}>
+          <Button variant="secondary" onClick={leaveGuard.stay}>
             Keep editing
           </Button>
-          <Button variant="danger" onClick={() => router.push(basePath)}>
+          <Button variant="danger" onClick={leaveGuard.proceed}>
             Discard and leave
           </Button>
         </div>
