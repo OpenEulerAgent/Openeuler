@@ -18,6 +18,7 @@ import { z } from "zod";
 import type { AppEnv } from "../app.js";
 import type { Executor, RunStatusNotification } from "../executor.js";
 import { HttpError } from "../errors.js";
+import { redactorForProject } from "../secrets.js";
 import { ensureLatestRevision } from "./workflows.js";
 
 /**
@@ -433,7 +434,13 @@ export function createRunsRouter(options: CreateRunsRouterOptions = {}): Hono<Ap
       status: "queued",
       branch: branchForRun(runId),
       iteration: 0,
-      task: body.prompt,
+      // #93 redacted-at-rest: the task is free text a secret can be pasted
+      // into, and the row is served back verbatim by the API — so values are
+      // swapped for ***NAME*** markers BEFORE the row is written. Run detail
+      // (and the driver prompt, which renders this same text) therefore
+      // shows the redacted task; agents consume secret values via env, not
+      // via the prompt.
+      task: redactorForProject(db, c.get("secretsKey"), project.id)(body.prompt),
       createdAt: now,
       updatedAt: now,
     };
@@ -695,8 +702,20 @@ export function createRunsRouter(options: CreateRunsRouterOptions = {}): Hono<Ap
     const project = db.projects.get(run.projectId);
     const baseBranch = project?.defaultBranch ?? "HEAD";
     const { stat, patch } = await worktrees.diffVsBase(info.path, baseBranch);
-    const capped = capPatchLines(patch);
-    const body: RunDiffBody = { scope, stat, ...capped, maxLines: MAX_DIFF_PATCH_LINES };
+    // #93: the cumulative diff is computed live from the worktree on disk —
+    // the one diff surface that never passes through the engine's
+    // redacted-before-persist writes — so scrub it (stat too: a secret
+    // pasted into a file name would otherwise survive in the summary)
+    // before responding. Redact before capping so the cap counts the
+    // served lines.
+    const redact = redactorForProject(db, c.get("secretsKey"), run.projectId);
+    const capped = capPatchLines(redact(patch));
+    const body: RunDiffBody = {
+      scope,
+      stat: redact(stat),
+      ...capped,
+      maxLines: MAX_DIFF_PATCH_LINES,
+    };
     return c.json(body);
   });
 
@@ -942,7 +961,12 @@ export function createRunsRouter(options: CreateRunsRouterOptions = {}): Hono<Ap
       status: "queued",
       branch: branchForRun(runId),
       iteration: 0,
-      ...(run.task === undefined ? {} : { task: run.task }),
+      // #93: re-redact the copied task — normally already redacted at rest,
+      // but rows written before redaction-at-rest (or a secret added after
+      // the original run was stored) still get scrubbed on copy.
+      ...(run.task === undefined
+        ? {}
+        : { task: redactorForProject(db, c.get("secretsKey"), run.projectId)(run.task) }),
       createdAt: now,
       updatedAt: now,
     };

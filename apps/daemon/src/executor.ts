@@ -7,6 +7,7 @@ import pLimit from "p-limit";
 import { recordRunStatusActivity } from "./activity.js";
 import { DEFAULT_MAX_CONCURRENT_RUNS, resolveMaxConcurrentRuns } from "./concurrency.js";
 import type { Logger } from "./logger.js";
+import { createSecretsSupport, type SecretsSupport } from "./secrets.js";
 
 export { DEFAULT_DRIVER_ID };
 
@@ -83,6 +84,14 @@ export interface ExecutorOptions {
   maxConcurrentRuns?: number;
   /** How long {@link Executor.shutdown} waits for active runs to settle. */
   shutdownSettleMs?: number;
+  /**
+   * Master key for per-project secrets (#93). When set, the executor loads
+   * each run's project secrets at run start: values are decrypted into the
+   * driver env and every persisted write (events, outputs, diffs, errors,
+   * activity payloads, run-tagged log fields) is redacted. Unset = runs
+   * execute without secret injection or redaction.
+   */
+  secretsKey?: Buffer;
 }
 
 interface ActiveRun {
@@ -158,6 +167,9 @@ export function createExecutor(options: ExecutorOptions): Executor {
     throw new Error(`maxConcurrentRuns must be an integer >= 1 (got ${maxConcurrentRuns})`);
   }
   const shutdownSettleMs = options.shutdownSettleMs ?? 2_000;
+  /** Per-project secrets support (#93); undefined when no master key is configured. */
+  const secrets: SecretsSupport | undefined =
+    options.secretsKey === undefined ? undefined : createSecretsSupport(db, options.secretsKey);
   const active = new Map<string, ActiveRun>();
   const runStatusListeners = new Set<RunStatusListener>();
   /**
@@ -191,6 +203,15 @@ export function createExecutor(options: ExecutorOptions): Executor {
   }
 
   /**
+   * Fresh redaction transform for a run's project (#93): applied to the
+   * executor's own persisted writes (activity payloads, failure errors)
+   * and its run-tagged log lines. No-ops when secrets are not configured.
+   */
+  function redactorFor(projectId: string): (text: string) => string {
+    return secrets === undefined ? (text) => text : secrets.redactorForProject(projectId);
+  }
+
+  /**
    * Records the feed entry (when feed-worthy) and broadcasts the transition
    * for a run whose row already carries the new status. Used both from the
    * engine's `run.status` hook and the executor's own out-of-engine
@@ -200,7 +221,7 @@ export function createExecutor(options: ExecutorOptions): Executor {
     try {
       const run = db.runs.get(runId);
       if (run === undefined) return;
-      recordRunStatusActivity(db, runId, run.status);
+      recordRunStatusActivity(db, runId, run.status, redactorFor(run.projectId));
       publishRunStatus({
         runId,
         status: run.status,
@@ -218,6 +239,7 @@ export function createExecutor(options: ExecutorOptions): Executor {
     drivers,
     logger,
     onRunStatus: (runId) => notifyRunStatus(runId),
+    ...(secrets === undefined ? {} : { loadRunSecrets: secrets.loadRunSecrets }),
   });
 
   /** Global semaphore: at most `maxConcurrentRuns` runs execute at once. */
@@ -269,11 +291,12 @@ export function createExecutor(options: ExecutorOptions): Executor {
   }
 
   function failRun(runId: string, message: string): void {
-    logger.error({ runId, error: message }, "run failed");
     try {
       const run = db.runs.get(runId);
+      const redact = run === undefined ? (text: string) => text : redactorFor(run.projectId);
+      logger.error({ runId, error: redact(message) }, "run failed");
       if (!run || isTerminal(run.status)) return;
-      db.runs.update(runId, { status: "failed", error: message });
+      db.runs.update(runId, { status: "failed", error: redact(message) });
       notifyRunStatus(runId);
     } catch (err) {
       logger.error({ err, runId }, "marking run failed failed");

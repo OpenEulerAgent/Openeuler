@@ -10,6 +10,7 @@ import {
   createAgentPresetRepo,
   createEventRepo,
   createProjectRepo,
+  createProjectSecretRepo,
   createRunRepo,
   createStepRunRepo,
   createWorkflowRepo,
@@ -20,6 +21,7 @@ import type {
   AgentPresetRepo,
   EventRepo,
   ProjectRepo,
+  ProjectSecretRepo,
   RunRepo,
   StepRunRepo,
   WorkflowRepo,
@@ -33,6 +35,8 @@ export type {
   AgentEventInput,
   AgentPresetPatch,
   EventInput,
+  ProjectSecret,
+  ProjectSecretName,
   RunPatch,
   StepRunPatch,
   WorkflowPatch,
@@ -44,6 +48,7 @@ export type {
   AgentPresetRepo,
   EventRepo,
   ProjectRepo,
+  ProjectSecretRepo,
   RunRepo,
   StepRunRepo,
   WorkflowRepo,
@@ -59,6 +64,7 @@ export interface Db {
   /** Raw better-sqlite3 handle (synchronous); use repos for typed access. */
   readonly sqlite: Database.Database;
   readonly projects: ProjectRepo;
+  readonly projectSecrets: ProjectSecretRepo;
   readonly agentPresets: AgentPresetRepo;
   readonly workflows: WorkflowRepo;
   readonly workflowRevisions: WorkflowRevisionRepo;
@@ -113,6 +119,7 @@ export function createDatabase(opts: CreateDatabaseOptions = {}): Db {
     path,
     sqlite,
     projects: createProjectRepo(db),
+    projectSecrets: createProjectSecretRepo(db),
     agentPresets: createAgentPresetRepo(db),
     workflows: createWorkflowRepo(db),
     workflowRevisions: createWorkflowRevisionRepo(db),

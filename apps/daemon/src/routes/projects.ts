@@ -180,9 +180,10 @@ export function createProjectsRouter(): Hono<AppEnv> {
     if (!db.projects.get(c.req.param("id"))) {
       throw new HttpError(404, "PROJECT_NOT_FOUND", `no project with id ${c.req.param("id")}`);
     }
-    // Presets are owned metadata (nodes keep config copies), so they go with
-    // the project instead of blocking the delete via the FK.
+    // Presets and secrets are owned metadata, so they go with the project
+    // instead of blocking the delete via the FKs.
     db.agentPresets.deleteAllForProject(id);
+    db.projectSecrets.deleteAllForProject(id);
     if (!db.projects.delete(id)) {
       throw new HttpError(404, "PROJECT_NOT_FOUND", `no project with id ${c.req.param("id")}`);
     }

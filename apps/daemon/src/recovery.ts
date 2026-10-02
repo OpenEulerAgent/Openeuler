@@ -4,6 +4,7 @@ import type { WorktreeManager } from "@openeuler/engine";
 import { recordRunStatusActivity } from "./activity.js";
 import type { Executor } from "./executor.js";
 import type { Logger } from "./logger.js";
+import { redactorForProject } from "./secrets.js";
 
 /** What {@link sweepInterruptedRuns} found and settled on this boot. */
 export interface SweepResult {
@@ -18,6 +19,12 @@ export interface SweepOptions {
   worktrees: WorktreeManager;
   executor: Executor;
   logger: Logger;
+  /**
+   * Master key for per-project secrets (#93). When set, the sweep's
+   * activity payloads are redacted against the run's project secrets;
+   * unset = no secrets configured, payloads pass through unchanged.
+   */
+  secretsKey?: Buffer;
 }
 
 /**
@@ -47,7 +54,17 @@ export async function sweepInterruptedRuns(options: SweepOptions): Promise<Sweep
         }
       }
       db.events.append(run.id, { type: "run.status", status: "interrupted" });
-      recordRunStatusActivity(db, run.id, "interrupted");
+      // #93: the activity payload snapshots the run's task — rows written
+      // before redaction-at-rest may still carry a secret, so scrub it.
+      // Transform construction never throws; a decrypt failure surfaces
+      // inside the activity writer's own never-throw guard (the feed entry
+      // is lost, never persisted raw — fail-closed).
+      recordRunStatusActivity(
+        db,
+        run.id,
+        "interrupted",
+        redactorForProject(db, options.secretsKey, run.projectId),
+      );
       logger.info({ runId: run.id, priorStatus: status }, "run interrupted by daemon restart");
       interruptedRunIds.push(run.id);
     }

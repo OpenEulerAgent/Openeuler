@@ -18,6 +18,7 @@ import type { AppEnv } from "../app.js";
 import { recordWorkflowCreatedActivity } from "../activity.js";
 import type { Executor } from "../executor.js";
 import { HttpError } from "../errors.js";
+import { redactorForProject } from "../secrets.js";
 
 /**
  * Workflow CRUD + graph revisions.
@@ -419,7 +420,10 @@ export function createWorkflowsRouter(): Hono<AppEnv> {
       status: "queued",
       branch: branchForRun(runId),
       iteration: 0,
-      task: body.task,
+      // #93 redacted-at-rest (same rule as POST /api/runs): the task is
+      // scrubbed before the row is written; run detail shows the redacted
+      // task and the engine renders the same redacted text.
+      task: redactorForProject(db, c.get("secretsKey"), workflow.projectId)(body.task),
       createdAt: now,
       updatedAt: now,
     };

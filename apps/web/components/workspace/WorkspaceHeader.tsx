@@ -8,9 +8,17 @@ import { Card } from "@/components/ui/card";
 
 /**
  * Workspace header: project path (mono), default branch badge, dirty
- * indicator from the project snapshot, and the New run CTA.
+ * indicator from the project snapshot, Settings, and the New run CTA.
  */
-export function WorkspaceHeader({ project, onNewRun }: { project: Project; onNewRun: () => void }) {
+export function WorkspaceHeader({
+  project,
+  onNewRun,
+  onSettings,
+}: {
+  project: Project;
+  onNewRun: () => void;
+  onSettings: () => void;
+}) {
   return (
     <Card>
       <div className="flex flex-wrap items-start justify-between gap-3">
@@ -51,6 +59,25 @@ export function WorkspaceHeader({ project, onNewRun }: { project: Project; onNew
           ) : project.dirty === false ? (
             <Badge variant="success">clean</Badge>
           ) : null}
+          <Button
+            variant="secondary"
+            size="icon"
+            onClick={onSettings}
+            aria-label="Project settings (secrets)"
+            title="Project settings (secrets)"
+          >
+            <svg
+              aria-hidden
+              viewBox="0 0 16 16"
+              className="size-4"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="1.5"
+            >
+              <path d="M6.5 1.5h3l.35 1.75 1.6.93 1.7-.62 1.5 2.6-1.35 1.17v1.34l1.35 1.17-1.5 2.6-1.7-.62-1.6.93L9.5 14.5h-3l-.35-1.75-1.6-.93-1.7.62-1.5-2.6 1.35-1.17V7.33L1.35 6.16l1.5-2.6 1.7.62 1.6-.93L6.5 1.5z" />
+              <circle cx="8" cy="8" r="2" />
+            </svg>
+          </Button>
           <Button onClick={onNewRun}>New run</Button>
         </div>
       </div>

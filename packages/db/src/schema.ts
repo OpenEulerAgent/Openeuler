@@ -139,6 +139,30 @@ export const stepRuns = sqliteTable(
 );
 
 /**
+ * Per-project secrets (#93): env-var-shaped credentials stored encrypted
+ * (AES-256-GCM, daemon-side key). `valueEnc` never leaves the db layer
+ * decrypted; the API exposes names only. One row per (project, name) —
+ * `set` upserts in place, keeping `createdAt`.
+ */
+export const projectSecrets = sqliteTable(
+  "project_secrets",
+  {
+    id: text("id").primaryKey(),
+    projectId: text("project_id")
+      .notNull()
+      .references(() => projects.id),
+    name: text("name").notNull(),
+    valueEnc: text("value_enc").notNull(),
+    createdAt: text("created_at").notNull(),
+    updatedAt: text("updated_at").notNull(),
+  },
+  (table) => [
+    uniqueIndex("project_secrets_project_id_name_unique").on(table.projectId, table.name),
+    index("project_secrets_project_id_idx").on(table.projectId),
+  ],
+);
+
+/**
  * Append-only agent event log. `seq` is assigned per run by the repository
  * (max(seq)+1 inside a transaction); `payload` stores the event JSON without
  * its `seq` so the column stays the single source of truth.
