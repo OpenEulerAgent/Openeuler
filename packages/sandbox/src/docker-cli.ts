@@ -1,5 +1,6 @@
 import { execFile, spawn } from "node:child_process";
 import { promisify } from "node:util";
+import type { Readable } from "node:stream";
 import { SandboxError } from "./error.js";
 
 const execFileAsync = promisify(execFile);
@@ -9,6 +10,25 @@ export const DOCKER_CLI = "docker";
 
 /** Default timeout for one docker CLI invocation. */
 export const DOCKER_CLI_TIMEOUT_MS = 60_000;
+
+/** Output cap enforced per CLI invocation (stdout/stderr combined). */
+export const DOCKER_CLI_MAX_BUFFER_BYTES = 32 * 1024 * 1024;
+
+/**
+ * Renders an argv array for error messages with `-e K=V` values redacted —
+ * environment values must never leak into logs or error text.
+ */
+export function argvSummary(args: readonly string[]): string {
+  return args
+    .map((arg, index) => {
+      if (args[index - 1] === "-e") {
+        const key = arg.split("=", 1)[0] ?? "";
+        return key === "" || key === arg ? "***" : `${key}=***`;
+      }
+      return arg;
+    })
+    .join(" ");
+}
 
 /** Availability probe result is cached this long. */
 export const DOCKER_AVAILABILITY_TTL_MS = 30_000;
@@ -31,6 +51,8 @@ export class DockerCliError extends Error {
   readonly timedOut: boolean;
   /** True when the docker binary could not be spawned at all (e.g. ENOENT). */
   readonly failedToSpawn: boolean;
+  /** True when the invocation's output exceeded the runner's maxBuffer. */
+  readonly maxBufferExceeded: boolean;
   /** The args that were attempted. */
   readonly args: readonly string[];
 
@@ -39,6 +61,7 @@ export class DockerCliError extends Error {
     details: {
       timedOut?: boolean;
       failedToSpawn?: boolean;
+      maxBufferExceeded?: boolean;
       args?: readonly string[];
       cause?: unknown;
     } = {},
@@ -48,6 +71,7 @@ export class DockerCliError extends Error {
     this.name = "DockerCliError";
     this.timedOut = details.timedOut ?? false;
     this.failedToSpawn = details.failedToSpawn ?? false;
+    this.maxBufferExceeded = details.maxBufferExceeded ?? false;
     this.args = details.args ?? [];
   }
 }
@@ -71,7 +95,7 @@ export const defaultDockerCliRunner: DockerCliRunner = async (args, options) => 
       timeout: timeoutMs,
       // execFile's timeout signal: kill the CLI immediately, no grace period.
       killSignal: "SIGKILL",
-      maxBuffer: 32 * 1024 * 1024,
+      maxBuffer: DOCKER_CLI_MAX_BUFFER_BYTES,
       windowsHide: true,
     });
     return { code: 0, stdout, stderr };
@@ -89,9 +113,18 @@ export const defaultDockerCliRunner: DockerCliRunner = async (args, options) => 
         { cause: err },
       );
     }
+    const message = err instanceof Error ? err.message : String(err);
+    // maxBuffer kills also set killed:true — classify them BEFORE timeouts.
+    if (details.code === "ENOBUFS" || /maxBuffer (?:length |size )?exceeded/i.test(message)) {
+      throw new DockerCliError(
+        `docker ${argvSummary(args)} output exceeded maxBuffer (${DOCKER_CLI_MAX_BUFFER_BYTES} bytes)`,
+        { maxBufferExceeded: true, args, cause: err },
+        { cause: err },
+      );
+    }
     if (details.killed === true) {
       throw new DockerCliError(
-        `docker ${args.join(" ")} timed out after ${timeoutMs}ms`,
+        `docker ${argvSummary(args)} timed out after ${timeoutMs}ms`,
         { timedOut: true, args, cause: err },
         { cause: err },
       );
@@ -100,7 +133,7 @@ export const defaultDockerCliRunner: DockerCliRunner = async (args, options) => 
       return { code: details.code, stdout: details.stdout ?? "", stderr: details.stderr ?? "" };
     }
     throw new DockerCliError(
-      `docker ${args.join(" ")} could not be executed: ${err instanceof Error ? err.message : String(err)}`,
+      `docker ${argvSummary(args)} could not be executed: ${message}`,
       { failedToSpawn: true, args, cause: err },
       { cause: err },
     );
@@ -161,7 +194,13 @@ export async function docker(
       if (err.timedOut) {
         throw new SandboxError(
           "SANDBOX_TIMEOUT",
-          `docker ${args.join(" ")} timed out: ${err.message}`,
+          `docker ${argvSummary(args)} timed out: ${err.message}`,
+        );
+      }
+      if (err.maxBufferExceeded) {
+        throw new SandboxError(
+          "SANDBOX_EXEC_FAILED",
+          `docker ${argvSummary(args)} output exceeded the CLI maxBuffer (${DOCKER_CLI_MAX_BUFFER_BYTES} bytes): ${err.message}`,
         );
       }
       throw new SandboxError("SANDBOX_UNAVAILABLE", `docker CLI unavailable: ${err.message}`);
@@ -169,7 +208,7 @@ export async function docker(
     if (err instanceof SandboxError) throw err;
     throw new SandboxError(
       "SANDBOX_EXEC_FAILED",
-      `docker ${args.join(" ")} failed unexpectedly: ${err instanceof Error ? err.message : String(err)}`,
+      `docker ${argvSummary(args)} failed unexpectedly: ${err instanceof Error ? err.message : String(err)}`,
     );
   }
 }
@@ -211,8 +250,8 @@ export async function dockerOk(
 
 /** A log source for `docker logs` demux: two piped streams plus a close event. */
 export interface DockerLogsSource {
-  stdout: NodeJS.ReadableStream;
-  stderr: NodeJS.ReadableStream;
+  stdout: Readable;
+  stderr: Readable;
   on(event: "error", listener: (err: Error) => void): unknown;
   on(event: "close", listener: (code: number | null) => void): unknown;
 }

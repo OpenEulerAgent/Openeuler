@@ -7,6 +7,7 @@ import {
   createDockerAvailabilityProbe,
   defaultDockerCliRunner,
   defaultDockerLogsSpawner,
+  type DockerCliResult,
   type DockerCliRunner,
   type DockerLogsSpawner,
   docker,
@@ -49,6 +50,21 @@ const PROVIDER_LABELS = new Set([
   DOCKER_CREATED_AT_LABEL,
 ]);
 
+/** Label namespace owned by the provider; `spec.labels` keys must not use it. */
+const RESERVED_LABEL_NAMESPACE = "openeuler.";
+
+/**
+ * Conservative image reference grammar: lowercase repo path (with optional
+ * `/` separators), optional tag, optional digest. Deliberately rejects
+ * anything that could reach docker's flag parser (`--privileged`, refs with
+ * leading dash/whitespace) and registry refs containing `:` before the last
+ * path segment (e.g. `localhost:5000/img` — rejected in v0.2).
+ */
+const IMAGE_REF_PATTERN = /^[a-z0-9._/-]+(:[A-Za-z0-9._-]+)?(@\S+)?$/;
+
+/** Default per-stream byte cap for `logs()` snapshots (truncation beyond). */
+export const DEFAULT_LOG_SNAPSHOT_CAP_BYTES = 8 * 1024 * 1024;
+
 /** Construction options for {@link createDockerSandboxProvider}. */
 export interface DockerSandboxProviderOptions {
   /** Registry id; defaults to `"docker"`. */
@@ -73,6 +89,14 @@ export interface DockerSandboxProviderOptions {
    * `["tail", "-f", "/dev/null"]`.
    */
   idleCommand?: string[];
+  /**
+   * Host IP published ports bind to (`-p <publishHost>::<containerPort>`).
+   * Default `"127.0.0.1"` so published ports are reachable from the host's
+   * loopback only, never the outside world.
+   */
+  publishHost?: string;
+  /** Per-stream byte cap for `logs()` snapshots; beyond it the stream is truncated with a marker line. Default 8 MiB. */
+  logsCapBytes?: number;
 }
 
 interface ResolvedDockerOptions {
@@ -85,6 +109,8 @@ interface ResolvedDockerOptions {
   stopGraceMs: number;
   limitedNetworkName: string;
   idleCommand: string[];
+  publishHost: string;
+  logsCapBytes: number;
 }
 
 const DEFAULT_IDLE_COMMAND = ["tail", "-f", "/dev/null"];
@@ -106,12 +132,48 @@ interface DockerPsRow {
   CreatedAt?: string;
 }
 
+/** Shared env-record validation for spec env and exec-time env. */
+function validateEnvRecord(env: Record<string, string>, what: string): void {
+  for (const [key, value] of Object.entries(env)) {
+    if (key === "" || key.includes("=")) {
+      throw new SandboxError(
+        "SANDBOX_INVALID_SPEC",
+        `${what} env key "${key}" must be non-empty and contain no "="`,
+      );
+    }
+    if (typeof value !== "string") {
+      throw new SandboxError(
+        "SANDBOX_INVALID_SPEC",
+        `${what} env value for "${key}" must be a string`,
+      );
+    }
+  }
+}
+
 function validateSpec(spec: SandboxSpec): void {
   if (typeof spec?.image !== "string" || spec.image.trim() === "") {
     throw new SandboxError("SANDBOX_IMAGE_MISSING", "sandbox spec requires a non-empty image");
   }
+  if (
+    spec.image.startsWith("-") ||
+    spec.image !== spec.image.trim() ||
+    !IMAGE_REF_PATTERN.test(spec.image)
+  ) {
+    throw new SandboxError(
+      "SANDBOX_INVALID_SPEC",
+      `image ref "${spec.image}" is not a valid image reference (no leading dash/whitespace, no flag-like refs)`,
+    );
+  }
   if (typeof spec.runId !== "string" || spec.runId.trim() === "") {
     throw new SandboxError("SANDBOX_INVALID_SPEC", "sandbox spec requires a non-empty runId");
+  }
+  for (const key of Object.keys(spec.labels ?? {})) {
+    if (key.startsWith(RESERVED_LABEL_NAMESPACE)) {
+      throw new SandboxError(
+        "SANDBOX_INVALID_SPEC",
+        `label key "${key}" uses the provider-reserved "${RESERVED_LABEL_NAMESPACE}" namespace`,
+      );
+    }
   }
   for (const mount of spec.mounts ?? []) {
     if (!isAbsolute(mount?.hostPath ?? "")) {
@@ -126,18 +188,20 @@ function validateSpec(spec: SandboxSpec): void {
         `mount containerPath "${mount?.containerPath}" must be absolute`,
       );
     }
-  }
-  for (const [key, value] of Object.entries(spec.env ?? {})) {
-    if (key === "" || key.includes("=")) {
+    if (mount?.hostPath.includes(":")) {
       throw new SandboxError(
         "SANDBOX_INVALID_SPEC",
-        `env key "${key}" must be non-empty and contain no "="`,
+        `mount hostPath "${mount.hostPath}" must not contain ":" (docker -v separator)`,
       );
     }
-    if (typeof value !== "string") {
-      throw new SandboxError("SANDBOX_INVALID_SPEC", `env value for "${key}" must be a string`);
+    if (mount?.containerPath.includes(":")) {
+      throw new SandboxError(
+        "SANDBOX_INVALID_SPEC",
+        `mount containerPath "${mount.containerPath}" must not contain ":" (docker -v separator)`,
+      );
     }
   }
+  validateEnvRecord(spec.env ?? {}, "spec");
   for (const port of spec.ports ?? []) {
     if (!Number.isInteger(port) || port < 1 || port > 65535) {
       throw new SandboxError(
@@ -207,7 +271,9 @@ function buildRunArgs(
     args.push("-e", `${key}=${value}`);
   }
   for (const port of spec.ports ?? []) {
-    args.push("-p", String(port));
+    // `ip::containerPort` → ephemeral host port bound to publishHost only
+    // (default loopback; `-p <port>` would bind 0.0.0.0, exposing the port).
+    args.push("-p", `${options.publishHost}::${port}`);
   }
   if (spec.resources?.memoryMb !== undefined) {
     args.push(`--memory=${Math.round(spec.resources.memoryMb)}m`);
@@ -321,6 +387,7 @@ class DockerSandboxHandle implements SandboxHandle {
         "exec cmd must be a non-empty array of strings",
       );
     }
+    validateEnvRecord(opts?.env ?? {}, "exec");
     if (this.destroyed || this.stoppedByUs) {
       throw new SandboxError(
         "SANDBOX_UNAVAILABLE",
@@ -375,6 +442,8 @@ class DockerSandboxHandle implements SandboxHandle {
    * CLI writes container stdout to its stdout and container stderr to its
    * stderr, so per-stream order is preserved; cross-stream interleaving
    * follows pipe-arrival order (the contract pins per-stream order only).
+   * Each stream is capped at `logsCapBytes` (default 8 MiB): crossing the cap
+   * emits a truncation marker and stops reading that stream (memory-bounded).
    */
   private async *snapshotLogs(opts: SandboxLogOptions): AsyncIterable<SandboxLogEntry> {
     if (this.destroyed) return;
@@ -383,21 +452,52 @@ class DockerSandboxHandle implements SandboxHandle {
     if (opts.since !== undefined) args.push("--since", new Date(opts.since).toISOString());
     args.push(this.id);
     const entries: SandboxLogEntry[] = [];
+    const cap = this.options.logsCapBytes;
     await new Promise<void>((resolve, reject) => {
       const child = this.options.logsSpawner(args);
-      createInterface({ input: child.stdout }).on("line", (line: string) => {
+      let stdoutBytes = 0;
+      let stderrBytes = 0;
+      let stdoutTruncated = false;
+      let stderrTruncated = false;
+      let rawStderr = "";
+      const stdoutInterface = createInterface({ input: child.stdout });
+      stdoutInterface.on("line", (line: string) => {
+        if (stdoutTruncated) return;
+        stdoutBytes += line.length + 1;
+        if (stdoutBytes > cap) {
+          stdoutTruncated = true;
+          entries.push({
+            stream: "stdout",
+            line: `[openeuler] stdout log snapshot truncated at ${cap} bytes`,
+          });
+          stdoutInterface.close();
+          child.stdout.destroy(); // unblock the CLI's pipe (expected EPIPE exit)
+          return;
+        }
         entries.push({ stream: "stdout", line: stripLogTimestamp(line) });
       });
-      let rawStderr = "";
       const stderrInterface = createInterface({ input: child.stderr });
       stderrInterface.on("line", (line: string) => {
-        rawStderr += `${line}\n`;
+        if (stderrTruncated) return;
+        stderrBytes += line.length + 1;
+        if (stderrBytes > cap) {
+          stderrTruncated = true;
+          entries.push({
+            stream: "stderr",
+            line: `[openeuler] stderr log snapshot truncated at ${cap} bytes`,
+          });
+          stderrInterface.close();
+          child.stderr.destroy();
+          return;
+        }
         entries.push({ stream: "stderr", line: stripLogTimestamp(line) });
+        if (rawStderr.length < cap) rawStderr += `${line}\n`;
       });
       let settled = false;
       const settle = (error: Error | undefined): void => {
         if (settled) return;
         settled = true;
+        stdoutInterface.close();
         stderrInterface.close();
         if (error) reject(error);
         else resolve();
@@ -412,6 +512,9 @@ class DockerSandboxHandle implements SandboxHandle {
       );
       child.on("close", (code) => {
         if (code === 0) return settle(undefined);
+        // Truncation closes the pipe early; the CLI's non-zero exit from the
+        // broken pipe is expected, not a failure.
+        if (stdoutTruncated || stderrTruncated) return settle(undefined);
         if (isContainerMissingText(rawStderr)) {
           entries.length = 0; // externally removed → empty stream, diagnostics dropped
           return settle(undefined);
@@ -466,14 +569,16 @@ class DockerSandboxHandle implements SandboxHandle {
       runner: this.options.runner,
       timeoutMs: this.options.opTimeoutMs,
     });
-    this.destroyed = true;
-    this.cachedHostPorts = {};
+    // Only mark destroyed when rm succeeded (or the container is already
+    // gone); otherwise the handle stays usable and destroy() is retryable.
     if (result.code !== 0 && !isContainerMissingText(result.stderr)) {
       throw new SandboxError(
         "SANDBOX_EXEC_FAILED",
         `failed to remove sandbox "${this.id}": ${stderrTail(result.stderr)}`,
       );
     }
+    this.destroyed = true;
+    this.cachedHostPorts = {};
   }
 
   private async inspect(): Promise<DockerInspectView> {
@@ -512,6 +617,26 @@ export class DockerSandboxProvider implements SandboxProvider {
 
   constructor(options: DockerSandboxProviderOptions = {}) {
     this.id = options.id ?? "docker";
+    if (
+      options.publishHost !== undefined &&
+      (typeof options.publishHost !== "string" ||
+        options.publishHost.trim() === "" ||
+        /\s/.test(options.publishHost))
+    ) {
+      throw new SandboxError(
+        "SANDBOX_INVALID_SPEC",
+        `publishHost must be a non-empty, whitespace-free host/IP (got "${String(options.publishHost)}")`,
+      );
+    }
+    if (
+      options.logsCapBytes !== undefined &&
+      (!Number.isInteger(options.logsCapBytes) || options.logsCapBytes <= 0)
+    ) {
+      throw new SandboxError(
+        "SANDBOX_INVALID_SPEC",
+        `logsCapBytes must be a positive integer (got ${String(options.logsCapBytes)})`,
+      );
+    }
     this.options = {
       id: this.id,
       runner: options.runner ?? defaultDockerCliRunner,
@@ -522,6 +647,8 @@ export class DockerSandboxProvider implements SandboxProvider {
       stopGraceMs: options.stopGraceMs ?? 10_000,
       limitedNetworkName: options.limitedNetworkName ?? "openeuler-limited",
       idleCommand: options.idleCommand ?? [...DEFAULT_IDLE_COMMAND],
+      publishHost: options.publishHost ?? "127.0.0.1",
+      logsCapBytes: options.logsCapBytes ?? DEFAULT_LOG_SNAPSHOT_CAP_BYTES,
     };
     this.probe = createDockerAvailabilityProbe(this.options.runner);
   }
@@ -542,12 +669,27 @@ export class DockerSandboxProvider implements SandboxProvider {
       const name = containerName(spec.runId);
       const createdAt = Date.now();
       const runArgs = buildRunArgs(spec, name, createdAt, this.options);
-      const started = await docker(runArgs, {
-        runner: this.options.runner,
-        timeoutMs: this.options.opTimeoutMs,
-      });
+      let started: DockerCliResult;
+      try {
+        started = await docker(runArgs, {
+          runner: this.options.runner,
+          timeoutMs: this.options.opTimeoutMs,
+        });
+      } catch (err) {
+        // The CLI died mid-run (timeout/spawn failure): the container may
+        // exist under our unique name — best-effort cleanup, then rethrow.
+        await this.bestEffortRemove(name);
+        throw err;
+      }
       if (started.code === 0) {
-        return this.buildHandle(spec, name, createdAt);
+        try {
+          return await this.buildHandle(spec, name, createdAt);
+        } catch (err) {
+          // Container is running but post-start inspect failed — remove the
+          // leaked container (best-effort), then rethrow the typed error.
+          await this.bestEffortRemove(name);
+          throw err;
+        }
       }
       if (isDaemonDown(started)) {
         throw new SandboxError(
@@ -614,7 +756,11 @@ export class DockerSandboxProvider implements SandboxProvider {
   }
 
   async stats(): Promise<SandboxUsage[]> {
-    const result = await dockerOk(["stats", "--no-stream", "--format", "json"], {
+    // Scope stats to provider-managed sandboxes only — `docker stats` without
+    // ids would cover EVERY container on the host, ours or not.
+    const ids = (await this.list()).map((summary) => summary.id).filter((id) => id !== "");
+    if (ids.length === 0) return [];
+    const result = await dockerOk(["stats", "--no-stream", "--format", "json", ...ids], {
       runner: this.options.runner,
       timeoutMs: this.options.opTimeoutMs,
       what: "docker stats",
@@ -633,6 +779,22 @@ export class DockerSandboxProvider implements SandboxProvider {
       });
     }
     return usage;
+  }
+
+  /**
+   * Best-effort `rm -f` used by `create()` cleanup paths: the name is ours
+   * and freshly generated, so removing it can never hit a foreign container;
+   * every failure is swallowed (the original error is what matters).
+   */
+  private async bestEffortRemove(name: string): Promise<void> {
+    try {
+      await docker(["rm", "-f", name], {
+        runner: this.options.runner,
+        timeoutMs: this.options.opTimeoutMs,
+      });
+    } catch {
+      // Best-effort only: CLI/daemon being down must not mask the real error.
+    }
   }
 
   /**

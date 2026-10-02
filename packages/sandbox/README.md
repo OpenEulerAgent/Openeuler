@@ -183,6 +183,8 @@ const provider = createDockerSandboxProvider({
   stopGraceMs: 10_000, // default stop() grace before SIGKILL
   limitedNetworkName: "openeuler-limited", // dedicated bridge (see below)
   idleCommand: ["tail", "-f", "/dev/null"], // container CMD while idle
+  publishHost: "127.0.0.1", // host IP published ports bind to (loopback-only default)
+  logsCapBytes: 8 * 1024 * 1024, // per-stream logs() snapshot cap (truncation marker beyond)
   runner: undefined, // injectable CLI runner (tests)
   logsSpawner: undefined, // injectable dual-stream spawner (tests)
 });
@@ -192,9 +194,16 @@ const provider = createDockerSandboxProvider({
 
 1. **Validates the spec** (typed `SANDBOX_INVALID_SPEC` errors): mount
    `hostPath`/`containerPath` must be **absolute** (docker would silently
-   create relative bind sources — rejected instead), ports must be integers in
-   `[1, 65535]`, env keys non-empty without `=`, and `ports` + `network:
-"none"` is rejected (docker cannot publish ports without a network).
+   create relative bind sources — rejected instead) and must not contain `:`
+   (the `-v` separator); ports must be integers in `[1, 65535]`; env keys
+   (spec and exec-time) non-empty without `=`; `ports` + `network: "none"`
+   is rejected (docker cannot publish ports without a network); label keys
+   must not use the provider-reserved `openeuler.*` namespace; image refs
+   must match a conservative grammar
+   (`^[a-z0-9._/-]+(:[A-Za-z0-9._-]+)?(@\S+)?$`, no leading dash/whitespace)
+   so flag-like refs such as `--privileged` can never reach docker's argument
+   parser — note this also rejects registry refs with a port before the last
+   path segment (`localhost:5000/img`) in v0.2.
 2. **Image pull policy `never-if-exists`**: `docker image inspect` first; only
    when missing does it run one `docker pull` (bounded by `pullTimeoutMs`).
    Pull failure (including auth/manifest errors) surfaces as
@@ -202,13 +211,14 @@ const provider = createDockerSandboxProvider({
 3. Runs `docker run -d --init --name openeuler-<runId>-<rand6>` with:
    - labels `openeuler.sandbox=1`, `openeuler.run=<runId>`,
      `openeuler.image=<image>`, `openeuler.createdAt=<epochMs>` plus every
-     `spec.labels` entry (`openeuler.*` keys are provider-reserved and
-     reported back stripped from `list()` summaries);
+     `spec.labels` entry (`openeuler.*` keys are provider-reserved: rejected
+     at `create()` and reported back stripped from `list()` summaries);
    - `--log-driver=json-file` so stdout/stderr stay demultiplexed (below);
    - `-w <workingDir>` — the spec value, defaulting to `/workspace` when
      mounts exist;
    - `-v host:container[:ro]` per mount, `-e K=V` per env (values may contain
-     `=`), `-p <port>` per spec port (ephemeral host side);
+     `=`), `-p 127.0.0.1::<port>` per spec port (ephemeral host side bound
+     to `publishHost` — loopback by default, see "Ports" below);
    - `--memory=<memoryMb>m` and `--cpus=<cpus>` when `resources` is set;
    - `--network none` for `network: "none"`; `--network openeuler-limited`
      for `"limited"` (bridge created on demand, race-tolerant); no flag for
@@ -217,6 +227,11 @@ const provider = createDockerSandboxProvider({
      `create` starts an idle keeper and all work happens via `exec`.
 4. `docker inspect` resolves the published host ports → `hostPorts()` (cached;
    stable across calls until `destroy()` → `{}`).
+
+If the container started but the post-start `docker inspect` fails (or the
+`docker run` invocation itself dies mid-flight, e.g. a timeout), `create()`
+runs a best-effort `docker rm -f <name>` before rethrowing, so a failed
+`create()` never leaks a running container under the provider's name.
 
 `--init` (docker-init/tini as PID 1) matters: it forwards SIGTERM so
 `stop()`'s grace period is honored instead of always burning into SIGKILL.
@@ -232,6 +247,13 @@ const provider = createDockerSandboxProvider({
   docker's `exited` to the contract's `stopped` (the handle remembers who
   stopped it).
 - `destroy()` → `docker rm -f` (idempotent; "No such container" is success).
+  The handle is only marked destroyed once `rm` actually succeeded (or the
+  container is already gone) — a failed `destroy()` stays retryable.
+- `list()` filters `docker ps` by the `openeuler.sandbox=1` label; `stats()`
+  is scoped the same way — it resolves the provider's sandbox ids first and
+  runs `docker stats --no-stream <ids…>` against those only (empty list →
+  `[]` without touching `docker stats`), so host containers unrelated to
+  openeuler are never reported.
 
 ### Logs demux (v0.2 snapshot)
 
@@ -243,7 +265,24 @@ prefix is stripped. Per-stream order is exact; cross-stream interleaving
 follows pipe-arrival order (the contract pins per-stream order only). Being a
 single-shot snapshot (follow is reserved), the iterator completes when `docker
 logs` exits; a container that vanished externally resolves to an empty stream,
-and destroyed handles return `[]` without spawning.
+and destroyed handles return `[]` without spawning. Each stream is capped at
+`logsCapBytes` (default 8 MiB): crossing the cap emits a `[openeuler] … log
+snapshot truncated` marker line and stops reading that stream, so a container
+writing unbounded output cannot grow memory without bound (the CLI's expected
+broken-pipe exit after truncation is treated as success).
+
+### Ports
+
+`spec.ports` lists container ports to publish. `hostPorts()` returns the
+container→host mapping; host sides are ephemeral and stable across calls
+until `destroy()` (then `{}`). Sandboxes without `ports` report `{}`.
+
+Published ports bind to the **host's loopback only** by default
+(`-p 127.0.0.1::<containerPort>` — docker's `ip::containerPort` syntax with
+an ephemeral host port). Plain `-p <port>` would bind `0.0.0.0` and expose
+the port to every interface; set the provider option `publishHost` (e.g.
+`"0.0.0.0"` or a specific address) when a sandbox port must be reachable
+off-host.
 
 ### Network modes — honest approximation
 

@@ -8,9 +8,10 @@ import {
   type DockerLogsSource,
   createDockerAvailabilityProbe,
   defaultDockerCliRunner,
+  docker,
 } from "./docker-cli.js";
 import { createDockerSandboxProvider } from "./docker.js";
-import type { SandboxHandle, SandboxSpec } from "./types.js";
+import type { SandboxHandle, SandboxLogEntry, SandboxSpec } from "./types.js";
 
 /**
  * Records every invocation and serves scripted results FIFO (its `run`
@@ -131,7 +132,7 @@ describe("docker provider unit (fake CLI runner)", () => {
       "-e",
       "K=V=X",
       "-p",
-      "8080",
+      "127.0.0.1::8080",
       "--memory=256m",
       "--cpus=1.5",
       "--network",
@@ -181,6 +182,18 @@ describe("docker provider unit (fake CLI runner)", () => {
     expect(runArgs[runArgs.indexOf("--network") + 1]).toBe("none");
   });
 
+  it("publishes ports on a configurable host via publishHost", async () => {
+    const runner = new RecordingRunner();
+    scriptCreate(runner);
+    const provider = createDockerSandboxProvider({
+      runner: (a) => runner.run(a),
+      publishHost: "192.0.2.10",
+    });
+    await provider.create(baseSpec({ ports: [8080] }));
+    const runArgs = findCall(runner, "run");
+    expect(runArgs[runArgs.indexOf("-p") + 1]).toBe("192.0.2.10::8080");
+  });
+
   it("rejects relative mount host paths with a typed validation error", async () => {
     const runner = new RecordingRunner();
     const provider = createDockerSandboxProvider({ runner: (a) => runner.run(a) });
@@ -210,6 +223,86 @@ describe("docker provider unit (fake CLI runner)", () => {
     await expect(provider.create(baseSpec({ network: "none", ports: [80] }))).rejects.toMatchObject(
       { code: "SANDBOX_INVALID_SPEC" },
     );
+  });
+
+  it("rejects image refs that could reach docker's flag parser", async () => {
+    const runner = new RecordingRunner();
+    const provider = createDockerSandboxProvider({ runner: (a) => runner.run(a) });
+    for (const bad of [
+      "--privileged", // flag-injection via leading dash
+      "-v", // short-flag lookalike
+      " img", // leading whitespace
+      "img ", // trailing whitespace
+      "img\nlatest",
+      "IMG:latest", // uppercase repo (conservative lowercase-only grammar)
+      "repo/name:has space",
+      "re po",
+    ]) {
+      const failure = await provider.create(baseSpec({ image: bad })).then(
+        () => undefined,
+        (error: unknown) => error,
+      );
+      expect(failure, `image "${bad}" must be rejected`).toMatchObject({
+        code: "SANDBOX_INVALID_SPEC",
+      });
+    }
+    expect(runner.calls).toEqual([]); // rejected before touching docker
+  });
+
+  it("accepts conservative image refs including digests", async () => {
+    const runner = new RecordingRunner();
+    scriptCreate(runner); // first create (also warms the availability cache)
+    runner.ok("{}").ok("container-id-456\n").ok(INSPECT_RUNNING); // second create
+    const provider = createDockerSandboxProvider({ runner: (a) => runner.run(a) });
+    await expect(
+      provider.create(baseSpec({ image: "reg.example.com/team/worker:1.0_beta-2" })),
+    ).resolves.toBeTruthy();
+    await expect(
+      provider.create(baseSpec({ image: "img:2@sha256:abcdef0123456789" })),
+    ).resolves.toBeTruthy();
+  });
+
+  it("rejects spec labels in the provider-reserved openeuler.* namespace", async () => {
+    const runner = new RecordingRunner();
+    const provider = createDockerSandboxProvider({ runner: (a) => runner.run(a) });
+    await expect(
+      provider.create(baseSpec({ labels: { "openeuler.run": "evil" } })),
+    ).rejects.toMatchObject({ code: "SANDBOX_INVALID_SPEC" });
+    await expect(
+      provider.create(baseSpec({ labels: { "openeuler.sandbox": "1" } })),
+    ).rejects.toMatchObject({ code: "SANDBOX_INVALID_SPEC" });
+    await expect(
+      provider.create(baseSpec({ labels: { "openeuler.custom": "x" } })),
+    ).rejects.toMatchObject({ code: "SANDBOX_INVALID_SPEC" });
+    expect(runner.calls).toEqual([]); // rejected before touching docker
+  });
+
+  it("rejects mount paths containing ':' (docker -v separator)", async () => {
+    const runner = new RecordingRunner();
+    const provider = createDockerSandboxProvider({ runner: (a) => runner.run(a) });
+    await expect(
+      provider.create(
+        baseSpec({ mounts: [{ hostPath: "/host:evil", containerPath: "/workspace" }] }),
+      ),
+    ).rejects.toMatchObject({ code: "SANDBOX_INVALID_SPEC" });
+    await expect(
+      provider.create(baseSpec({ mounts: [{ hostPath: "/host", containerPath: "/work:space" }] })),
+    ).rejects.toMatchObject({ code: "SANDBOX_INVALID_SPEC" });
+    expect(runner.calls).toEqual([]);
+  });
+
+  it("validates exec-time env keys like spec env", async () => {
+    const runner = new RecordingRunner();
+    scriptCreate(runner);
+    const provider = createDockerSandboxProvider({ runner: (a) => runner.run(a) });
+    const sandbox = await provider.create(baseSpec());
+    await expect(
+      sandbox.exec(["true"], { env: { "BAD=KEY": "v" } as Record<string, string> }),
+    ).rejects.toMatchObject({ code: "SANDBOX_INVALID_SPEC" });
+    await expect(
+      sandbox.exec(["true"], { env: { "": "v" } as Record<string, string> }),
+    ).rejects.toMatchObject({ code: "SANDBOX_INVALID_SPEC" });
+    expect(runner.calls.some((args) => args[0] === "exec")).toBe(false);
   });
 
   it("maps daemon-down output to SANDBOX_UNAVAILABLE", async () => {
@@ -307,6 +400,53 @@ describe("docker provider unit (fake CLI runner)", () => {
     });
   });
 
+  it("best-effort removes the container when post-start inspect fails", async () => {
+    const runner = new RecordingRunner();
+    runner
+      .ok("29.8.1") // probe ok
+      .ok("{}") // image present
+      .ok("container-id-123\n") // docker run succeeds
+      .fail(1, "Error: No such container: vanished"); // inspect fails
+    runner.ok("removed"); // best-effort rm -f
+    const provider = createDockerSandboxProvider({ runner: (a) => runner.run(a) });
+    const failure = await provider.create(baseSpec()).then(
+      () => undefined,
+      (error: unknown) => error,
+    );
+    expect(failure).toBeInstanceOf(SandboxError);
+    expect(failure).toMatchObject({ code: "SANDBOX_EXEC_FAILED" }); // original error rethrown
+    const rmCalls = runner.calls.filter((args) => args[0] === "rm");
+    expect(rmCalls).toHaveLength(1);
+    expect(rmCalls[0]?.[1]).toBe("-f");
+    expect(rmCalls[0]?.[2]).toMatch(/^openeuler-run-1-[a-z0-9]{6}$/); // our leaked container
+  });
+
+  it("best-effort removes the container when docker run times out", async () => {
+    const runner = new RecordingRunner();
+    runner.ok("29.8.1").ok("{}"); // probe + image present
+    runner.throw(new DockerCliError("docker run timed out after 30000ms", { timedOut: true }));
+    runner.ok("removed"); // best-effort rm -f
+    const provider = createDockerSandboxProvider({ runner: (a) => runner.run(a) });
+    await expect(provider.create(baseSpec())).rejects.toMatchObject({ code: "SANDBOX_TIMEOUT" });
+    const rmCalls = runner.calls.filter((args) => args[0] === "rm");
+    expect(rmCalls).toHaveLength(1);
+    expect(rmCalls[0]?.[2]).toMatch(/^openeuler-run-1-[a-z0-9]{6}$/);
+  });
+
+  it("best-effort cleanup swallows its own failure and rethrows the original error", async () => {
+    const runner = new RecordingRunner();
+    runner.ok("29.8.1").ok("{}").ok("container-id-123\n"); // probe + image + run
+    runner.fail(1, "Error: No such container: vanished"); // inspect fails
+    runner.throw(new DockerCliError("docker CLI not found in PATH", { failedToSpawn: true })); // rm also fails
+    const provider = createDockerSandboxProvider({ runner: (a) => runner.run(a) });
+    const failure = await provider.create(baseSpec()).then(
+      () => undefined,
+      (error: unknown) => error,
+    );
+    expect(failure).toBeInstanceOf(SandboxError);
+    expect(failure).toMatchObject({ code: "SANDBOX_EXEC_FAILED" }); // inspect error, not the rm failure
+  });
+
   it("maps CLI timeouts to SANDBOX_TIMEOUT", async () => {
     const runner = new RecordingRunner();
     scriptCreate(runner);
@@ -391,6 +531,23 @@ describe("docker provider unit (fake CLI runner)", () => {
     expect(findCall(runner, "stop").slice(0, 3)).toEqual(["stop", "-t", "2"]);
   });
 
+  it("destroy stays retryable when rm fails and succeeds on retry", async () => {
+    const runner = new RecordingRunner();
+    scriptCreate(runner);
+    runner.fail(1, "Error: removal went wrong"); // first rm fails
+    runner.ok("name"); // retried rm succeeds
+    const provider = createDockerSandboxProvider({ runner: (a) => runner.run(a) });
+    const sandbox = await provider.create(baseSpec());
+
+    await expect(sandbox.destroy()).rejects.toMatchObject({ code: "SANDBOX_EXEC_FAILED" });
+    // Failure did NOT mark the handle destroyed → destroy is retryable.
+    await expect(sandbox.destroy()).resolves.toBeUndefined();
+    // Now destroyed: idempotent, no further docker calls.
+    await expect(sandbox.destroy()).resolves.toBeUndefined();
+    expect(runner.calls.filter((args) => args[0] === "rm")).toHaveLength(2);
+    await expect(sandbox.exec(["true"])).rejects.toMatchObject({ code: "SANDBOX_UNAVAILABLE" });
+  });
+
   it("hostPorts parses IPv4 bindings from docker inspect", async () => {
     const runner = new RecordingRunner();
     scriptCreate(runner);
@@ -441,8 +598,16 @@ describe("docker provider unit (fake CLI runner)", () => {
     });
   });
 
-  it("stats parses docker stats json rows", async () => {
+  it("stats scopes to provider sandboxes via list() ids", async () => {
     const runner = new RecordingRunner();
+    runner.ok(
+      `${JSON.stringify({
+        Names: "openeuler-run-1-abc123",
+        Image: "img:2",
+        Labels: "openeuler.sandbox=1,openeuler.image=img:2,openeuler.createdAt=1700000000000",
+        State: "running",
+      })}\n`,
+    );
     runner.ok(
       `${JSON.stringify({
         Name: "openeuler-run-1-abc123",
@@ -452,9 +617,24 @@ describe("docker provider unit (fake CLI runner)", () => {
     );
     const provider = createDockerSandboxProvider({ runner: (a) => runner.run(a) });
     const usage = await provider.stats();
+    expect(findCall(runner, "stats")).toEqual([
+      "stats",
+      "--no-stream",
+      "--format",
+      "json",
+      "openeuler-run-1-abc123", // ids from list(), never the whole host
+    ]);
     expect(usage).toHaveLength(1);
     expect(usage[0]).toMatchObject({ id: "openeuler-run-1-abc123", memoryMb: 64 });
     expect(usage[0]?.cpus ?? 0).toBeGreaterThan(0);
+  });
+
+  it("stats returns [] without invoking docker stats when list() is empty", async () => {
+    const runner = new RecordingRunner();
+    runner.ok(""); // docker ps → no sandboxes
+    const provider = createDockerSandboxProvider({ runner: (a) => runner.run(a) });
+    await expect(provider.stats()).resolves.toEqual([]);
+    expect(runner.calls.some((args) => args[0] === "stats")).toBe(false);
   });
 });
 
@@ -575,6 +755,29 @@ describe("docker logs demux (fake spawner)", () => {
     expect(failure).toMatchObject({ code: "SANDBOX_EXEC_FAILED" });
   });
 
+  it("caps per-stream accumulation with a truncation marker and stops reading", async () => {
+    // ~100-byte lines in 10KiB chunks, comfortably past the 8 MiB cap.
+    const line = `${"x".repeat(99)}\n`;
+    const chunk = line.repeat(100);
+    const stdoutChunks: string[] = [];
+    for (let i = 0; i < 900; i += 1) stdoutChunks.push(chunk); // ~9.2 MiB total
+    const provider = logsProvider(stdoutChunks, ["2026-10-03T04:57:41.089908247Z err\n"], 1);
+    const sandbox = await provider.create(baseSpec());
+    const entries: SandboxLogEntry[] = [];
+    for await (const entry of sandbox.logs()) entries.push(entry);
+
+    const stdoutLines = entries.filter((e) => e.stream === "stdout");
+    const stdoutBytes = stdoutLines.reduce((sum, e) => sum + e.line.length + 1, 0);
+    expect(stdoutBytes).toBeLessThanOrEqual(8 * 1024 * 1024 + 1_000); // bounded, not 9.2 MiB
+    expect(stdoutLines[stdoutLines.length - 1]?.line).toMatch(
+      /stdout log snapshot truncated at 8388608 bytes/,
+    );
+    // The other stream still flows through.
+    expect(entries.filter((e) => e.stream === "stderr").map((e) => e.line)).toEqual(["err"]);
+    // Truncation treats the CLI's broken-pipe exit (here 1) as success.
+    expect(entries.some((e) => e.stream === "stdout" && e.line === "x".repeat(99))).toBe(true);
+  });
+
   it("rejects follow:true in v0.2", async () => {
     const runner = new RecordingRunner();
     scriptCreate(runner);
@@ -622,5 +825,48 @@ describe("docker availability probe", () => {
     // Either a real timeout or (with a broken PATH) a spawn failure — both
     // must surface as structured DockerCliError, never a raw child_process error.
     expect(failure).toBeInstanceOf(DockerCliError);
+  });
+});
+
+describe("docker CLI error hygiene (argv redaction, maxBuffer)", () => {
+  it("redacts -e values in argv summaries used for error messages", async () => {
+    const args = ["exec", "-e", "TOKEN=hunter2", "-e", "PLAIN", "sandbox-1", "env"];
+    const failure = await docker(args, {
+      runner: async () => {
+        throw new DockerCliError("docker exec timed out after 5ms", {
+          timedOut: true,
+          args,
+        });
+      },
+    }).then(
+      () => undefined,
+      (error: unknown) => error,
+    );
+    expect(failure).toBeInstanceOf(SandboxError);
+    expect(failure).toMatchObject({ code: "SANDBOX_TIMEOUT" });
+    const message = (failure as SandboxError).message;
+    expect(message).toContain("-e TOKEN=***");
+    expect(message).toContain("-e ***"); // value-less -e arg fully redacted
+    expect(message).not.toContain("hunter2");
+  });
+
+  it("maps maxBuffer overflow to SANDBOX_EXEC_FAILED with a size message", async () => {
+    const args = ["logs", "--timestamps", "sandbox-1"];
+    const failure = await docker(args, {
+      runner: async () => {
+        throw new DockerCliError(
+          "docker logs --timestamps sandbox-1 output exceeded maxBuffer (33554432 bytes)",
+          { maxBufferExceeded: true, args },
+        );
+      },
+    }).then(
+      () => undefined,
+      (error: unknown) => error,
+    );
+    expect(failure).toBeInstanceOf(SandboxError);
+    expect(failure).toMatchObject({ code: "SANDBOX_EXEC_FAILED" });
+    const message = (failure as SandboxError).message;
+    expect(message).toContain("33554432");
+    expect(message).toContain("maxBuffer");
   });
 });

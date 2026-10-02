@@ -22,7 +22,7 @@ function spec(overrides: Partial<SandboxSpec> = {}): SandboxSpec {
     image: BUSYBOX,
     mounts: [],
     env: {},
-    labels: { "openeuler.test": TEST_TAG },
+    labels: { "openeuler-test": TEST_TAG },
     ...overrides,
   };
 }
@@ -90,12 +90,21 @@ describe.skipIf(!dockerLive)("docker provider integration (real daemon)", () => 
     }
   });
 
-  it("publishes ports and serves HTTP from inside the container", async () => {
+  it("publishes ports on the loopback interface and serves HTTP from inside the container", async () => {
     const sandbox = await track(provider().create(spec({ ports: [8080] })));
     const ports = await sandbox.hostPorts();
     expect(Object.keys(ports)).toEqual(["8080"]);
     const hostPort = ports[8080];
     expect(hostPort).toBeGreaterThan(0);
+
+    // The published binding must be 127.0.0.1, never 0.0.0.0.
+    const bindings = await docker(
+      ["inspect", sandbox.id, "--format", "{{json .NetworkSettings.Ports}}"],
+      { timeoutMs: 30_000 },
+    );
+    expect(bindings.code).toBe(0);
+    expect(bindings.stdout).toContain('"HostIp":"127.0.0.1"');
+    expect(bindings.stdout).not.toContain('"HostIp":"0.0.0.0"');
 
     // busybox httpd daemonizes; serve /tmp so GET / answers 404/200, not ECONNREFUSED.
     const start = await sandbox.exec(["httpd", "-p", "8080", "-h", "/tmp"]);
@@ -197,7 +206,7 @@ describe.skipIf(!dockerLive)("docker provider integration (real daemon)", () => 
         "ps",
         "-aq",
         "--filter",
-        `label=openeuler.test=${TEST_TAG}`,
+        `label=openeuler-test=${TEST_TAG}`,
         "--filter",
         `name=${sandbox.id}`,
       ],
@@ -209,7 +218,7 @@ describe.skipIf(!dockerLive)("docker provider integration (real daemon)", () => 
   it("rejects a genuinely missing image with SANDBOX_IMAGE_MISSING", async () => {
     const ghost = `busybox:1.36-missing-${randomBytes(4).toString("hex")}`;
     const failure = await provider()
-      .create(spec({ image: ghost, labels: { "openeuler.test": TEST_TAG } }))
+      .create(spec({ image: ghost, labels: { "openeuler-test": TEST_TAG } }))
       .then(
         () => undefined,
         (error: unknown) => error,
@@ -220,7 +229,7 @@ describe.skipIf(!dockerLive)("docker provider integration (real daemon)", () => 
 
   it("list reports only provider-managed containers (orphan query)", async () => {
     const mine = await track(
-      provider().create(spec({ labels: { "openeuler.test": TEST_TAG, run: "mine" } })),
+      provider().create(spec({ labels: { "openeuler-test": TEST_TAG, run: "mine" } })),
     );
     const orphanName = `openeuler-orphan-${randomBytes(3).toString("hex")}`;
     const orphan = await docker(["run", "--name", orphanName, BUSYBOX, "true"], {
@@ -250,13 +259,24 @@ describe.skipIf(!dockerLive)("docker provider integration (real daemon)", () => 
     }
   });
 
-  it("stats reports live usage for running sandboxes", async () => {
+  it("stats reports live usage for provider sandboxes, not the whole host", async () => {
     const sandbox = await track(provider().create(spec()));
-    const usage = await provider().stats();
-    const mine = usage.find((entry) => entry.id === sandbox.id);
-    expect(mine).toBeDefined();
-    expect(mine?.memoryMb === undefined || mine.memoryMb >= 0).toBe(true);
-    await sandbox.destroy();
+    const orphanName = `openeuler-orphan-${randomBytes(3).toString("hex")}`;
+    const orphan = await docker(
+      ["run", "-d", "--name", orphanName, BUSYBOX, "tail", "-f", "/dev/null"],
+      { timeoutMs: 60_000 },
+    );
+    expect(orphan.code).toBe(0); // running but not provider-managed
+    try {
+      const usage = await provider().stats();
+      const mine = usage.find((entry) => entry.id === sandbox.id);
+      expect(mine).toBeDefined();
+      expect(mine?.memoryMb === undefined || mine.memoryMb >= 0).toBe(true);
+      expect(usage.some((entry) => entry.id === orphanName)).toBe(false); // scoped via list()
+    } finally {
+      await docker(["rm", "-f", orphanName], { timeoutMs: 30_000 });
+      await sandbox.destroy();
+    }
   });
 
   it("reports unavailability when the docker CLI cannot be spawned (PATH stripped)", async () => {
@@ -278,7 +298,7 @@ describe.skipIf(!dockerLive)("docker provider integration (real daemon)", () => 
     for (const handle of handles) {
       await handle.destroy().catch(() => undefined);
     }
-    const leftovers = await docker(["ps", "-aq", "--filter", `label=openeuler.test=${TEST_TAG}`], {
+    const leftovers = await docker(["ps", "-aq", "--filter", `label=openeuler-test=${TEST_TAG}`], {
       timeoutMs: 30_000,
     });
     const ids = leftovers.stdout
@@ -288,7 +308,7 @@ describe.skipIf(!dockerLive)("docker provider integration (real daemon)", () => 
     for (const id of ids) {
       await docker(["rm", "-f", id], { timeoutMs: 30_000 });
     }
-    const after = await docker(["ps", "-aq", "--filter", `label=openeuler.test=${TEST_TAG}`], {
+    const after = await docker(["ps", "-aq", "--filter", `label=openeuler-test=${TEST_TAG}`], {
       timeoutMs: 30_000,
     });
     if (after.stdout.trim() !== "") {

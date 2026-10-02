@@ -118,7 +118,7 @@ function makeDockerContractProvider(script: SandboxContractScript): SandboxProvi
       const handle = await provider.create({
         ...spec,
         image,
-        labels: { ...spec.labels, "openeuler.test": TEST_TAG },
+        labels: { ...spec.labels, "openeuler-test": TEST_TAG },
       });
       imageById.set(handle.id, spec.image);
       return wrapHandle(handle, spec.image, state);
@@ -149,7 +149,7 @@ describe.skipIf(!dockerLive)("docker provider contract (real daemon)", () => {
 
   afterAll(async () => {
     // Sweep every container this file created; the suite must leave none.
-    const leftovers = await docker(["ps", "-aq", "--filter", `label=openeuler.test=${TEST_TAG}`], {
+    const leftovers = await docker(["ps", "-aq", "--filter", `label=openeuler-test=${TEST_TAG}`], {
       timeoutMs: 30_000,
     });
     const ids = leftovers.stdout
@@ -159,7 +159,7 @@ describe.skipIf(!dockerLive)("docker provider contract (real daemon)", () => {
     for (const id of ids) {
       await docker(["rm", "-f", id], { timeoutMs: 30_000 });
     }
-    const after = await docker(["ps", "-aq", "--filter", `label=openeuler.test=${TEST_TAG}`], {
+    const after = await docker(["ps", "-aq", "--filter", `label=openeuler-test=${TEST_TAG}`], {
       timeoutMs: 30_000,
     });
     if (after.stdout.trim() !== "") {
