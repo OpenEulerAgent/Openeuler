@@ -18,10 +18,17 @@ export type ExitFlowNode = Node<ExitNodeData, "exit">;
 export type CanvasFlowNode = Node<CanvasNodeData, "agent" | "exit">;
 
 /**
- * Validation issue counts per node id, provided by the editor so the cards
+ * Validation blocker counts per node id, provided by the editor so the cards
  * render red badges without polluting the (serialized) node data.
  */
 export const NodeIssueCountsContext = createContext<ReadonlyMap<string, number>>(new Map());
+
+/**
+ * Hint (structural WIP) issue counts per node id (#68) — amber badges for
+ * findings like an unreachable freshly dropped node. Still blocks saving;
+ * purely a calmer tone than blockers.
+ */
+export const NodeHintCountsContext = createContext<ReadonlyMap<string, number>>(new Map());
 
 /**
  * Advisory warning counts per node id (e.g. a router with no `always`
@@ -47,16 +54,52 @@ function SessionIcon({ className }: { className?: string }) {
   );
 }
 
-function IssueBadge({ count }: { count: number }) {
+function CountBadge({
+  count,
+  tone,
+  label,
+}: {
+  count: number;
+  tone: "danger" | "warning";
+  label: string;
+}) {
   if (count === 0) return null;
   return (
     <span
       role="status"
-      aria-label={`${count} validation issue${count === 1 ? "" : "s"}`}
-      title={`${count} validation issue${count === 1 ? "" : "s"}`}
-      className="absolute -top-2 -right-2 flex size-5 items-center justify-center rounded-full border border-danger bg-danger-strong text-[10px] font-semibold text-white shadow-2"
+      aria-label={label}
+      title={label}
+      className={cn(
+        "flex size-5 items-center justify-center rounded-full border text-[10px] font-semibold shadow-2",
+        tone === "danger"
+          ? "border-danger bg-danger-strong text-white"
+          : "border-warning bg-warning text-black",
+      )}
     >
       {count > 9 ? "9+" : count}
+    </span>
+  );
+}
+
+/**
+ * Live validation badges for one node (#68): red dot(s) for blockers, amber
+ * dot for hints (e.g. a freshly dropped, not-yet-connected node). Both
+ * update as the document changes, before any save attempt.
+ */
+function IssueBadges({ blockers, hints }: { blockers: number; hints: number }) {
+  if (blockers === 0 && hints === 0) return null;
+  return (
+    <span className="absolute -top-2 -right-2 flex gap-1" data-issue-badges>
+      <CountBadge
+        count={blockers}
+        tone="danger"
+        label={`${blockers} validation blocker${blockers === 1 ? "" : "s"}`}
+      />
+      <CountBadge
+        count={hints}
+        tone="warning"
+        label={`${hints} validation hint${hints === 1 ? "" : "s"}`}
+      />
     </span>
   );
 }
@@ -82,6 +125,7 @@ function NoFallbackBadge() {
  */
 function AgentNodeCard({ id, data, selected }: NodeProps<AgentFlowNode>) {
   const issueCounts = useContext(NodeIssueCountsContext);
+  const hintCounts = useContext(NodeHintCountsContext);
   const warningCounts = useContext(NodeWarningCountsContext);
   const { config } = data;
   return (
@@ -92,7 +136,7 @@ function AgentNodeCard({ id, data, selected }: NodeProps<AgentFlowNode>) {
       )}
       data-canvas-node="agent"
     >
-      <IssueBadge count={issueCounts.get(id) ?? 0} />
+      <IssueBadges blockers={issueCounts.get(id) ?? 0} hints={hintCounts.get(id) ?? 0} />
       {(warningCounts.get(id) ?? 0) > 0 ? <NoFallbackBadge /> : null}
       {data.isEntry ? (
         <span className="absolute -top-2.5 left-3 rounded-full border border-accent/60 bg-accent px-2 py-0.5 text-[10px] font-semibold tracking-wide text-accent-fg uppercase">
@@ -143,6 +187,7 @@ function AgentNodeCard({ id, data, selected }: NodeProps<AgentFlowNode>) {
 /** Exit terminal marker: a stop-symbol card that accepts connections only. */
 function ExitNodeCard({ id, data, selected }: NodeProps<ExitFlowNode>) {
   const issueCounts = useContext(NodeIssueCountsContext);
+  const hintCounts = useContext(NodeHintCountsContext);
   return (
     <div
       className={cn(
@@ -151,7 +196,7 @@ function ExitNodeCard({ id, data, selected }: NodeProps<ExitFlowNode>) {
       )}
       data-canvas-node="exit"
     >
-      <IssueBadge count={issueCounts.get(id) ?? 0} />
+      <IssueBadges blockers={issueCounts.get(id) ?? 0} hints={hintCounts.get(id) ?? 0} />
       <span
         aria-hidden
         className="flex size-4 shrink-0 items-center justify-center rounded-sm border-2 border-danger bg-danger-subtle"

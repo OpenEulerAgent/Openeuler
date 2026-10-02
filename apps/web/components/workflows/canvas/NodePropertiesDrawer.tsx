@@ -15,7 +15,12 @@ import {
   upstreamNodes,
   type InspectorFieldErrors,
 } from "@/lib/graph/inspector";
-import { issuesForNode, type CanvasIssue } from "@/lib/graph/validation";
+import {
+  classifyIssue,
+  issueHint,
+  issuesForNode,
+  type CanvasIssue,
+} from "@/lib/graph/validation";
 import { cn } from "@/lib/cn";
 
 /**
@@ -68,6 +73,8 @@ export function NodePropertiesDrawer({
   const nodeIssues = issuesForNode(issues, node.id).filter(
     (issue) => !(issue.field ?? "").startsWith("config.") && issue.field !== "name",
   );
+  const nodeBlockers = nodeIssues.filter((issue) => classifyIssue(issue) === "blocker");
+  const nodeHints = nodeIssues.filter((issue) => classifyIssue(issue) === "hint");
   const [saveAsOpen, setSaveAsOpen] = useState(false);
 
   return (
@@ -125,14 +132,28 @@ export function NodePropertiesDrawer({
           />
         ) : null}
 
-        {nodeIssues.length > 0 ? (
+        {nodeBlockers.length > 0 ? (
           <div className="rounded-lg border border-danger/40 bg-danger-subtle p-3" role="alert">
             <p className="text-sm font-medium text-danger">
-              {nodeIssues.length} issue{nodeIssues.length === 1 ? "" : "s"} on this node
+              {nodeBlockers.length} blocker{nodeBlockers.length === 1 ? "" : "s"} on this node
             </p>
             <ul className="mt-1 flex list-disc flex-col gap-0.5 pl-4 text-xs text-danger">
-              {nodeIssues.map((issue, index) => (
+              {nodeBlockers.map((issue, index) => (
                 <li key={index}>{issue.message}</li>
+              ))}
+            </ul>
+          </div>
+        ) : null}
+
+        {nodeHints.length > 0 ? (
+          <div
+            className="rounded-lg border border-warning/50 bg-warning-subtle p-3"
+            role="status"
+            data-node-hints
+          >
+            <ul className="flex list-disc flex-col gap-0.5 pl-4 text-xs text-warning">
+              {nodeHints.map((issue, index) => (
+                <li key={index}>{issueHint(issue) ?? issue.message}</li>
               ))}
             </ul>
           </div>

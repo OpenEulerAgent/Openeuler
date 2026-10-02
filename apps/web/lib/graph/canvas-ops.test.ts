@@ -4,6 +4,7 @@ import { WorkflowGraphSchema } from "@openeuler/core";
 import {
   createAgentNode,
   createExitNode,
+  DEFAULT_AGENT_PROMPT_TEMPLATE,
   toCanvasDocument,
   type CanvasDocument,
   type CanvasNode,
@@ -346,7 +347,7 @@ describe("history (undo/redo)", () => {
     const undone = undo(history);
     const restoredReview = undone.value?.nodes.find((candidate) => candidate.id === "review");
     expect(restoredReview?.data.kind === "agent" && restoredReview.data.config.promptTemplate).toBe(
-      "",
+      DEFAULT_AGENT_PROMPT_TEMPLATE,
     );
   });
 
@@ -391,7 +392,7 @@ describe("history (undo/redo)", () => {
     history = commitWithBefore(history, beforeTyping, history.present);
 
     const undone = undo(history);
-    expect(undone.value && promptOf(undone.value)).toBe("");
+    expect(undone.value && promptOf(undone.value)).toBe(DEFAULT_AGENT_PROMPT_TEMPLATE);
     const redone = redo(undone.history);
     expect(redone.value && promptOf(redone.value)).toBe("abc");
     // A second undo still reaches the earlier committed edit.

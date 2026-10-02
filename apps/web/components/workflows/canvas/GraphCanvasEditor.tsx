@@ -69,7 +69,10 @@ import {
   routerFallbackWarnings,
 } from "@/lib/graph/edge-inspector";
 import {
+  classifyIssue,
+  dedupeIssues,
   issuesFromApiDetails,
+  severitySummary,
   validateCanvasDocument,
   type CanvasIssue,
 } from "@/lib/graph/validation";
@@ -85,6 +88,7 @@ import {
 } from "@/lib/workflows-api";
 import {
   canvasNodeTypes,
+  NodeHintCountsContext,
   NodeIssueCountsContext,
   NodeWarningCountsContext,
   toFlowNodes,
@@ -124,13 +128,21 @@ function positionsChanged(before: CanvasDocument, after: CanvasDocument): boolea
  * Document → React Flow edges. Condition summaries label every router and
  * conditional edge (#48): conditional edges dashed in info blue, the
  * `always` fallback of a router subtle and dotted, unconfigured
- * placeholder conditions in warning amber, validation-flagged edges red.
+ * placeholder conditions in warning amber, blocker-flagged edges red.
+ * Hint-flagged edges (condition not set yet, #68) keep the amber tone.
  * Plain chain edges (a node's single unconditional outgoing edge) stay
  * unlabeled to keep linear graphs quiet.
  */
 function toFlowEdges(doc: CanvasDocument, issues: readonly CanvasIssue[]): Edge<CanvasEdgeData>[] {
-  const problematic = new Set(
-    issues.filter((issue) => issue.edgeId !== undefined).map((issue) => issue.edgeId),
+  const blockerEdges = new Set(
+    issues
+      .filter((issue) => issue.edgeId !== undefined && classifyIssue(issue) === "blocker")
+      .map((issue) => issue.edgeId),
+  );
+  const hintEdges = new Set(
+    issues
+      .filter((issue) => issue.edgeId !== undefined && classifyIssue(issue) === "hint")
+      .map((issue) => issue.edgeId),
   );
   const outgoing = new Map<string, number>();
   for (const edge of doc.edges) {
@@ -138,7 +150,8 @@ function toFlowEdges(doc: CanvasDocument, issues: readonly CanvasIssue[]): Edge<
   }
   return doc.edges.map((edge): Edge<CanvasEdgeData> => {
     const conditional = !isUnconditionalEdge(edge.data);
-    const invalid = problematic.has(edge.id);
+    const blocked = blockerEdges.has(edge.id);
+    const hinted = hintEdges.has(edge.id);
     const unconfigured = needsConditionConfig(edge.data);
     const router = (outgoing.get(edge.source) ?? 0) > 1;
 
@@ -148,7 +161,7 @@ function toFlowEdges(doc: CanvasDocument, issues: readonly CanvasIssue[]): Edge<
     if (conditional) {
       stroke = "var(--info)";
       dash = { strokeDasharray: "6 4" };
-      if (unconfigured) {
+      if (unconfigured || hinted) {
         stroke = "var(--warning)";
         strokeWidth = 2.5;
       }
@@ -156,7 +169,7 @@ function toFlowEdges(doc: CanvasDocument, issues: readonly CanvasIssue[]): Edge<
       strokeWidth = 1.5;
       dash = { strokeDasharray: "2 5" };
     }
-    if (invalid) {
+    if (blocked) {
       stroke = "var(--danger)";
       strokeWidth = 2.5;
     }
@@ -168,7 +181,7 @@ function toFlowEdges(doc: CanvasDocument, issues: readonly CanvasIssue[]): Edge<
       labelBgPadding: [6, 3] as [number, number],
       labelBgBorderRadius: 4,
       labelStyle: {
-        fill: invalid ? "var(--danger)" : unconfigured ? "var(--warning)" : stroke,
+        fill: blocked ? "var(--danger)" : unconfigured || hinted ? "var(--warning)" : stroke,
         fontSize: "10px",
       },
       style: { stroke, strokeWidth, ...dash },
@@ -249,7 +262,7 @@ function GraphCanvasInner({
 
   const doc = history.present;
   const [savedDoc, setSavedDoc] = useState<CanvasDocument>(initialDoc);
-  const [issues, setIssues] = useState<CanvasIssue[]>([]);
+  const [serverIssues, setServerIssues] = useState<CanvasIssue[]>([]);
   const [revision, setRevision] = useState(workflow.latestRevision?.number);
   const [saving, setSaving] = useState(false);
   const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
@@ -270,13 +283,17 @@ function GraphCanvasInner({
   // guarded programmatic leaves below) through the shared confirm dialog.
   const leaveGuard = useUnsavedChanges(dirty);
 
-  // Live-refresh the validation overlay while issues are shown, so badges
-  // clear as the user fixes things.
+  // Always-on live validation (#68): the pure client-side mirror of the
+  // daemon's rules recomputes on every document change, so badges, the
+  // panel, and per-severity tones update BEFORE any save attempt. Daemon
+  // 422 mappings only supplement it until the next edit re-validates.
   useEffect(() => {
-    if (issues.length === 0) return;
-    setIssues(validateCanvasDocument(historyRef.current.present));
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+    setServerIssues([]);
   }, [doc]);
+  const issues = useMemo(
+    () => dedupeIssues(validateCanvasDocument(doc), serverIssues),
+    [doc, serverIssues],
+  );
 
   const clearEditTimer = useCallback(() => {
     if (editTimerRef.current !== null) {
@@ -377,12 +394,13 @@ function GraphCanvasInner({
     if (saving) return;
     flushPendingEdit();
     const clientIssues = validateCanvasDocument(historyRef.current.present);
-    setIssues(clientIssues);
     if (clientIssues.length > 0) {
+      // Live validation already surfaced these; the toast just confirms the
+      // save is blocked (hints included — they block like blockers do).
       toast({
         variant: "danger",
         title: "Cannot save yet",
-        description: `${clientIssues.length} issue${clientIssues.length === 1 ? "" : "s"} must be fixed — see the validation panel.`,
+        description: `${severitySummary(clientIssues)} must be fixed — see the validation panel.`,
       });
       return;
     }
@@ -399,11 +417,11 @@ function GraphCanvasInner({
       setSavedDoc(normalized);
       updateHistory((current) => replacePresent(current, normalized));
       setRevision(result.revision.number);
-      setIssues([]);
+      setServerIssues([]);
       toast({ variant: "success", title: `Saved revision ${result.revision.number}` });
     } catch (cause) {
       if (cause instanceof ApiError && cause.details !== undefined && cause.details.length > 0) {
-        setIssues(issuesFromApiDetails(historyRef.current.present, cause.details));
+        setServerIssues(issuesFromApiDetails(historyRef.current.present, cause.details));
         toast({
           variant: "danger",
           title: "The daemon rejected the graph",
@@ -705,13 +723,21 @@ function GraphCanvasInner({
 
   const nodes = useMemo(() => toFlowNodes(doc.nodes), [doc.nodes]);
   const edges = useMemo(() => toFlowEdges(doc, issues), [doc, issues]);
-  const issueCounts = useMemo(() => {
-    const counts = new Map<string, number>();
-    for (const issue of issues) {
-      if (issue.nodeId !== undefined) counts.set(issue.nodeId, (counts.get(issue.nodeId) ?? 0) + 1);
-    }
-    return counts;
-  }, [issues]);
+  // Per-node badge counts, split by severity (#68): red blockers vs amber
+  // hints (structural WIP like an unconnected dropped node). Both live.
+  const nodeIssueCountBy = useCallback(
+    (severity: "hint" | "blocker") => {
+      const counts = new Map<string, number>();
+      for (const issue of issues) {
+        if (issue.nodeId === undefined || classifyIssue(issue) !== severity) continue;
+        counts.set(issue.nodeId, (counts.get(issue.nodeId) ?? 0) + 1);
+      }
+      return counts;
+    },
+    [issues],
+  );
+  const issueCounts = useMemo(() => nodeIssueCountBy("blocker"), [nodeIssueCountBy]);
+  const hintCounts = useMemo(() => nodeIssueCountBy("hint"), [nodeIssueCountBy]);
   // Advisory warnings (router with no `always` fallback) are live, not
   // save-gated — they should appear and clear as the user edits.
   const warnings = useMemo(() => routerFallbackWarnings(doc), [doc]);
@@ -902,40 +928,42 @@ function GraphCanvasInner({
           data-canvas-canvas
         >
           <NodeIssueCountsContext.Provider value={issueCounts}>
-            <NodeWarningCountsContext.Provider value={warningCounts}>
-              <ReactFlow
-                nodes={nodes}
-                edges={edges}
-                nodeTypes={canvasNodeTypes}
-                onNodesChange={onNodesChange}
-                onEdgesChange={onEdgesChange}
-                onConnect={onConnect}
-                onNodeDragStart={onNodeDragStart}
-                onNodeDragStop={onNodeDragStop}
-                onNodeClick={(_, node) => {
-                  setSelectedEdgeId(null);
-                  setSelectedNodeId(node.id);
-                }}
-                onEdgeClick={(_, edge) => {
-                  setSelectedNodeId(null);
-                  setSelectedEdgeId(edge.id);
-                }}
-                onPaneClick={() => {
-                  setSelectedNodeId(null);
-                  setSelectedEdgeId(null);
-                }}
-                deleteKeyCode={null}
-                multiSelectionKeyCode={["Meta", "Shift"]}
-                minZoom={0.2}
-                maxZoom={2.5}
-                fitView
-                fitViewOptions={{ padding: 0.2, maxZoom: 1 }}
-                colorMode="dark"
-              >
-                <Background variant={BackgroundVariant.Dots} gap={24} size={1.5} />
-                <Controls showInteractive={false} />
-              </ReactFlow>
-            </NodeWarningCountsContext.Provider>
+            <NodeHintCountsContext.Provider value={hintCounts}>
+              <NodeWarningCountsContext.Provider value={warningCounts}>
+                <ReactFlow
+                  nodes={nodes}
+                  edges={edges}
+                  nodeTypes={canvasNodeTypes}
+                  onNodesChange={onNodesChange}
+                  onEdgesChange={onEdgesChange}
+                  onConnect={onConnect}
+                  onNodeDragStart={onNodeDragStart}
+                  onNodeDragStop={onNodeDragStop}
+                  onNodeClick={(_, node) => {
+                    setSelectedEdgeId(null);
+                    setSelectedNodeId(node.id);
+                  }}
+                  onEdgeClick={(_, edge) => {
+                    setSelectedNodeId(null);
+                    setSelectedEdgeId(edge.id);
+                  }}
+                  onPaneClick={() => {
+                    setSelectedNodeId(null);
+                    setSelectedEdgeId(null);
+                  }}
+                  deleteKeyCode={null}
+                  multiSelectionKeyCode={["Meta", "Shift"]}
+                  minZoom={0.2}
+                  maxZoom={2.5}
+                  fitView
+                  fitViewOptions={{ padding: 0.2, maxZoom: 1 }}
+                  colorMode="dark"
+                >
+                  <Background variant={BackgroundVariant.Dots} gap={24} size={1.5} />
+                  <Controls showInteractive={false} />
+                </ReactFlow>
+              </NodeWarningCountsContext.Provider>
+            </NodeHintCountsContext.Provider>
           </NodeIssueCountsContext.Provider>
 
           {isEmpty ? (
