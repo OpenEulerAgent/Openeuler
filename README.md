@@ -129,18 +129,24 @@ curl -sN localhost:8787/api/runs/<run-id>/events
 
 Read at process start (no `.env` file is loaded; export them or prefix the command):
 
-| Variable                 | Used by                 | Default                    | Meaning                                                                             |
-| ------------------------ | ----------------------- | -------------------------- | ----------------------------------------------------------------------------------- |
-| `OPENEULER_DB`           | `@openeuler/db`         | `<repo>/data/openeuler.db` | SQLite database file path                                                           |
-| `OPENEULER_WORKTREES`    | `@openeuler/engine`     | `~/.openeuler/worktrees`   | Root directory for per-run git worktrees                                            |
-| `OPENEULER_DRIVER`       | daemon executor, engine | `fake`                     | Driver for **ad-hoc** runs (`POST /api/runs`); graph nodes carry their own `driver` |
-| `MAX_CONCURRENT_RUNS`    | daemon executor         | `2`                        | Global cap on runs executing at once (integer ≥ 1; echoed by `/health`)             |
-| `PORT`                   | daemon                  | `8787`                     | Daemon HTTP port                                                                    |
-| `CORS_ORIGIN`            | daemon                  | `http://localhost:3000`    | Allowed browser origin                                                              |
-| `OPENEULER_TOKEN`        | daemon                  | _(unset = open)_           | Bearer token required on every `/api` route (#92) — see "Token auth" below          |
-| `OPENEULER_SECRET_KEY`   | daemon                  | `<data>/secret.key`        | Path to the master key file for project secrets (#93) — see "Per-project secrets"   |
-| `LOG_LEVEL`              | daemon                  | `info`                     | pino log level                                                                      |
-| `NEXT_PUBLIC_DAEMON_URL` | `@openeuler/web`        | `http://localhost:8787`    | Daemon base URL for the browser app                                                 |
+| Variable                 | Used by                 | Default                    | Meaning                                                                                   |
+| ------------------------ | ----------------------- | -------------------------- | ----------------------------------------------------------------------------------------- |
+| `OPENEULER_DB`           | `@openeuler/db`         | `<repo>/data/openeuler.db` | SQLite database file path                                                                 |
+| `OPENEULER_WORKTREES`    | `@openeuler/engine`     | `~/.openeuler/worktrees`   | Root directory for per-run git worktrees                                                  |
+| `OPENEULER_DRIVER`       | daemon executor, engine | `fake`                     | Driver for **ad-hoc** runs (`POST /api/runs`); graph nodes carry their own `driver`       |
+| `MAX_CONCURRENT_RUNS`    | daemon executor         | `2`                        | Global cap on runs executing at once (integer ≥ 1; echoed by `/health`)                   |
+| `PORT`                   | daemon                  | `8787`                     | Daemon HTTP port                                                                          |
+| `CORS_ORIGIN`            | daemon                  | `http://localhost:3000`    | Allowed browser origin(s), comma-separated allowlist (#97)                                |
+| `OPENEULER_TOKEN`        | daemon                  | _(unset = open)_           | Bearer token required on every `/api` route (#92) — see "Token auth" below                |
+| `OPENEULER_SECRET_KEY`   | daemon                  | `<data>/secret.key`        | Path to the master key file for project secrets (#93) — see "Per-project secrets"         |
+| `RATE_LIMIT_MUTATE`      | daemon                  | `120`                      | `/api/*` POST/PUT/PATCH/DELETE cap per client per minute, burst 30; `0` disables (#97)    |
+| `RATE_LIMIT_READ`        | daemon                  | `600`                      | `/api/*` GET cap per client per minute; `0` disables (#97)                                |
+| `TRUST_PROXY`            | daemon                  | _(unset = off)_            | `1` = trust `X-Forwarded-For` for rate-limit keys — only behind a proxy you control (#97) |
+| `MAX_BODY_BYTES`         | daemon                  | `1048576`                  | Request-body cap for `/api/*` (1 MiB); larger bodies answer `413` (#97)                   |
+| `FRAME_ANCESTORS`        | daemon                  | _(see below)_              | Raw CSP `frame-ancestors` sources overriding the framing policy (#97)                     |
+| `PREVIEW_IFRAME`         | daemon                  | _(unset = deny)_           | `1` = allow framing by the app + CORS allowlist (placeholder for M7 previews) (#97)       |
+| `LOG_LEVEL`              | daemon                  | `info`                     | pino log level                                                                            |
+| `NEXT_PUBLIC_DAEMON_URL` | `@openeuler/web`        | `http://localhost:8787`    | Daemon base URL for the browser app                                                       |
 
 ## Token auth (opt-in)
 
@@ -155,6 +161,15 @@ OPENEULER_TOKEN=$(openssl rand -hex 32) pnpm dev
 - **SSE streams** (`/api/runs/:id/events`, `/api/runs/stream`): `EventSource` cannot set headers, so these GET streaming routes (only these) also accept `?token=<token>`. The tradeoff: the token appears in URLs — visible to proxies between browser and daemon, which is why the fallback is scoped strictly to streaming routes and the daemon redacts `token=` from its logs.
 - **`/health`** stays open for liveness probes but answers minimal info (`ok` + version) while auth is on.
 - **Rotation**: change the env var and restart the daemon; in the web, save the new token when the 401 card appears (or hit **Forget token** in Settings first). No logout dance beyond that.
+
+## Hardening: rate limits, payload caps, CORS allowlist, security headers
+
+Before exposing the daemon beyond localhost, four middleware layers (#97) apply to every request — all on by default with generous local-dev values, no configuration needed:
+
+- **Rate limits** — per-client token buckets on `/api/*`, keyed by IP + route class: `mutate` (POST/PUT/PATCH/DELETE) 120/min with a burst of 30 (`RATE_LIMIT_MUTATE`), `read` (GET) 600/min (`RATE_LIMIT_READ`). `0` disables a class. SSE streams (`/api/runs/:id/events`, `/api/runs/stream`, previews) and `/metrics` are **exempt** — long-lived connections never get shed. Over the limit: `429 {"error":{"code":"RATE_LIMITED"}}` with a `Retry-After` (seconds) and `X-RateLimit-Remaining` headers. The client IP is the socket's remote address; `X-Forwarded-For` is honored **only** with `TRUST_PROXY=1` — never enable it on direct exposure, or clients can pick their own bucket key. Buckets live in memory, capped at 10k keys (idle entries swept, least-recently-touched evicted first).
+- **Payload cap** — `/api/*` bodies above 1 MiB (`MAX_BODY_BYTES`) answer `413 {"error":{"code":"PAYLOAD_TOO_LARGE"}}` before any handler runs; graph PUTs and prompt payloads are covered implicitly. The cheap path checks `Content-Length`; chunked bodies are measured (buffered once) instead.
+- **CORS allowlist** — `CORS_ORIGIN` accepts a comma-separated list (`http://localhost:3000,http://alt.origin`); a request's `Origin` must match an entry **exactly** for `Access-Control-Allow-Origin` to be sent at all. A lone `*` restores wildcard mode.
+- **Security headers** — every response carries `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer`, a minimal `Permissions-Policy`, and a framing policy; `/api/*` responses add `Cache-Control: no-store` (handler-chosen directives like SSE's `no-cache` win). Framing is denied outright by default (`X-Frame-Options: DENY` + `Content-Security-Policy: frame-ancestors 'none'`) — nothing legitimately frames the daemon today. `PREVIEW_IFRAME=1` (placeholder for the M7 `/previews` iframe proxy) switches to `frame-ancestors 'self' <CORS allowlist>` and drops XFO; `FRAME_ANCESTORS` sets the CSP sources verbatim (XFO is then only sent for `'none'`).
 
 ## Per-project secrets (redacted everywhere)
 

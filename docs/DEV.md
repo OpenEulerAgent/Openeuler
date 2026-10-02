@@ -112,6 +112,17 @@ After every node/step the engine snapshots the worktree: `git add -A` → `diff`
 
 ## Daemon internals
 
+### Hardening middleware (#97)
+
+Middleware order in `createApp` (app.ts): **security headers** → CORS → request logger → **rate limit** → **payload cap** → auth (#92) → context → routes. Hardening layers run ahead of auth so brute-force and oversized requests are shed cheaply (they still burn the offender's own bucket).
+
+- **Rate limits** (`rate-limit.ts`): in-memory token buckets keyed `class:ip`. Classes: `mutate` (POST/PUT/PATCH/DELETE on `/api/*`, default 120/min burst 30), `read` (GET/HEAD/OPTIONS on `/api/*`, default 600/min, capacity = per-minute rate), `stream` (the routes in `STREAM_ROUTE_PATTERNS` — both SSE streams, previews, `/metrics`) and `other` (non-`/api`) are exempt. `429 RATE_LIMITED` + `Retry-After` seconds + `X-RateLimit-Remaining` (also sent on allowed requests). IPs come from the node-server socket (`c.env.incoming`); `X-Forwarded-For` only with `TRUST_PROXY=1`. `TokenBucketStore` takes an injected clock (`take(key, config, nowMs)`), bounds memory at 10k keys (Map order doubles as LRU touch order) and sweeps idle buckets on an unref'd 60s interval.
+- **Payload cap** (`security.ts`): `/api/*` bodies > `MAX_BODY_BYTES` (default 1 MiB) → `413 PAYLOAD_TOO_LARGE`. Fast path: declared `Content-Length`; fallback for missing lengths buffers the body once via hono's cached body read (`c.req.arrayBuffer()` — later `c.req.json()` in handlers reuses the cache). Stream routes exempt.
+- **CORS allowlist**: `parseCorsOrigins` splits `CORS_ORIGIN` on commas (trim/dedupe; `*` → wildcard). Hono's cors middleware does exact matching for both string and array origins — unmatched origins get no ACAO header at all, including preflights.
+- **Security headers** (`security.ts`): nosniff / Referrer-Policy `no-referrer` / minimal Permissions-Policy / CSP `frame-ancestors` + optional `X-Frame-Options: DENY` on **every** response (mounted before CORS so preflight 204s carry them; set after `next()` so error and 404 responses are covered too). Framing policy resolution (`resolveFramePolicy`): explicit `FRAME_ANCESTORS` wins (XFO only when the sources are `'none'`); else `PREVIEW_IFRAME=1` allows `'self'` + CORS allowlist (XFO dropped — it can't express lists, M7 previews placeholder); else deny. `/api/*` gets `Cache-Control: no-store` unless the handler set its own (SSE sends `no-cache`).
+
+Tests: `rate-limit.test.ts` (classification, env resolution, bucket refill/LRU/sweep with an injected clock, 429 + headers, stream exemptions, per-IP buckets with/without `TRUST_PROXY`) and `security.test.ts` (413 via declared and measured lengths, graph PUT coverage, CORS multi-origin + foreign-origin no-header, headers on `/health` / `/api` / 404 / 500, cache-control, frame-policy modes).
+
 ### Scheduler (two layers, lock order gate → slot)
 
 - **Per-project gate** — only one active run per project (worktrees branch from the same HEAD, so siblings must not race). Later runs for the same project wait FIFO, staying `queued` in the db.
