@@ -431,16 +431,28 @@ function GraphCanvasInner({
     number: number;
     doc: CanvasDocument | null;
   } | null>(null);
+  const viewRevisionCancelRef = useRef<(() => void) | null>(null);
+  const closeRevisionView = useCallback(() => {
+    viewRevisionCancelRef.current?.();
+    viewRevisionCancelRef.current = null;
+    setViewingRevision(null);
+  }, []);
   const viewRevision = useCallback(
     async (revisionNumber: number) => {
       setRevisionsOpen(false);
       setSelectedNodeId(null);
       setSelectedEdgeId(null);
       setViewingRevision({ number: revisionNumber, doc: null });
+      let cancelled = false;
+      viewRevisionCancelRef.current = () => {
+        cancelled = true;
+      };
       try {
         const graph = await fetchWorkflowRevision(workflow.id, revisionNumber);
+        if (cancelled) return;
         setViewingRevision({ number: revisionNumber, doc: toCanvasDocument(graph) });
       } catch (cause) {
+        if (cancelled) return;
         setViewingRevision(null);
         toast({
           variant: "danger",
@@ -1058,7 +1070,14 @@ function GraphCanvasInner({
   // its own Escape listener returns to the editor instead.
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent): void => {
-      if (viewingRevision !== null) return;
+      // The read-only revision view (#77) suspends every editing shortcut —
+      // its own Escape listener returns to the editor instead. preventDefault
+      // first so a suspended cmd+s never falls through to the browser's
+      // native save-page dialog.
+      if (viewingRevision !== null) {
+        if (event.metaKey || event.ctrlKey) event.preventDefault();
+        return;
+      }
       const mod = event.metaKey || event.ctrlKey;
       if (mod && event.key.toLowerCase() === "s") {
         event.preventDefault();
@@ -1394,7 +1413,7 @@ function GraphCanvasInner({
         <ReadOnlyRevisionView
           revisionNumber={viewingRevision.number}
           doc={viewingRevision.doc}
-          onExit={() => setViewingRevision(null)}
+           onExit={closeRevisionView}
         />
       ) : (
         <div className="flex min-h-0 flex-1">
