@@ -30,8 +30,12 @@ import type { Logger } from "./logger.js";
  * (`@hono/node-server` conn info on `c.env`). `X-Forwarded-For` is honored
  * **only** when `TRUST_PROXY=1` — enable it solely behind a reverse proxy
  * you control, otherwise any client can spoof its bucket key (and bypass
- * shared limits by rotating the header). When no address is known (e.g.
- * in-process `app.request` tests) all callers share the `unknown` bucket.
+ * shared limits by rotating the header). When trusted, the **rightmost**
+ * hop is used: append-style proxies prepend spoofed client hops, so only
+ * the hop appended by our own nearest proxy is trustworthy — and only under
+ * the single-trusted-proxy-tier assumption documented at {@link clientIp}.
+ * When no address is known (e.g. in-process `app.request` tests) all
+ * callers share the `unknown` bucket.
  */
 
 export const RATE_LIMIT_MUTATE_ENV = "RATE_LIMIT_MUTATE";
@@ -97,15 +101,21 @@ function remoteAddress(c: Context<AppEnv>): string | undefined {
 }
 
 /**
- * Bucket key for a request: the socket remote address, or the first
- * `X-Forwarded-For` hop when {@link resolveTrustProxy} is on. Falls back to
- * `unknown` when neither is available (unit tests via `app.request`).
+ * Bucket key for a request: the socket remote address, or the **rightmost**
+ * `X-Forwarded-For` hop when {@link resolveTrustProxy} is on. Append-style
+ * proxies add the real client last, so the rightmost hop is the one our own
+ * nearest proxy attests — everything to its left is client-controlled and
+ * rotatable. This assumes a single trusted proxy tier (the proxy both strips
+ * inbound `X-Forwarded-For` and appends the true client); with multiple
+ * chained proxies, count and skip that many hops from the right instead.
+ * Falls back to `unknown` when neither is available (unit tests via
+ * `app.request`).
  */
 export function clientIp(c: Context<AppEnv>, trustProxy: boolean): string {
   if (trustProxy) {
     const forwarded = c.req.header("x-forwarded-for");
-    const first = forwarded?.split(",")[0]?.trim();
-    if (first !== undefined && first.length > 0) return first;
+    const rightmost = forwarded?.split(",").pop()?.trim();
+    if (rightmost !== undefined && rightmost.length > 0) return rightmost;
   }
   return remoteAddress(c) ?? "unknown";
 }

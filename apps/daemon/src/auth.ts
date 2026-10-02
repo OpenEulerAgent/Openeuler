@@ -30,7 +30,9 @@ export const STREAM_ROUTE_PATTERNS: readonly RegExp[] = [
   /^\/api\/runs\/stream$/,
   // Per-run event stream (replay + tail).
   /^\/api\/runs\/[^/]+\/events$/,
-  // Live preview streams (v0.2; matched ahead of the route landing).
+  // Live preview streams (v0.2; matched ahead of the route landing). The
+  // query-token fallback below stays GET-scoped (see acceptsQueryToken);
+  // widening these exemptions beyond GET must be justified by M7.
   /^\/(api\/)?previews(\/|$)/,
   // Prometheus scrape endpoint (#94): GET-only, sits outside `/api`; many
   // scraper configs cannot set headers, so it takes `?token=` like SSE.

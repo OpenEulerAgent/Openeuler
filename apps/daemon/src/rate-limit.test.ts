@@ -78,9 +78,10 @@ describe("clientIp", () => {
       return c.json({ ok: true });
     });
     await app.request("/ip", { headers: { "X-Forwarded-For": "1.2.3.4, 5.6.7.8" } });
-    // No socket info under app.request → unknown; trustProxy takes the first hop.
+    // No socket info under app.request → unknown; trustProxy takes the
+    // rightmost hop (the one our own proxy appended).
     expect(seenA).toBe("unknown");
-    expect(seenB).toBe("1.2.3.4");
+    expect(seenB).toBe("5.6.7.8");
   });
 });
 
@@ -189,7 +190,8 @@ describe("rate limiting middleware", () => {
 
   it("buckets per client IP when TRUST_PROXY is enabled", async () => {
     const { app } = build({ mutatePerMin: 1 }, { trustProxy: true });
-    // app.request carries no socket info; with trustProxy the XFF header keys the bucket.
+    // app.request carries no socket info; with trustProxy the rightmost XFF
+    // hop (the one our own proxy appended) keys the bucket.
     const a1 = await app.request("/api/projects", {
       method: "POST",
       headers: { "X-Forwarded-For": "10.0.0.1" },
@@ -205,6 +207,29 @@ describe("rate limiting middleware", () => {
     expect(a1.status).not.toBe(429);
     expect(a2.status).toBe(429);
     expect(b1.status).not.toBe(429);
+  });
+
+  it("keys on the rightmost hop, so rotating leftmost hops cannot bypass the bucket", async () => {
+    const { app } = build({ mutatePerMin: 1 }, { trustProxy: true });
+    // Fixed rightmost (the trusted proxy's attestation), rotating leftmost
+    // (client-controlled): same bucket → limited.
+    const first = await app.request("/api/projects", {
+      method: "POST",
+      headers: { "X-Forwarded-For": "1.1.1.1, 10.0.0.9" },
+    });
+    expect(first.status).not.toBe(429);
+    const rotated = await app.request("/api/projects", {
+      method: "POST",
+      headers: { "X-Forwarded-For": "2.2.2.2, 10.0.0.9" },
+    });
+    expect(rotated.status).toBe(429);
+    // A different rightmost hop is a different proxy-observed client → a
+    // fresh bucket.
+    const other = await app.request("/api/projects", {
+      method: "POST",
+      headers: { "X-Forwarded-For": "3.3.3.3, 10.0.0.8" },
+    });
+    expect(other.status).not.toBe(429);
   });
 
   it("ignores X-Forwarded-For when TRUST_PROXY is off (shared unknown bucket)", async () => {

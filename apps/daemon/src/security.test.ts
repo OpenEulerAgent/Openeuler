@@ -86,6 +86,68 @@ describe("payload cap", () => {
     expect(body.error.code).toBe("PAYLOAD_TOO_LARGE");
   });
 
+  it("413s a chunked over-cap body without buffering past the cap (cap + one chunk)", async () => {
+    const { app } = build();
+    const CHUNK = 64 * 1024;
+    let bytesEnqueued = 0;
+    let cancelled = false;
+    // An endless chunked body: without incremental reading this is unbounded.
+    // `highWaterMark: 0` keeps the stream strictly on-demand, so the counter
+    // measures exactly what the middleware chose to read.
+    const endless = new ReadableStream<Uint8Array>(
+      {
+        pull(controller) {
+          bytesEnqueued += CHUNK;
+          controller.enqueue(new Uint8Array(CHUNK));
+        },
+        cancel() {
+          cancelled = true;
+        },
+      },
+      { highWaterMark: 0 },
+    );
+    const res = await app.request(
+      new Request("http://localhost/api/projects", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: endless,
+        duplex: "half",
+      }),
+    );
+    expect(res.status).toBe(413);
+    const body = (await res.json()) as { error: { code: string } };
+    expect(body.error.code).toBe("PAYLOAD_TOO_LARGE");
+    // The read aborts at the first chunk past the cap — memory stays bounded.
+    expect(bytesEnqueued).toBeLessThanOrEqual(ONE_MB + CHUNK);
+    expect(cancelled).toBe(true);
+  });
+
+  it("passes an under-cap chunked body through to the route intact", async () => {
+    const { app } = build();
+    // Routes must be registered before the first request (matcher freezes).
+    app.post("/api/echo", async (c) => c.json({ echoed: await c.req.json() }));
+    const payload = JSON.stringify({ hello: "chunked", pad: "x".repeat(4096) });
+    const encoder = new TextEncoder();
+    const chunked = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(encoder.encode(payload.slice(0, 64)));
+        controller.enqueue(encoder.encode(payload.slice(64)));
+        controller.close();
+      },
+    });
+    const res = await app.request(
+      new Request("http://localhost/api/echo", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: chunked,
+        duplex: "half",
+      }),
+    );
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { echoed: { hello: string; pad: string } };
+    expect(body.echoed).toEqual({ hello: "chunked", pad: "x".repeat(4096) });
+  });
+
   it("413s on a declared Content-Length without reading the body", async () => {
     const { app } = build();
     const res = await app.request(

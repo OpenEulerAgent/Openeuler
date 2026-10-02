@@ -95,7 +95,8 @@ export interface CreateAppOptions {
    */
   rateLimit?: { mutatePerMin?: number; readPerMin?: number; mutateBurst?: number };
   /**
-   * Trust `X-Forwarded-For` for rate-limit bucket keys (#97). Only enable
+   * Trust `X-Forwarded-For` for rate-limit bucket keys (#97) — keyed on the
+   * rightmost hop (single trusted proxy tier; see `clientIp`). Only enable
    * behind a reverse proxy you control. Defaults to `$TRUST_PROXY=1`.
    */
   trustProxy?: boolean;

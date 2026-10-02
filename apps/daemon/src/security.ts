@@ -47,17 +47,50 @@ export function resolveMaxBodyBytes(raw: string | undefined): number {
   return Number.isInteger(parsed) && parsed >= 1 ? parsed : DEFAULT_MAX_BODY_BYTES;
 }
 
-/** Methods whose bodies get measured when Content-Length is absent (hono caches the read; handlers re-parse freely). */
+/** Methods whose bodies get measured when Content-Length is absent. */
 const BODY_MEASURED_METHODS = new Set(["POST", "PUT", "PATCH"]);
+
+/**
+ * Reads a body-less-Content-Length request stream incrementally, keeping at
+ * most `maxBytes` buffered: the chunk that crosses the cap is counted, not
+ * kept, and the reader is cancelled so no further bytes are pulled. Returns
+ * the concatenated bytes (≤ `maxBytes`), or `undefined` when the cap was
+ * exceeded.
+ */
+async function readBodyBounded(raw: Request, maxBytes: number): Promise<Uint8Array | undefined> {
+  if (raw.body === null) return new Uint8Array(0);
+  const reader = raw.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    total += value.byteLength;
+    if (total > maxBytes) {
+      await reader.cancel();
+      return undefined;
+    }
+    chunks.push(value);
+  }
+  const bytes = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return bytes;
+}
 
 /**
  * Rejects `/api/*` request bodies larger than the cap with
  * `413 {"error":{"code":"PAYLOAD_TOO_LARGE"}}` — this is what bounds graph
  * PUTs and prompt payloads without per-route code. The cheap path reads the
  * declared `Content-Length`; when it is absent (e.g. chunked or test
- * requests) the body is buffered once via hono's cached body read, so route
- * handlers still see it. Stream routes (SSE, `/metrics`) are exempt — they
- * carry no request bodies.
+ * requests) the raw body is consumed once in transport-sized chunks and the
+ * request is rebuilt from the buffered bytes (bounded at `maxBytes` plus one
+ * transient chunk), so route handlers still see a parseable body via hono's
+ * cached read. Stream routes (SSE, `/metrics`) are exempt — they carry no
+ * request bodies.
  */
 export function createPayloadCapMiddleware(options: {
   maxBytes: number;
@@ -74,14 +107,21 @@ export function createPayloadCapMiddleware(options: {
       );
     }
     if (c.req.header("content-length") === undefined && BODY_MEASURED_METHODS.has(c.req.method)) {
-      const body = await c.req.arrayBuffer();
-      if (body.byteLength > maxBytes) {
+      const raw = c.req.raw;
+      const buffered = await readBodyBounded(raw, maxBytes);
+      if (buffered === undefined) {
         throw new HttpError(
           413,
           "PAYLOAD_TOO_LARGE",
-          `request body of ${body.byteLength} bytes exceeds the ${maxBytes} byte limit`,
+          `request body exceeds the ${maxBytes} byte limit`,
         );
       }
+      c.req.raw = new Request(raw.url, {
+        method: raw.method,
+        headers: raw.headers,
+        body: buffered,
+        signal: raw.signal,
+      });
     }
     return next();
   };
