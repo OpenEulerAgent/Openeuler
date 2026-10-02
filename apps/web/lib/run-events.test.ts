@@ -91,6 +91,21 @@ describe("runEventsUrl", () => {
       "http://d:8787/api/runs/run-1/events?afterSeq=42",
     );
   });
+
+  it("appends the token (EventSource cannot set headers, #92) beside the cursor", () => {
+    expect(runEventsUrl("run-1", "http://d:8787", 42, "tok-en")).toBe(
+      "http://d:8787/api/runs/run-1/events?afterSeq=42&token=tok-en",
+    );
+    expect(runEventsUrl("run-1", "http://d:8787", undefined, "tok-en")).toBe(
+      "http://d:8787/api/runs/run-1/events?token=tok-en",
+    );
+  });
+
+  it("omits the token param when there is none", () => {
+    expect(runEventsUrl("run-1", "http://d:8787", 42, null)).toBe(
+      "http://d:8787/api/runs/run-1/events?afterSeq=42",
+    );
+  });
 });
 
 describe("parseRunStreamEvent", () => {

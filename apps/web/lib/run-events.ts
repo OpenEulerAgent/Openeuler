@@ -1,6 +1,7 @@
 import type { AgentEvent, RunEvent, RunStatusEvent } from "@openeuler/core";
 import { AgentEventSchema, RunEventSchema, TERMINAL_RUN_STATUSES } from "@openeuler/core";
 import { daemonBaseUrl } from "./api";
+import { getStoredToken } from "./token";
 
 /** Every event type the daemon may send on a run stream (driver + engine events). */
 export const RUN_EVENT_TYPES = [
@@ -34,14 +35,24 @@ export type RunStreamEvent = AgentEvent | RunEvent;
  */
 export type RunStreamState = "connecting" | "open" | "reconnecting" | "error" | "closed";
 
-/** Absolute SSE URL for a run's event stream, with an optional explicit cursor. */
+/**
+ * Absolute SSE URL for a run's event stream, with an optional explicit
+ * cursor. A stored daemon token (#92) rides along as `?token=` —
+ * `EventSource` cannot set headers, and the daemon accepts query tokens on
+ * its GET streaming routes only.
+ */
 export function runEventsUrl(
   runId: string,
   baseUrl: string = daemonBaseUrl(),
   afterSeq?: number,
+  token: string | null = getStoredToken(),
 ): string {
+  const params = new URLSearchParams();
+  if (afterSeq !== undefined) params.set("afterSeq", String(afterSeq));
+  if (token !== null && token.trim().length > 0) params.set("token", token.trim());
+  const query = params.toString();
   const url = `${baseUrl}/api/runs/${encodeURIComponent(runId)}/events`;
-  return afterSeq === undefined ? url : `${url}?afterSeq=${afterSeq}`;
+  return query.length > 0 ? `${url}?${query}` : url;
 }
 
 /** Parse one SSE `data` payload; `null` when it is not valid JSON or not a known event. */

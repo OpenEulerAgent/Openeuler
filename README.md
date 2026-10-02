@@ -137,8 +137,23 @@ Read at process start (no `.env` file is loaded; export them or prefix the comma
 | `MAX_CONCURRENT_RUNS`    | daemon executor         | `2`                        | Global cap on runs executing at once (integer ≥ 1; echoed by `/health`)             |
 | `PORT`                   | daemon                  | `8787`                     | Daemon HTTP port                                                                    |
 | `CORS_ORIGIN`            | daemon                  | `http://localhost:3000`    | Allowed browser origin                                                              |
+| `OPENEULER_TOKEN`        | daemon                  | _(unset = open)_           | Bearer token required on every `/api` route (#92) — see "Token auth" below          |
 | `LOG_LEVEL`              | daemon                  | `info`                     | pino log level                                                                      |
 | `NEXT_PUBLIC_DAEMON_URL` | `@openeuler/web`        | `http://localhost:8787`    | Daemon base URL for the browser app                                                 |
+
+## Token auth (opt-in)
+
+Local-first defaults to **open** (no auth) for `localhost` dev; expose the daemon to a LAN and you want a gate. Set `OPENEULER_TOKEN` before starting the daemon:
+
+```bash
+OPENEULER_TOKEN=$(openssl rand -hex 32) pnpm dev
+```
+
+- Every `/api/*` route then requires `Authorization: Bearer <token>` (compared in constant time; a wrong/missing token answers `401 {"error":{"code":"UNAUTHORIZED"}}`).
+- **Web**: the browser stores the token in localStorage (`openeuler.token`). On the first 401 a full-page card asks for the token, saves it and retries the failed action; Settings shows whether the daemon runs with auth (`GET /api/system/auth-status`, always open).
+- **SSE streams** (`/api/runs/:id/events`, `/api/runs/stream`): `EventSource` cannot set headers, so these GET streaming routes (only these) also accept `?token=<token>`. The tradeoff: the token appears in URLs — visible to proxies between browser and daemon, which is why the fallback is scoped strictly to streaming routes and the daemon redacts `token=` from its logs.
+- **`/health`** stays open for liveness probes but answers minimal info (`ok` + version) while auth is on.
+- **Rotation**: change the env var and restart the daemon; in the web, save the new token when the 401 card appears (or hit **Forget token** in Settings first). No logout dance beyond that.
 
 ## Project layout
 

@@ -5,10 +5,11 @@ import { Hono } from "hono";
 import type { ContentfulStatusCode } from "hono/utils/http-status";
 import { cors } from "hono/cors";
 import { ZodError } from "zod";
+import { createAuthMiddleware, redactTokenQuery, resolveAuthToken } from "./auth.js";
 import { resolveMaxConcurrentRuns } from "./concurrency.js";
 import type { Executor } from "./executor.js";
 import { HttpError } from "./errors.js";
-import { healthPayload } from "./health.js";
+import { healthPayload, minimalHealthPayload } from "./health.js";
 import { createLogger } from "./logger.js";
 import type { Logger } from "./logger.js";
 import { createShutdownRegistry } from "./shutdown.js";
@@ -61,11 +62,19 @@ export interface CreateAppOptions {
    * same resolution, so index.ts passes its resolved value to keep them equal.
    */
   maxConcurrentRuns?: number;
+  /**
+   * Bearer-token auth (#92): when set, every `/api/*` route requires
+   * `Authorization: Bearer <token>` (GET streaming routes also accept
+   * `?token=`). Defaults to `$OPENEULER_TOKEN`; unset = open mode.
+   */
+  authToken?: string;
 }
 
 export interface DaemonApp {
   app: Hono<AppEnv>;
   logger: Logger;
+  /** True when the bearer-token middleware is active (#92). */
+  authRequired: boolean;
   onShutdown: (hook: ShutdownHook, name?: string) => void;
   handleShutdown: (signal?: string) => Promise<void>;
 }
@@ -87,6 +96,13 @@ export function createApp(options: CreateAppOptions = {}): DaemonApp {
   const corsOrigin = options.corsOrigin ?? process.env["CORS_ORIGIN"] ?? DEFAULT_CORS_ORIGIN;
   const maxConcurrentRuns =
     options.maxConcurrentRuns ?? resolveMaxConcurrentRuns(process.env["MAX_CONCURRENT_RUNS"]);
+  // Explicit option wins over the env var; both go through the same
+  // trim/empty-means-unset normalization.
+  const authToken = resolveAuthToken({
+    ...process.env,
+    ...(options.authToken === undefined ? {} : { OPENEULER_TOKEN: options.authToken }),
+  });
+  const authRequired = authToken !== undefined;
 
   const app = new Hono<AppEnv>();
 
@@ -102,16 +118,28 @@ export function createApp(options: CreateAppOptions = {}): DaemonApp {
   app.use("*", async (c, next) => {
     const start = performance.now();
     await next();
+    const queryIndex = c.req.url.indexOf("?");
     logger.info(
       {
         method: c.req.method,
         path: c.req.path,
+        // Query string with the SSE `token` param redacted (#92) — the token
+        // must never reach the logs.
+        ...(queryIndex === -1
+          ? {}
+          : { query: redactTokenQuery(c.req.url.slice(queryIndex)) }),
         status: c.res.status,
         durationMs: Math.round(performance.now() - start),
       },
       "request",
     );
   });
+
+  // Bearer-token gate (#92): every /api/* route except the open auth-status
+  // probe. No-op in open mode (no OPENEULER_TOKEN).
+  if (authToken !== undefined) {
+    app.use("/api/*", createAuthMiddleware({ token: authToken, logger }));
+  }
 
   app.use("*", (c, next) => {
     c.set("logger", logger);
@@ -121,14 +149,16 @@ export function createApp(options: CreateAppOptions = {}): DaemonApp {
     return next();
   });
 
-  app.get("/health", (c) => c.json(healthPayload(maxConcurrentRuns)));
+  app.get("/health", (c) =>
+    c.json(authRequired ? minimalHealthPayload() : healthPayload(maxConcurrentRuns)),
+  );
 
   app.route("/api/projects", createProjectsRouter());
   app.route("/api/projects", createFilesRouter());
   app.route("/api/projects", createPresetsRouter());
   app.route("/api/drivers", createDriversRouter(options.drivers));
   // The system router reads the worktree store root from the context.
-  app.route("/api/system", createSystemRouter(options.system));
+  app.route("/api/system", createSystemRouter({ ...options.system, authRequired }));
   app.route("/api/workflows", createWorkflowsRouter());
   app.route(
     "/api/runs",
@@ -187,5 +217,11 @@ export function createApp(options: CreateAppOptions = {}): DaemonApp {
 
   const shutdown = createShutdownRegistry({ logger, ...options.shutdown });
 
-  return { app, logger, onShutdown: shutdown.onShutdown, handleShutdown: shutdown.handleShutdown };
+  return {
+    app,
+    logger,
+    authRequired,
+    onShutdown: shutdown.onShutdown,
+    handleShutdown: shutdown.handleShutdown,
+  };
 }
