@@ -61,6 +61,11 @@ import {
 } from "@/lib/graph/history";
 import { applyLayout } from "@/lib/graph/layout";
 import { applyInspectorAction } from "@/lib/graph/inspector";
+import {
+  flowViewportBounds,
+  jitteredRectCenter,
+  shouldFocusNewNode,
+} from "@/lib/graph/canvas-focus";
 import { useUnsavedChanges } from "@/lib/use-unsaved-changes";
 import {
   applyEdgeInspectorAction,
@@ -228,7 +233,11 @@ function GraphCanvasInner({
 }) {
   const router = useRouter();
   const { toast } = useToast();
-  const { screenToFlowPosition, fitView } = useReactFlow();
+  const { screenToFlowPosition, fitView, getViewport } = useReactFlow();
+
+  /** The canvas pane element — its rect anchors click-add centering and
+   *  off-viewport detection (#72), never the window (palette + header). */
+  const canvasRef = useRef<HTMLDivElement | null>(null);
 
   const initialDoc = useMemo(() => workflowToCanvasDocument(workflow), [workflow]);
 
@@ -244,11 +253,16 @@ function GraphCanvasInner({
 
   // Preset roster ("your team", #49). Fetched for the project; the palette
   // and the inspector share it. Nodes only ever hold config COPIES — a
-  // missing preset (deleted) just means the badge stops resolving.
+  // missing preset (deleted) just means the badge stops resolving. While
+  // the first fetch is in flight the palette shows skeleton rows and
+  // drop/click-adds explain themselves instead of no-op'ing (#72).
   const [presets, setPresets] = useState<AgentPreset[]>([]);
+  const [presetsLoaded, setPresetsLoaded] = useState(false);
+  const rosterToastAtRef = useRef(0);
   const [managePresetsOpen, setManagePresetsOpen] = useState(false);
   useEffect(() => {
     let cancelled = false;
+    setPresetsLoaded(false);
     void fetchAgentPresets(workflow.projectId)
       .then((roster) => {
         if (!cancelled) setPresets(roster);
@@ -256,6 +270,11 @@ function GraphCanvasInner({
       .catch(() => {
         // Older daemon or transient failure: no roster, palette shows the
         // empty hint; creating nodes keeps working without presets.
+      })
+      .finally(() => {
+        // Failures settle the roster too — a stuck skeleton would read as
+        // "the palette is broken" (worse than an empty team list, #72).
+        if (!cancelled) setPresetsLoaded(true);
       });
     return () => {
       cancelled = true;
@@ -457,6 +476,36 @@ function GraphCanvasInner({
     }
   }, [dirty, flushPendingEdit, saving, toast, updateHistory, workflow.id]);
 
+  /**
+   * Off-viewport adds (#72): a node created outside the visible rect —
+   * typically auto-placed right of the rightmost node while the user is
+   * panned/zoomed elsewhere — scrolls into view instead of reading as
+   * "add didn't work". In-view adds never re-frame.
+   */
+  const focusNodeIfOffscreen = useCallback(
+    (node: CanvasNode) => {
+      const rect = canvasRef.current?.getBoundingClientRect();
+      if (rect === undefined || rect.width === 0) return;
+      if (!shouldFocusNewNode(flowViewportBounds(rect, getViewport()), node.position)) return;
+      void fitView({ nodes: [{ id: node.id }], duration: 300, maxZoom: 1, padding: 0.3 });
+    },
+    [fitView, getViewport],
+  );
+
+  /**
+   * Click-to-add drop point (#72): the CANVAS pane's center (the window's
+   * center is shifted right by the 240px palette and down by the header),
+   * with a small jitter so repeated adds don't stack exactly.
+   */
+  const clickAddSpot = useCallback((): { x: number; y: number } => {
+    const rect = canvasRef.current?.getBoundingClientRect();
+    const point =
+      rect !== undefined
+        ? jitteredRectCenter(rect)
+        : { x: window.innerWidth / 2, y: window.innerHeight / 2 };
+    return screenToFlowPosition(point);
+  }, [screenToFlowPosition]);
+
   const addNode = useCallback(
     (kind: PaletteNodeKind, position?: { x: number; y: number }) => {
       const current = historyRef.current.present;
@@ -475,22 +524,36 @@ function GraphCanvasInner({
       commitDoc({ nodes: [...current.nodes, node], edges: current.edges });
       setSelectedEdgeId(null);
       setSelectedNodeId(node.id);
+      focusNodeIfOffscreen(node);
     },
-    [commitDoc, drivers],
+    [commitDoc, drivers, focusNodeIfOffscreen],
   );
 
   /**
    * Creates a node preconfigured from a preset (#49): name = preset name,
    * config = deep copy, presetId carried for the badge. Position defaults
-   * to the viewport center (click-to-add); drags pass the drop point.
+   * to the canvas-pane center with jitter (#72); drags pass the drop point.
+   * While the roster fetch is still in flight, the add explains itself
+   * instead of silently no-op'ing (#72).
    */
   const addPresetNode = useCallback(
     (presetId: string, position?: { x: number; y: number }) => {
+      if (!presetsLoaded) {
+        const now = Date.now();
+        if (now - rosterToastAtRef.current > 2_000) {
+          rosterToastAtRef.current = now;
+          toast({
+            variant: "info",
+            title: "Team roster is still loading",
+            description: "Try again in a moment.",
+          });
+        }
+        return;
+      }
       const preset = presets.find((candidate) => candidate.id === presetId);
       if (preset === undefined) return;
       const current = historyRef.current.present;
-      const spot =
-        position ?? screenToFlowPosition({ x: window.innerWidth / 2, y: window.innerHeight / 2 });
+      const spot = position ?? clickAddSpot();
       const node = createPresetAgentNode({
         preset: asPresetSource(preset),
         position: spot,
@@ -499,8 +562,9 @@ function GraphCanvasInner({
       commitDoc({ nodes: [...current.nodes, node], edges: current.edges });
       setSelectedEdgeId(null);
       setSelectedNodeId(node.id);
+      focusNodeIfOffscreen(node);
     },
-    [commitDoc, presets, screenToFlowPosition],
+    [clickAddSpot, commitDoc, focusNodeIfOffscreen, presets, presetsLoaded, toast],
   );
 
   const onConnect = useCallback(
@@ -929,6 +993,7 @@ function GraphCanvasInner({
           sections={paletteSections}
           onAdd={(kind) => addNode(kind)}
           presets={presets.map(toPalettePreset)}
+          presetsLoading={!presetsLoaded}
           onAddPreset={(presetId) => addPresetNode(presetId)}
           onManagePresets={() => setManagePresetsOpen(true)}
         />
@@ -958,6 +1023,7 @@ function GraphCanvasInner({
             event.preventDefault();
             event.dataTransfer.dropEffect = "move";
           }}
+          ref={canvasRef}
           data-canvas-canvas
         >
           <NodeIssueCountsContext.Provider value={issueCounts}>
@@ -1000,9 +1066,13 @@ function GraphCanvasInner({
                   fitView
                   fitViewOptions={{ padding: 0.2, maxZoom: 1 }}
                   colorMode="dark"
+                  attributionPosition="top-right"
                 >
                   <Background variant={BackgroundVariant.Dots} gap={24} size={1.5} />
-                  <Controls showInteractive={false} />
+                  {/* Bottom-right (#72): the ValidationPanel owns bottom-left
+                      whenever issues/warnings render, and overlapped zoom
+                      buttons read as "the canvas is broken". */}
+                  <Controls position="bottom-right" showInteractive={false} />
                 </ReactFlow>
               </NodeWarningCountsContext.Provider>
             </NodeHintCountsContext.Provider>
