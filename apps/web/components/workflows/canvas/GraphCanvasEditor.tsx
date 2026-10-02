@@ -400,6 +400,14 @@ function GraphCanvasInner({
   // `measured`, `dragging`, …) must never read as unsaved changes.
   const dirty = useMemo(() => !canvasDocsEquivalent(doc, savedDoc), [doc, savedDoc]);
 
+  // A failed save's error flag is only meaningful while the doc still differs
+  // from the saved snapshot — if the user undoes back to the saved state
+  // (clean-gated Save disabled), a stale "Save failed" chip would have no
+  // retry path.
+  useEffect(() => {
+    if (!dirty && !saving) setSaveFailed(false);
+  }, [dirty, saving]);
+
   // Persistent save status (#75): a pure derivation over the save flags —
   // the chip next to the Save button never goes stale the way a transient
   // toast does.
@@ -969,8 +977,9 @@ function GraphCanvasInner({
   );
   const issueCounts = useMemo(() => nodeIssueCountBy("blocker"), [nodeIssueCountBy]);
   const hintCounts = useMemo(() => nodeIssueCountBy("hint"), [nodeIssueCountBy]);
-  // Referential-stable minimap fill fn (#75): rebuilt only when the badge
-  // counts flip, so the minimap skips needless re-renders.
+  // Minimap fill fn (#75): rebuilt when the badge-count maps change (fresh
+  // Map identities per doc change — the minimap re-renders on node moves
+  // regardless); kept memoized for stable identity between recompute.
   const miniMapNodeColor = useMemo(
     () => miniMapNodeColorFor(issueCounts, hintCounts),
     [issueCounts, hintCounts],
