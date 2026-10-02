@@ -110,11 +110,12 @@ describe("bearerFromHeader", () => {
 });
 
 describe("acceptsQueryToken", () => {
-  it("allows exactly the GET streaming routes", () => {
+  it("allows exactly the GET streaming routes plus /metrics", () => {
     expect(acceptsQueryToken("GET", "/api/runs/stream")).toBe(true);
     expect(acceptsQueryToken("GET", "/api/runs/uuid-1/events")).toBe(true);
     expect(acceptsQueryToken("GET", "/api/previews/abc")).toBe(true);
     expect(acceptsQueryToken("GET", "/previews/abc/chunks")).toBe(true);
+    expect(acceptsQueryToken("GET", "/metrics")).toBe(true);
   });
 
   it("rejects non-streaming routes and non-GET methods", () => {
@@ -122,8 +123,10 @@ describe("acceptsQueryToken", () => {
     expect(acceptsQueryToken("GET", "/api/runs")).toBe(false);
     expect(acceptsQueryToken("GET", "/api/runs/uuid-1")).toBe(false);
     expect(acceptsQueryToken("GET", "/api/runs/uuid-1/diff")).toBe(false);
+    expect(acceptsQueryToken("GET", "/metricsx")).toBe(false);
     expect(acceptsQueryToken("POST", "/api/runs/uuid-1/events")).toBe(false);
     expect(acceptsQueryToken("POST", "/api/runs/stream")).toBe(false);
+    expect(acceptsQueryToken("POST", "/metrics")).toBe(false);
     expect(acceptsQueryToken("GET", "/api/system/auth-status")).toBe(false);
   });
 });
@@ -277,7 +280,11 @@ describe("auth mode — SSE ?token= fallback", () => {
 
   it("rejects the global stream without, and with a wrong, query token", async () => {
     const h = setup(TOKEN);
-    for (const path of ["/api/runs/stream", "/api/runs/stream?token=wrong", "/api/runs/stream?token="]) {
+    for (const path of [
+      "/api/runs/stream",
+      "/api/runs/stream?token=wrong",
+      "/api/runs/stream?token=",
+    ]) {
       const { status } = await stream(h, path);
       expect(status).toBe(401);
     }
@@ -294,7 +301,13 @@ describe("auth mode — SSE ?token= fallback", () => {
   it("accepts the query token on a run's event stream", async () => {
     const h = setup(TOKEN);
     const now = new Date().toISOString();
-    h.db.projects.create({ id: "p1", path: "/tmp/p1", name: "p1", defaultBranch: "main", createdAt: now });
+    h.db.projects.create({
+      id: "p1",
+      path: "/tmp/p1",
+      name: "p1",
+      defaultBranch: "main",
+      createdAt: now,
+    });
     h.db.runs.create({
       id: "run-1",
       projectId: "p1",

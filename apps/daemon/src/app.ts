@@ -12,6 +12,7 @@ import { HttpError } from "./errors.js";
 import { healthPayload, minimalHealthPayload } from "./health.js";
 import { createLogger } from "./logger.js";
 import type { Logger } from "./logger.js";
+import { METRICS_CONTENT_TYPE, scrapeMetrics } from "./metrics.js";
 import { createShutdownRegistry } from "./shutdown.js";
 import type { ShutdownHook, ShutdownRegistryOptions } from "./shutdown.js";
 import { createProjectsRouter } from "./routes/projects.js";
@@ -159,6 +160,9 @@ export function createApp(options: CreateAppOptions = {}): DaemonApp {
   // probe. No-op in open mode (no OPENEULER_TOKEN).
   if (authToken !== undefined) {
     app.use("/api/*", createAuthMiddleware({ token: authToken, logger }));
+    // `/metrics` (#94) sits outside /api but is token-gated too: bearer
+    // header, or `?token=` on GET (scrapers often cannot set headers).
+    app.use("/metrics", createAuthMiddleware({ token: authToken, logger }));
   }
 
   app.use("*", (c, next) => {
@@ -172,6 +176,14 @@ export function createApp(options: CreateAppOptions = {}): DaemonApp {
 
   app.get("/health", (c) =>
     c.json(authRequired ? minimalHealthPayload() : healthPayload(maxConcurrentRuns)),
+  );
+
+  // Prometheus scrape endpoint (#94): gauges refreshed on scrape from cheap
+  // sqlite counts + in-memory executor/worktree state (see metrics.ts).
+  app.get("/metrics", (c) =>
+    c.newResponse(scrapeMetrics({ db, executor, worktrees }), 200, {
+      "Content-Type": METRICS_CONTENT_TYPE,
+    }),
   );
 
   app.route("/api/projects", createProjectsRouter());

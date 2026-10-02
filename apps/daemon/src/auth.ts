@@ -32,6 +32,9 @@ const QUERY_TOKEN_PATH_PATTERNS: readonly RegExp[] = [
   /^\/api\/runs\/[^/]+\/events$/,
   // Live preview streams (v0.2; matched ahead of the route landing).
   /^\/(api\/)?previews(\/|$)/,
+  // Prometheus scrape endpoint (#94): GET-only, sits outside `/api`; many
+  // scraper configs cannot set headers, so it takes `?token=` like SSE.
+  /^\/metrics$/,
 ];
 
 /** Whether a request may authenticate via `?token=` (GET streaming routes only). */

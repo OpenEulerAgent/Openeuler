@@ -122,6 +122,12 @@ After every node/step the engine snapshots the worktree: `git add -A` → `diff`
 
 Before serving, `sweepInterruptedRuns` marks any run left `queued`/`running` by a **previous** daemon process as `interrupted` (steps too), persists a `run.status` event so SSE replay shows the transition, and prunes git worktree metadata across every referenced repo — orphaned worktree paths are **reported, not deleted** (a later `remove(runId)` can still clean the branch).
 
+### Metrics (`GET /metrics`) & ops events
+
+- Hand-rolled Prometheus text exposition (0.0.4, no client dep), refreshed **on scrape** from cheap sqlite counts + in-memory state — no counters wired into the executor funnel; the db rows the funnel writes are the counter state. Families: `openeuler_runs_total{status}` (all six statuses, zeros included), `openeuler_runs_active` (executor's in-memory active set), `openeuler_queue_depth` (rows sitting in `queued`), `openeuler_event_log_rows`, `openeuler_worktrees_active` (live worktree metadata on disk), `openeuler_uptime_seconds`, `openeuler_info{version}`, and `openeuler_sandboxes_active` (placeholder `0` until M6).
+- Auth: `/metrics` sits **outside** `/api` but follows the same mode — open when `OPENEULER_TOKEN` is unset; bearer header or `?token=` (GET only, like SSE) when set.
+- Ops events reuse the `activity` table with `ops.*` types (no project/run): `ops.daemon-boot {version}` (written by `main()`), `ops.recovery-sweep {interrupted, orphanedWorktrees}` (written by the sweep), `ops.gc` (helper ready; M6's sandbox GC emits). The feed API passes them through; the web renders them as small gray system lines.
+
 ### Resume & retry
 
 - `POST /api/runs/:id/resume` — interrupted runs only, and only when **every started StepRun recorded a sessionId** (`409 RUN_RESUME_NOT_POSSIBLE` otherwise: the agent context is gone). Re-queues the run in place; the engine continues against the **pinned revision** (graph runs reconstruct as above).

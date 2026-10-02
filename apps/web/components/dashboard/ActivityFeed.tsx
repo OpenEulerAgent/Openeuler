@@ -12,6 +12,7 @@ import {
   ACTIVITY_PAGE_SIZE,
   activityErrorMessage,
   fetchActivityFeed,
+  isOpsActivityType,
   type ActivityItem,
   type ActivityType,
 } from "@/lib/activity";
@@ -30,6 +31,11 @@ const TYPE_VARIANT: Record<ActivityType, BadgeVariant> = {
   "run.failed": "danger",
   "run.aborted": "warning",
   "run.interrupted": "warning",
+  // ops.* rows never render a badge (OpsRow below); entries only keep the
+  // record exhaustive over the API's type union.
+  "ops.daemon-boot": "neutral",
+  "ops.recovery-sweep": "neutral",
+  "ops.gc": "neutral",
 };
 
 const TYPE_ICON: Record<ActivityType, string> = {
@@ -40,6 +46,9 @@ const TYPE_ICON: Record<ActivityType, string> = {
   "run.failed": "✕",
   "run.aborted": "■",
   "run.interrupted": "⚠",
+  "ops.daemon-boot": "⚙",
+  "ops.recovery-sweep": "⚙",
+  "ops.gc": "⚙",
 };
 
 /** Icon block for one feed item (text glyphs — no per-type art assets yet). */
@@ -51,6 +60,26 @@ function ActivityGlyph({ type }: { type: ActivityType }) {
     >
       {TYPE_ICON[type]}
     </span>
+  );
+}
+
+/**
+ * ops.* system line (#94): daemon-level events (boot, recovery sweep, GC)
+ * render as one small gray line — no glyph bubble, badge or run link.
+ */
+function OpsRow({ item }: { item: ActivityItem }) {
+  return (
+    <li className="first:pt-0" data-testid="activity-ops-item">
+      <div className="flex items-center gap-2 rounded-md px-2 py-1.5 text-xs text-muted-fg">
+        <span aria-hidden className="shrink-0">
+          ⚙
+        </span>
+        <span className="min-w-0 truncate">{item.message}</span>
+        <span className="ml-auto shrink-0 whitespace-nowrap">
+          {formatRelativeAge(item.createdAt)}
+        </span>
+      </div>
+    </li>
   );
 }
 
@@ -189,9 +218,13 @@ export function ActivityFeed() {
         ) : (
           <div className="flex flex-col gap-4">
             <ul className="divide-y divide-border" aria-label="Activity feed">
-              {state.items.map((item) => (
-                <FeedRow key={item.id} item={item} />
-              ))}
+              {state.items.map((item) =>
+                isOpsActivityType(item.type) ? (
+                  <OpsRow key={item.id} item={item} />
+                ) : (
+                  <FeedRow key={item.id} item={item} />
+                ),
+              )}
             </ul>
             {state.nextCursor !== undefined ? (
               <Button

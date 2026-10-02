@@ -3,8 +3,9 @@ import type { Db } from "@openeuler/db";
 import { Hono, type Context } from "hono";
 import { z } from "zod";
 import type { AppEnv } from "../app.js";
-import type { ActivityType } from "../activity.js";
+import { type ActivityType, isOpsActivityType, type OpsActivityType } from "../activity.js";
 import { HttpError } from "../errors.js";
+import { getVersion } from "../version.js";
 
 /**
  * Activity feed API (#51): `GET /api/activity?cursor=<id>&limit=20` — an
@@ -66,14 +67,40 @@ function runLabel(
   return run?.branch ?? "run";
 }
 
+/** `n <label>` / `n <label>s` — keeps count-bearing messages readable. */
+function plural(count: number, label: string): string {
+  return `${count} ${label}${count === 1 ? "" : "s"}`;
+}
+
+function opsMessage(type: OpsActivityType, payload: Record<string, unknown> | undefined): string {
+  const numberish = (value: unknown): number =>
+    typeof value === "number" && Number.isFinite(value) ? value : 0;
+  switch (type) {
+    case "ops.daemon-boot": {
+      const version =
+        typeof payload?.["version"] === "string" ? (payload["version"] as string) : getVersion();
+      return `Daemon v${version} started`;
+    }
+    case "ops.recovery-sweep":
+      return `Boot recovery sweep: ${plural(
+        numberish(payload?.["interrupted"]),
+        "interrupted run",
+      )}, ${plural(numberish(payload?.["orphanedWorktrees"]), "orphaned worktree")}`;
+    case "ops.gc":
+      return "Garbage collection ran";
+  }
+}
+
 function activityMessage(
   type: ActivityType,
   refs: {
     projectName?: string;
     workflowName?: string;
     run?: { branch: string; task?: string };
+    payload?: Record<string, unknown>;
   },
 ): string {
+  if (isOpsActivityType(type)) return opsMessage(type, refs.payload);
   switch (type) {
     case "project.created":
       return `Project ${refs.projectName ?? "unknown"} registered`;
@@ -158,6 +185,9 @@ export function createActivityRouter(): Hono<AppEnv> {
             runSummary === undefined
               ? undefined
               : { branch: runSummary.branch, ...(task === undefined ? {} : { task }) },
+          // ops.* rows carry their message inputs (version, sweep counts) in
+          // the payload; entity rows ignore it (#94).
+          payload: row.payload,
         }),
       } satisfies ActivityApiItem;
     });

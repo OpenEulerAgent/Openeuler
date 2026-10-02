@@ -17,7 +17,20 @@ export type ActivityType =
   | "run.completed"
   | "run.failed"
   | "run.aborted"
-  | "run.interrupted";
+  | "run.interrupted"
+  | OpsActivityType;
+
+/**
+ * Daemon-level ops events (#94): system lines in the feed (no project, no
+ * run) emitted by boot/recovery/GC machinery. `ops.gc` is written by M6's
+ * sandbox GC; the helper exists so the feed rendering is final now.
+ */
+export type OpsActivityType = "ops.daemon-boot" | "ops.recovery-sweep" | "ops.gc";
+
+/** True for `ops.*` rows: rendered as small gray system lines in the web feed. */
+export function isOpsActivityType(type: ActivityType): type is OpsActivityType {
+  return type.startsWith("ops.");
+}
 
 /** Map a run status to its feed type; `queued` never enters the feed. */
 export function runActivityType(status: RunStatus): ActivityType | null {
@@ -114,5 +127,50 @@ export function recordWorkflowCreatedActivity(db: Db, workflow: Workflow): void 
     });
   } catch {
     // Feed appends must never break the workflow creation itself.
+  }
+}
+
+/**
+ * Records the daemon boot (`ops.daemon-boot`, #94) with the running
+ * version. Never throws into the caller: a failed append is a lost feed
+ * entry, not a lost boot.
+ */
+export function recordDaemonBootActivity(db: Db, version: string): void {
+  try {
+    db.activity.append({ type: "ops.daemon-boot", payload: { version } });
+  } catch {
+    // Feed appends must never break the boot itself.
+  }
+}
+
+/** Payload snapshot of {@link recordRecoverySweepActivity}. */
+export interface RecoverySweepActivityPayload {
+  /** Runs the sweep transitioned to `interrupted`. */
+  interrupted: number;
+  /** Orphaned worktree paths reported (report-only, nothing deleted). */
+  orphanedWorktrees: number;
+}
+
+/**
+ * Records the boot recovery sweep outcome (`ops.recovery-sweep`, #94).
+ * Same never-throw guard as the other writers.
+ */
+export function recordRecoverySweepActivity(db: Db, payload: RecoverySweepActivityPayload): void {
+  try {
+    db.activity.append({ type: "ops.recovery-sweep", payload: { ...payload } });
+  } catch {
+    // Feed appends must never break the sweep itself.
+  }
+}
+
+/**
+ * Records a garbage-collection pass (`ops.gc`, #94). Placeholder for M6's
+ * sandbox GC — the helper ships now so emitters can land feature-by-feature.
+ */
+export function recordGcActivity(db: Db, payload: Record<string, unknown> = {}): void {
+  try {
+    db.activity.append({ type: "ops.gc", payload });
+  } catch {
+    // Feed appends must never break the GC pass itself.
   }
 }
