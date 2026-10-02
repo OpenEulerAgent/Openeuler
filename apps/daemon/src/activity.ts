@@ -24,8 +24,14 @@ export type ActivityType =
  * Daemon-level ops events (#94): system lines in the feed (no project, no
  * run) emitted by boot/recovery/GC machinery. `ops.gc` is written by M6's
  * sandbox GC; the helper exists so the feed rendering is final now.
+ * `ops.image-pull` / `ops.image-build` (#100) record image-job completions.
  */
-export type OpsActivityType = "ops.daemon-boot" | "ops.recovery-sweep" | "ops.gc";
+export type OpsActivityType =
+  | "ops.daemon-boot"
+  | "ops.recovery-sweep"
+  | "ops.gc"
+  | "ops.image-pull"
+  | "ops.image-build";
 
 /** True for `ops.*` rows: rendered as small gray system lines in the web feed. */
 export function isOpsActivityType(type: ActivityType): type is OpsActivityType {
@@ -172,5 +178,38 @@ export function recordGcActivity(db: Db, payload: Record<string, unknown> = {}):
     db.activity.append({ type: "ops.gc", payload });
   } catch {
     // Feed appends must never break the GC pass itself.
+  }
+}
+
+/** Payload of an image-job completion event (#100). */
+export interface ImageJobActivityPayload {
+  /** Pulled ref or built `openeuler/<name>:latest` tag. */
+  ref: string;
+  /** Build name (`ops.image-build` only). */
+  name?: string;
+  /** True when the job finished successfully. */
+  done: boolean;
+  /** Failure message when `done` is false. */
+  error?: string;
+}
+
+/**
+ * Records an image pull/build completion (`ops.image-pull` / `ops.image-build`,
+ * #100). One event per job, emitted at completion (no per-line progress).
+ * Same never-throw guard as the other writers.
+ */
+export function recordImageJobActivity(
+  db: Db | undefined,
+  type: "ops.image-pull" | "ops.image-build",
+  payload: ImageJobActivityPayload,
+): void {
+  if (db === undefined) return;
+  try {
+    db.activity.append({
+      type,
+      payload: { ...payload, ...(payload.error === undefined ? {} : { error: payload.error }) },
+    });
+  } catch {
+    // Feed appends must never break the image job itself.
   }
 }

@@ -15,7 +15,9 @@ export type ActivityType =
   | "run.interrupted"
   | "ops.daemon-boot"
   | "ops.recovery-sweep"
-  | "ops.gc";
+  | "ops.gc"
+  | "ops.image-pull"
+  | "ops.image-build";
 
 /**
  * ops.* rows (#94) are daemon-level system lines (boot, recovery sweep,

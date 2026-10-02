@@ -9,6 +9,7 @@ import { EmptyState } from "@/components/ui/empty-state";
 import { Input } from "@/components/ui/input";
 import { SkeletonLines } from "@/components/ui/skeleton";
 import { useToast } from "@/components/ui/toast";
+import { SandboxImagesCard } from "@/components/settings/SandboxImagesCard";
 import {
   DEFAULT_PURGE_DAYS,
   PURGE_CONFIRM_WORD,
@@ -24,9 +25,11 @@ import {
 
 /**
  * Settings hub (#95): daemon facts cards (System, Drivers, Concurrency,
- * Storage) plus the Danger Zone maintenance actions. Everything is read-only
- * except maintenance; each action confirms in a dialog (type-to-confirm for
- * the purge), reports its counts as a toast, and refreshes the payload.
+ * Storage), the Sandbox section (#100: image catalog + pull/build/delete),
+ * and the Danger Zone maintenance actions. Everything is read-only except
+ * maintenance and sandbox images; each action confirms in a dialog
+ * (type-to-confirm for the purge), reports its outcome as a toast, and
+ * refreshes the payload.
  */
 export function SettingsHub() {
   const { toast } = useToast();
@@ -211,6 +214,9 @@ export function SettingsHub() {
           )}
         </CardContent>
       </Card>
+
+      {/* Sandbox section (#100): image catalog + pull/build/delete forms. */}
+      <SandboxImagesCard />
 
       <Card>
         <CardHeader>

@@ -8,6 +8,59 @@ const execFileAsync = promisify(execFile);
 /** Binary the wrapper invokes; resolved from PATH, never through a shell. */
 export const DOCKER_CLI = "docker";
 
+/**
+ * Classifies one execFile failure (callback or promise flavor) exactly like
+ * {@link defaultDockerCliRunner}: resolves non-zero exits as data, throws
+ * typed `DockerCliError`s for infrastructure failures. Shared so the stdin
+ * runner below keeps identical semantics.
+ */
+function classifyExecFileFailure(
+  err: unknown,
+  ctx: { args: readonly string[]; timeoutMs: number; stdout?: string; stderr?: string },
+): DockerCliResult {
+  const details = err as {
+    code?: number | string;
+    stdout?: string;
+    stderr?: string;
+    killed?: boolean;
+  };
+  if (details.code === "ENOENT") {
+    throw new DockerCliError(
+      `docker CLI not found in PATH (tried "${DOCKER_CLI}")`,
+      { failedToSpawn: true, args: ctx.args, cause: err },
+      { cause: err },
+    );
+  }
+  const message = err instanceof Error ? err.message : String(err);
+  // maxBuffer kills also set killed:true — classify them BEFORE timeouts.
+  if (details.code === "ENOBUFS" || /maxBuffer (?:length |size )?exceeded/i.test(message)) {
+    throw new DockerCliError(
+      `docker ${argvSummary(ctx.args)} output exceeded maxBuffer (${DOCKER_CLI_MAX_BUFFER_BYTES} bytes)`,
+      { maxBufferExceeded: true, args: ctx.args, cause: err },
+      { cause: err },
+    );
+  }
+  if (details.killed === true) {
+    throw new DockerCliError(
+      `docker ${argvSummary(ctx.args)} timed out after ${ctx.timeoutMs}ms`,
+      { timedOut: true, args: ctx.args, cause: err },
+      { cause: err },
+    );
+  }
+  if (typeof details.code === "number") {
+    return {
+      code: details.code,
+      stdout: details.stdout ?? ctx.stdout ?? "",
+      stderr: details.stderr ?? ctx.stderr ?? "",
+    };
+  }
+  throw new DockerCliError(
+    `docker ${argvSummary(ctx.args)} could not be executed: ${message}`,
+    { failedToSpawn: true, args: ctx.args, cause: err },
+    { cause: err },
+  );
+}
+
 /** Default timeout for one docker CLI invocation. */
 export const DOCKER_CLI_TIMEOUT_MS = 60_000;
 
@@ -100,45 +153,51 @@ export const defaultDockerCliRunner: DockerCliRunner = async (args, options) => 
     });
     return { code: 0, stdout, stderr };
   } catch (err) {
-    const details = err as {
-      code?: number | string;
-      stdout?: string;
-      stderr?: string;
-      killed?: boolean;
-    };
-    if (details.code === "ENOENT") {
-      throw new DockerCliError(
-        `docker CLI not found in PATH (tried "${DOCKER_CLI}")`,
-        { failedToSpawn: true, args, cause: err },
-        { cause: err },
-      );
-    }
-    const message = err instanceof Error ? err.message : String(err);
-    // maxBuffer kills also set killed:true — classify them BEFORE timeouts.
-    if (details.code === "ENOBUFS" || /maxBuffer (?:length |size )?exceeded/i.test(message)) {
-      throw new DockerCliError(
-        `docker ${argvSummary(args)} output exceeded maxBuffer (${DOCKER_CLI_MAX_BUFFER_BYTES} bytes)`,
-        { maxBufferExceeded: true, args, cause: err },
-        { cause: err },
-      );
-    }
-    if (details.killed === true) {
-      throw new DockerCliError(
-        `docker ${argvSummary(args)} timed out after ${timeoutMs}ms`,
-        { timedOut: true, args, cause: err },
-        { cause: err },
-      );
-    }
-    if (typeof details.code === "number") {
-      return { code: details.code, stdout: details.stdout ?? "", stderr: details.stderr ?? "" };
-    }
-    throw new DockerCliError(
-      `docker ${argvSummary(args)} could not be executed: ${message}`,
-      { failedToSpawn: true, args, cause: err },
-      { cause: err },
-    );
+    return classifyExecFileFailure(err, { args, timeoutMs });
   }
 };
+
+/**
+ * Runs one docker CLI invocation with `input` written to the child's stdin
+ * (used by `docker build -` to send a Dockerfile without a context
+ * directory). Same argv-only/no-shell guarantees and the same failure
+ * classification as {@link defaultDockerCliRunner}.
+ */
+export type DockerStdinCliRunner = (
+  args: readonly string[],
+  input: string,
+  options: { timeoutMs?: number },
+) => Promise<DockerCliResult>;
+
+export const defaultDockerStdinCliRunner: DockerStdinCliRunner = (args, input, options) =>
+  new Promise<DockerCliResult>((resolve, reject) => {
+    const timeoutMs = options.timeoutMs ?? DOCKER_CLI_TIMEOUT_MS;
+    const child = execFile(
+      DOCKER_CLI,
+      args,
+      {
+        timeout: timeoutMs,
+        killSignal: "SIGKILL",
+        maxBuffer: DOCKER_CLI_MAX_BUFFER_BYTES,
+        windowsHide: true,
+      },
+      (err, stdout, stderr) => {
+        if (err === null) {
+          resolve({ code: 0, stdout, stderr });
+          return;
+        }
+        try {
+          resolve(classifyExecFileFailure(err, { args, timeoutMs, stdout, stderr }));
+        } catch (classified) {
+          reject(classified);
+        }
+      },
+    );
+    // The CLI may exit before draining stdin (e.g. an early build failure);
+    // the EPIPE is expected and the exit code carries the real story.
+    child.stdin?.on("error", () => undefined);
+    child.stdin?.end(input);
+  });
 
 /** Trailing `max` characters of stderr, whitespace-trimmed (error-message tail). */
 export function stderrTail(stderr: string, max = 400): string {

@@ -19,6 +19,8 @@ import { createProjectsRouter } from "./routes/projects.js";
 import { createDriversRouter } from "./routes/drivers.js";
 import { createFilesRouter } from "./routes/files.js";
 import { createPresetsRouter } from "./routes/presets.js";
+import { createSandboxRouter } from "./routes/sandbox.js";
+import type { SandboxRouterOptions } from "./routes/sandbox.js";
 import { createSecretsRouter } from "./routes/secrets.js";
 import type { EventStreamOptions, GlobalStreamOptions } from "./routes/runs.js";
 import { createRunsRouter } from "./routes/runs.js";
@@ -110,10 +112,16 @@ export interface CreateAppOptions {
   frameAncestors?: string;
   /**
    * M7 preview-iframe placeholder (#97): allow framing by the app itself
-   * and the CORS allowlist instead of denying framing outright. Defaults
-   * to `$PREVIEW_IFRAME=1`.
+   * and the CORS allowlist instead of denying framing outright. Defaults to
+   * `$PREVIEW_IFRAME=1`.
    */
   previewIframe?: boolean;
+  /**
+   * Sandbox image management (#100): the provider backing the in-use check
+   * plus injectable docker CLI runners for the image catalog/pull/build
+   * operations. index.ts passes the boot-composed docker provider.
+   */
+  sandbox?: SandboxRouterOptions;
 }
 
 export interface DaemonApp {
@@ -271,6 +279,8 @@ export function createApp(options: CreateAppOptions = {}): DaemonApp {
   app.route("/api/projects", createPresetsRouter());
   app.route("/api/projects", createSecretsRouter());
   app.route("/api/drivers", createDriversRouter(options.drivers));
+  // Sandbox image management (#100); `GET /api/sandbox/status` is #106.
+  app.route("/api/sandbox", createSandboxRouter(options.sandbox));
   // The system router reads the worktree store root from the context and
   // reports the boot driver registry + resolved concurrency cap (#95).
   app.route(

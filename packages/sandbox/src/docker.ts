@@ -58,9 +58,11 @@ const RESERVED_LABEL_NAMESPACE = "openeuler.";
  * `/` separators), optional tag, optional digest. Deliberately rejects
  * anything that could reach docker's flag parser (`--privileged`, refs with
  * leading dash/whitespace) and registry refs containing `:` before the last
- * path segment (e.g. `localhost:5000/img` — rejected in v0.2).
+ * path segment (e.g. `localhost:5000/img` — rejected in v0.2). Exported for
+ * the image-management helpers (`images.ts`) which validate pull refs with
+ * the same grammar.
  */
-const IMAGE_REF_PATTERN = /^[a-z0-9._/-]+(:[A-Za-z0-9._-]+)?(@\S+)?$/;
+export const IMAGE_REF_PATTERN = /^[a-z0-9._/-]+(:[A-Za-z0-9._-]+)?(@\S+)?$/;
 
 /** Default per-stream byte cap for `logs()` snapshots (truncation beyond). */
 export const DEFAULT_LOG_SNAPSHOT_CAP_BYTES = 8 * 1024 * 1024;

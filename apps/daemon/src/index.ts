@@ -2,6 +2,7 @@ import { serve } from "@hono/node-server";
 import { createDatabase, migrateLinearWorkflowsToGraphs } from "@openeuler/db";
 import { createDriverRegistry, createFakeDriver, createOpenCodeDriver } from "@openeuler/drivers";
 import { WorktreeManager } from "@openeuler/engine";
+import { createDockerSandboxProvider, registerSandboxProvider } from "@openeuler/sandbox";
 import { dirname } from "node:path";
 import { createApp } from "./app.js";
 import { recordDaemonBootActivity } from "./activity.js";
@@ -47,6 +48,13 @@ export async function main(): Promise<void> {
   const worktrees = new WorktreeManager();
   const executor = createExecutor({ db, worktrees, drivers, logger, secretsKey: secretKey.key });
 
+  // Sandbox composition at boot (#100): the docker provider backs the image
+  // management API (in-use checks) and future sandbox routes. Registered on
+  // the module-level default registry as a convenience for callers that
+  // resolve providers by id (`getSandboxProvider("docker")`).
+  const sandboxProvider = createDockerSandboxProvider();
+  registerSandboxProvider(sandboxProvider);
+
   // Startup task #1: snapshot legacy `steps` workflows as graph revision 1
   // (idempotent — workflows that already have revisions are untouched), so
   // every run can pin an immutable revision.
@@ -86,6 +94,7 @@ export async function main(): Promise<void> {
     worktrees,
     maxConcurrentRuns: executor.maxConcurrentRuns,
     secretsKey: secretKey.key,
+    sandbox: { provider: sandboxProvider },
   });
 
   // LIFO: http-server → executor → db.
