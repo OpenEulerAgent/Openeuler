@@ -183,6 +183,23 @@ const setInputValue = (input: HTMLInputElement, value: string): void => {
   });
 };
 
+/** Types into a controlled textarea the way a real keystroke would. */
+const setTextAreaValue = (area: HTMLTextAreaElement, value: string): void => {
+  act(() => {
+    const setter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, "value")?.set;
+    setter?.call(area, value);
+    area.dispatchEvent(new Event("input", { bubbles: true }));
+  });
+};
+
+/** Dirties the doc through a valid inspector edit on the given node. */
+const editPrompt = (nodeId: string, value: string): void => {
+  click(document.querySelector(`.react-flow__node[data-id="${nodeId}"] [data-canvas-node="agent"]`));
+  const prompt = document.querySelector<HTMLTextAreaElement>("#node-prompt");
+  if (prompt === null) throw new Error("prompt textarea not found");
+  setTextAreaValue(prompt, value);
+};
+
 const graphPut = (): { path: string; init: RequestInit | undefined } | undefined =>
   apiMock.state.calls.find((call) => call.path.includes("/graph") && call.init?.method === "PUT");
 
@@ -268,6 +285,10 @@ describe("GraphCanvasEditor guided edge-condition flow (#69)", () => {
         ],
       });
     };
+
+    // The save button is clean-gated (#71), so the doc must be dirty before
+    // the PUT (and the 422) can happen: a valid prompt edit on `fix`.
+    editPrompt("fix", "work harder: {{task}}");
 
     clickSave();
     await act(async () => {});

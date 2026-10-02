@@ -406,7 +406,9 @@ function GraphCanvasInner({
   }, [flushPendingEdit, pruneSelection, updateHistory]);
 
   const save = useCallback(async () => {
-    if (saving) return;
+    // Clean-gate (#71): a clean doc must never mint a redundant revision —
+    // the button disables and cmd+s no-ops here instead of firing the PUT.
+    if (saving || !dirty) return;
     flushPendingEdit();
     const clientIssues = validateCanvasDocument(historyRef.current.present);
     if (clientIssues.length > 0) {
@@ -453,7 +455,7 @@ function GraphCanvasInner({
     } finally {
       setSaving(false);
     }
-  }, [flushPendingEdit, saving, toast, updateHistory, workflow.id]);
+  }, [dirty, flushPendingEdit, saving, toast, updateHistory, workflow.id]);
 
   const addNode = useCallback(
     (kind: PaletteNodeKind, position?: { x: number; y: number }) => {
@@ -908,7 +910,14 @@ function GraphCanvasInner({
           >
             Auto-layout
           </Button>
-          <Button size="sm" onClick={() => void save()} disabled={saving} loading={saving}>
+          <Button
+            size="sm"
+            onClick={() => void save()}
+            disabled={saving || !dirty}
+            loading={saving}
+            aria-label={dirty ? "Save" : "No changes to save"}
+            title={dirty ? "Save (⌘/Ctrl+S)" : "No changes to save"}
+          >
             {saving ? "Saving…" : "Save"}
           </Button>
           <ShortcutsPopover />
