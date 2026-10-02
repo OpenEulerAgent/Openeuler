@@ -5,6 +5,7 @@ import { Handle, Position, type NodeProps } from "@xyflow/react";
 import type { Node, NodeTypes } from "@xyflow/react";
 import { Badge } from "@/components/ui/badge";
 import { cn } from "@/lib/cn";
+import { CANVAS_NODE_SIZE_CLASSES } from "@/lib/graph/canvas-geometry";
 import type {
   AgentNodeData,
   CanvasNode,
@@ -121,7 +122,10 @@ function NoFallbackBadge() {
 /**
  * Agent node card: name, driver chip, model, mode badge, session icon; the
  * entry node additionally carries the pinned Entry badge and no target
- * handle (nothing may connect into it).
+ * handle (nothing may connect into it). The box is deterministic (#88):
+ * width AND height pinned to the geometry tokens (240×72) with a nowrap,
+ * truncating badge row — wrapping badges can never change the node size,
+ * so dagre's reserved box always matches the painted card.
  */
 function AgentNodeCard({ id, data, selected }: NodeProps<AgentFlowNode>) {
   const issueCounts = useContext(NodeIssueCountsContext);
@@ -131,7 +135,9 @@ function AgentNodeCard({ id, data, selected }: NodeProps<AgentFlowNode>) {
   return (
     <div
       className={cn(
-        "relative w-60 rounded-lg border bg-surface p-3 shadow-2 transition-colors",
+        "relative flex flex-col rounded-lg border bg-surface p-3 shadow-2 transition-colors",
+        CANVAS_NODE_SIZE_CLASSES.agent.width,
+        CANVAS_NODE_SIZE_CLASSES.agent.height,
         selected ? "border-accent" : "border-border hover:border-muted-fg",
       )}
       data-canvas-node="agent"
@@ -152,25 +158,29 @@ function AgentNodeCard({ id, data, selected }: NodeProps<AgentFlowNode>) {
           {data.name.length > 0 ? data.name : "Untitled agent"}
         </p>
       </div>
-      <div className="mt-2 flex flex-wrap items-center gap-1.5">
-        <Badge variant="outline" className="max-w-full truncate px-2 py-0 font-mono text-[10px]">
-          {config.driver}
+      <div className="mt-2 flex flex-nowrap items-center gap-1.5">
+        <Badge
+          variant="outline"
+          className="min-w-0 truncate px-2 py-0 font-mono text-[10px]"
+          title={config.driver}
+        >
+          {config.driver.length > 0 ? config.driver : "—"}
         </Badge>
         {config.model ? (
-          <Badge variant="neutral" className="max-w-full truncate px-2 py-0 font-mono text-[10px]">
+          <Badge variant="neutral" className="min-w-0 truncate px-2 py-0 font-mono text-[10px]">
             {config.model}
           </Badge>
         ) : null}
         <Badge
           variant={config.mode === "ask" ? "warning" : "info"}
-          className="px-2 py-0 text-[10px] lowercase"
+          className="shrink-0 px-2 py-0 text-[10px] lowercase"
         >
           {config.mode}
         </Badge>
         {config.continueSession ? (
           <span
             title="Continues the previous session"
-            className="inline-flex items-center gap-1 rounded-full bg-elevated px-2 py-0.5 text-[10px] font-medium text-muted-fg"
+            className="inline-flex shrink-0 items-center gap-1 rounded-full bg-elevated px-2 py-0.5 text-[10px] font-medium text-muted-fg"
           >
             <SessionIcon className="size-3" /> session
           </span>
@@ -191,7 +201,9 @@ function ExitNodeCard({ id, data, selected }: NodeProps<ExitFlowNode>) {
   return (
     <div
       className={cn(
-        "relative flex w-35 items-center gap-2 rounded-lg border border-dashed bg-surface px-3 py-3 shadow-2 transition-colors",
+        "relative flex items-center gap-2 rounded-lg border border-dashed bg-surface px-3 py-3 shadow-2 transition-colors",
+        CANVAS_NODE_SIZE_CLASSES.exit.width,
+        CANVAS_NODE_SIZE_CLASSES.exit.height,
         selected ? "border-accent" : "border-border",
       )}
       data-canvas-node="exit"
@@ -216,11 +228,23 @@ function ExitNodeCard({ id, data, selected }: NodeProps<ExitFlowNode>) {
  * Canvas nodes → React Flow nodes. The entry gets `deletable: false` so no
  * React Flow delete path can remove it (the editor's own delete planning
  * double-checks); the flag is runtime-only and never serialized.
+ * Identity-preserving (#88): non-entry nodes pass through UNCHANGED, and
+ * the entry's stamped object is cached against its document node — a drag
+ * or single-field edit does not invalidate node references. Without this,
+ * every recompute rebuilt the entry object, React Flow re-adopted it,
+ * wiped its `measured` dimensions and flashed the card hidden until the
+ * next ResizeObserver pass (the blank-node/flicker symptom).
  */
+const entryFlowNodeCache = new WeakMap<CanvasNode, CanvasFlowNode>();
+
 export function toFlowNodes(nodes: readonly CanvasNode[]): CanvasFlowNode[] {
   return nodes.map((node) => {
-    const isEntry = node.data.kind === "agent" && node.data.isEntry;
-    return isEntry ? { ...node, deletable: false } : { ...node };
+    if (node.data.kind !== "agent" || !node.data.isEntry) return node as CanvasFlowNode;
+    const cached = entryFlowNodeCache.get(node);
+    if (cached !== undefined) return cached;
+    const stamped = { ...node, deletable: false } as CanvasFlowNode;
+    entryFlowNodeCache.set(node, stamped);
+    return stamped;
   });
 }
 

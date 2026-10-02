@@ -1114,6 +1114,10 @@ function GraphCanvasInner({
         (change): change is NodeChange<CanvasNode> =>
           change.type === "position" || change.type === "select",
       ) as unknown as NodeChange<CanvasNode>[];
+      // Measurement-only change bursts (dimensions) carry nothing to apply;
+      // skipping them keeps the document — and every node reference in it —
+      // untouched instead of churning a fresh array per ResizeObserver pass.
+      if (structural.length === 0) return;
       updateHistory((current) => ({
         ...current,
         present: {
@@ -1159,19 +1163,35 @@ function GraphCanvasInner({
   const edges = useMemo(() => toFlowEdges(doc, issues), [doc, issues]);
   // Per-node badge counts, split by severity (#68): red blockers vs amber
   // hints (structural WIP like an unconnected dropped node). Both live.
-  const nodeIssueCountBy = useCallback(
-    (severity: "hint" | "blocker") => {
-      const counts = new Map<string, number>();
-      for (const issue of issues) {
-        if (issue.nodeId === undefined || classifyIssue(issue) !== severity) continue;
-        counts.set(issue.nodeId, (counts.get(issue.nodeId) ?? 0) + 1);
-      }
-      return counts;
-    },
-    [issues],
-  );
-  const issueCounts = useMemo(() => nodeIssueCountBy("blocker"), [nodeIssueCountBy]);
-  const hintCounts = useMemo(() => nodeIssueCountBy("hint"), [nodeIssueCountBy]);
+  // Identity-stable (#88): `issues` recomputes on every doc change (node
+  // drags included), so memoising on its identity alone would hand the
+  // badge contexts fresh Maps per edit and re-render every card. The maps
+  // are keyed on a cheap content signature instead — same counts, same
+  // Map objects; changed counts, fresh Maps.
+  const badgeCountsRef = useRef<{
+    signature: string;
+    blockers: ReadonlyMap<string, number>;
+    hints: ReadonlyMap<string, number>;
+  } | null>(null);
+  const badgeCounts = useMemo(() => {
+    const signature = issues
+      .filter((issue) => issue.nodeId !== undefined)
+      .map((issue) => `${issue.nodeId}:${classifyIssue(issue)}`)
+      .sort()
+      .join("|");
+    if (badgeCountsRef.current?.signature === signature) return badgeCountsRef.current;
+    const blockers = new Map<string, number>();
+    const hints = new Map<string, number>();
+    for (const issue of issues) {
+      if (issue.nodeId === undefined) continue;
+      const counts = classifyIssue(issue) === "blocker" ? blockers : hints;
+      counts.set(issue.nodeId, (counts.get(issue.nodeId) ?? 0) + 1);
+    }
+    badgeCountsRef.current = { signature, blockers, hints };
+    return badgeCountsRef.current;
+  }, [issues]);
+  const issueCounts = badgeCounts.blockers;
+  const hintCounts = badgeCounts.hints;
   // Minimap fill fn (#75): rebuilt when the badge-count maps change (fresh
   // Map identities per doc change — the minimap re-renders on node moves
   // regardless); kept memoized for stable identity between recompute.
@@ -1180,13 +1200,24 @@ function GraphCanvasInner({
     [issueCounts, hintCounts],
   );
   // Advisory warnings (router with no `always` fallback) are live, not
-  // save-gated — they should appear and clear as the user edits.
+  // save-gated — they should appear and clear as the user edits. Same
+  // signature-keyed identity trick as the badge counts above (#88).
   const warnings = useMemo(() => routerFallbackWarnings(doc), [doc]);
+  const warningCountsRef = useRef<{
+    signature: string;
+    counts: ReadonlyMap<string, number>;
+  } | null>(null);
   const warningCounts = useMemo(() => {
+    const signature = warnings
+      .map((warning) => `${warning.nodeId}:${warning.message}`)
+      .sort()
+      .join("|");
+    if (warningCountsRef.current?.signature === signature) return warningCountsRef.current.counts;
     const counts = new Map<string, number>();
     for (const warning of warnings) {
       counts.set(warning.nodeId, (counts.get(warning.nodeId) ?? 0) + 1);
     }
+    warningCountsRef.current = { signature, counts };
     return counts;
   }, [warnings]);
   const nodeNames = useMemo(
@@ -1413,7 +1444,7 @@ function GraphCanvasInner({
         <ReadOnlyRevisionView
           revisionNumber={viewingRevision.number}
           doc={viewingRevision.doc}
-           onExit={closeRevisionView}
+          onExit={closeRevisionView}
         />
       ) : (
         <div className="flex min-h-0 flex-1">
@@ -1429,8 +1460,8 @@ function GraphCanvasInner({
           <div
             className={
               layoutAnimating
-                ? "relative min-w-0 flex-1 canvas-layout-animating"
-                : "relative min-w-0 flex-1"
+                ? "relative min-h-[480px] min-w-0 flex-1 canvas-layout-animating"
+                : "relative min-h-[480px] min-w-0 flex-1"
             }
             onDrop={(event) => {
               event.preventDefault();

@@ -1,4 +1,5 @@
 import dagre from "@dagrejs/dagre";
+import { CANVAS_NODE_SIZES } from "./canvas-geometry";
 import type { CanvasDocument, CanvasNode } from "./canvas-document";
 
 /**
@@ -7,11 +8,12 @@ import type { CanvasDocument, CanvasNode } from "./canvas-document";
  * same output — so it is unit-testable without a browser.
  */
 
-/** Rendered node bounding boxes (must match the node card styles). */
-export const NODE_SIZES = {
-  agent: { width: 240, height: 104 },
-  exit: { width: 140, height: 64 },
-} as const;
+/**
+ * Rendered node bounding boxes. Re-exported from the geometry tokens
+ * (#88) so dagre reserves exactly what the cards pin via their Tailwind
+ * utilities — one source of truth, nothing kept in sync by hand.
+ */
+export const NODE_SIZES = CANVAS_NODE_SIZES;
 
 export interface LayoutOptions {
   rankdir?: "LR" | "TB";
