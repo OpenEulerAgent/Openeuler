@@ -11,12 +11,12 @@ import { EmptyState } from "@/components/ui/empty-state";
 import { SkeletonLines } from "@/components/ui/skeleton";
 import { FolderIcon } from "@/components/shell/icons";
 import { apiFetch, ApiError } from "@/lib/api";
-import { fetchWorkflows } from "@/lib/workflows-api";
+import { fetchWorkflows, type WorkflowListed } from "@/lib/workflows-api";
 import { RunWorkflowModal } from "./RunWorkflowModal";
 
 type ListState =
   | { phase: "loading" }
-  | { phase: "ready"; workflows: Workflow[] }
+  | { phase: "ready"; workflows: WorkflowListed[] }
   | { phase: "error"; message: string };
 
 /** Badge body summarizing a workflow's loop config, or null when it runs linearly. */
@@ -34,10 +34,23 @@ export function loopBadge(workflow: Workflow): string | null {
   return `${targetLabel} while ${condition} (max ${workflow.loopBack.maxIterations})`;
 }
 
+/** "N nodes · M edges · rev R" line for a graph summary (#70). */
+export function graphSummaryLine(summary: {
+  nodeCount: number;
+  edgeCount: number;
+  revision: number;
+}): string {
+  const nodes = `${summary.nodeCount} node${summary.nodeCount === 1 ? "" : "s"}`;
+  const edges = `${summary.edgeCount} edge${summary.edgeCount === 1 ? "" : "s"}`;
+  return `${nodes} · ${edges} · rev ${summary.revision}`;
+}
+
 /**
- * Workflow list for a project: name, step count, loop badge, run/edit/delete.
- * Used both in the workspace tab and on the dedicated workflows page; "edit"
- * opens the graph canvas at `/projects/[id]/workflows/[workflowId]/edit`.
+ * Workflow list for a project: name, current graph shape (nodes/edges/rev +
+ * loop/router badges from the daemon summary, #70) with a legacy step-count
+ * fallback, run/edit/delete. Used both in the workspace tab and on the
+ * dedicated workflows page; "edit" opens the graph canvas at
+ * `/projects/[id]/workflows/[workflowId]/edit`.
  */
 export function WorkflowsList({ projectId }: { projectId: string }) {
   const router = useRouter();
@@ -118,6 +131,7 @@ export function WorkflowsList({ projectId }: { projectId: string }) {
         ) : (
           <ul className="divide-y divide-border" data-testid="workflow-list">
             {state.workflows.map((workflow) => {
+              const summary = workflow.graphSummary;
               const loop = loopBadge(workflow);
               const deletingThis = confirmDelete === workflow.id && deleting;
               return (
@@ -131,10 +145,25 @@ export function WorkflowsList({ projectId }: { projectId: string }) {
                         {workflow.name}
                       </span>
                       <span className="mt-0.5 flex flex-wrap items-center gap-2 text-xs text-muted-fg">
-                        <span>
-                          {workflow.steps.length} step{workflow.steps.length === 1 ? "" : "s"}
-                        </span>
-                        {loop ? <Badge variant="accent">loop {loop}</Badge> : <Badge>linear</Badge>}
+                        {summary ? (
+                          <>
+                            <span>{graphSummaryLine(summary)}</span>
+                            {summary.hasLoop ? <Badge variant="accent">loop</Badge> : null}
+                            {summary.hasRouter ? <Badge variant="accent">router</Badge> : null}
+                            {!summary.hasLoop && !summary.hasRouter ? <Badge>linear</Badge> : null}
+                          </>
+                        ) : (
+                          <>
+                            <span>
+                              {workflow.steps.length} step{workflow.steps.length === 1 ? "" : "s"}
+                            </span>
+                            {loop ? (
+                              <Badge variant="accent">loop {loop}</Badge>
+                            ) : (
+                              <Badge>linear</Badge>
+                            )}
+                          </>
+                        )}
                       </span>
                     </Link>
                     <span className="flex items-center gap-2">

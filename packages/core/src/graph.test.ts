@@ -7,6 +7,7 @@ import {
   graphToLinear,
   linearToGraph,
   renderPromptTemplate,
+  summarizeGraph,
 } from "./index.js";
 import type { GraphEdge, LoopBack, Step, WorkflowGraph } from "./index.js";
 
@@ -428,6 +429,103 @@ describe("linearToGraph / graphToLinear", () => {
     const templatedResult = graphToLinear(templated);
     expect(templatedResult.ok).toBe(false);
     if (!templatedResult.ok) expect(templatedResult.reason).toContain("{{output:");
+  });
+});
+
+describe("summarizeGraph (list read model, #70)", () => {
+  const steps: Step[] = [
+    {
+      id: "s1",
+      name: "implement",
+      driver: "impl",
+      mode: "auto",
+      promptTemplate: "{{task}}",
+      continueSession: false,
+    },
+    {
+      id: "s2",
+      name: "review",
+      driver: "rev",
+      mode: "auto",
+      promptTemplate: "rev: {{prevOutput}}",
+      continueSession: true,
+    },
+    {
+      id: "s3",
+      name: "ship",
+      driver: "ship",
+      mode: "auto",
+      promptTemplate: "ship: {{prevOutput}}",
+      continueSession: true,
+    },
+  ];
+
+  it("counts nodes/edges of a linear chain with no loop and no router", () => {
+    const graph = linearToGraph({ steps });
+    expect(summarizeGraph(graph, 1)).toEqual({
+      nodeCount: 4,
+      edgeCount: 3,
+      hasLoop: false,
+      hasRouter: false,
+      revision: 1,
+    });
+  });
+
+  it("flags the conditional loop-back + router of a legacy loop workflow", () => {
+    const graph = linearToGraph({
+      steps,
+      loopBack: {
+        toStepIndex: 1,
+        when: { type: "outputNotContains", pattern: "LGTM" },
+        maxIterations: 5,
+      },
+    });
+    // The last node routes (loop edge + always exit) and the s3→s2 back-edge
+    // closes a conditional cycle.
+    expect(summarizeGraph(graph, 7)).toEqual({
+      nodeCount: 4,
+      edgeCount: 4,
+      hasLoop: true,
+      hasRouter: true,
+      revision: 7,
+    });
+  });
+
+  it("flags routers and conditional back-edges on branchy graphs", () => {
+    const graph = WorkflowGraphSchema.parse({
+      entryNodeId: "n1",
+      nodes: [agentNode("n1"), agentNode("n2"), exitNode()],
+      edges: [
+        edge("e-review", "n1", "n2", { condition: { type: "outputContains", pattern: "GO" } }),
+        edge("e-exit", "n1", "exit"),
+        edge("e-loop", "n2", "n1", { condition: { type: "outputNotContains", pattern: "DONE" } }),
+      ],
+    });
+    expect(summarizeGraph(graph, 2)).toEqual({
+      nodeCount: 3,
+      edgeCount: 3,
+      hasLoop: true,
+      hasRouter: true,
+      revision: 2,
+    });
+  });
+
+  it("detects self-loops", () => {
+    const graph = WorkflowGraphSchema.parse({
+      entryNodeId: "n1",
+      nodes: [agentNode("n1"), exitNode()],
+      edges: [
+        edge("e-self", "n1", "n1", { condition: { type: "outputContains", pattern: "AGAIN" } }),
+        edge("e-exit", "n1", "exit"),
+      ],
+    });
+    expect(summarizeGraph(graph, 1)).toEqual({
+      nodeCount: 2,
+      edgeCount: 2,
+      hasLoop: true,
+      hasRouter: true,
+      revision: 1,
+    });
   });
 });
 
