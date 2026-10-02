@@ -6,14 +6,15 @@ import { canvasEdgeId } from "./canvas-document";
  * Pure canvas operations with UX rules beyond the schema (#46): connection
  * validation (entry is a pure source, no duplicate edges, exit is a
  * terminal), conditional newcomers when a node gains an extra outgoing edge
- * (its `always` fallback stays), and selection-aware deletion.
+ * (its `always` fallback stays), self-loops born conditional (#73), and
+ * selection-aware deletion.
  */
 
 export type ConnectFailureReason = "entry-target" | "duplicate" | "exit-source" | "unknown-node";
 
 /** Outcome of {@link checkConnect}: either an edge to add, or why not. */
 export type ConnectCheck =
-  | { ok: true; edge: CanvasEdge; convertedEdgeId?: string }
+  | { ok: true; edge: CanvasEdge; convertedEdgeId?: string; selfLoop?: boolean }
   | { ok: false; reason: ConnectFailureReason; message: string };
 
 /** Whether an edge is unconditional (a non-inverted `always`). */
@@ -43,6 +44,10 @@ export interface ConnectParams {
  *   fallback: the first outgoing edge is that fallback, and any additional
  *   edge is born conditional with {@link AUTO_CONVERTED_CONDITION} —
  *   `convertedEdgeId` (the new edge's id) tells the caller to announce it
+ * - a self-loop (source === target) is always born conditional (#73): an
+ *   unconditional self-loop is exactly the "unconditional cycle rejected"
+ *   the schema forbids, while a conditional one is a legal repeat-while
+ *   edge — `selfLoop: true` tells the caller to hint at the semantics
  */
 export function checkConnect(doc: CanvasDocument, params: ConnectParams): ConnectCheck {
   const sourceNode = doc.nodes.find((node) => node.id === params.source);
@@ -80,9 +85,11 @@ export function checkConnect(doc: CanvasDocument, params: ConnectParams): Connec
   }
 
   const id = canvasEdgeId(params.source, params.target);
+  const selfLoop = params.source === params.target;
   const hasFallback = doc.edges.some(
     (edge) => edge.source === params.source && isUnconditionalEdge(edge.data),
   );
+  const conditional = selfLoop || hasFallback;
 
   return {
     ok: true,
@@ -90,9 +97,10 @@ export function checkConnect(doc: CanvasDocument, params: ConnectParams): Connec
       id,
       source: params.source,
       target: params.target,
-      data: { condition: hasFallback ? AUTO_CONVERTED_CONDITION : { type: "always" } },
+      data: { condition: conditional ? AUTO_CONVERTED_CONDITION : { type: "always" } },
     },
-    ...(hasFallback ? { convertedEdgeId: id } : {}),
+    ...(conditional ? { convertedEdgeId: id } : {}),
+    ...(selfLoop ? { selfLoop: true } : {}),
   };
 }
 

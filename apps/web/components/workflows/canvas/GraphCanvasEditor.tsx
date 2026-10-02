@@ -442,10 +442,14 @@ function GraphCanvasInner({
       return;
     }
     setSaving(true);
+    // 422 mapping (#73): the daemon validates THIS doc — `cause.details`
+    // indexes must resolve against it, never against whatever the user
+    // edits while the PUT is in flight.
+    const requestDoc = historyRef.current.present;
     try {
       const result = await saveWorkflowGraph({
         workflowId: workflow.id,
-        graph: fromCanvasDocument(historyRef.current.present),
+        graph: fromCanvasDocument(requestDoc),
       });
       const normalized =
         result.workflow.graph !== undefined
@@ -458,12 +462,23 @@ function GraphCanvasInner({
       toast({ variant: "success", title: `Saved revision ${result.revision.number}` });
     } catch (cause) {
       if (cause instanceof ApiError && cause.details !== undefined && cause.details.length > 0) {
-        setServerIssues(issuesFromApiDetails(historyRef.current.present, cause.details));
-        toast({
-          variant: "danger",
-          title: "The daemon rejected the graph",
-          description: "See the flagged nodes and edges.",
-        });
+        const mapped = issuesFromApiDetails(requestDoc, historyRef.current.present, cause.details);
+        if (mapped.length > 0) {
+          setServerIssues(mapped);
+          toast({
+            variant: "danger",
+            title: "The daemon rejected the graph",
+            description: "See the flagged nodes and edges.",
+          });
+        } else {
+          // Everything the daemon flagged was deleted mid-flight: nothing
+          // left to badge, so the rejection reads as a plain failure.
+          toast({
+            variant: "danger",
+            title: "Failed to save",
+            description: cause.message,
+          });
+        }
       } else {
         toast({
           variant: "danger",
@@ -584,14 +599,25 @@ function GraphCanvasInner({
         // Guided flow (#69): the born-conditional edge is selected and its
         // drawer opens immediately — the pattern input is focused so the
         // condition is configured in place, right where the eye lands.
+        // Self-loops (#73) join the same flow: their toast explains the
+        // repeat-while semantics instead of the router-fallback rule.
         setSelectedNodeId(null);
         setSelectedEdgeId(check.convertedEdgeId);
-        toast({
-          variant: "info",
-          title: "Edge added as conditional",
-          description:
-            "A node can keep only one always edge (its router fallback) — the new edge needs a condition before the graph can be saved.",
-        });
+        toast(
+          check.selfLoop === true
+            ? {
+                variant: "info",
+                title: "Self-loop added as conditional",
+                description:
+                  "A self-loop repeats this node while its condition holds — set the condition.",
+              }
+            : {
+                variant: "info",
+                title: "Edge added as conditional",
+                description:
+                  "A node can keep only one always edge (its router fallback) — the new edge needs a condition before the graph can be saved.",
+              },
+        );
       }
     },
     [commitDoc, toast],

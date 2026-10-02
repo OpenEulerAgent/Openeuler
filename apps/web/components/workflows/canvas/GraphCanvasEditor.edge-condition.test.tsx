@@ -186,7 +186,10 @@ const setInputValue = (input: HTMLInputElement, value: string): void => {
 /** Types into a controlled textarea the way a real keystroke would. */
 const setTextAreaValue = (area: HTMLTextAreaElement, value: string): void => {
   act(() => {
-    const setter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, "value")?.set;
+    const setter = Object.getOwnPropertyDescriptor(
+      window.HTMLTextAreaElement.prototype,
+      "value",
+    )?.set;
     setter?.call(area, value);
     area.dispatchEvent(new Event("input", { bubbles: true }));
   });
@@ -194,10 +197,31 @@ const setTextAreaValue = (area: HTMLTextAreaElement, value: string): void => {
 
 /** Dirties the doc through a valid inspector edit on the given node. */
 const editPrompt = (nodeId: string, value: string): void => {
-  click(document.querySelector(`.react-flow__node[data-id="${nodeId}"] [data-canvas-node="agent"]`));
+  click(
+    document.querySelector(`.react-flow__node[data-id="${nodeId}"] [data-canvas-node="agent"]`),
+  );
   const prompt = document.querySelector<HTMLTextAreaElement>("#node-prompt");
   if (prompt === null) throw new Error("prompt textarea not found");
   setTextAreaValue(prompt, value);
+};
+
+/** Clicks the first button whose visible label matches. */
+const clickButtonByText = (label: string): void => {
+  const button = [...document.querySelectorAll<HTMLButtonElement>("button")].find(
+    (candidate) => candidate.textContent?.trim() === label,
+  );
+  if (button === undefined) throw new Error(`button "${label}" not found`);
+  act(() => {
+    button.click();
+  });
+};
+
+/** Deletes a node the user's way: select it, then its drawer's Delete. */
+const deleteNodeViaDrawer = (nodeId: string): void => {
+  click(
+    document.querySelector(`.react-flow__node[data-id="${nodeId}"] [data-canvas-node="agent"]`),
+  );
+  clickButtonByText("Delete node");
 };
 
 const graphPut = (): { path: string; init: RequestInit | undefined } | undefined =>
@@ -300,5 +324,86 @@ describe("GraphCanvasEditor guided edge-condition flow (#69)", () => {
     // same render — the live mirror of this doc is clean, panel gone at once.
     click(document.querySelector('.react-flow__node[data-id="review"] [data-canvas-node="agent"]'));
     expect(panel()).toBeNull();
+  });
+});
+
+describe("GraphCanvasEditor daemon 422 mapping against the request doc (#73)", () => {
+  /**
+   * Puts the graph route into a never-settling mode; the returned setter
+   * rejects the in-flight PUT. Graph node order the PUT serializes:
+   * entry(0), review(1), fix(2), exit(3).
+   */
+  const pendingRejectionRoute = (): ((cause: unknown) => void) => {
+    let rejectPut: ((cause: unknown) => void) | undefined;
+    apiMock.state.routes["/api/workflows/w1/graph"] = () =>
+      new Promise((_resolve, reject) => {
+        rejectPut = reject;
+      });
+    return (cause: unknown) => rejectPut?.(cause);
+  };
+
+  it("badges the REQUEST doc's node when a mid-flight delete shifted indexes", async () => {
+    renderEditor();
+    const settlePut = pendingRejectionRoute();
+
+    // Dirty the doc (clean gate), then fire the PUT.
+    editPrompt("fix", "work harder: {{task}}");
+    clickSave();
+    expect(graphPut()).toBeDefined();
+
+    // While the PUT is in flight, deleting `review` (index 1) shifts every
+    // later index: `graph.nodes.2` now names the EXIT node in the current
+    // doc — but the daemon validated the REQUEST doc, where it is `fix`.
+    deleteNodeViaDrawer("review");
+
+    await act(async () => {
+      settlePut(
+        new ApiError("VALIDATION_ERROR", "The daemon rejected the graph", 422, {
+          details: [
+            { path: "graph.nodes.2.config.driver", message: 'driver "ghost" is not available' },
+          ],
+        }),
+      );
+    });
+
+    expect(text()).toContain("The daemon rejected the graph");
+    expect(text()).toContain('driver "ghost" is not available');
+    // Exactly one daemon blocker, badged `fix` — the node the daemon
+    // actually rejected — never the Exit node the shifted index would
+    // point at (the Exit row in the hints list is a live unreachable
+    // finding, not a mis-attributed daemon badge).
+    const blockerRows = document.querySelectorAll("[data-validation-blockers] li");
+    expect(blockerRows).toHaveLength(1);
+    expect(document.querySelector("[data-validation-blockers] button > span")?.textContent).toBe(
+      "fix",
+    );
+  });
+
+  it("drops findings whose target was deleted mid-flight (plain failure toast)", async () => {
+    renderEditor();
+    const settlePut = pendingRejectionRoute();
+
+    editPrompt("fix", "work harder: {{task}}");
+    clickSave();
+
+    // The flagged node itself is deleted while the PUT is in flight.
+    deleteNodeViaDrawer("fix");
+
+    await act(async () => {
+      settlePut(
+        new ApiError("VALIDATION_ERROR", "The daemon rejected the graph", 422, {
+          details: [
+            { path: "graph.nodes.2.config.driver", message: 'driver "ghost" is not available' },
+          ],
+        }),
+      );
+    });
+
+    // Nothing left to badge: no daemon rows and no "see the flagged nodes"
+    // toast — the rejection reads as a plain save failure.
+    expect(text()).toContain("Failed to save");
+    expect(text()).not.toContain("See the flagged nodes and edges.");
+    expect(text()).not.toContain('driver "ghost" is not available');
+    expect(document.querySelector("[data-validation-blockers]")).toBeNull();
   });
 });

@@ -1,10 +1,11 @@
 import { describe, expect, it } from "vitest";
 import type { WorkflowGraph } from "@openeuler/core";
-import { WorkflowGraphSchema } from "@openeuler/core";
+import { DEFAULT_EDGE_MAX_ITERATIONS, WorkflowGraphSchema } from "@openeuler/core";
 import {
   createAgentNode,
   createExitNode,
   DEFAULT_AGENT_PROMPT_TEMPLATE,
+  fromCanvasDocument,
   toCanvasDocument,
   type CanvasDocument,
   type CanvasNode,
@@ -160,6 +161,102 @@ describe("checkConnect / applyConnect", () => {
     expect(after.edges.find((edge) => edge.id === "e-review-test")?.data.condition).toEqual(
       AUTO_CONVERTED_CONDITION,
     );
+  });
+
+  describe("self-loops (#73)", () => {
+    it("a self-loop on a node with no other outgoing edge is born conditional + flagged", () => {
+      const check = checkConnect(unconnectedDoc(), { source: "review", target: "review" });
+      expect(check.ok).toBe(true);
+      if (!check.ok) return;
+      expect(check.selfLoop).toBe(true);
+      expect(check.edge).toMatchObject({
+        id: "e-review-review",
+        source: "review",
+        target: "review",
+      });
+      // Same placeholder condition as a converted router edge: an
+      // unconditional self-loop is an unconditional cycle, so it is NEVER
+      // born `always`, even without an existing fallback.
+      expect(check.edge.data.condition).toEqual(AUTO_CONVERTED_CONDITION);
+      // The guided flow opens the edge drawer for it.
+      expect(check.convertedEdgeId).toBe("e-review-review");
+    });
+
+    it("a self-loop as a second outgoing edge follows the same conversion, fallback untouched", () => {
+      const doc = chainDoc();
+      const check = checkConnect(doc, { source: "review", target: "review" });
+      expect(check.ok).toBe(true);
+      if (!check.ok) return;
+      expect(check.selfLoop).toBe(true);
+      expect(check.edge.data.condition).toEqual(AUTO_CONVERTED_CONDITION);
+      const next = applyConnect(doc, check);
+      expect(next.edges.find((edge) => edge.id === "e-review-exit")?.data.condition).toEqual({
+        type: "always",
+      });
+    });
+
+    it("a plain second edge stays a non-self-loop conversion (flag absent)", () => {
+      const doc = chainDoc();
+      const withFix: CanvasDocument = {
+        nodes: [...doc.nodes, node("fix", { x: 600, y: 200 })],
+        edges: doc.edges,
+      };
+      const check = checkConnect(withFix, { source: "review", target: "fix" });
+      expect(check.ok).toBe(true);
+      if (!check.ok) return;
+      expect(check.selfLoop).toBeUndefined();
+      expect(check.convertedEdgeId).toBe("e-review-fix");
+    });
+
+    it("a filled-in self-loop validates, saves, and round-trips with its condition", () => {
+      const base = chainDoc();
+      const check = checkConnect(base, { source: "review", target: "review" });
+      if (!check.ok) throw new Error("expected self-loop connect to succeed");
+      const withLoop = applyConnect(base, check);
+      // The placeholder blocks saving (missing-condition hint on the loop).
+      const placeholderIssues = validateCanvasDocument(withLoop);
+      expect(placeholderIssues.some((issue) => issue.edgeId === "e-review-review")).toBe(true);
+
+      const filled: CanvasDocument = {
+        ...withLoop,
+        edges: withLoop.edges.map((edge) =>
+          edge.id === "e-review-review"
+            ? {
+                ...edge,
+                data: { ...edge.data, condition: { type: "outputContains", pattern: "RETRY" } },
+              }
+            : edge,
+        ),
+      };
+      expect(validateCanvasDocument(filled)).toEqual([]);
+
+      const saved: WorkflowGraph = WorkflowGraphSchema.parse(fromCanvasDocument(filled));
+      const loop = saved.edges.find((edge) => edge.id === "e-review-review");
+      expect(loop).toMatchObject({ source: "review", target: "review" });
+      expect(loop?.condition).toEqual({ type: "outputContains", pattern: "RETRY" });
+      // Self-loops participate in a cycle: the schema stamps the guard.
+      expect(loop?.maxIterations).toBe(DEFAULT_EDGE_MAX_ITERATIONS);
+      // And the canvas projection reloads the loop verbatim.
+      expect(toCanvasDocument(saved).edges.some((edge) => edge.id === "e-review-review")).toBe(
+        true,
+      );
+    });
+
+    it("rejects self-loops into the entry, out of an exit, and duplicates", () => {
+      const entryLoop = checkConnect(chainDoc(), { source: "entry", target: "entry" });
+      expect(entryLoop).toMatchObject({ ok: false, reason: "entry-target" });
+      const exitLoop = checkConnect(chainDoc(), { source: "exit", target: "exit" });
+      expect(exitLoop).toMatchObject({ ok: false, reason: "exit-source" });
+
+      const base = chainDoc();
+      const check = checkConnect(base, { source: "review", target: "review" });
+      if (!check.ok) throw new Error("expected self-loop connect to succeed");
+      const duplicate = checkConnect(applyConnect(base, check), {
+        source: "review",
+        target: "review",
+      });
+      expect(duplicate).toMatchObject({ ok: false, reason: "duplicate" });
+    });
   });
 });
 
