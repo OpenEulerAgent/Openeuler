@@ -119,21 +119,33 @@ export function validateCanvasDocument(doc: CanvasDocument): CanvasIssue[] {
 
 /**
  * Maps daemon 422 `details` (dot-joined paths like
- * `graph.nodes.2.config.promptTemplate`) onto canvas targets. Paths are
- * resolved against the document that was serialized for the failed request,
- * so array indexes line up.
+ * `graph.nodes.2.config.promptTemplate`) onto canvas targets (#73):
+ * array indexes are resolved against `requestDoc` — the document that was
+ * serialized for the failed PUT, so indexes line up even if the user
+ * edited the graph while the request was in flight — and the resolved ids
+ * are then checked against `currentDoc` for badge placement: an element
+ * deleted mid-flight cannot carry a badge, so its findings drop silently
+ * (the doc has moved on, and the next doc change clears daemon
+ * supplements anyway). Untargeted (graph-level) findings always pass
+ * through.
  */
 export function issuesFromApiDetails(
-  doc: CanvasDocument,
+  requestDoc: CanvasDocument,
+  currentDoc: CanvasDocument,
   details: readonly ApiErrorDetail[],
 ): CanvasIssue[] {
+  const nodeIds = new Set(currentDoc.nodes.map((node) => node.id));
+  const edgeIds = new Set(currentDoc.edges.map((edge) => edge.id));
   const issues: CanvasIssue[] = [];
   for (const detail of details) {
     const segments = detail.path
       .split(".")
       .filter((segment, index) => !(index === 0 && segment === "graph"))
       .map((segment) => (/^\d+$/.test(segment) ? Number(segment) : segment));
-    issues.push(issueFrom(doc, segments, detail.message));
+    const issue = issueFrom(requestDoc, segments, detail.message);
+    if (issue.nodeId !== undefined && !nodeIds.has(issue.nodeId)) continue;
+    if (issue.edgeId !== undefined && !edgeIds.has(issue.edgeId)) continue;
+    issues.push(issue);
   }
   return dedupe(issues);
 }

@@ -496,7 +496,7 @@ describe("issuesFromApiDetails (daemon 422 path mapping)", () => {
         message: "promptTemplate must be a non-empty string",
       },
     ];
-    const issues = issuesFromApiDetails(doc, details);
+    const issues = issuesFromApiDetails(doc, doc, details);
     expect(issues).toHaveLength(1);
     expect(issues[0]).toMatchObject({
       nodeId: "b",
@@ -509,7 +509,7 @@ describe("issuesFromApiDetails (daemon 422 path mapping)", () => {
     const details: ApiErrorDetail[] = [
       { path: "graph.edges.0.condition.pattern", message: "pattern must be a non-empty string" },
     ];
-    const issues = issuesFromApiDetails(doc, details);
+    const issues = issuesFromApiDetails(doc, doc, details);
     expect(issues[0]).toMatchObject({ edgeId: "e-a-b", field: "condition.pattern" });
   });
 
@@ -517,7 +517,7 @@ describe("issuesFromApiDetails (daemon 422 path mapping)", () => {
     const details: ApiErrorDetail[] = [
       { path: "nodes.2", message: 'node "x" is not reachable from the entry node "a"' },
     ];
-    const issues = issuesFromApiDetails(doc, details);
+    const issues = issuesFromApiDetails(doc, doc, details);
     expect(issues[0]).toMatchObject({
       nodeId: "x",
       message: expect.stringContaining("not reachable"),
@@ -528,8 +528,90 @@ describe("issuesFromApiDetails (daemon 422 path mapping)", () => {
     const details: ApiErrorDetail[] = [
       { path: "graph.entryNodeId", message: 'entryNodeId "missing" does not reference any node' },
     ];
-    const issues = issuesFromApiDetails(doc, details);
+    const issues = issuesFromApiDetails(doc, doc, details);
     expect(issues[0]?.nodeId).toBe("a");
     expect(issues[0]?.field).toBe("entryNodeId");
+  });
+});
+
+describe("issuesFromApiDetails against the request doc (#73)", () => {
+  /** entry(0) → b(1) → exit(2); edges [e-a-b(0), e-b-x(1)] — what the PUT serialized. */
+  const requestDoc: CanvasDocument = {
+    nodes: [node("a", { isEntry: true }), node("b", { position: { x: 300, y: 0 } }), exit("x")],
+    edges: [edge("a", "b", "always"), edge("b", "x", "always")],
+  };
+
+  it("resolves node indexes against the REQUEST doc when a node was added mid-flight", () => {
+    // A node inserted before `b` shifts `graph.nodes.1`: mapping against
+    // the current doc would badge the newcomer, not `b`.
+    const currentDoc: CanvasDocument = {
+      nodes: [
+        node("a", { isEntry: true }),
+        node("new", { position: { x: 150, y: 200 } }),
+        node("b", { position: { x: 300, y: 0 } }),
+        exit("x"),
+      ],
+      edges: [...requestDoc.edges],
+    };
+    const issues = issuesFromApiDetails(requestDoc, currentDoc, [
+      {
+        path: "graph.nodes.1.config.promptTemplate",
+        message: "promptTemplate must be a non-empty string",
+      },
+    ]);
+    expect(issues).toHaveLength(1);
+    expect(issues[0]).toMatchObject({ nodeId: "b", field: "config.promptTemplate" });
+  });
+
+  it("resolves edge indexes against the REQUEST doc after an edge was inserted mid-flight", () => {
+    const currentDoc: CanvasDocument = {
+      nodes: [...requestDoc.nodes],
+      // e-a-x inserted at index 1 shifts e-b-x; `graph.edges.1` must still
+      // resolve to e-b-x (the request doc's index 1), not e-a-x.
+      edges: [edge("a", "b", "always"), edge("a", "x", "always"), edge("b", "x", "always")],
+    };
+    const issues = issuesFromApiDetails(requestDoc, currentDoc, [
+      { path: "graph.edges.1.condition.pattern", message: "pattern must be a non-empty string" },
+    ]);
+    expect(issues).toHaveLength(1);
+    expect(issues[0]).toMatchObject({ edgeId: "e-b-x", field: "condition.pattern" });
+  });
+
+  it("drops a deleted node's findings while keeping still-present targets", () => {
+    // `b` deleted mid-flight: its dangling edge e-b-x drops with it; the
+    // entry survives, so an entryNodeId finding still lands on `a`.
+    const currentDoc: CanvasDocument = {
+      nodes: [node("a", { isEntry: true }), exit("x")],
+      edges: [],
+    };
+    const issues = issuesFromApiDetails(requestDoc, currentDoc, [
+      { path: "graph.nodes.1.config.promptTemplate", message: "promptTemplate is empty" },
+      { path: "graph.edges.1.condition.pattern", message: "pattern is empty" },
+      { path: "graph.entryNodeId", message: 'entryNodeId "a" does not reference any node' },
+    ]);
+    expect(issues).toHaveLength(1);
+    expect(issues[0]).toMatchObject({ nodeId: "a", field: "entryNodeId" });
+  });
+
+  it("drops a deleted edge's finding while keeping a sibling edge's", () => {
+    const currentDoc: CanvasDocument = {
+      nodes: [...requestDoc.nodes],
+      edges: [edge("a", "b", "always")],
+    };
+    const issues = issuesFromApiDetails(requestDoc, currentDoc, [
+      { path: "graph.edges.0.condition.pattern", message: "pattern is empty" },
+      { path: "graph.edges.1.condition.pattern", message: "pattern is empty" },
+    ]);
+    expect(issues).toHaveLength(1);
+    expect(issues[0]).toMatchObject({ edgeId: "e-a-b" });
+  });
+
+  it("passes untargeted graph-level findings through even after deletions", () => {
+    const currentDoc: CanvasDocument = { nodes: [node("a", { isEntry: true })], edges: [] };
+    const issues = issuesFromApiDetails(requestDoc, currentDoc, [
+      { path: "graph", message: "something is wrong with the graph" },
+    ]);
+    expect(issues).toHaveLength(1);
+    expect(issues[0]).toMatchObject({ message: "something is wrong with the graph" });
   });
 });
