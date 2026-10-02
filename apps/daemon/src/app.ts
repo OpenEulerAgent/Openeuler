@@ -103,6 +103,15 @@ export function createApp(options: CreateAppOptions = {}): DaemonApp {
     ...(options.authToken === undefined ? {} : { OPENEULER_TOKEN: options.authToken }),
   });
   const authRequired = authToken !== undefined;
+  // A set-but-empty OPENEULER_TOKEN is almost certainly a misconfiguration
+  // (someone meant to lock the daemon) — surface it loudly at boot instead
+  // of silently degrading to open mode.
+  if (!authRequired && (process.env.OPENEULER_TOKEN ?? "").trim() === "" && process.env.OPENEULER_TOKEN !== undefined) {
+    options.logger?.warn(
+      { env: "OPENEULER_TOKEN" },
+      "OPENEULER_TOKEN is set but empty — running in OPEN mode; set a non-empty value to require auth",
+    );
+  }
 
   const app = new Hono<AppEnv>();
 

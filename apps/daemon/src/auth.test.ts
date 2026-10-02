@@ -103,9 +103,9 @@ describe("bearerFromHeader", () => {
     expect(bearerFromHeader(undefined)).toBeUndefined();
     expect(bearerFromHeader(`Bearer ${TOKEN}`)).toBe(TOKEN);
     expect(bearerFromHeader(`bearer ${TOKEN}`)).toBe(TOKEN);
-    expect(bearerFromHeader(`Basic ${TOKEN}`)).toBeUndefined();
-    expect(bearerFromHeader("Bearer")).toBeUndefined();
-    expect(bearerFromHeader("Bearer  ")).toBeUndefined();
+    expect(bearerFromHeader(`Basic ${TOKEN}`)).toBeNull();
+    expect(bearerFromHeader("Bearer")).toBeNull();
+    expect(bearerFromHeader("Bearer  ")).toBeNull();
   });
 });
 
@@ -191,6 +191,16 @@ describe("auth mode (OPENEULER_TOKEN set)", () => {
       // No token echo, ever.
       expect(JSON.stringify(body)).not.toContain(TOKEN);
     }
+  });
+
+  it("a malformed Authorization header does not fall through to a query token", async () => {
+    const h = setup(TOKEN);
+    const res = await h.request(`/api/runs/stream?token=${encodeURIComponent(TOKEN)}`, {
+      headers: { Authorization: `Basic ${TOKEN}` },
+    });
+    expect(res.status).toBe(401);
+    const body = (await res.json()) as { error: { code: string } };
+    expect(body.error.code).toBe("UNAUTHORIZED");
   });
 
   it("accepts a valid bearer token (case-insensitive scheme)", async () => {

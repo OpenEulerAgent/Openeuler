@@ -58,11 +58,11 @@ export function tokensMatch(expected: string, presented: string): boolean {
   return timingSafeEqual(hash(expected), hash(presented));
 }
 
-/** Parses an `Authorization: Bearer <token>` header; undefined when absent/malformed. */
-export function bearerFromHeader(header: string | undefined): string | undefined {
+/** Parses an `Authorization: Bearer <token>` header; null when the header is present but malformed. */
+export function bearerFromHeader(header: string | undefined): string | undefined | null {
   if (header === undefined) return undefined;
   const match = /^Bearer\s+(\S+)\s*$/i.exec(header);
-  return match?.[1];
+  return match?.[1] ?? null;
 }
 
 /**
@@ -93,11 +93,12 @@ export function createAuthMiddleware(options: AuthMiddlewareOptions): Middleware
     if (c.req.path === AUTH_STATUS_PATH) return next();
 
     const headerToken = bearerFromHeader(c.req.header("Authorization"));
-    if (headerToken !== undefined && tokensMatch(token, headerToken)) return next();
+    if (typeof headerToken === "string" && tokensMatch(token, headerToken)) return next();
 
     // Header-less fallback for EventSource, scoped to GET streaming routes.
-    // A present-but-wrong Authorization header must NOT fall through to the
-    // query param — only a truly absent header may.
+    // A present-but-wrong (or malformed, e.g. Basic) Authorization header
+    // must NOT fall through to the query param — only a truly absent
+    // header may.
     if (headerToken === undefined && acceptsQueryToken(c.req.method, c.req.path)) {
       const queryToken = c.req.query("token");
       if (queryToken !== undefined && queryToken !== "" && tokensMatch(token, queryToken)) {
