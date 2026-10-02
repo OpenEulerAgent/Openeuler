@@ -56,7 +56,13 @@ export async function main(): Promise<void> {
   // Startup task #2, before serving: settle runs orphaned by a previous
   // daemon process (SIGKILL/crash) to `interrupted` and report orphaned
   // worktrees.
-  const sweep = await sweepInterruptedRuns({ db, worktrees, executor, logger });
+  const sweep = await sweepInterruptedRuns({
+    db,
+    worktrees,
+    executor,
+    logger,
+    secretsKey: secretKey.key,
+  });
   if (sweep.interruptedRunIds.length > 0 || sweep.orphanedWorktrees.length > 0) {
     logger.info(
       {

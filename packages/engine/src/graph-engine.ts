@@ -113,8 +113,11 @@ export interface GraphEngineDeps {
   finalizeRun(runId: string, status: RunStatus, patch: { output?: string; error?: string }): void;
   /** Aborts the run (row, StepRun settle, event). */
   abortRun(runId: string): void;
-  /** Captures + advances the per-step diff snapshot; never fails the run. */
-  captureDiff(worktreePath: string, base: { ref: string }): Promise<string>;
+  /**
+   * Captures + advances the per-step diff snapshot; never fails the run.
+   * `runId` tags the failure log for run-scoped redaction (#93).
+   */
+  captureDiff(runId: string, worktreePath: string, base: { ref: string }): Promise<string>;
   /** Creates (or re-uses a queued/interrupted) StepRun row, flipped to running. */
   beginStepRun(runId: string, step: { stepId: string }, iteration: number): StepRun;
   /**
@@ -498,7 +501,7 @@ async function runNode(
 
   const exit = await handle.exited;
   control.onHandle?.(undefined);
-  const diff = await deps.captureDiff(worktreePath, diffBase);
+  const diff = await deps.captureDiff(runId, worktreePath, diffBase);
 
   let status: RunStatus;
   let error: string | undefined;

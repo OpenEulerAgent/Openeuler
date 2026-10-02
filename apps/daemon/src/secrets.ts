@@ -40,8 +40,28 @@ export function createSecretsSupport(db: Db, key: Buffer): SecretsSupport {
       };
     },
     redactorForProject(projectId) {
-      const secrets = decryptAll(projectId);
-      return (text) => redactSecrets(text, secrets);
+      // Lazy on purpose: secrets are decrypted at first use, not at transform
+      // creation, so a decrypt failure surfaces inside the caller's own
+      // redaction call site (several of which are never-throw guarded)
+      // instead of at setup time.
+      return (text) => redactSecrets(text, decryptAll(projectId));
     },
   };
+}
+
+/**
+ * Route/sweep-level redaction (#93): a transform for one project's current
+ * secrets, loaded fresh from the db on each use (rotations apply
+ * immediately). No master key configured → identity (the secrets feature
+ * is off; there is nothing to redact against). Construction never throws;
+ * an undecryptable secret row throws at use, fail-closed.
+ */
+export function redactorForProject(
+  db: Db,
+  key: Buffer | undefined,
+  projectId: string,
+): (text: string) => string {
+  return key === undefined
+    ? (text) => text
+    : createSecretsSupport(db, key).redactorForProject(projectId);
 }

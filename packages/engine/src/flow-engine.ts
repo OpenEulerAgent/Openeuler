@@ -225,25 +225,31 @@ export function createFlowEngine(options: FlowEngineOptions): FlowEngine {
    * Redacts structured log fields for run-tagged lines (#93, pragmatic
    * scope): the walk covers every enumerable string the caller passes
    * (`delta`/`output`/`error` snippets and the like). `Error` values under
-   * an `err` key are converted to redacted plain objects (pino's own err
-   * serializer then prints the sanitized shape). Lines without a runId are
-   * passed through as-is.
+   * an `err` key are flattened to plain objects FIRST — `redactJson`'s walk
+   * only sees enumerable fields, and an Error's `message`/`stack` are not,
+   * so they would otherwise be dropped instead of redacted — and the walk
+   * then scrubs them (pino's own err serializer prints the sanitized
+   * shape). Lines without a runId are passed through as-is.
    */
   const redactLogObj = (obj: object): object => {
     const runId = (obj as { runId?: unknown }).runId;
     if (typeof runId !== "string") return obj;
     const secrets = secretsOf(runId);
     if (secrets.length === 0) return obj;
-    const walked = redactJson(obj, secrets) as Record<string, unknown>;
-    const err = walked["err"];
-    if (err instanceof Error) {
-      walked["err"] = {
-        name: err.name,
-        message: redactSecrets(err.message, secrets),
-        stack: err.stack === undefined ? undefined : redactSecrets(err.stack, secrets),
-      };
-    }
-    return walked;
+    const source = obj as Record<string, unknown>;
+    const err = source["err"];
+    const flattened =
+      err instanceof Error
+        ? {
+            ...source,
+            err: {
+              name: err.name,
+              message: err.message,
+              ...(err.stack === undefined ? {} : { stack: err.stack }),
+            },
+          }
+        : source;
+    return redactJson(flattened, secrets) as object;
   };
 
   const log = {
@@ -325,15 +331,21 @@ export function createFlowEngine(options: FlowEngineOptions): FlowEngine {
    * Captures one step's incremental diff (`stat\npatch` combined, the stored
    * StepRun.diff shape) against `base.ref` and advances `base.ref` to the
    * fresh snapshot tree. Failing to capture never fails the run: the step
-   * just stores no diff (and the base stays put).
+   * just stores no diff (and the base stays put). The failure log carries
+   * `runId` so it lands inside the run-tagged log redaction (#93) — an
+   * untagged line would print the raw error (which may quote a secret).
    */
-  async function captureDiff(worktreePath: string, base: { ref: string }): Promise<string> {
+  async function captureDiff(
+    runId: string,
+    worktreePath: string,
+    base: { ref: string },
+  ): Promise<string> {
     try {
       const { stat, patch, tree } = await worktrees.stepDiff(worktreePath, base.ref);
       base.ref = tree;
       return [stat.trim(), patch].filter((part) => part.length > 0).join("\n");
     } catch (err) {
-      log.warn({ err, worktreePath }, "diff capture failed (continuing without diff)");
+      log.warn({ err, runId, worktreePath }, "diff capture failed (continuing without diff)");
       return "";
     }
   }
@@ -555,7 +567,7 @@ export function createFlowEngine(options: FlowEngineOptions): FlowEngine {
 
     const exit = await handle.exited;
     control.onHandle?.(undefined);
-    const diff = await captureDiff(worktreePath, diffBase);
+    const diff = await captureDiff(runId, worktreePath, diffBase);
 
     let status: RunStatus;
     let error: string | undefined;

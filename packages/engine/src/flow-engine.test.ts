@@ -1093,6 +1093,56 @@ describe("createFlowEngine (abort vs worktree lifecycle)", () => {
   });
 });
 
+describe("createFlowEngine (diff capture failure logging, #93)", () => {
+  it("tags the diff-capture warning with runId so it lands in run-scoped redaction", async () => {
+    const h = setup();
+    const secretName = "NPM_TOKEN";
+    const secretValue = "npat_rt_difflog_224466";
+
+    const lines: string[] = [];
+    const capture =
+      (level: string) =>
+      (obj: object, msg: string): void => {
+        lines.push(JSON.stringify({ level, msg, ...obj }));
+      };
+    const logger = { info: capture("info"), warn: capture("warn"), error: capture("error") };
+
+    // Real worktree lifecycle, but every stepDiff explodes with an error
+    // message quoting the secret — exactly what a git failure quoting file
+    // contents would look like.
+    const worktrees = new WorktreeManager({ storeRoot: h.storeRoot });
+    worktrees.stepDiff = async () => {
+      throw new Error(`diff backend exploded near ${secretValue}`);
+    };
+
+    const engine = createFlowEngine({
+      db: h.db,
+      worktrees,
+      drivers: h.registry,
+      logger,
+      loadRunSecrets: () => ({
+        env: { [secretName]: secretValue },
+        secrets: [{ name: secretName, value: secretValue }],
+      }),
+    });
+
+    const workflow = h.makeWorkflow([step({ id: "s1", driver: "impl" })]);
+    const run = h.enqueueRun(workflow.id);
+    await engine.executeRun(run.id, noAbort);
+    await awaitStatus(h, run.id, "success");
+
+    // The run itself is unaffected (continues without a diff)…
+    expect(h.db.stepRuns.listByRun(run.id)[0]?.diff).toBeUndefined();
+
+    // …but the warning is run-tagged AND redacted.
+    const warnings = lines.filter((line) => line.includes("diff capture failed"));
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toContain(run.id);
+    expect(warnings[0]).toContain(`***${secretName}***`);
+    expect(warnings[0]).not.toContain(secretValue);
+  });
+});
+
 describe("createFlowEngine (graph revision runs — dispatch to the graph engine)", () => {
   /** StepRun rows flattened for equivalence comparisons, iteration-major. */
   const stepRunTrace = (h: Harness, runId: string): string[] =>
