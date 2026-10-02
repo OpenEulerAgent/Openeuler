@@ -37,3 +37,8 @@ export type {
   FakeSandboxProviderOptions,
   FakeStopCall,
 } from "./fake.js";
+
+export { createDockerSandboxProvider, DockerSandboxProvider } from "./docker.js";
+export type { DockerSandboxProviderOptions } from "./docker.js";
+export { dockerAvailable } from "./docker-cli.js";
+export type { DockerCliResult, DockerCliRunner } from "./docker-cli.js";
