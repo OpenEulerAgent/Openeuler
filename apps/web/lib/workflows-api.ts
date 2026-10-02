@@ -72,18 +72,36 @@ export async function fetchWorkflowForEditor(
 /** Driver dropdown fallback when `GET /api/drivers` is unreachable or empty. */
 const DEFAULT_DRIVER_IDS: readonly string[] = ["opencode"];
 
+/** Driver ids plus whether the static default list had to stand in (#74). */
+export interface DriverIdsResult {
+  ids: string[];
+  /** True when `/api/drivers` was unreachable or empty and the defaults are used. */
+  fallback: boolean;
+}
+
+/**
+ * Registered driver ids from `GET /api/drivers`, reporting whether the
+ * static default list had to stand in (#74) so callers can warn.
+ */
+export async function fetchDriverIdsResult(
+  fetcher: WorkflowFetcher = apiFetch,
+): Promise<DriverIdsResult> {
+  try {
+    const body = await fetcher<{ drivers: string[] }>("/api/drivers");
+    if (body.drivers.length > 0) return { ids: body.drivers, fallback: false };
+    return { ids: [...DEFAULT_DRIVER_IDS], fallback: true };
+  } catch {
+    return { ids: [...DEFAULT_DRIVER_IDS], fallback: true };
+  }
+}
+
 /**
  * Registered driver ids for the step dropdown, from `GET /api/drivers`.
  * Falls back to the static default list when the daemon is unreachable or
  * reports none (older daemon without the endpoint).
  */
 export async function fetchDriverIds(fetcher: WorkflowFetcher = apiFetch): Promise<string[]> {
-  try {
-    const body = await fetcher<{ drivers: string[] }>("/api/drivers");
-    return body.drivers.length > 0 ? body.drivers : [...DEFAULT_DRIVER_IDS];
-  } catch {
-    return [...DEFAULT_DRIVER_IDS];
-  }
+  return (await fetchDriverIdsResult(fetcher)).ids;
 }
 
 export async function deleteWorkflow(
