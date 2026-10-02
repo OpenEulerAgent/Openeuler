@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import "@xyflow/react/dist/style.css";
 import "./canvas.css";
@@ -9,6 +9,7 @@ import {
   BackgroundVariant,
   Controls,
   MarkerType,
+  MiniMap,
   ReactFlow,
   ReactFlowProvider,
   applyEdgeChanges,
@@ -17,6 +18,7 @@ import {
   type Connection,
   type Edge,
   type EdgeChange,
+  type Node,
   type NodeChange,
 } from "@xyflow/react";
 import type { AgentPreset, StepConfig } from "@openeuler/core";
@@ -24,6 +26,7 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Dialog } from "@/components/ui/dialog";
 import { useToast } from "@/components/ui/toast";
+import { cn } from "@/lib/cn";
 import { ApiError } from "@/lib/api";
 import {
   canvasDocsEquivalent,
@@ -39,7 +42,10 @@ import {
   type CanvasEdge,
   type CanvasEdgeData,
   type CanvasNode,
+  type CanvasNodeData,
 } from "@/lib/graph/canvas-document";
+import { selectionModeReducer, shouldShowMiniMap } from "@/lib/graph/canvas-affordances";
+import { saveStatus, type SaveStatusView } from "@/lib/graph/save-status";
 import {
   applyConnect,
   applyDelete,
@@ -118,6 +124,12 @@ import { ValidationPanel } from "./ValidationPanel";
 const EDIT_COMMIT_DEBOUNCE_MS = 500;
 /** How long node position transitions animate after auto-layout. */
 const LAYOUT_ANIMATION_MS = 320;
+/** How long the "Saved · revision N" chip keeps its vivid tone before
+ *  fading to muted (#75) — enough to register, not enough to nag. */
+const SAVE_STATUS_FADE_MS = 4_000;
+/** Invisible edge hit-area width (#75): a 16px stroke around the 2px
+ *  hairlines makes edges comfortable to click without looking chunky. */
+const EDGE_INTERACTION_WIDTH = 16;
 
 function isTypingTarget(target: EventTarget | null): boolean {
   return (
@@ -145,7 +157,8 @@ function positionsChanged(before: CanvasDocument, after: CanvasDocument): boolea
  * (never an empty-pattern summary), blocker-flagged edges red.
  * Hint-flagged edges (condition not set yet, #68) keep the amber tone.
  * Plain chain edges (a node's single unconditional outgoing edge) stay
- * unlabeled to keep linear graphs quiet.
+ * unlabeled to keep linear graphs quiet. Every edge also carries a wide
+ * invisible interaction stroke (#75) so clicks land on the first try.
  */
 function toFlowEdges(doc: CanvasDocument, issues: readonly CanvasIssue[]): Edge<CanvasEdgeData>[] {
   const blockerEdges = new Set(
@@ -190,6 +203,7 @@ function toFlowEdges(doc: CanvasDocument, issues: readonly CanvasIssue[]): Edge<
 
     return {
       ...edge,
+      interactionWidth: EDGE_INTERACTION_WIDTH,
       label: conditional || router ? edgeChipLabel(edge.data) : undefined,
       labelBgStyle: { fill: "var(--surface)" },
       labelBgPadding: [6, 3] as [number, number],
@@ -202,6 +216,77 @@ function toFlowEdges(doc: CanvasDocument, issues: readonly CanvasIssue[]): Edge<
       markerEnd: { type: MarkerType.ArrowClosed, color: stroke },
     };
   });
+}
+
+/** Spinner glyph for the chip's "Saving…" state. */
+function ChipSpinner() {
+  return (
+    <svg aria-hidden viewBox="0 0 16 16" className="size-3 animate-spin" fill="none">
+      <circle cx="8" cy="8" r="6.5" stroke="currentColor" strokeOpacity="0.25" strokeWidth="2" />
+      <path
+        d="M8 1.5a6.5 6.5 0 0 1 6.5 6.5"
+        stroke="currentColor"
+        strokeWidth="2"
+        strokeLinecap="round"
+      />
+    </svg>
+  );
+}
+
+/**
+ * Persistent save-status chip (#75): always-visible feedback next to the
+ * Save button — "No changes" / "Unsaved changes" (amber) / "Saving…" /
+ * "Saved · revision N" (fades to muted) / "Save failed" (red). The status
+ * itself is the pure {@link saveStatus} derivation; only the fade timer
+ * lives in the editor component.
+ */
+function SaveStatusChip({ status, muted }: { status: SaveStatusView; muted: boolean }) {
+  const dotClass =
+    status.kind === "unsaved" ? "bg-warning" : status.kind === "error" ? "bg-danger" : "bg-success";
+  const toneClass =
+    status.kind === "unsaved"
+      ? "text-warning"
+      : status.kind === "error"
+        ? "text-danger"
+        : status.kind === "saving"
+          ? "text-info"
+          : status.kind === "saved" && !muted
+            ? "text-success"
+            : "text-muted-fg";
+  return (
+    <span
+      data-save-status={status.kind}
+      data-muted={muted || undefined}
+      role="status"
+      className={cn("inline-flex items-center gap-1.5 text-xs whitespace-nowrap", toneClass)}
+    >
+      {status.kind === "saving" ? (
+        <ChipSpinner />
+      ) : status.kind === "clean" ? null : (
+        <span aria-hidden className={cn("size-1.5 shrink-0 rounded-full", dotClass)} />
+      )}
+      {status.label}
+    </span>
+  );
+}
+
+/**
+ * Minimap node fill (#75), themed for the dark canvas from status and node
+ * kind: validation blockers red, hints amber, the entry node accent, exit
+ * terminals red, plain agents muted.
+ */
+function miniMapNodeColorFor(
+  issueCounts: ReadonlyMap<string, number>,
+  hintCounts: ReadonlyMap<string, number>,
+): (node: Node) => string {
+  return (node) => {
+    if ((issueCounts.get(node.id) ?? 0) > 0) return "var(--danger)";
+    if ((hintCounts.get(node.id) ?? 0) > 0) return "var(--warning)";
+    const data = node.data as CanvasNodeData;
+    if (data.kind === "exit") return "var(--danger)";
+    if (data.kind === "agent" && data.isEntry) return "var(--accent)";
+    return "var(--muted-fg)";
+  };
 }
 
 /**
@@ -293,6 +378,15 @@ function GraphCanvasInner({
   const [serverIssues, setServerIssues] = useState<CanvasIssue[]>([]);
   const [revision, setRevision] = useState(workflow.latestRevision?.number);
   const [saving, setSaving] = useState(false);
+  // Persistent save-status chip inputs (#75): the revision minted by the
+  // last session save (drives "Saved · revision N"), whether the last
+  // attempt failed, and the post-save fade-to-muted tone.
+  const [savedRevision, setSavedRevision] = useState<number | null>(null);
+  const [saveFailed, setSaveFailed] = useState(false);
+  const [savedMuted, setSavedMuted] = useState(false);
+  // Marquee selection (#75): "Select area" toggles pointer drags between
+  // panning and painting a selection box; Escape resets to panning.
+  const [selectionMode, dispatchSelectionMode] = useReducer(selectionModeReducer, "pan");
   const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
   const [selectedEdgeId, setSelectedEdgeId] = useState<string | null>(null);
   const [layoutAnimating, setLayoutAnimating] = useState(false);
@@ -305,6 +399,21 @@ function GraphCanvasInner({
   // Dirty via the serialized projections: React Flow runtime keys (`selected`,
   // `measured`, `dragging`, …) must never read as unsaved changes.
   const dirty = useMemo(() => !canvasDocsEquivalent(doc, savedDoc), [doc, savedDoc]);
+
+  // Persistent save status (#75): a pure derivation over the save flags —
+  // the chip next to the Save button never goes stale the way a transient
+  // toast does.
+  const status = saveStatus({ dirty, saving, savedRevision, error: saveFailed });
+
+  // "Saved · revision N" keeps its vivid tone for a few seconds, then fades
+  // to muted so the steady-state header stays quiet. The timer resets on
+  // every new save (savedRevision changes restart the clock).
+  useEffect(() => {
+    if (status.kind !== "saved") return;
+    setSavedMuted(false);
+    const timer = window.setTimeout(() => setSavedMuted(true), SAVE_STATUS_FADE_MS);
+    return () => window.clearTimeout(timer);
+  }, [status.kind, savedRevision]);
 
   // Route-exit guard (#67): beforeunload for real unloads, plus interception
   // of client-side navigation (popstate Back, internal anchor clicks, and the
@@ -442,6 +551,7 @@ function GraphCanvasInner({
       return;
     }
     setSaving(true);
+    setSaveFailed(false);
     // 422 mapping (#73): the daemon validates THIS doc — `cause.details`
     // indexes must resolve against it, never against whatever the user
     // edits while the PUT is in flight.
@@ -458,9 +568,14 @@ function GraphCanvasInner({
       setSavedDoc(normalized);
       updateHistory((current) => replacePresent(current, normalized));
       setRevision(result.revision.number);
+      setSavedRevision(result.revision.number);
+      setSavedMuted(false);
       setServerIssues([]);
       toast({ variant: "success", title: `Saved revision ${result.revision.number}` });
     } catch (cause) {
+      // The chip keeps reading "Save failed" until the next attempt (#75);
+      // toasts stay the detailed explanation channel.
+      setSaveFailed(true);
       if (cause instanceof ApiError && cause.details !== undefined && cause.details.length > 0) {
         const mapped = issuesFromApiDetails(requestDoc, historyRef.current.present, cause.details);
         if (mapped.length > 0) {
@@ -775,6 +890,12 @@ function GraphCanvasInner({
       if ((event.key === "Delete" || event.key === "Backspace") && !isTypingTarget(event.target)) {
         event.preventDefault();
         deleteSelection();
+        return;
+      }
+      // Escape always leaves marquee mode (#75) — never stuck painting
+      // selection boxes.
+      if (event.key === "Escape" && !isTypingTarget(event.target)) {
+        dispatchSelectionMode({ type: "reset" });
       }
     };
     window.addEventListener("keydown", onKeyDown);
@@ -848,6 +969,12 @@ function GraphCanvasInner({
   );
   const issueCounts = useMemo(() => nodeIssueCountBy("blocker"), [nodeIssueCountBy]);
   const hintCounts = useMemo(() => nodeIssueCountBy("hint"), [nodeIssueCountBy]);
+  // Referential-stable minimap fill fn (#75): rebuilt only when the badge
+  // counts flip, so the minimap skips needless re-renders.
+  const miniMapNodeColor = useMemo(
+    () => miniMapNodeColorFor(issueCounts, hintCounts),
+    [issueCounts, hintCounts],
+  );
   // Advisory warnings (router with no `always` fallback) are live, not
   // save-gated — they should appear and clear as the user edits.
   const warnings = useMemo(() => routerFallbackWarnings(doc), [doc]);
@@ -970,7 +1097,8 @@ function GraphCanvasInner({
           {workflow.name}
         </h1>
         {revision !== undefined ? <Badge variant="neutral">revision {revision}</Badge> : null}
-        {dirty ? <Badge variant="warning">unsaved changes</Badge> : null}
+        {/* The persistent save-status chip next to Save (#75) replaced the
+            old transient "unsaved changes" badge here. */}
         <div className="ml-auto flex items-center gap-2">
           <Button
             variant="secondary"
@@ -1000,6 +1128,21 @@ function GraphCanvasInner({
           >
             Auto-layout
           </Button>
+          <Button
+            variant="secondary"
+            size="sm"
+            aria-pressed={selectionMode === "marquee"}
+            onClick={() => dispatchSelectionMode({ type: "toggle" })}
+            className={
+              selectionMode === "marquee"
+                ? "border-accent bg-accent/10 text-accent hover:bg-accent/20"
+                : undefined
+            }
+            title="Drag to select multiple nodes (Esc returns to panning)"
+          >
+            Select area
+          </Button>
+          <SaveStatusChip status={status} muted={status.kind === "saved" && savedMuted} />
           <Button
             size="sm"
             onClick={() => void save()}
@@ -1086,7 +1229,12 @@ function GraphCanvasInner({
                     setSelectedEdgeId(null);
                   }}
                   deleteKeyCode={null}
-                  multiSelectionKeyCode={["Meta", "Shift"]}
+                  multiSelectionKeyCode={["Shift"]}
+                  panOnScroll
+                  zoomOnScroll={false}
+                  zoomOnPinch
+                  selectionOnDrag={selectionMode === "marquee"}
+                  panOnDrag={selectionMode !== "marquee"}
                   minZoom={0.2}
                   maxZoom={2.5}
                   fitView
@@ -1097,8 +1245,21 @@ function GraphCanvasInner({
                   <Background variant={BackgroundVariant.Dots} gap={24} size={1.5} />
                   {/* Bottom-right (#72): the ValidationPanel owns bottom-left
                       whenever issues/warnings render, and overlapped zoom
-                      buttons read as "the canvas is broken". */}
+                      buttons read as "the canvas is broken". The minimap
+                      (#75) takes top-left inside the pane (the palette is a
+                      sibling outside it) — clear of the top-right
+                      attribution and bottom-right Controls — and only
+                      appears once the graph is big enough to navigate. */}
                   <Controls position="bottom-right" showInteractive={false} />
+                  {shouldShowMiniMap(doc.nodes.length) ? (
+                    <MiniMap
+                      position="top-left"
+                      pannable
+                      zoomable
+                      nodeColor={miniMapNodeColor}
+                      ariaLabel="Graph minimap"
+                    />
+                  ) : null}
                 </ReactFlow>
               </NodeWarningCountsContext.Provider>
             </NodeHintCountsContext.Provider>

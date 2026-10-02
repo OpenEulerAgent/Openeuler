@@ -69,6 +69,8 @@ const SHORTCUTS: ReadonlyArray<{ keys: string; action: string }> = [
   { keys: "⇧⌘/Ctrl + Z", action: "Redo" },
   { keys: "Delete / Backspace", action: "Delete selection" },
   { keys: "Space + drag", action: "Pan the canvas" },
-  { keys: "Scroll", action: "Zoom" },
+  { keys: "Scroll", action: "Pan · ⌘/Ctrl + scroll zooms" },
+  { keys: "Shift + click", action: "Add to selection" },
+  { keys: "Esc", action: "Leave area selection" },
   { keys: "Drag from handle", action: "Connect nodes" },
 ];
