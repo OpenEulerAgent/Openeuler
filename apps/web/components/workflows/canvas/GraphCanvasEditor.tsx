@@ -64,15 +64,17 @@ import { applyInspectorAction } from "@/lib/graph/inspector";
 import { useUnsavedChanges } from "@/lib/use-unsaved-changes";
 import {
   applyEdgeInspectorAction,
-  conditionSummary,
+  edgeChipLabel,
   needsConditionConfig,
   routerFallbackWarnings,
 } from "@/lib/graph/edge-inspector";
 import {
   classifyIssue,
+  clearIssuesIfStale,
   dedupeIssues,
+  edgeTargetLabel,
   issuesFromApiDetails,
-  severitySummary,
+  saveBlockMessage,
   validateCanvasDocument,
   type CanvasIssue,
 } from "@/lib/graph/validation";
@@ -96,7 +98,13 @@ import {
 } from "./canvas-nodes";
 import { EdgePropertiesDrawer } from "./EdgePropertiesDrawer";
 import { NodePropertiesDrawer } from "./NodePropertiesDrawer";
-import { Palette, type PaletteNodeKind, type PaletteSection, CANVAS_NODE_MIME, CANVAS_PRESET_MIME } from "./Palette";
+import {
+  Palette,
+  type PaletteNodeKind,
+  type PaletteSection,
+  CANVAS_NODE_MIME,
+  CANVAS_PRESET_MIME,
+} from "./Palette";
 import { PresetManagerDrawer } from "./PresetManagerDrawer";
 import { ShortcutsPopover } from "./ShortcutsPopover";
 import { ValidationPanel } from "./ValidationPanel";
@@ -125,10 +133,11 @@ function positionsChanged(before: CanvasDocument, after: CanvasDocument): boolea
 }
 
 /**
- * Document → React Flow edges. Condition summaries label every router and
- * conditional edge (#48): conditional edges dashed in info blue, the
+ * Document → React Flow edges. Condition chips label every router and
+ * conditional edge (#48, #69): conditional edges dashed in info blue, the
  * `always` fallback of a router subtle and dotted, unconfigured
- * placeholder conditions in warning amber, blocker-flagged edges red.
+ * placeholder conditions in warning amber with a "set condition…" chip
+ * (never an empty-pattern summary), blocker-flagged edges red.
  * Hint-flagged edges (condition not set yet, #68) keep the amber tone.
  * Plain chain edges (a node's single unconditional outgoing edge) stay
  * unlabeled to keep linear graphs quiet.
@@ -176,7 +185,7 @@ function toFlowEdges(doc: CanvasDocument, issues: readonly CanvasIssue[]): Edge<
 
     return {
       ...edge,
-      label: conditional || router ? conditionSummary(edge.data) : undefined,
+      label: conditional || router ? edgeChipLabel(edge.data) : undefined,
       labelBgStyle: { fill: "var(--surface)" },
       labelBgPadding: [6, 3] as [number, number],
       labelBgBorderRadius: 4,
@@ -286,10 +295,16 @@ function GraphCanvasInner({
   // Always-on live validation (#68): the pure client-side mirror of the
   // daemon's rules recomputes on every document change, so badges, the
   // panel, and per-severity tones update BEFORE any save attempt. Daemon
-  // 422 mappings only supplement it until the next edit re-validates.
-  useEffect(() => {
-    setServerIssues([]);
-  }, [doc]);
+  // 422 mappings only supplement it until the next edit re-validates —
+  // cleared DURING render (not in a post-render effect) so the first
+  // paint of an edited doc never merges stale server findings, and via
+  // the identity-preserving guard so an already-empty list causes no
+  // redundant state churn / double validation run (#69 QA).
+  const [serverIssuesDoc, setServerIssuesDoc] = useState(doc);
+  if (serverIssuesDoc !== doc) {
+    setServerIssuesDoc(doc);
+    setServerIssues(clearIssuesIfStale);
+  }
   const issues = useMemo(
     () => dedupeIssues(validateCanvasDocument(doc), serverIssues),
     [doc, serverIssues],
@@ -396,11 +411,12 @@ function GraphCanvasInner({
     const clientIssues = validateCanvasDocument(historyRef.current.present);
     if (clientIssues.length > 0) {
       // Live validation already surfaced these; the toast just confirms the
-      // save is blocked (hints included — they block like blockers do).
+      // save is blocked, naming any edge that still needs its condition
+      // (hints included — they block like blockers do, #69).
       toast({
         variant: "danger",
         title: "Cannot save yet",
-        description: `${severitySummary(clientIssues)} must be fixed — see the validation panel.`,
+        description: saveBlockMessage(historyRef.current.present, clientIssues),
       });
       return;
     }
@@ -472,8 +488,7 @@ function GraphCanvasInner({
       if (preset === undefined) return;
       const current = historyRef.current.present;
       const spot =
-        position ??
-        screenToFlowPosition({ x: window.innerWidth / 2, y: window.innerHeight / 2 });
+        position ?? screenToFlowPosition({ x: window.innerWidth / 2, y: window.innerHeight / 2 });
       const node = createPresetAgentNode({
         preset: asPresetSource(preset),
         position: spot,
@@ -500,6 +515,11 @@ function GraphCanvasInner({
       }
       commitDoc(applyConnect(current, check));
       if (check.convertedEdgeId !== undefined) {
+        // Guided flow (#69): the born-conditional edge is selected and its
+        // drawer opens immediately — the pattern input is focused so the
+        // condition is configured in place, right where the eye lands.
+        setSelectedNodeId(null);
+        setSelectedEdgeId(check.convertedEdgeId);
         toast({
           variant: "info",
           title: "Edge added as conditional",
@@ -550,9 +570,7 @@ function GraphCanvasInner({
   /** Preset provenance actions are discrete: one undo snapshot per click. */
   const detachPreset = useCallback(
     (nodeId: string) => {
-      commitDoc(
-        applyInspectorAction(historyRef.current.present, { type: "detachPreset", nodeId }),
-      );
+      commitDoc(applyInspectorAction(historyRef.current.present, { type: "detachPreset", nodeId }));
     },
     [commitDoc],
   );
@@ -752,6 +770,12 @@ function GraphCanvasInner({
     () => new Map(doc.nodes.map((node) => [node.id, node.data.name])),
     [doc.nodes],
   );
+  // Human-readable "source → target" names so panel rows and toasts call
+  // edges out by role, not raw id (#69).
+  const edgeLabels = useMemo(
+    () => new Map(doc.edges.map((edge) => [edge.id, edgeTargetLabel(doc, edge.id) ?? edge.id])),
+    [doc],
+  );
 
   const selectedNode =
     selectedNodeId === null ? null : (doc.nodes.find((node) => node.id === selectedNodeId) ?? null);
@@ -939,7 +963,16 @@ function GraphCanvasInner({
                   onConnect={onConnect}
                   onNodeDragStart={onNodeDragStart}
                   onNodeDragStop={onNodeDragStop}
-                  onNodeClick={(_, node) => {
+                  onNodeClick={(event, node) => {
+                    // Handle clicks drive connections (and the guided
+                    // edge flow, #69) — the bubbled node click must not
+                    // clobber the selection the connect just made.
+                    if (
+                      event.target instanceof Element &&
+                      event.target.closest(".react-flow__handle") !== null
+                    ) {
+                      return;
+                    }
                     setSelectedEdgeId(null);
                     setSelectedNodeId(node.id);
                   }}
@@ -980,6 +1013,7 @@ function GraphCanvasInner({
             issues={issues}
             warnings={warnings}
             nodeNames={nodeNames}
+            edgeLabels={edgeLabels}
             onFocusIssue={focusIssue}
             className="absolute bottom-3 left-3 z-10 w-[28rem] max-w-[calc(100%-1.5rem)]"
           />
@@ -1049,8 +1083,7 @@ function GraphCanvasInner({
                     toast({
                       variant: "danger",
                       title: "Could not save preset",
-                      description:
-                        cause instanceof ApiError ? cause.message : "Unexpected error",
+                      description: cause instanceof ApiError ? cause.message : "Unexpected error",
                     });
                   })
               : undefined
@@ -1077,7 +1110,11 @@ function GraphCanvasInner({
           onDelete={(presetId) =>
             removePreset(presetId)
               .then(() =>
-                toast({ variant: "success", title: "Preset deleted", description: "Nodes created from it keep their config copies." }),
+                toast({
+                  variant: "success",
+                  title: "Preset deleted",
+                  description: "Nodes created from it keep their config copies.",
+                }),
               )
               .catch((cause) => {
                 toast({

@@ -1,6 +1,6 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import type { ExitCondition } from "@openeuler/core";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -15,6 +15,7 @@ import {
   conditionForType,
   conditionSummary,
   cyclicEdgeIds,
+  edgeChipLabel,
   edgeFieldErrors,
   needsConditionConfig,
   routerFallbackWarnings,
@@ -22,7 +23,7 @@ import {
   testCondition,
   type ConditionMatchRegion,
 } from "@/lib/graph/edge-inspector";
-import { issueHint, issuesForEdge, type CanvasIssue } from "@/lib/graph/validation";
+import { classifyIssue, issueHint, issuesForEdge, type CanvasIssue } from "@/lib/graph/validation";
 import { cn } from "@/lib/cn";
 
 /**
@@ -34,6 +35,12 @@ import { cn } from "@/lib/cn";
  * evaluation order (first match wins, `always` fallback last). Patches
  * apply to the document live; the editor debounces them into undo entries
  * and settles them on field blur / close / selection change.
+ *
+ * Guided edge-condition flow (#69): the drawer opens automatically on a
+ * freshly auto-converted edge with the pattern input focused, an
+ * unconfigured condition shows the amber "set condition…" chip, and the
+ * issue banners split severity like the node drawer (red blockers, amber
+ * hints).
  */
 export function EdgePropertiesDrawer({
   edge,
@@ -58,7 +65,22 @@ export function EdgePropertiesDrawer({
 }) {
   const fieldErrors = useMemo(() => edgeFieldErrors(edge.data), [edge.data]);
   const edgeIssues = issuesForEdge(issues, edge.id);
+  // Same red/amber severity split as the node drawer and the panel (#68,
+  // #69 QA): hard blockers red, structural hints (condition not set yet)
+  // amber — both still block the save.
+  const edgeBlockers = edgeIssues.filter((issue) => classifyIssue(issue) === "blocker");
+  const edgeHints = edgeIssues.filter((issue) => classifyIssue(issue) === "hint");
   const condition = edge.data.condition;
+
+  // Guided flow (#69): when the drawer opens on an unconfigured condition
+  // (or the user switches the condition type), focus the pattern/regex
+  // input. Re-focusing on every data change would steal focus from the
+  // flags/negate/maxIterations fields while the condition is still empty.
+  const conditionInputRef = useRef<HTMLInputElement | null>(null);
+  useEffect(() => {
+    if (needsConditionConfig(edge.data)) conditionInputRef.current?.focus();
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- focus only on drawer open, edge switch, or condition-type switch; re-focusing on every edit would steal focus from flags/negate/maxIterations
+  }, [edge.id, condition.type]);
 
   const source = doc.nodes.find((node) => node.id === edge.source);
   const target = doc.nodes.find((node) => node.id === edge.target);
@@ -113,7 +135,7 @@ export function EdgePropertiesDrawer({
               className="max-w-full truncate px-2 py-1 font-mono text-[11px]"
               title="Derived from the condition — shown on the canvas edge"
             >
-              {conditionSummary(edge.data)}
+              {edgeChipLabel(edge.data)}
             </Badge>
           </div>
         </div>
@@ -137,6 +159,7 @@ export function EdgePropertiesDrawer({
           <Field label="Pattern" htmlFor="edge-pattern" error={fieldErrors.pattern}>
             <Input
               id="edge-pattern"
+              ref={conditionInputRef}
               value={condition.pattern}
               invalid={fieldErrors.pattern !== undefined}
               onChange={(event) =>
@@ -152,6 +175,7 @@ export function EdgePropertiesDrawer({
             <Field label="Regex" htmlFor="edge-regex" error={fieldErrors.regex}>
               <Input
                 id="edge-regex"
+                ref={conditionInputRef}
                 value={condition.regex}
                 invalid={fieldErrors.regex !== undefined}
                 onChange={(event) =>
@@ -262,14 +286,32 @@ export function EdgePropertiesDrawer({
           </div>
         ) : null}
 
-        {edgeIssues.length > 0 ? (
-          <div className="rounded-lg border border-danger/40 bg-danger-subtle p-3" role="alert">
+        {edgeBlockers.length > 0 ? (
+          <div
+            className="rounded-lg border border-danger/40 bg-danger-subtle p-3"
+            role="alert"
+            data-edge-blockers
+          >
             <p className="text-sm font-medium text-danger">
-              {edgeIssues.length} issue{edgeIssues.length === 1 ? "" : "s"} on this edge — saving
-              stays blocked
+              {edgeBlockers.length} blocker{edgeBlockers.length === 1 ? "" : "s"} on this edge —
+              saving stays blocked
             </p>
             <ul className="mt-1 flex list-disc flex-col gap-0.5 pl-4 text-xs text-danger">
-              {edgeIssues.map((issue, index) => (
+              {edgeBlockers.map((issue, index) => (
+                <li key={index}>{issue.message}</li>
+              ))}
+            </ul>
+          </div>
+        ) : null}
+
+        {edgeHints.length > 0 ? (
+          <div
+            className="rounded-lg border border-warning/50 bg-warning-subtle p-3"
+            role="status"
+            data-edge-hints
+          >
+            <ul className="flex list-disc flex-col gap-0.5 pl-4 text-xs text-warning">
+              {edgeHints.map((issue, index) => (
                 <li key={index}>{issueHint(issue) ?? issue.message}</li>
               ))}
             </ul>
@@ -407,7 +449,7 @@ function EvaluationOrder({
                 → {nodeNames.get(row.edge.target) ?? row.edge.target}
               </span>
               <span className="block truncate font-mono text-[10px] text-muted-fg">
-                {conditionSummary(row.edge.data)}
+                {edgeChipLabel(row.edge.data)}
               </span>
             </span>
             <span className="flex shrink-0 gap-1">
