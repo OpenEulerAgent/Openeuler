@@ -240,6 +240,27 @@ export async function createWorkflowWithGraph(options: {
   });
 }
 
+/** One revision row as the LIST serves it (#77): no graph blobs. */
+export interface WorkflowRevisionListed {
+  id: string;
+  number: number;
+  createdAt: string;
+}
+
+/**
+ * Revision history (#77): `GET /api/workflows/:id/revisions` — number +
+ * createdAt per immutable snapshot, no graph payloads.
+ */
+export async function fetchWorkflowRevisions(
+  workflowId: string,
+  fetcher: WorkflowFetcher = apiFetch,
+): Promise<WorkflowRevisionListed[]> {
+  const body = await fetcher<{ revisions: WorkflowRevisionListed[] }>(
+    `/api/workflows/${encodeURIComponent(workflowId)}/revisions`,
+  );
+  return body.revisions;
+}
+
 /**
  * Run-modal submit flow: POST /api/workflows/:id/runs with the required task,
  * returning the accepted run (202) to navigate to `/runs/:id`.

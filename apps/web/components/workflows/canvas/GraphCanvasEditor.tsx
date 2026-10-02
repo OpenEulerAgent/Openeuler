@@ -22,7 +22,6 @@ import {
   type NodeChange,
 } from "@xyflow/react";
 import type { AgentPreset, StepConfig } from "@openeuler/core";
-import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Dialog } from "@/components/ui/dialog";
 import { useToast } from "@/components/ui/toast";
@@ -45,6 +44,12 @@ import {
   type CanvasNodeData,
 } from "@/lib/graph/canvas-document";
 import { selectionModeReducer, shouldShowMiniMap } from "@/lib/graph/canvas-affordances";
+import {
+  docHasConfiguredPrompt,
+  loadDismissedCanvasHints,
+  saveDismissedCanvasHints,
+  visibleCanvasHints,
+} from "@/lib/graph/canvas-hints";
 import {
   conflictBanner,
   conflictFromError,
@@ -107,6 +112,7 @@ import {
   type AgentPresetUpdatePatch,
   type WorkflowWithGraph,
 } from "@/lib/workflows-api";
+import { fetchWorkflowRevision } from "@/lib/run-graph/document";
 import {
   canvasNodeTypes,
   NodeHintCountsContext,
@@ -125,6 +131,8 @@ import {
   CANVAS_PRESET_MIME,
 } from "./Palette";
 import { PresetManagerDrawer } from "./PresetManagerDrawer";
+import { ReadOnlyRevisionView } from "./ReadOnlyRevisionView";
+import { RevisionHistoryDrawer } from "./RevisionHistoryDrawer";
 import { ShortcutsPopover } from "./ShortcutsPopover";
 import { ValidationPanel } from "./ValidationPanel";
 
@@ -398,6 +406,51 @@ function GraphCanvasInner({
   const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
   const [selectedEdgeId, setSelectedEdgeId] = useState<string | null>(null);
   const [layoutAnimating, setLayoutAnimating] = useState(false);
+
+  // Onboarding coach hints (#77): per-hint dismissal persists in
+  // localStorage (`openeuler.canvasHints`); the visible set is re-derived
+  // from the document on every render and auto-hides when its condition
+  // clears.
+  const [dismissedHints, setDismissedHints] = useState<string[]>(() =>
+    typeof window === "undefined" ? [] : loadDismissedCanvasHints(window.localStorage),
+  );
+  const dismissHint = useCallback((hintId: string) => {
+    setDismissedHints((current) => {
+      if (current.includes(hintId)) return current;
+      const next = [...current, hintId];
+      saveDismissedCanvasHints(typeof window === "undefined" ? null : window.localStorage, next);
+      return next;
+    });
+  }, []);
+
+  // Revision history (#77): the header "rev N" chip opens the list drawer;
+  // "View" loads a snapshot into the read-only render. The editing canvas
+  // (history + dirty state) is only ever hidden, so Close restores it as-was.
+  const [revisionsOpen, setRevisionsOpen] = useState(false);
+  const [viewingRevision, setViewingRevision] = useState<{
+    number: number;
+    doc: CanvasDocument | null;
+  } | null>(null);
+  const viewRevision = useCallback(
+    async (revisionNumber: number) => {
+      setRevisionsOpen(false);
+      setSelectedNodeId(null);
+      setSelectedEdgeId(null);
+      setViewingRevision({ number: revisionNumber, doc: null });
+      try {
+        const graph = await fetchWorkflowRevision(workflow.id, revisionNumber);
+        setViewingRevision({ number: revisionNumber, doc: toCanvasDocument(graph) });
+      } catch (cause) {
+        setViewingRevision(null);
+        toast({
+          variant: "danger",
+          title: `Could not load revision ${revisionNumber}`,
+          description: cause instanceof ApiError ? cause.message : "Unexpected error",
+        });
+      }
+    },
+    [toast, workflow.id],
+  );
 
   // Node-drag + debounced-edit undo capture.
   const dragBeforeRef = useRef<CanvasDocument | null>(null);
@@ -1001,8 +1054,11 @@ function GraphCanvasInner({
   );
 
   // Keyboard: cmd+s save, cmd+z/shift+cmd+z undo/redo, delete selection.
+  // The read-only revision view (#77) suspends every editing shortcut —
+  // its own Escape listener returns to the editor instead.
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent): void => {
+      if (viewingRevision !== null) return;
       const mod = event.metaKey || event.ctrlKey;
       if (mod && event.key.toLowerCase() === "s") {
         event.preventDefault();
@@ -1028,7 +1084,7 @@ function GraphCanvasInner({
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [deleteSelection, doRedo, doUndo, save]);
+  }, [deleteSelection, doRedo, doUndo, save, viewingRevision]);
 
   const onNodesChange = useCallback(
     (changes: NodeChange<CanvasFlowNode>[]) => {
@@ -1133,6 +1189,21 @@ function GraphCanvasInner({
   const isEmpty = doc.nodes.length <= 1 && doc.edges.length === 0;
   const basePath = `/projects/${encodeURIComponent(workflow.projectId)}/workflows`;
 
+  // Coach hints (#77): at most one card shows — the first hint of the
+  // onboarding order that still applies and wasn't dismissed. Conditions
+  // derive from the live document, so clearing a condition hides its card.
+  const visibleHints = useMemo(
+    () =>
+      visibleCanvasHints({
+        nodeCount: doc.nodes.length,
+        connectedOnce: doc.edges.length > 0,
+        hasConfiguredPrompt: docHasConfiguredPrompt(doc),
+        dismissed: dismissedHints,
+      }),
+    [doc, dismissedHints],
+  );
+  const coachHint = visibleHints[0] ?? null;
+
   const paletteSections: PaletteSection[] = [
     {
       id: "steps",
@@ -1225,7 +1296,20 @@ function GraphCanvasInner({
         <h1 className="min-w-0 truncate text-sm font-semibold text-fg" title={workflow.name}>
           {workflow.name}
         </h1>
-        {revision !== undefined ? <Badge variant="neutral">revision {revision}</Badge> : null}
+        {/* Revision history affordance (#77): the "rev N" chip opens the
+            list drawer — the immutable-revision model becomes visible. */}
+        {revision !== undefined ? (
+          <button
+            type="button"
+            data-revision-chip={revision}
+            aria-label={`Revision history (currently revision ${revision})`}
+            title="Revision history"
+            onClick={() => setRevisionsOpen(true)}
+            className="inline-flex items-center rounded-full bg-elevated px-2.5 py-0.5 text-xs font-medium text-muted-fg transition-colors hover:text-fg focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
+          >
+            rev {revision}
+          </button>
+        ) : null}
         {/* Focus-probe banner (#76): someone saved a newer revision while
             this tab was away; dismissible, and it self-clears once the
             editor catches up (reload or a successful save). */}
@@ -1306,140 +1390,174 @@ function GraphCanvasInner({
         </div>
       </header>
 
-      <div className="flex min-h-0 flex-1">
-        <Palette
-          sections={paletteSections}
-          onAdd={(kind) => addNode(kind)}
-          presets={presets.map(toPalettePreset)}
-          presetsLoading={!presetsLoaded}
-          onAddPreset={(presetId) => addPresetNode(presetId)}
-          onManagePresets={() => setManagePresetsOpen(true)}
+      {viewingRevision !== null ? (
+        <ReadOnlyRevisionView
+          revisionNumber={viewingRevision.number}
+          doc={viewingRevision.doc}
+          onExit={() => setViewingRevision(null)}
         />
+      ) : (
+        <div className="flex min-h-0 flex-1">
+          <Palette
+            sections={paletteSections}
+            onAdd={(kind) => addNode(kind)}
+            presets={presets.map(toPalettePreset)}
+            presetsLoading={!presetsLoaded}
+            onAddPreset={(presetId) => addPresetNode(presetId)}
+            onManagePresets={() => setManagePresetsOpen(true)}
+          />
 
-        <div
-          className={
-            layoutAnimating
-              ? "relative min-w-0 flex-1 canvas-layout-animating"
-              : "relative min-w-0 flex-1"
-          }
-          onDrop={(event) => {
-            event.preventDefault();
-            const position = screenToFlowPosition({
-              x: event.clientX,
-              y: event.clientY,
-            });
-            const presetId = event.dataTransfer.getData(CANVAS_PRESET_MIME);
-            if (presetId.length > 0) {
-              addPresetNode(presetId, position);
-              return;
+          <div
+            className={
+              layoutAnimating
+                ? "relative min-w-0 flex-1 canvas-layout-animating"
+                : "relative min-w-0 flex-1"
             }
-            const kind = event.dataTransfer.getData(CANVAS_NODE_MIME);
-            if (kind !== "agent" && kind !== "exit") return;
-            addNode(kind, position);
-          }}
-          onDragOver={(event) => {
-            event.preventDefault();
-            event.dataTransfer.dropEffect = "move";
-          }}
-          ref={canvasRef}
-          data-canvas-canvas
-        >
-          <NodeIssueCountsContext.Provider value={issueCounts}>
-            <NodeHintCountsContext.Provider value={hintCounts}>
-              <NodeWarningCountsContext.Provider value={warningCounts}>
-                <ReactFlow
-                  nodes={nodes}
-                  edges={edges}
-                  nodeTypes={canvasNodeTypes}
-                  onNodesChange={onNodesChange}
-                  onEdgesChange={onEdgesChange}
-                  onConnect={onConnect}
-                  onNodeDragStart={onNodeDragStart}
-                  onNodeDragStop={onNodeDragStop}
-                  onNodeClick={(event, node) => {
-                    // Handle clicks drive connections (and the guided
-                    // edge flow, #69) — the bubbled node click must not
-                    // clobber the selection the connect just made.
-                    if (
-                      event.target instanceof Element &&
-                      event.target.closest(".react-flow__handle") !== null
-                    ) {
-                      return;
-                    }
-                    setSelectedEdgeId(null);
-                    setSelectedNodeId(node.id);
-                  }}
-                  onEdgeClick={(_, edge) => {
-                    setSelectedNodeId(null);
-                    setSelectedEdgeId(edge.id);
-                  }}
-                  onPaneClick={() => {
-                    setSelectedNodeId(null);
-                    setSelectedEdgeId(null);
-                  }}
-                  deleteKeyCode={null}
-                  multiSelectionKeyCode={["Shift"]}
-                  panOnScroll
-                  zoomOnScroll={false}
-                  zoomOnPinch
-                  selectionOnDrag={selectionMode === "marquee"}
-                  panOnDrag={selectionMode !== "marquee"}
-                  minZoom={0.2}
-                  maxZoom={2.5}
-                  fitView
-                  fitViewOptions={{ padding: 0.2, maxZoom: 1 }}
-                  colorMode="dark"
-                  attributionPosition="top-right"
-                >
-                  <Background variant={BackgroundVariant.Dots} gap={24} size={1.5} />
-                  {/* Bottom-right (#72): the ValidationPanel owns bottom-left
+            onDrop={(event) => {
+              event.preventDefault();
+              const position = screenToFlowPosition({
+                x: event.clientX,
+                y: event.clientY,
+              });
+              const presetId = event.dataTransfer.getData(CANVAS_PRESET_MIME);
+              if (presetId.length > 0) {
+                addPresetNode(presetId, position);
+                return;
+              }
+              const kind = event.dataTransfer.getData(CANVAS_NODE_MIME);
+              if (kind !== "agent" && kind !== "exit") return;
+              addNode(kind, position);
+            }}
+            onDragOver={(event) => {
+              event.preventDefault();
+              event.dataTransfer.dropEffect = "move";
+            }}
+            ref={canvasRef}
+            data-canvas-canvas
+          >
+            <NodeIssueCountsContext.Provider value={issueCounts}>
+              <NodeHintCountsContext.Provider value={hintCounts}>
+                <NodeWarningCountsContext.Provider value={warningCounts}>
+                  <ReactFlow
+                    nodes={nodes}
+                    edges={edges}
+                    nodeTypes={canvasNodeTypes}
+                    onNodesChange={onNodesChange}
+                    onEdgesChange={onEdgesChange}
+                    onConnect={onConnect}
+                    onNodeDragStart={onNodeDragStart}
+                    onNodeDragStop={onNodeDragStop}
+                    onNodeClick={(event, node) => {
+                      // Handle clicks drive connections (and the guided
+                      // edge flow, #69) — the bubbled node click must not
+                      // clobber the selection the connect just made.
+                      if (
+                        event.target instanceof Element &&
+                        event.target.closest(".react-flow__handle") !== null
+                      ) {
+                        return;
+                      }
+                      setSelectedEdgeId(null);
+                      setSelectedNodeId(node.id);
+                    }}
+                    onEdgeClick={(_, edge) => {
+                      setSelectedNodeId(null);
+                      setSelectedEdgeId(edge.id);
+                    }}
+                    onPaneClick={() => {
+                      setSelectedNodeId(null);
+                      setSelectedEdgeId(null);
+                    }}
+                    deleteKeyCode={null}
+                    multiSelectionKeyCode={["Shift"]}
+                    panOnScroll
+                    zoomOnScroll={false}
+                    zoomOnPinch
+                    selectionOnDrag={selectionMode === "marquee"}
+                    panOnDrag={selectionMode !== "marquee"}
+                    minZoom={0.2}
+                    maxZoom={2.5}
+                    fitView
+                    fitViewOptions={{ padding: 0.2, maxZoom: 1 }}
+                    colorMode="dark"
+                    attributionPosition="top-right"
+                  >
+                    <Background variant={BackgroundVariant.Dots} gap={24} size={1.5} />
+                    {/* Bottom-right (#72): the ValidationPanel owns bottom-left
                       whenever issues/warnings render, and overlapped zoom
                       buttons read as "the canvas is broken". The minimap
                       (#75) takes top-left inside the pane (the palette is a
                       sibling outside it) — clear of the top-right
                       attribution and bottom-right Controls — and only
                       appears once the graph is big enough to navigate. */}
-                  <Controls position="bottom-right" showInteractive={false} />
-                  {shouldShowMiniMap(doc.nodes.length) ? (
-                    <MiniMap
-                      position="top-left"
-                      pannable
-                      zoomable
-                      nodeColor={miniMapNodeColor}
-                      ariaLabel="Graph minimap"
-                    />
-                  ) : null}
-                </ReactFlow>
-              </NodeWarningCountsContext.Provider>
-            </NodeHintCountsContext.Provider>
-          </NodeIssueCountsContext.Provider>
+                    <Controls position="bottom-right" showInteractive={false} />
+                    {shouldShowMiniMap(doc.nodes.length) ? (
+                      <MiniMap
+                        position="top-left"
+                        pannable
+                        zoomable
+                        nodeColor={miniMapNodeColor}
+                        ariaLabel="Graph minimap"
+                      />
+                    ) : null}
+                  </ReactFlow>
+                </NodeWarningCountsContext.Provider>
+              </NodeHintCountsContext.Provider>
+            </NodeIssueCountsContext.Provider>
 
-          {isEmpty ? (
-            <div className="pointer-events-none absolute top-6 left-1/2 z-10 w-80 -translate-x-1/2 rounded-lg border border-border bg-surface p-3 text-center shadow-3">
-              <p className="text-sm font-medium text-fg">Start building your graph</p>
-              <p className="mt-1 text-xs text-muted-fg">
-                Drag an <span className="font-medium text-fg">Agent step</span> from the palette,
-                connect it to the pinned entry node, then add branches, loops, and an exit.
+            {isEmpty ? (
+              <div className="pointer-events-none absolute top-6 left-1/2 z-10 w-80 -translate-x-1/2 rounded-lg border border-border bg-surface p-3 text-center shadow-3">
+                <p className="text-sm font-medium text-fg">Start building your graph</p>
+                <p className="mt-1 text-xs text-muted-fg">
+                  Drag an <span className="font-medium text-fg">Agent step</span> from the palette,
+                  connect it to the pinned entry node, then add branches, loops, and an exit.
+                </p>
+              </div>
+            ) : null}
+
+            <ValidationPanel
+              issues={issues}
+              warnings={warnings}
+              nodeNames={nodeNames}
+              edgeLabels={edgeLabels}
+              onFocusIssue={focusIssue}
+              className="absolute bottom-3 left-3 z-10 w-[28rem] max-w-[calc(100%-1.5rem)]"
+            />
+
+            {dirty ? (
+              <p className="absolute bottom-3 right-14 z-10 text-xs text-muted-fg" role="status">
+                Unsaved changes — ⌘/Ctrl+S to save
               </p>
-            </div>
-          ) : null}
+            ) : null}
 
-          <ValidationPanel
-            issues={issues}
-            warnings={warnings}
-            nodeNames={nodeNames}
-            edgeLabels={edgeLabels}
-            onFocusIssue={focusIssue}
-            className="absolute bottom-3 left-3 z-10 w-[28rem] max-w-[calc(100%-1.5rem)]"
-          />
-
-          {dirty ? (
-            <p className="absolute bottom-3 right-14 z-10 text-xs text-muted-fg" role="status">
-              Unsaved changes — ⌘/Ctrl+S to save
-            </p>
-          ) : null}
+            {/* Coach hint card (#77): bottom-center keeps it clear of the
+              bottom-left ValidationPanel, bottom-right Controls, and the
+              top-center empty-state card. Dismissal persists per hint id. */}
+            {coachHint !== null ? (
+              <div
+                data-canvas-hint={coachHint.id}
+                role="status"
+                className="absolute bottom-3 left-1/2 z-10 flex -translate-x-1/2 items-center gap-2 rounded-lg border border-border bg-surface px-3 py-2 shadow-2"
+              >
+                <span className="text-xs text-fg">
+                  {coachHint.message}
+                  {coachHint.saveNote !== undefined ? (
+                    <span className="text-muted-fg"> — {coachHint.saveNote}</span>
+                  ) : null}
+                </span>
+                <button
+                  type="button"
+                  aria-label={`Dismiss hint: ${coachHint.id}`}
+                  onClick={() => dismissHint(coachHint.id)}
+                  className="rounded px-1 leading-none text-muted-fg transition-colors hover:bg-elevated hover:text-fg focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
+                >
+                  ×
+                </button>
+              </div>
+            ) : null}
+          </div>
         </div>
-      </div>
+      )}
 
       {selectedEdge !== null ? (
         <EdgePropertiesDrawer
@@ -1542,6 +1660,14 @@ function GraphCanvasInner({
           }
         />
       ) : null}
+
+      <RevisionHistoryDrawer
+        open={revisionsOpen}
+        workflowId={workflow.id}
+        currentRevision={revision ?? null}
+        onClose={() => setRevisionsOpen(false)}
+        onView={(revisionNumber) => void viewRevision(revisionNumber)}
+      />
 
       <Dialog open={leaveGuard.confirmOpen} onClose={leaveGuard.stay} label="Unsaved changes">
         <h2 className="text-title font-semibold text-fg">Leave with unsaved changes?</h2>
