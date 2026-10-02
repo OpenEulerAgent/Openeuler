@@ -291,6 +291,13 @@ describe("GraphCanvasEditor canvas interaction (#72)", () => {
 
     expect(text()).toContain("Team roster is still loading");
     expect(nodeIds()).toHaveLength(1); // only the pinned entry node
+
+    // Repeated early drops within the dedupe window fire one toast, not a stack.
+    dropPreset("preset-1");
+    dropPreset("preset-1");
+    const viewport = document.querySelector('div[aria-label="Notifications"]');
+    const toasts = viewport?.querySelectorAll('[role="status"], [role="alert"]') ?? [];
+    expect(toasts.length).toBeLessThanOrEqual(1);
   });
 
   it("a settled empty roster fails open: skeleton gives way to the empty hint", async () => {

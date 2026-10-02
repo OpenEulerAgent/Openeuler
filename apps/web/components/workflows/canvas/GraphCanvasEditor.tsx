@@ -258,6 +258,7 @@ function GraphCanvasInner({
   // drop/click-adds explain themselves instead of no-op'ing (#72).
   const [presets, setPresets] = useState<AgentPreset[]>([]);
   const [presetsLoaded, setPresetsLoaded] = useState(false);
+  const rosterToastAtRef = useRef(0);
   const [managePresetsOpen, setManagePresetsOpen] = useState(false);
   useEffect(() => {
     let cancelled = false;
@@ -538,11 +539,15 @@ function GraphCanvasInner({
   const addPresetNode = useCallback(
     (presetId: string, position?: { x: number; y: number }) => {
       if (!presetsLoaded) {
-        toast({
-          variant: "info",
-          title: "Team roster is still loading",
-          description: "Try again in a moment.",
-        });
+        const now = Date.now();
+        if (now - rosterToastAtRef.current > 2_000) {
+          rosterToastAtRef.current = now;
+          toast({
+            variant: "info",
+            title: "Team roster is still loading",
+            description: "Try again in a moment.",
+          });
+        }
         return;
       }
       const preset = presets.find((candidate) => candidate.id === presetId);
@@ -1061,6 +1066,7 @@ function GraphCanvasInner({
                   fitView
                   fitViewOptions={{ padding: 0.2, maxZoom: 1 }}
                   colorMode="dark"
+                  attributionPosition="top-right"
                 >
                   <Background variant={BackgroundVariant.Dots} gap={24} size={1.5} />
                   {/* Bottom-right (#72): the ValidationPanel owns bottom-left
