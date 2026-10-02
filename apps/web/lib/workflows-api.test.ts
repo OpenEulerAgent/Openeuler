@@ -10,6 +10,7 @@ import {
   fetchDriverIdsResult,
   fetchWorkflow,
   fetchWorkflowForEditor,
+  fetchWorkflowRevisions,
   fetchWorkflows,
   startWorkflowRun,
   updateAgentPreset,
@@ -78,6 +79,19 @@ describe("fetchWorkflow", () => {
     await expect(fetchWorkflow("x", fetcher as unknown as WorkflowFetcher)).rejects.toThrow(
       ApiError,
     );
+  });
+});
+
+describe("fetchWorkflowRevisions (#77)", () => {
+  it("lists revisions (number + createdAt, no graph blobs)", async () => {
+    const revisions = [
+      { id: "r1", number: 1, createdAt: "2026-01-02T10:00:00Z" },
+      { id: "r2", number: 2, createdAt: "2026-01-03T10:00:00Z" },
+    ];
+    const fetcher = vi.fn().mockResolvedValue({ revisions });
+    const listed = await fetchWorkflowRevisions("w-1", fetcher as unknown as WorkflowFetcher);
+    expect(listed).toEqual(revisions);
+    expect(fetcher).toHaveBeenCalledWith("/api/workflows/w-1/revisions");
   });
 });
 
