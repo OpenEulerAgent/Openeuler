@@ -158,6 +158,18 @@ Before serving, `sweepInterruptedRuns` marks any run left `queued`/`running` by 
 
 The onboarding wizard's environment preflight (#53): probes git (`git --version`), the opencode CLI (`--version` + `opencode auth list`; exit 0 + non-empty output = authenticated) and the worktree store (created + writable), each with actionable hints. Results are cached for 30s (`?refresh=1` bypasses — the wizard's **Re-check** button); per-command timeout 5s. Tests: `system.test.ts` "caches probes: a second hit within the TTL does not re-spawn binaries", "?refresh=1 bypasses the cache and refreshes it", "unauthenticated opencode (auth list exits non-zero) surfaces the exact login command".
 
+### Settings hub (`GET /api/system/settings` + `POST /api/system/maintenance`)
+
+Read-only daemon facts for the settings page (#95), plus its danger-zone actions. Both auth-gated like every other `/api` route (only `auth-status` is exempt).
+
+- `GET /api/system/settings` → `{version, dbPath, dbBytes, worktreeRoot, worktreeBytes, drivers: [{id}], defaultDriver (first registered), maxConcurrentRuns, authEnabled, uptimeSeconds}`. `worktreeBytes` comes from `du -sb` over the store, cached 60s (`?refresh=1` bypasses); `du` missing/failing reports `null`, never 500s.
+- `POST /api/system/maintenance {action}` — idempotent, count-based results, typed errors only (`422` bad action/days, `503` missing db/worktree manager, `500 MAINTENANCE_FAILED` wrapping underlying failures):
+  - `prune-worktrees` → `{removed, remaining}`: runs `WorktreeManager.pruneAll` (git-side prune + orphan report), then deletes the reported orphan directories — store-root-confined (`relative()` check). Orphan metadata files are kept so a later `remove(runId)` can still drop the branch.
+  - `purge-events {days?}` (default 30) → `{deleted, dbBytes}`: deletes events of **terminal** runs whose `updated_at` is older than the cutoff (non-terminal and fresh runs untouched), then `wal_checkpoint(TRUNCATE)` so the space is actually returned.
+  - `vacuum` → `{dbBytes}`: rebuilds the SQLite file in place.
+
+The web renders these as the settings hub cards (System / Drivers / Concurrency / Storage with shared-scale usage bars, Danger zone); destructive actions confirm in a dialog — type-to-confirm (`purge`) plus a days input only for the purge — and report counts as toasts before refetching.
+
 ## The web canvas
 
 ### Canvas data flow (schema ⇄ React Flow serialization)

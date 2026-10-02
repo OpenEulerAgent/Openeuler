@@ -191,8 +191,17 @@ export function createApp(options: CreateAppOptions = {}): DaemonApp {
   app.route("/api/projects", createPresetsRouter());
   app.route("/api/projects", createSecretsRouter());
   app.route("/api/drivers", createDriversRouter(options.drivers));
-  // The system router reads the worktree store root from the context.
-  app.route("/api/system", createSystemRouter({ ...options.system, authRequired }));
+  // The system router reads the worktree store root from the context and
+  // reports the boot driver registry + resolved concurrency cap (#95).
+  app.route(
+    "/api/system",
+    createSystemRouter({
+      drivers: options.drivers,
+      maxConcurrentRuns,
+      ...options.system,
+      authRequired,
+    }),
+  );
   app.route("/api/workflows", createWorkflowsRouter());
   app.route(
     "/api/runs",
