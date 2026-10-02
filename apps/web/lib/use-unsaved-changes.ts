@@ -13,6 +13,27 @@ export function isGuardHistoryState(state: unknown): boolean {
   );
 }
 
+/**
+ * True when two URLs are identical except for the fragment — the signature
+ * of a same-document hash navigation, which must not trip the back-guard.
+ * Identical URLs (a Back onto the mirrored dummy entry) return false.
+ */
+export function differsOnlyByFragment(before: string | null, after: string): boolean {
+  if (before === null || before === after) return false;
+  try {
+    const from = new URL(before);
+    const to = new URL(after);
+    return (
+      from.origin === to.origin &&
+      from.pathname === to.pathname &&
+      from.search === to.search &&
+      from.hash !== to.hash
+    );
+  } catch {
+    return false;
+  }
+}
+
 export interface ClickGuardInput {
   target: EventTarget | null;
   button?: number;
@@ -57,7 +78,7 @@ export type GuardPending =
 export type GuardEvent =
   | { type: "engage" }
   | { type: "disengage"; onDummyEntry: boolean }
-  | { type: "popstate" }
+  | { type: "popstate"; fragmentOnly?: boolean }
   | { type: "click"; href: string }
   | { type: "programmatic" }
   | { type: "stay" }
@@ -65,22 +86,21 @@ export type GuardEvent =
 
 export type GuardEffect =
   | { kind: "push-dummy" }
+  | { kind: "absorb-pin" }
   | { kind: "consume-dummy" }
-  | { kind: "navigate-back"; depth: number }
+  | { kind: "navigate-back" }
   | { kind: "navigate"; href: string }
   | { kind: "run-programmatic" };
 
 export interface GuardState {
   engaged: boolean;
   confirm: GuardPending | null;
-  dummies: number;
   traversing: boolean;
 }
 
 export const initialGuardState: GuardState = {
   engaged: false,
   confirm: null,
-  dummies: 0,
   traversing: false,
 };
 
@@ -92,7 +112,7 @@ export function guardReducer(
     case "engage": {
       if (state.engaged) return { state, effects: [] };
       return {
-        state: { ...state, engaged: true, dummies: 1 },
+        state: { ...state, engaged: true },
         effects: [{ kind: "push-dummy" }],
       };
     }
@@ -100,20 +120,18 @@ export function guardReducer(
       if (!state.engaged) return { state, effects: [] };
       const effects: GuardEffect[] = [];
       if (event.onDummyEntry) effects.push({ kind: "consume-dummy" });
-      return {
-        state: { engaged: false, confirm: null, dummies: 0, traversing: false },
-        effects,
-      };
+      return { state: initialGuardState, effects };
     }
     case "popstate": {
       if (!state.engaged) return { state, effects: [] };
       if (state.traversing) return { state: { ...state, traversing: false }, effects: [] };
-      const dummies = state.dummies + 1;
-      if (state.confirm !== null) {
-        return { state: { ...state, dummies }, effects: [{ kind: "push-dummy" }] };
-      }
+      // Fragment churn absorbs the landed-on entry instead of growing the
+      // stack, so the dialog (and its fixed back depth) only ever opens
+      // from the renormalized `[previous, current, dummy]` position.
+      if (event.fragmentOnly) return { state, effects: [{ kind: "absorb-pin" }] };
+      if (state.confirm !== null) return { state, effects: [{ kind: "push-dummy" }] };
       return {
-        state: { ...state, dummies, confirm: { kind: "back" } },
+        state: { ...state, confirm: { kind: "back" } },
         effects: [{ kind: "push-dummy" }],
       };
     }
@@ -141,7 +159,7 @@ export function guardReducer(
       if (pending.kind === "back") {
         return {
           state: { ...state, confirm: null, traversing: true },
-          effects: [{ kind: "navigate-back", depth: state.dummies + 1 }],
+          effects: [{ kind: "navigate-back" }],
         };
       }
       if (pending.kind === "link") {
@@ -166,12 +184,56 @@ export interface UnsavedChangesGuard {
   requestLeave: (navigate: () => void) => void;
 }
 
+/** The leave request of the most recently mounted guard, if any. */
+let activeRequestLeave: ((navigate: () => void) => void) | null = null;
+
+/**
+ * Programmatic navigation shared by shell chrome (the ⌘K command palette):
+ * when an unsaved-changes guard is mounted, the navigation goes through its
+ * confirm flow; with no guard mounted (clean pages) it runs immediately.
+ */
+export function navigateWithGuard(navigate: () => void): void {
+  if (activeRequestLeave === null) {
+    navigate();
+    return;
+  }
+  activeRequestLeave(navigate);
+}
+
+/**
+ * Route-exit guard (#67): while `dirty`, intercepts client-side navigation
+ * (browser Back via a pinned dummy history entry, internal anchor clicks,
+ * and programmatic leaves through {@link navigateWithGuard} /
+ * {@link UnsavedChangesGuard.requestLeave}) and routes it through a confirm
+ * dialog; `beforeunload` covers real document unloads.
+ *
+ * History accounting: engaging pushes exactly one dummy entry on top of the
+ * current entry (pushState inherently truncates any forward history — the
+ * user loses the forward stack while guarded). Every Back-triggered
+ * popstate re-pins the dummy (truncate + push), so when the confirm dialog
+ * opens the stack tail is invariantly `[previous, current, dummy]` with the
+ * cursor on the dummy — a confirmed Back leave is therefore always a fixed
+ * `history.go(-2)` (dummy → current → previous), never a counted depth.
+ * Same-document fragment navigation never prompts: its popstate is
+ * recognized by state/URL and the landed-on entry is absorbed into the pin
+ * via replaceState (no stack growth); Back presses that undo hash churn
+ * collapse those stale pins silently, and the first Back onto the real
+ * current entry re-normalizes the stack and asks. Fragment churn under the
+ * open modal dialog is unreachable (the dialog traps all interaction).
+ *
+ * Tradeoff: a confirmed link/programmatic leave simply `router.push`es, so
+ * the pinned dummy (mirroring the current URL) stays one Back press away
+ * from the destination — the user can return to the (now clean) page once.
+ * Consuming it first would need an async go-back-then-push dance around the
+ * router; accepted cost, asserted as expected behavior in the tests.
+ */
 export function useUnsavedChanges(dirty: boolean): UnsavedChangesGuard {
   const router = useRouter();
   const routerRef = useRef(router);
   routerRef.current = router;
   const stateRef = useRef<GuardState>(initialGuardState);
   const programmaticRef = useRef<(() => void) | null>(null);
+  const pinnedUrlRef = useRef<string | null>(null);
   const [pending, setPending] = useState<GuardPending | null>(null);
 
   const perform = useCallback((effect: GuardEffect) => {
@@ -185,12 +247,30 @@ export function useUnsavedChanges(dirty: boolean): UnsavedChangesGuard {
           "",
           window.location.href,
         );
+        pinnedUrlRef.current = window.location.href;
+        break;
+      case "absorb-pin":
+        // Fragment churn: mark the entry the cursor landed on (the
+        // same-document fragment entry, or a stale pin) as the new pin —
+        // no stack growth, no dialog.
+        window.history.replaceState(
+          {
+            ...(window.history.state as Record<string, unknown> | null),
+            [UNSAVED_GUARD_STATE_KEY]: true,
+          },
+          "",
+          window.location.href,
+        );
+        pinnedUrlRef.current = window.location.href;
         break;
       case "consume-dummy":
         window.history.back();
         break;
       case "navigate-back":
-        window.history.go(-effect.depth);
+        // Fixed depth: the cursor sits on the pinned dummy directly above
+        // the current entry, so -2 crosses dummy + current and lands on
+        // the previous route (see the hook docblock).
+        window.history.go(-2);
         break;
       case "navigate": {
         const url = new URL(effect.href, window.location.origin);
@@ -227,13 +307,22 @@ export function useUnsavedChanges(dirty: boolean): UnsavedChangesGuard {
     [run],
   );
 
+  // Publish the guard for shell-level programmatic navigation (⌘K palette).
+  useEffect(() => {
+    activeRequestLeave = requestLeave;
+    return () => {
+      if (activeRequestLeave === requestLeave) activeRequestLeave = null;
+    };
+  }, [requestLeave]);
+
   useEffect(() => {
     if (!dirty) return undefined;
     const onClick = (event: MouseEvent): void => {
       const href = shouldInterceptClick(event, true, window.location.origin);
       if (href === null) return;
+      // preventDefault alone stops next/link (it bails on defaultPrevented)
+      // while letting other capture/bubble click listeners still run.
       event.preventDefault();
-      event.stopPropagation();
       if (stateRef.current.confirm === null) run({ type: "click", href });
     };
     document.addEventListener("click", onClick, true);
@@ -242,8 +331,13 @@ export function useUnsavedChanges(dirty: boolean): UnsavedChangesGuard {
 
   useEffect(() => {
     if (!dirty) return undefined;
-    const onPopstate = (): void => {
-      run({ type: "popstate" });
+    const onPopstate = (event: PopStateEvent): void => {
+      // Same-document fragment navigation (or landing back on one of our
+      // pinned entries): re-pin silently instead of prompting.
+      const fragmentOnly =
+        isGuardHistoryState(event.state) ||
+        differsOnlyByFragment(pinnedUrlRef.current, window.location.href);
+      run({ type: "popstate", fragmentOnly });
     };
     window.addEventListener("popstate", onPopstate);
     return () => window.removeEventListener("popstate", onPopstate);
