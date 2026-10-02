@@ -386,11 +386,13 @@ function MaintenanceDialog({
   if (action === null) return null;
   const copy = DIALOG_COPY[action];
   const parsedDays = Number.parseInt(days, 10);
-  const daysValid = action !== "purge-events" || (Number.isInteger(parsedDays) && parsedDays >= 0);
+  const daysValid =
+    action !== "purge-events" ||
+    (Number.isInteger(parsedDays) && parsedDays >= 0 && parsedDays <= 3650);
   const typedOk = action !== "purge-events" || confirmWord.trim() === PURGE_CONFIRM_WORD;
 
   return (
-    <Dialog open={action !== null} onClose={onClose} label={copy.title}>
+    <Dialog open={action !== null} onClose={onClose} label={copy.title} disableClose={busy}>
       <div className="flex flex-col gap-4">
         <div>
           <h2 className="text-lg font-semibold text-fg">{copy.title}</h2>
