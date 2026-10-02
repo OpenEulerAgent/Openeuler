@@ -2,10 +2,12 @@ import { serve } from "@hono/node-server";
 import { createDatabase, migrateLinearWorkflowsToGraphs } from "@openeuler/db";
 import { createDriverRegistry, createFakeDriver, createOpenCodeDriver } from "@openeuler/drivers";
 import { WorktreeManager } from "@openeuler/engine";
+import { dirname } from "node:path";
 import { createApp } from "./app.js";
 import { createExecutor } from "./executor.js";
 import { createLogger } from "./logger.js";
 import { sweepInterruptedRuns } from "./recovery.js";
+import { loadOrCreateSecretKey } from "./secrets-crypto.js";
 
 const DEFAULT_PORT = 8787;
 
@@ -18,6 +20,17 @@ export async function main(): Promise<void> {
   const logger = createLogger();
   const db = createDatabase();
 
+  // Master key for per-project secrets (#93): generated on first boot next
+  // to the db (mode 600). Losing this file makes stored secrets
+  // undecryptable — back it up alongside the database.
+  const secretKey = loadOrCreateSecretKey({ dataDir: dirname(db.path) });
+  logger.info(
+    { path: secretKey.path, created: secretKey.created },
+    secretKey.created
+      ? "secret key generated (keep it safe; losing it loses stored secrets)"
+      : "secret key loaded",
+  );
+
   // Driver composition at boot: every driver listed in `GET /api/drivers`.
   // `fake` needs no external binary; `opencode` spawns the real CLI.
   // OPENEULER_DRIVER selects the driver for ad-hoc runs; workflow steps pick
@@ -27,7 +40,7 @@ export async function main(): Promise<void> {
   drivers.registerDriver(createOpenCodeDriver());
 
   const worktrees = new WorktreeManager();
-  const executor = createExecutor({ db, worktrees, drivers, logger });
+  const executor = createExecutor({ db, worktrees, drivers, logger, secretsKey: secretKey.key });
 
   // Startup task #1: snapshot legacy `steps` workflows as graph revision 1
   // (idempotent — workflows that already have revisions are untouched), so
@@ -61,6 +74,7 @@ export async function main(): Promise<void> {
     drivers,
     worktrees,
     maxConcurrentRuns: executor.maxConcurrentRuns,
+    secretsKey: secretKey.key,
   });
 
   // LIFO: http-server → executor → db.

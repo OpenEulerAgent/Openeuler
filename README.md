@@ -138,6 +138,7 @@ Read at process start (no `.env` file is loaded; export them or prefix the comma
 | `PORT`                   | daemon                  | `8787`                     | Daemon HTTP port                                                                    |
 | `CORS_ORIGIN`            | daemon                  | `http://localhost:3000`    | Allowed browser origin                                                              |
 | `OPENEULER_TOKEN`        | daemon                  | _(unset = open)_           | Bearer token required on every `/api` route (#92) — see "Token auth" below          |
+| `OPENEULER_SECRET_KEY`   | daemon                  | `<data>/secret.key`        | Path to the master key file for project secrets (#93) — see "Per-project secrets"   |
 | `LOG_LEVEL`              | daemon                  | `info`                     | pino log level                                                                      |
 | `NEXT_PUBLIC_DAEMON_URL` | `@openeuler/web`        | `http://localhost:8787`    | Daemon base URL for the browser app                                                 |
 
@@ -154,6 +155,16 @@ OPENEULER_TOKEN=$(openssl rand -hex 32) pnpm dev
 - **SSE streams** (`/api/runs/:id/events`, `/api/runs/stream`): `EventSource` cannot set headers, so these GET streaming routes (only these) also accept `?token=<token>`. The tradeoff: the token appears in URLs — visible to proxies between browser and daemon, which is why the fallback is scoped strictly to streaming routes and the daemon redacts `token=` from its logs.
 - **`/health`** stays open for liveness probes but answers minimal info (`ok` + version) while auth is on.
 - **Rotation**: change the env var and restart the daemon; in the web, save the new token when the 401 card appears (or hit **Forget token** in Settings first). No logout dance beyond that.
+
+## Per-project secrets (redacted everywhere)
+
+Agents need credentials (npm tokens, API keys) without them landing in prompts, events, or logs. Register them per project and every run of that project receives them as env vars — while the daemon scrubs the values from everything it persists.
+
+- **Storage**: `PUT /api/projects/:id/secrets {name, value}` upserts (same name = rotate). Values are encrypted at rest with AES-256-GCM using a master key file generated on first boot (`<data>/secret.key`, mode 600; override the path with `OPENEULER_SECRET_KEY`). **Back the key up with your database — losing it makes stored secrets undecryptable.** The API only ever lists names (`GET …/secrets` → `[{name, createdAt}]`); values are write-only over the wire, and the web UI (project workspace → header gear → Settings) shows write-only inputs.
+- **Names** follow env-var rules: `^[A-Z_][A-Z0-9_]*$`, ≤ 64 chars (422 otherwise). Values shorter than 4 characters are not redacted (they would match unrelated text).
+- **Injection**: at run start the executor decrypts the project's secrets and merges them into every agent process env (`{...process.env, ...secrets}` in the `opencode` driver).
+- **Redaction**: every persisted write for a run — event payloads, StepRun output/diff, run output/error, activity feed payloads — replaces each value with `***NAME***` (case-sensitive substring, longest values first). Run-tagged structured log fields are redacted the same way; the snapshot is taken at run start, so a secret rotated mid-run stays redacted for that run. Pragmatic scope: a value that only appears in a non-run-tagged log line (e.g. a plain HTTP access log) is out of scope — secrets belong in outputs/events, which are fully covered.
+- **Failure mode is fail-closed**: if secrets cannot be decrypted (wrong/tampered key file → `SECRETS_KEY_UNREADABLE`), the run fails instead of executing without redaction.
 
 ## Project layout
 

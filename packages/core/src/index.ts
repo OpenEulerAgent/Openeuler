@@ -136,3 +136,15 @@ export {
 export type { PromptTemplateVariable, PromptTemplateVars } from "./prompt.js";
 
 export { isValidRegex } from "./regex.js";
+
+export {
+  MIN_SECRET_REDACTION_LENGTH,
+  SECRET_NAME_MAX_LENGTH,
+  SECRET_NAME_REGEX,
+  SECRET_NAME_SCHEMA,
+  REDACTION_STRUCTURAL_KEYS,
+  redactJson,
+  redactSecrets,
+  secretRedactionMarker,
+} from "./secrets.js";
+export type { SecretForRedaction } from "./secrets.js";

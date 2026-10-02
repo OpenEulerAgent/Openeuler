@@ -1,15 +1,17 @@
 import { randomUUID } from "node:crypto";
-import { renderPromptTemplate } from "@openeuler/core";
+import { redactJson, redactSecrets, renderPromptTemplate } from "@openeuler/core";
 import type {
   LoopBack,
   LoopVerdict,
+  PersistedEvent,
   Run,
   RunStatus,
+  SecretForRedaction,
   Step,
   StepRun,
   WorkflowGraph,
 } from "@openeuler/core";
-import type { Db } from "@openeuler/db";
+import type { Db, EventInput } from "@openeuler/db";
 import type { AgentDriver, AgentHandle, AgentMode, DriverRegistry } from "@openeuler/drivers";
 import {
   compileExitCondition,
@@ -74,6 +76,22 @@ export interface RunControl {
   onHandle?(handle: AgentHandle | undefined): void;
 }
 
+/**
+ * Per-run secret context (#93), resolved once at run start by the daemon:
+ * the decrypted env merged into every driver start, plus the name+value
+ * list used to redact everything the run persists (event payloads, outputs,
+ * diffs, errors, run-scoped log fields).
+ */
+export interface RunSecrets {
+  /** Secret env vars merged into every `driver.start` call for the run. */
+  env: Record<string, string>;
+  /** Decrypted secrets powering the redaction transform. */
+  secrets: ReadonlyArray<SecretForRedaction>;
+}
+
+/** Resolves a run's {@link RunSecrets}; undefined = no secrets configured. */
+export type RunSecretsLoader = (run: Run) => RunSecrets | undefined;
+
 export interface FlowEngineOptions {
   db: Db;
   worktrees: WorktreeManager;
@@ -87,6 +105,14 @@ export interface FlowEngineOptions {
    * hook failures are logged and never break execution.
    */
   onRunStatus?: (runId: string, status: RunStatus) => void;
+  /**
+   * Loads a run's project secrets at run start (#93). The returned env is
+   * merged into every driver start; every persisted write for the run
+   * (event payloads, StepRun output/diff, run output/error, run-scoped log
+   * fields) is redacted first. Loader errors fail the run (fail-closed:
+   * a run never executes with secrets it cannot redact).
+   */
+  loadRunSecrets?: RunSecretsLoader;
 }
 
 export interface FlowEngine {
@@ -174,17 +200,63 @@ export function createFlowEngine(options: FlowEngineOptions): FlowEngine {
   const { db, worktrees, drivers } = options;
   const logger = options.logger;
 
+  /**
+   * Per-run secret snapshots (#93): set once at run start, removed when the
+   * run settles. Keyed by runId so every append/write/log call site can
+   * redact without threading a closure through the whole engine.
+   */
+  const runSecrets = new Map<string, RunSecrets>();
+
+  const secretsOf = (runId: string): ReadonlyArray<SecretForRedaction> =>
+    runSecrets.get(runId)?.secrets ?? [];
+
+  /** Redacts a run-scoped free-text value (output, diff, error message). */
+  const redactText = (runId: string, text: string): string => redactSecrets(text, secretsOf(runId));
+
+  /**
+   * Persists one event with run-scoped secret redaction applied to the
+   * payload (#93). Structural keys (`type`, `seq`, `status`, …) pass
+   * through untouched, so the repo's schema parse is unaffected.
+   */
+  const appendEvent = (runId: string, event: EventInput): PersistedEvent =>
+    db.events.append(runId, redactJson(event, secretsOf(runId)) as EventInput);
+
+  /**
+   * Redacts structured log fields for run-tagged lines (#93, pragmatic
+   * scope): the walk covers every enumerable string the caller passes
+   * (`delta`/`output`/`error` snippets and the like). `Error` values under
+   * an `err` key are converted to redacted plain objects (pino's own err
+   * serializer then prints the sanitized shape). Lines without a runId are
+   * passed through as-is.
+   */
+  const redactLogObj = (obj: object): object => {
+    const runId = (obj as { runId?: unknown }).runId;
+    if (typeof runId !== "string") return obj;
+    const secrets = secretsOf(runId);
+    if (secrets.length === 0) return obj;
+    const walked = redactJson(obj, secrets) as Record<string, unknown>;
+    const err = walked["err"];
+    if (err instanceof Error) {
+      walked["err"] = {
+        name: err.name,
+        message: redactSecrets(err.message, secrets),
+        stack: err.stack === undefined ? undefined : redactSecrets(err.stack, secrets),
+      };
+    }
+    return walked;
+  };
+
   const log = {
-    info: (obj: object, msg: string): void => logger?.info(obj, msg),
-    warn: (obj: object, msg: string): void => logger?.warn(obj, msg),
-    error: (obj: object, msg: string): void => logger?.error(obj, msg),
+    info: (obj: object, msg: string): void => logger?.info(redactLogObj(obj), msg),
+    warn: (obj: object, msg: string): void => logger?.warn(redactLogObj(obj), msg),
+    error: (obj: object, msg: string): void => logger?.error(redactLogObj(obj), msg),
   };
 
   function emitRunStatus(runId: string, status: RunStatus, error?: string): void {
-    db.events.append(runId, {
+    appendEvent(runId, {
       type: "run.status",
       status,
-      ...(error === undefined ? {} : { error }),
+      ...(error === undefined ? {} : { error: redactText(runId, error) }),
     });
     if (options.onRunStatus !== undefined) {
       try {
@@ -231,19 +303,21 @@ export function createFlowEngine(options: FlowEngineOptions): FlowEngine {
     const run = db.runs.get(runId);
     if (!run) return;
     const finalStatus = isTerminal(run.status) ? run.status : status;
+    // Output/error are the run's persisted verdict text — redacted before
+    // they ever touch the row (#93).
+    const output = patch.output === undefined ? undefined : redactText(runId, patch.output);
+    const error = patch.error === undefined ? undefined : redactText(runId, patch.error);
     if (!isTerminal(run.status)) {
       db.runs.update(runId, {
         status,
-        ...(patch.output === undefined || patch.output.length === 0
-          ? {}
-          : { output: patch.output }),
-        ...(patch.error === undefined ? {} : { error: patch.error }),
+        ...(output === undefined || output.length === 0 ? {} : { output }),
+        ...(error === undefined ? {} : { error }),
       });
       settleStepRuns(runId, status);
-    } else if (patch.output !== undefined && patch.output.length > 0) {
-      db.runs.update(runId, { output: patch.output });
+    } else if (output !== undefined && output.length > 0) {
+      db.runs.update(runId, { output });
     }
-    emitRunStatus(runId, finalStatus, patch.error);
+    emitRunStatus(runId, finalStatus, error);
     log.info({ runId, status: finalStatus }, "run finished");
   }
 
@@ -434,7 +508,7 @@ export function createFlowEngine(options: FlowEngineOptions): FlowEngine {
     });
 
     const stepRun = beginStepRun(runId, step, iteration);
-    db.events.append(runId, {
+    appendEvent(runId, {
       type: "step.started",
       stepId: step.stepId,
       stepName: step.stepName,
@@ -446,6 +520,8 @@ export function createFlowEngine(options: FlowEngineOptions): FlowEngine {
     // A restarted (resumed) step continues its own recorded session even when
     // the step is not configured continueSession; otherwise normal chaining.
     const sessionId = restartSessionId ?? (step.continueSession ? inheritedSessionId : undefined);
+    // Project secrets (#93): decrypted env merged into the driver process.
+    const secretEnv = runSecrets.get(runId)?.env;
     const handle = driver.start({
       cwd: worktreePath,
       prompt,
@@ -453,6 +529,9 @@ export function createFlowEngine(options: FlowEngineOptions): FlowEngine {
       ...(step.model === undefined ? {} : { model: step.model }),
       ...(step.agent === undefined ? {} : { agent: step.agent }),
       ...(sessionId === undefined ? {} : { sessionId }),
+      ...(secretEnv === undefined || Object.keys(secretEnv).length === 0
+        ? {}
+        : { env: { ...secretEnv } }),
     });
     control.onHandle?.(handle);
 
@@ -460,7 +539,7 @@ export function createFlowEngine(options: FlowEngineOptions): FlowEngine {
     let sessionFromEvents: string | undefined;
     try {
       for await (const event of handle.events) {
-        db.events.append(runId, event);
+        appendEvent(runId, event);
         if (event.type === "session") {
           sessionFromEvents = event.sessionId;
           db.stepRuns.update(stepRun.id, { sessionId: event.sessionId });
@@ -501,10 +580,10 @@ export function createFlowEngine(options: FlowEngineOptions): FlowEngine {
 
     db.stepRuns.update(stepRun.id, {
       status,
-      output: exit.output,
-      ...(diff.length > 0 ? { diff } : {}),
+      output: redactText(runId, exit.output),
+      ...(diff.length > 0 ? { diff: redactText(runId, diff) } : {}),
     });
-    db.events.append(runId, {
+    appendEvent(runId, {
       type: "step.completed",
       stepId: step.stepId,
       stepName: step.stepName,
@@ -533,6 +612,9 @@ export function createFlowEngine(options: FlowEngineOptions): FlowEngine {
     abortRun,
     captureDiff,
     beginStepRun,
+    appendEvent,
+    redactText,
+    runSecretsEnv: (runId) => runSecrets.get(runId)?.env,
   };
 
   async function execute(
@@ -552,6 +634,24 @@ export function createFlowEngine(options: FlowEngineOptions): FlowEngine {
     if (control.isAbortRequested()) {
       abortRun(runId);
       return;
+    }
+
+    // Project secrets snapshot (#93): resolved once, before anything runs,
+    // so every subsequent write can redact. Loader failures fail the run —
+    // never execute with secrets that cannot be redacted (fail-closed).
+    if (options.loadRunSecrets !== undefined) {
+      let loaded: RunSecrets | undefined;
+      try {
+        loaded = options.loadRunSecrets(run);
+      } catch (err) {
+        runSecrets.delete(runId);
+        finalizeRun(runId, "failed", {
+          error: `failed to load project secrets: ${describeError(err)}`,
+        });
+        return;
+      }
+      if (loaded === undefined) runSecrets.delete(runId);
+      else runSecrets.set(runId, loaded);
     }
 
     db.runs.updateStatus(runId, "running");
@@ -731,7 +831,7 @@ export function createFlowEngine(options: FlowEngineOptions): FlowEngine {
         detail = `${description} unmet; jumping back to step ${loopBack.toStepIndex + 1} of ${steps.length}`;
       }
 
-      db.events.append(runId, {
+      appendEvent(runId, {
         type: "loop.iteration",
         iteration,
         verdict,
@@ -760,10 +860,12 @@ export function createFlowEngine(options: FlowEngineOptions): FlowEngine {
         log.error({ err, runId }, "flow engine crashed unexpectedly");
         const run = db.runs.get(runId);
         if (run && !isTerminal(run.status)) {
-          db.runs.update(runId, { status: "failed", error: message });
+          db.runs.update(runId, { status: "failed", error: redactText(runId, message) });
           settleStepRuns(runId, "failed");
           emitRunStatus(runId, "failed", message);
         }
+      } finally {
+        runSecrets.delete(runId);
       }
     },
   };

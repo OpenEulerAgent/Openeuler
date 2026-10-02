@@ -9,7 +9,8 @@ import type {
   StepRun,
   WorkflowGraph,
 } from "@openeuler/core";
-import type { Db } from "@openeuler/db";
+import type { Db, EventInput } from "@openeuler/db";
+import type { PersistedEvent } from "@openeuler/core";
 import type { AgentDriver, DriverRegistry } from "@openeuler/drivers";
 import {
   compileExitCondition,
@@ -116,6 +117,15 @@ export interface GraphEngineDeps {
   captureDiff(worktreePath: string, base: { ref: string }): Promise<string>;
   /** Creates (or re-uses a queued/interrupted) StepRun row, flipped to running. */
   beginStepRun(runId: string, step: { stepId: string }, iteration: number): StepRun;
+  /**
+   * Persists one event with the run's secret redaction applied to the
+   * payload (#93). All graph-path event writes go through here.
+   */
+  appendEvent(runId: string, event: EventInput): PersistedEvent;
+  /** Redacts a run-scoped free-text value (output, diff, error) (#93). */
+  redactText(runId: string, text: string): string;
+  /** The run's secret env (merged into driver starts); undefined = none. */
+  runSecretsEnv(runId: string): Record<string, string> | undefined;
 }
 
 /** Terminal outcome of one node execution. */
@@ -388,7 +398,7 @@ async function runNode(
   diffBase: { ref: string },
 ): Promise<NodeOutcome> {
   const { iteration } = cursor;
-  deps.db.events.append(runId, {
+  deps.appendEvent(runId, {
     type: "node.queued",
     nodeId: node.id,
     nodeName: node.name,
@@ -400,7 +410,7 @@ async function runNode(
     deps.db.runs.update(runId, { iteration: iteration - 1 });
   }
   const startedAtMs = Date.now();
-  deps.db.events.append(runId, {
+  deps.appendEvent(runId, {
     type: "node.started",
     nodeId: node.id,
     nodeName: node.name,
@@ -410,7 +420,7 @@ async function runNode(
 
   const fail = (error: string): NodeOutcome => {
     deps.db.stepRuns.update(stepRun.id, { status: "failed", output: "" });
-    deps.db.events.append(runId, {
+    deps.appendEvent(runId, {
       type: "node.completed",
       nodeId: node.id,
       nodeName: node.name,
@@ -418,7 +428,7 @@ async function runNode(
       status: "failed",
       output: "",
       durationMs: Math.max(0, Date.now() - startedAtMs),
-      error,
+      error: deps.redactText(runId, error),
     });
     appendBreadcrumb(deps, runId, state, { kind: "node", nodeId: node.id, iteration });
     return { status: "failed", output: "", error, sessionId: undefined };
@@ -453,6 +463,8 @@ async function runNode(
         : cursor.prevSessionId;
   }
   const sessionId = cursor.restartSessionId ?? inherited;
+  // Project secrets (#93): decrypted env merged into the driver process.
+  const secretEnv = deps.runSecretsEnv(runId);
   const handle = driver.start({
     cwd: worktreePath,
     prompt,
@@ -460,6 +472,9 @@ async function runNode(
     ...(node.config.model === undefined ? {} : { model: node.config.model }),
     ...(node.config.agent === undefined ? {} : { agent: node.config.agent }),
     ...(sessionId === undefined ? {} : { sessionId }),
+    ...(secretEnv === undefined || Object.keys(secretEnv).length === 0
+      ? {}
+      : { env: { ...secretEnv } }),
   });
   control.onHandle?.(handle);
 
@@ -467,7 +482,7 @@ async function runNode(
   let sessionFromEvents: string | undefined;
   try {
     for await (const event of handle.events) {
-      deps.db.events.append(runId, event);
+      deps.appendEvent(runId, event);
       if (event.type === "session") {
         sessionFromEvents = event.sessionId;
         deps.db.stepRuns.update(stepRun.id, { sessionId: event.sessionId });
@@ -504,18 +519,18 @@ async function runNode(
   const effectiveSessionId = sessionFromEvents ?? cursor.restartSessionId ?? inherited;
   deps.db.stepRuns.update(stepRun.id, {
     status,
-    output: exit.output,
-    ...(diff.length > 0 ? { diff } : {}),
+    output: deps.redactText(runId, exit.output),
+    ...(diff.length > 0 ? { diff: deps.redactText(runId, diff) } : {}),
   });
-  deps.db.events.append(runId, {
+  deps.appendEvent(runId, {
     type: "node.completed",
     nodeId: node.id,
     nodeName: node.name,
     iteration,
     status,
-    output: exit.output,
+    output: exit.output === "" ? "" : deps.redactText(runId, exit.output),
     durationMs: Math.max(0, Date.now() - startedAtMs),
-    ...(error === undefined ? {} : { error }),
+    ...(error === undefined ? {} : { error: deps.redactText(runId, error) }),
   });
   appendBreadcrumb(deps, runId, state, { kind: "node", nodeId: node.id, iteration });
   deps.log.info({ runId, nodeId: node.id, iteration, status }, "node finished");
@@ -566,7 +581,7 @@ function routeFromNode(
     const { max, clampedFrom } = effectiveMaxIterations(winner);
     const taken = state.takenCounts.get(winner.id) ?? 0;
     if (taken >= max) {
-      deps.db.events.append(runId, {
+      deps.appendEvent(runId, {
         type: "edge.cap-reached",
         edgeId: winner.id,
         source: winner.source,
@@ -619,7 +634,7 @@ function takeEdge(
   sourceIteration: number,
   source: AgentGraphNode,
 ): Cursor | undefined {
-  deps.db.events.append(runId, {
+  deps.appendEvent(runId, {
     type: "edge.taken",
     edgeId: edge.id,
     source: edge.source,

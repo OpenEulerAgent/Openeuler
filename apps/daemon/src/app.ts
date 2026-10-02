@@ -18,6 +18,7 @@ import { createProjectsRouter } from "./routes/projects.js";
 import { createDriversRouter } from "./routes/drivers.js";
 import { createFilesRouter } from "./routes/files.js";
 import { createPresetsRouter } from "./routes/presets.js";
+import { createSecretsRouter } from "./routes/secrets.js";
 import type { EventStreamOptions, GlobalStreamOptions } from "./routes/runs.js";
 import { createRunsRouter } from "./routes/runs.js";
 import type { SystemRouterOptions } from "./routes/system.js";
@@ -34,6 +35,8 @@ export interface AppEnv {
     executor: Executor | undefined;
     /** Worktree manager; required for live cumulative diffs (`GET /api/runs/:id/diff`). */
     worktrees: WorktreeManager | undefined;
+    /** Master key for project secrets (#93); unset = secrets routes answer 503. */
+    secretsKey: Buffer | undefined;
   };
 }
 
@@ -68,6 +71,12 @@ export interface CreateAppOptions {
    * `?token=`). Defaults to `$OPENEULER_TOKEN`; unset = open mode.
    */
   authToken?: string;
+  /**
+   * Master key for per-project secrets (#93), loaded at boot by
+   * `loadOrCreateSecretKey`. Without it the secrets API answers 503 and
+   * runs execute without secret env injection.
+   */
+  secretsKey?: Buffer;
 }
 
 export interface DaemonApp {
@@ -106,7 +115,11 @@ export function createApp(options: CreateAppOptions = {}): DaemonApp {
   // A set-but-empty OPENEULER_TOKEN is almost certainly a misconfiguration
   // (someone meant to lock the daemon) — surface it loudly at boot instead
   // of silently degrading to open mode.
-  if (!authRequired && (process.env.OPENEULER_TOKEN ?? "").trim() === "" && process.env.OPENEULER_TOKEN !== undefined) {
+  if (
+    !authRequired &&
+    (process.env.OPENEULER_TOKEN ?? "").trim() === "" &&
+    process.env.OPENEULER_TOKEN !== undefined
+  ) {
     options.logger?.warn(
       { env: "OPENEULER_TOKEN" },
       "OPENEULER_TOKEN is set but empty — running in OPEN mode; set a non-empty value to require auth",
@@ -134,9 +147,7 @@ export function createApp(options: CreateAppOptions = {}): DaemonApp {
         path: c.req.path,
         // Query string with the SSE `token` param redacted (#92) — the token
         // must never reach the logs.
-        ...(queryIndex === -1
-          ? {}
-          : { query: redactTokenQuery(c.req.url.slice(queryIndex)) }),
+        ...(queryIndex === -1 ? {} : { query: redactTokenQuery(c.req.url.slice(queryIndex)) }),
         status: c.res.status,
         durationMs: Math.round(performance.now() - start),
       },
@@ -155,6 +166,7 @@ export function createApp(options: CreateAppOptions = {}): DaemonApp {
     c.set("db", db);
     c.set("executor", executor);
     c.set("worktrees", worktrees);
+    c.set("secretsKey", options.secretsKey);
     return next();
   });
 
@@ -165,6 +177,7 @@ export function createApp(options: CreateAppOptions = {}): DaemonApp {
   app.route("/api/projects", createProjectsRouter());
   app.route("/api/projects", createFilesRouter());
   app.route("/api/projects", createPresetsRouter());
+  app.route("/api/projects", createSecretsRouter());
   app.route("/api/drivers", createDriversRouter(options.drivers));
   // The system router reads the worktree store root from the context.
   app.route("/api/system", createSystemRouter({ ...options.system, authRequired }));

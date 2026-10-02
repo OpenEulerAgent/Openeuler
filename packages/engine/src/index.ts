@@ -30,6 +30,8 @@ export {
   type FlowEngineOptions,
   type FlowLogger,
   type RunControl,
+  type RunSecrets,
+  type RunSecretsLoader,
   type StepDefinition,
 } from "./flow-engine.js";
 

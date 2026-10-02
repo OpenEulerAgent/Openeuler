@@ -50,8 +50,16 @@ export function isTerminalStatus(status: RunStatus): boolean {
  * driver stalls mid-stream), and the engine's later closing event must not
  * duplicate the feed entry. Never throws into the caller: a failed append
  * is a lost feed entry, not a lost run.
+ *
+ * `redact` (#93), when provided, scrubs secret values from the payload's
+ * free text (`task`) before it is persisted.
  */
-export function recordRunStatusActivity(db: Db, runId: string, status: RunStatus): void {
+export function recordRunStatusActivity(
+  db: Db,
+  runId: string,
+  status: RunStatus,
+  redact?: (text: string) => string,
+): void {
   const type = runActivityType(status);
   if (type === null) return;
   try {
@@ -69,7 +77,9 @@ export function recordRunStatusActivity(db: Db, runId: string, status: RunStatus
       payload: {
         status,
         branch: run.branch,
-        ...(run.task === undefined || run.task.length === 0 ? {} : { task: run.task }),
+        ...(run.task === undefined || run.task.length === 0
+          ? {}
+          : { task: redact === undefined ? run.task : redact(run.task) }),
       },
     });
   } catch {

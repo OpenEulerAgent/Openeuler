@@ -122,6 +122,42 @@ export interface WorkflowRevisionRepo {
   deleteAllForWorkflow(workflowId: string): number;
 }
 
+/** One stored project secret; the value stays encrypted (`valueEnc`). */
+export interface ProjectSecret {
+  id: string;
+  projectId: string;
+  name: string;
+  /** AES-256-GCM ciphertext envelope (`v1:<iv>:<tag>:<cipher>`, base64 parts). */
+  valueEnc: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+/** Name-only projection the API may safely return (values never leave the daemon). */
+export interface ProjectSecretName {
+  name: string;
+  createdAt: string;
+}
+
+export interface ProjectSecretRepo {
+  /**
+   * Upserts the (projectId, name) secret to `valueEnc`; the creating insert
+   * keeps its `createdAt`, an update only bumps `updatedAt`. The repo mints
+   * the id.
+   */
+  set(projectId: string, name: string, valueEnc: string): ProjectSecret;
+  /** Deletes the named secret; true when a row was removed. */
+  delete(projectId: string, name: string): boolean;
+  /** Names + createdAt for a project, ordered by name. Values never included. */
+  listNames(projectId: string): ProjectSecretName[];
+  /** Full row (encrypted value) for one secret, for the executor's decrypt path. */
+  get(projectId: string, name: string): ProjectSecret | undefined;
+  /** Every full row for a project (encrypted values), for run-start loading. */
+  list(projectId: string): ProjectSecret[];
+  /** Deletes every secret of a project (project delete path). Returns rows removed. */
+  deleteAllForProject(projectId: string): number;
+}
+
 /** Fields of an agent preset that may change after creation; `null` clears `icon`. */
 export type AgentPresetPatch = {
   name?: string;
@@ -520,6 +556,95 @@ export function createAgentPresetRepo(db: Db): AgentPresetRepo {
       const result = db
         .delete(schema.agentPresets)
         .where(eq(schema.agentPresets.projectId, projectId))
+        .run();
+      return result.changes;
+    },
+  };
+}
+
+export function createProjectSecretRepo(db: Db): ProjectSecretRepo {
+  return {
+    set(projectId, name, valueEnc) {
+      const now = new Date().toISOString();
+      return db.transaction((tx) => {
+        const existing = tx
+          .select()
+          .from(schema.projectSecrets)
+          .where(
+            and(
+              eq(schema.projectSecrets.projectId, projectId),
+              eq(schema.projectSecrets.name, name),
+            ),
+          )
+          .get();
+        if (existing !== undefined) {
+          const row = tx
+            .update(schema.projectSecrets)
+            .set({ valueEnc, updatedAt: now })
+            .where(eq(schema.projectSecrets.id, existing.id))
+            .returning()
+            .get();
+          return row as typeof schema.projectSecrets.$inferSelect;
+        }
+        const row = tx
+          .insert(schema.projectSecrets)
+          .values({
+            id: crypto.randomUUID(),
+            projectId,
+            name,
+            valueEnc,
+            createdAt: now,
+            updatedAt: now,
+          })
+          .returning()
+          .get();
+        return row as typeof schema.projectSecrets.$inferSelect;
+      });
+    },
+    delete(projectId, name) {
+      const result = db
+        .delete(schema.projectSecrets)
+        .where(
+          and(eq(schema.projectSecrets.projectId, projectId), eq(schema.projectSecrets.name, name)),
+        )
+        .run();
+      return result.changes > 0;
+    },
+    listNames(projectId) {
+      const rows = db
+        .select({ name: schema.projectSecrets.name, createdAt: schema.projectSecrets.createdAt })
+        .from(schema.projectSecrets)
+        .where(eq(schema.projectSecrets.projectId, projectId))
+        .orderBy(schema.projectSecrets.name)
+        .all();
+      return rows;
+    },
+    get(projectId, name) {
+      return (
+        db
+          .select()
+          .from(schema.projectSecrets)
+          .where(
+            and(
+              eq(schema.projectSecrets.projectId, projectId),
+              eq(schema.projectSecrets.name, name),
+            ),
+          )
+          .get() ?? undefined
+      );
+    },
+    list(projectId) {
+      return db
+        .select()
+        .from(schema.projectSecrets)
+        .where(eq(schema.projectSecrets.projectId, projectId))
+        .orderBy(schema.projectSecrets.name)
+        .all();
+    },
+    deleteAllForProject(projectId) {
+      const result = db
+        .delete(schema.projectSecrets)
+        .where(eq(schema.projectSecrets.projectId, projectId))
         .run();
       return result.changes;
     },
