@@ -36,6 +36,8 @@ const TYPE_VARIANT: Record<ActivityType, BadgeVariant> = {
   "ops.daemon-boot": "neutral",
   "ops.recovery-sweep": "neutral",
   "ops.gc": "neutral",
+  "ops.image-pull": "neutral",
+  "ops.image-build": "neutral",
 };
 
 const TYPE_ICON: Record<ActivityType, string> = {
@@ -49,6 +51,8 @@ const TYPE_ICON: Record<ActivityType, string> = {
   "ops.daemon-boot": "⚙",
   "ops.recovery-sweep": "⚙",
   "ops.gc": "⚙",
+  "ops.image-pull": "⬇",
+  "ops.image-build": "⛏",
 };
 
 /** Icon block for one feed item (text glyphs — no per-type art assets yet). */

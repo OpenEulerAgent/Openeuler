@@ -48,6 +48,10 @@ const stubFetch = (): void => {
   fetchMock.mockImplementation(async (url: string | URL, init?: RequestInit) => {
     const path = String(url);
     calls.push({ url: path, init });
+    // Sandbox section (#100): an empty catalog keeps the hub quiet.
+    if (path.includes("/api/sandbox/images")) {
+      return jsonResponse({ images: [] });
+    }
     if (path.endsWith("/api/system/maintenance")) {
       maintenanceBodies.push(
         typeof init?.body === "string" ? (JSON.parse(init.body) as Record<string, unknown>) : {},

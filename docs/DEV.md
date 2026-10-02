@@ -181,6 +181,18 @@ Read-only daemon facts for the settings page (#95), plus its danger-zone actions
 
 The web renders these as the settings hub cards (System / Drivers / Concurrency / Storage with shared-scale usage bars, Danger zone); destructive actions confirm in a dialog — type-to-confirm (`purge`) plus a days input only for the purge — and report counts as toasts before refetching.
 
+### Sandbox image management (`/api/sandbox/*`, #100)
+
+What sandboxes run on, from the settings page's Sandbox section. The daemon composes a `DockerSandboxProvider` at boot and registers it on the sandbox package's default registry; image operations go through the same argv-only `docker` CLI wrapper (no shell, injectable runners for tests). `GET /api/sandbox/status` is a separate milestone (#106).
+
+- `GET /api/sandbox/images` → `{images: [{repository, tag, id, sizeBytes, createdAt, ours}]}` — the catalog is NOT every local image: only repositories under the `openeuler/` namespace (`ours: true`, the ownership marker — docker cannot label images) plus a curated common-base list (`node:22-alpine`, `python:3.12-slim`, `golang:1.23`, `alpine:3.20`, `busybox:musl`, `denoland/deno:2`, `ours: false`). Sizes/creation times are enriched by one batched `docker image inspect` (exact bytes + RFC3339), falling back to parsing the `docker images` rows (decimal size strings, offset-timestamps) when an image vanishes mid-listing.
+- `POST /api/sandbox/images/pull {ref}` → `202 {jobId}` — async; refs are grammar-validated first (`422`, same conservative rules as sandbox specs: no flags/whitespace/uppercase/host-port registries) then passed verbatim to `docker pull`. One completion event `ops.image-pull {ref, done, error?}` lands in the activity feed — no per-line progress events. Concurrent pulls of the same ref dedupe onto one job.
+- `POST /api/sandbox/images/build {name, dockerfileText?, baseRef?}` → `202 {jobId, tag}` — builds `openeuler/<name>:latest` (`name` must match `^[a-z0-9._-]+$`) by piping the Dockerfile to `docker build -` with an **empty context** (v0.2 constraint: `COPY`/`ADD` have no files and fail). An empty `dockerfileText` + `baseRef` synthesizes `FROM <baseRef>`. Completion emits `ops.image-build {ref, name, done, error?}`.
+- `DELETE /api/sandbox/images/:ref` (percent-encoded) → `{deleted}` — checks the provider's sandboxes first (`409 IMAGE_IN_USE` with `details.sandboxes` when one runs the image; refs normalize `:latest` before comparing), then `docker image inspect` (`404 IMAGE_NOT_FOUND`) and `docker rmi` (docker-side conflicts also map to `409`).
+- `GET /api/sandbox/jobs/:id` → `{id, kind, ref, status: running|done|failed, error?, createdAt, finishedAt}` — in-memory job registry; jobs are lost on daemon restart (a vanished job is a 404, the image operation itself already completed or never started).
+
+The web client (`lib/sandbox-api.ts`) wraps these with `waitForSandboxJob` (1s poll loop); the Sandbox settings card renders the catalog table (repo:tag, size, age, ours/base badge), inline progress rows per running job, confirm-dialog deletes that surface 409s as danger toasts, and the pull/build forms (client-side name rule mirrored from the daemon).
+
 ## The web canvas
 
 ### Canvas data flow (schema ⇄ React Flow serialization)

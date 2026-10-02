@@ -88,6 +88,18 @@ function opsMessage(type: OpsActivityType, payload: Record<string, unknown> | un
       )}, ${plural(numberish(payload?.["orphanedWorktrees"]), "orphaned worktree")}`;
     case "ops.gc":
       return "Garbage collection ran";
+    case "ops.image-pull": {
+      const ref = typeof payload?.["ref"] === "string" ? (payload["ref"] as string) : "image";
+      return payload?.["done"] === false
+        ? `Image pull failed: ${ref}`
+        : `Image pulled: ${ref}`;
+    }
+    case "ops.image-build": {
+      const ref = typeof payload?.["ref"] === "string" ? (payload["ref"] as string) : "image";
+      return payload?.["done"] === false
+        ? `Image build failed: ${ref}`
+        : `Image built: ${ref}`;
+    }
   }
 }
 
