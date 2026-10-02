@@ -22,7 +22,7 @@ import {
   testCondition,
   type ConditionMatchRegion,
 } from "@/lib/graph/edge-inspector";
-import { issuesForEdge, type CanvasIssue } from "@/lib/graph/validation";
+import { issueHint, issuesForEdge, type CanvasIssue } from "@/lib/graph/validation";
 import { cn } from "@/lib/cn";
 
 /**
@@ -270,7 +270,7 @@ export function EdgePropertiesDrawer({
             </p>
             <ul className="mt-1 flex list-disc flex-col gap-0.5 pl-4 text-xs text-danger">
               {edgeIssues.map((issue, index) => (
-                <li key={index}>{issue.message}</li>
+                <li key={index}>{issueHint(issue) ?? issue.message}</li>
               ))}
             </ul>
           </div>

@@ -10,6 +10,9 @@ import {
 import {
   canvasDocsEquivalent,
   canvasEdgeId,
+  createAgentNode,
+  createPresetAgentNode,
+  DEFAULT_AGENT_PROMPT_TEMPLATE,
   fromCanvasDocument,
   starterGraph,
   toCanvasDocument,
@@ -244,6 +247,56 @@ describe("canvas serialization round-trip", () => {
     });
     expect(fromCanvasDocument(doc).nodes[0]?.id).toBe("s1");
     expect(doc.nodes.some((node) => node.data.kind === "agent" && node.data.isEntry)).toBe(true);
+  });
+});
+
+describe("palette-drop prompt prefill (#68)", () => {
+  it("createAgentNode prefills a {{task}}-based default prompt", () => {
+    const node = createAgentNode();
+    expect(node.data.kind).toBe("agent");
+    if (node.data.kind !== "agent") throw new Error("unreachable");
+    expect(node.data.config.promptTemplate).toBe(DEFAULT_AGENT_PROMPT_TEMPLATE);
+    expect(node.data.config.promptTemplate).toContain("{{task}}");
+  });
+
+  it("the default prompt parses under the save-time schema (one connection from valid)", () => {
+    const doc: CanvasDocument = {
+      nodes: [createAgentNode({ id: "entry", isEntry: true }), createAgentNode({ id: "next" })],
+      edges: [{ id: "e-entry-next", source: "entry", target: "next", data: { condition: { type: "always" } } }],
+    };
+    expect(() => WorkflowGraphSchema.parse(fromCanvasDocument(doc))).not.toThrow();
+  });
+
+  it("preset drops keep the preset's prompt, but fall back to the default when empty", () => {
+    const withPrompt = createPresetAgentNode({
+      preset: {
+        id: "p1",
+        name: "Reviewer",
+        config: {
+          driver: "opencode",
+          mode: "auto",
+          promptTemplate: "review: {{task}}",
+          continueSession: false,
+        },
+      },
+    });
+    if (withPrompt.data.kind !== "agent") throw new Error("unreachable");
+    expect(withPrompt.data.config.promptTemplate).toBe("review: {{task}}");
+
+    const withEmpty = createPresetAgentNode({
+      preset: {
+        id: "p2",
+        name: "Blank",
+        config: {
+          driver: "opencode",
+          mode: "auto",
+          promptTemplate: "",
+          continueSession: false,
+        },
+      },
+    });
+    if (withEmpty.data.kind !== "agent") throw new Error("unreachable");
+    expect(withEmpty.data.config.promptTemplate).toBe(DEFAULT_AGENT_PROMPT_TEMPLATE);
   });
 });
 

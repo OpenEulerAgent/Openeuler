@@ -9,7 +9,7 @@ import { fromCanvasDocument, type CanvasDocument } from "./canvas-document";
 /**
  * Canvas validation UX (#46): client-side pre-validation with the daemon's
  * exact rules (zod schemas from core), plus mapping of daemon 422 `details`
- * paths onto canvas targets (which node/edge gets the red badge).
+ * paths onto canvas targets (which node/edge gets the badge).
  *
  * Both sources produce the same {@link CanvasIssue} shape, so the summary
  * panel and badges cover client-side and server-side findings identically.
@@ -24,6 +24,17 @@ export interface CanvasIssue {
   /** Dot-joined field path under the node/edge (e.g. `config.promptTemplate`). */
   field?: string;
 }
+
+/**
+ * Severity split (#68): structural work-in-progress findings surface as
+ * amber hints mid-editing; everything else is a hard red blocker. The split
+ * is purely visual/tonal — ANY issue still blocks saving.
+ */
+export type IssueSeverity = "hint" | "blocker";
+
+/** Friendly action copy for the hint class of issues (shown in the panel). */
+export const UNREACHABLE_HINT = "Connect this node to the flow";
+export const MISSING_CONDITION_HINT = "Set a condition on this edge";
 
 interface PathTarget {
   nodeId?: string;
@@ -71,6 +82,14 @@ function dedupe(issues: CanvasIssue[]): CanvasIssue[] {
     unique.push(issue);
   }
   return unique;
+}
+
+/**
+ * Collapses overlapping issues from multiple sources (live client validation
+ * + daemon 422 mappings) onto one list, keeping first-seen order.
+ */
+export function dedupeIssues(...lists: readonly CanvasIssue[][]): CanvasIssue[] {
+  return dedupe(lists.flat());
 }
 
 /**
@@ -139,4 +158,79 @@ export function badgeLabelFor(issues: readonly CanvasIssue[]): string {
   if (issues.length === 0) return "";
   const first = issues[0] as CanvasIssue;
   return issues.length === 1 ? "1 issue" : `${issues.length} issues — ${first.message}`;
+}
+
+// ---------------------------------------------------------------------------
+// Severity classification (#68)
+//
+
+/**
+ * Node-attributed reachability finding from `validateWorkflowGraph`
+ * (`node "…" is not reachable from the entry node "…"`): expected
+ * mid-editing while the user is still wiring a freshly dropped node.
+ */
+function isUnreachableIssue(issue: CanvasIssue): boolean {
+  return (
+    issue.nodeId !== undefined &&
+    issue.edgeId === undefined &&
+    issue.message.includes("is not reachable from the entry node")
+  );
+}
+
+/**
+ * Edge-attributed "condition not filled in yet" finding: the zod
+ * non-empty-string violation on a conditional edge's `pattern`/`regex` —
+ * the placeholder state the type switcher creates. A typed-but-broken
+ * regex (does not compile / bad flags) is a hard blocker instead.
+ */
+function isMissingConditionIssue(issue: CanvasIssue): boolean {
+  return (
+    issue.edgeId !== undefined &&
+    (issue.field === "condition.pattern" || issue.field === "condition.regex") &&
+    issue.message.includes("must be a non-empty string")
+  );
+}
+
+/**
+ * Pure severity mapping for an issue: `'hint'` for structural WIP
+ * (unreachable node, edge missing its condition pattern), `'blocker'` for
+ * everything else (empty prompt, bad regex, dual-always, exit-node outgoing
+ * edges, non-upstream `{{output:}}`, …). Purely tonal — both severities
+ * block the save; see the editor's save gating.
+ */
+export function classifyIssue(issue: CanvasIssue): IssueSeverity {
+  if (isUnreachableIssue(issue) || isMissingConditionIssue(issue)) return "hint";
+  return "blocker";
+}
+
+/** Friendly "what to do" copy for a hint issue (undefined for blockers). */
+export function issueHint(issue: CanvasIssue): string | undefined {
+  if (isUnreachableIssue(issue)) return UNREACHABLE_HINT;
+  if (isMissingConditionIssue(issue)) return MISSING_CONDITION_HINT;
+  return undefined;
+}
+
+/** Issues split by severity, blockers first. */
+export function splitIssuesBySeverity(issues: readonly CanvasIssue[]): {
+  blockers: CanvasIssue[];
+  hints: CanvasIssue[];
+} {
+  const blockers: CanvasIssue[] = [];
+  const hints: CanvasIssue[] = [];
+  for (const issue of issues) {
+    (classifyIssue(issue) === "hint" ? hints : blockers).push(issue);
+  }
+  return { blockers, hints };
+}
+
+/**
+ * One-line severity summary for panels/toasts, e.g. `"2 blockers · 1 hint"`;
+ * empty string when there are no issues.
+ */
+export function severitySummary(issues: readonly CanvasIssue[]): string {
+  const { blockers, hints } = splitIssuesBySeverity(issues);
+  const parts: string[] = [];
+  if (blockers.length > 0) parts.push(`${blockers.length} blocker${blockers.length === 1 ? "" : "s"}`);
+  if (hints.length > 0) parts.push(`${hints.length} hint${hints.length === 1 ? "" : "s"}`);
+  return parts.join(" · ");
 }

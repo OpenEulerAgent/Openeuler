@@ -6,11 +6,20 @@ import {
   type CanvasDocument,
   type CanvasNode,
 } from "./canvas-document";
+import { applyConnect, checkConnect } from "./canvas-ops";
 import {
   validateCanvasDocument,
   issuesFromApiDetails,
   issuesForEdge,
   issuesForNode,
+  classifyIssue,
+  issueHint,
+  dedupeIssues,
+  severitySummary,
+  splitIssuesBySeverity,
+  UNREACHABLE_HINT,
+  MISSING_CONDITION_HINT,
+  type CanvasIssue,
 } from "./validation";
 
 function node(
@@ -176,6 +185,205 @@ describe("validateCanvasDocument", () => {
     const edgeIssues = issuesForEdge(issues, "e-b-a");
     expect(edgeIssues.length).toBeGreaterThan(0);
     expect(issuesForEdge(issues, "e-a-b")).toEqual([]);
+  });
+});
+
+describe("classifyIssue (severity split, #68)", () => {
+  it("unreachable-from-entry nodes are hints", () => {
+    const doc: CanvasDocument = {
+      nodes: [
+        node("a", { isEntry: true }),
+        node("b", { position: { x: 300, y: 0 } }),
+        node("orphan", { position: { x: 0, y: 300 } }),
+        exit("x"),
+      ],
+      edges: [edge("a", "b", "always"), edge("b", "x", "always"), edge("orphan", "x", "always")],
+    };
+    const unreachable = validateCanvasDocument(doc).find((issue) =>
+      issue.message.includes("not reachable"),
+    );
+    expect(unreachable).toBeDefined();
+    expect(classifyIssue(unreachable as CanvasIssue)).toBe("hint");
+    expect(issueHint(unreachable as CanvasIssue)).toBe(UNREACHABLE_HINT);
+  });
+
+  it("edges missing their condition pattern are hints", () => {
+    const doc: CanvasDocument = {
+      nodes: [node("a", { isEntry: true }), exit("x")],
+      edges: [edge("a", "x", { pattern: "" })],
+    };
+    const missing = validateCanvasDocument(doc).find((issue) =>
+      issue.message.includes("pattern must be a non-empty string"),
+    );
+    expect(missing).toBeDefined();
+    expect(classifyIssue(missing as CanvasIssue)).toBe("hint");
+    expect(issueHint(missing as CanvasIssue)).toBe(MISSING_CONDITION_HINT);
+  });
+
+  it("edges with an empty regex placeholder are hints too", () => {
+    const doc: CanvasDocument = {
+      nodes: [node("a", { isEntry: true }), exit("x")],
+      edges: [
+        {
+          id: "e-a-x",
+          source: "a",
+          target: "x",
+          data: { condition: { type: "outputMatches", regex: "" } },
+        },
+      ],
+    };
+    const missing = validateCanvasDocument(doc).find((issue) =>
+      issue.message.includes("regex must be a non-empty string"),
+    );
+    expect(missing).toBeDefined();
+    expect(classifyIssue(missing as CanvasIssue)).toBe("hint");
+  });
+
+  it("a typed-but-broken regex is a blocker, not a hint", () => {
+    const doc: CanvasDocument = {
+      nodes: [node("a", { isEntry: true }), exit("x")],
+      edges: [
+        {
+          id: "e-a-x",
+          source: "a",
+          target: "x",
+          data: { condition: { type: "outputMatches", regex: "([a-z" } },
+        },
+      ],
+    };
+    const broken = validateCanvasDocument(doc).find((issue) =>
+      issue.message.includes("invalid regular expression"),
+    );
+    expect(broken).toBeDefined();
+    expect(classifyIssue(broken as CanvasIssue)).toBe("blocker");
+    expect(issueHint(broken as CanvasIssue)).toBeUndefined();
+  });
+
+  it("an empty prompt (user-cleared) is a blocker", () => {
+    const doc: CanvasDocument = {
+      nodes: [
+        node("a", { isEntry: true }),
+        node("b", { promptTemplate: "", position: { x: 300, y: 0 } }),
+      ],
+      edges: [edge("a", "b", "always")],
+    };
+    const emptyPrompt = validateCanvasDocument(doc).find((issue) =>
+      issue.message.includes("promptTemplate"),
+    );
+    expect(emptyPrompt).toBeDefined();
+    expect(classifyIssue(emptyPrompt as CanvasIssue)).toBe("blocker");
+  });
+
+  it("hard graph rules are blockers", () => {
+    const dualAlways: CanvasDocument = {
+      nodes: [
+        node("a", { isEntry: true }),
+        node("b", { position: { x: 300, y: -100 } }),
+        node("c", { position: { x: 300, y: 100 } }),
+      ],
+      edges: [edge("a", "b", "always"), edge("a", "c", "always")],
+    };
+    const dual = validateCanvasDocument(dualAlways).find((issue) =>
+      issue.message.includes("unconditional (always) outgoing edges"),
+    );
+    expect(classifyIssue(dual as CanvasIssue)).toBe("blocker");
+
+    const exitOutgoing: CanvasDocument = {
+      nodes: [node("a", { isEntry: true }), exit("x", { x: 300, y: 0 }), node("b")],
+      edges: [edge("a", "x", "always"), edge("x", "b", "always")],
+    };
+    const exitIssue = validateCanvasDocument(exitOutgoing).find((issue) =>
+      issue.message.includes("must not have outgoing edges"),
+    );
+    expect(classifyIssue(exitIssue as CanvasIssue)).toBe("blocker");
+
+    const badReference: CanvasDocument = {
+      nodes: [
+        node("a", { isEntry: true }),
+        node("b", { promptTemplate: "use {{output:ghost}}", position: { x: 300, y: 0 } }),
+      ],
+      edges: [edge("a", "b", "always")],
+    };
+    const reference = validateCanvasDocument(badReference).find((issue) =>
+      issue.message.includes("not an upstream node"),
+    );
+    expect(classifyIssue(reference as CanvasIssue)).toBe("blocker");
+  });
+});
+
+describe("live validation over a palette drop (#68)", () => {
+  const entry = node("a", { isEntry: true });
+  const dropped: CanvasNode = createAgentNode({
+    id: "dropped",
+    position: { x: 300, y: 0 },
+    name: "Agent 2",
+  });
+  const withPrompt = (prompt: string): CanvasNode => {
+    if (dropped.data.kind !== "agent") throw new Error("unreachable");
+    return {
+      ...dropped,
+      data: { ...dropped.data, config: { ...dropped.data.config, promptTemplate: prompt } },
+    };
+  };
+
+  it("a fresh palette drop (prefilled prompt) yields ONLY the unreachable hint", () => {
+    const doc: CanvasDocument = { nodes: [entry, dropped], edges: [] };
+    const issues = validateCanvasDocument(doc);
+    expect(issues).toHaveLength(1);
+    expect(classifyIssue(issues[0] as CanvasIssue)).toBe("hint");
+    expect(issues[0]?.nodeId).toBe("dropped");
+    expect(severitySummary(issues)).toBe("1 hint");
+  });
+
+  it("connecting the dropped node clears every issue (one connection from valid)", () => {
+    const doc: CanvasDocument = { nodes: [entry, dropped], edges: [] };
+    const check = checkConnect(doc, { source: "a", target: "dropped" });
+    if (!check.ok) throw new Error("expected connect to succeed");
+    const connected = applyConnect(doc, check);
+    expect(validateCanvasDocument(connected)).toEqual([]);
+  });
+
+  it("clearing the prompt manually turns the doc into a blocker", () => {
+    const cleared: CanvasDocument = {
+      nodes: [entry, withPrompt("")],
+      edges: [edge("a", "dropped", "always")],
+    };
+    const issues = validateCanvasDocument(cleared);
+    expect(issues).toHaveLength(1);
+    expect(classifyIssue(issues[0] as CanvasIssue)).toBe("blocker");
+  });
+
+  it("mixed docs split blockers-first and summarize with counts", () => {
+    const doc: CanvasDocument = {
+      nodes: [
+        node("a", { isEntry: true }),
+        { ...node("empty", { promptTemplate: "", position: { x: 300, y: 0 } }) },
+        node("orphan", { position: { x: 0, y: 300 } }),
+      ],
+      edges: [edge("a", "empty", "always")],
+    };
+    const issues = validateCanvasDocument(doc);
+    const { blockers, hints } = splitIssuesBySeverity(issues);
+    expect(blockers.length).toBe(1);
+    expect(hints.length).toBe(1);
+    expect(blockers[0]?.nodeId).toBe("empty");
+    expect(hints[0]?.nodeId).toBe("orphan");
+    expect(severitySummary(issues)).toBe("1 blocker · 1 hint");
+    expect(severitySummary([])).toBe("");
+    expect(severitySummary(blockers)).toBe("1 blocker");
+    expect(severitySummary(hints)).toBe("1 hint");
+  });
+
+  it("dedupeIssues collapses identical client + daemon findings", () => {
+    const client: CanvasIssue = {
+      nodeId: "b",
+      field: "config.promptTemplate",
+      message: "promptTemplate must be a non-empty string",
+    };
+    expect(dedupeIssues([client], [client, { nodeId: "z", message: "other" }])).toEqual([
+      client,
+      { nodeId: "z", message: "other" },
+    ]);
   });
 });
 
