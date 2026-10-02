@@ -14,7 +14,16 @@ export interface SandboxResources {
   memoryMb?: number;
 }
 
-/** Network exposure of a sandbox. `none` = fully isolated. */
+/**
+ * Network exposure of a sandbox.
+ * - `none` — fully isolated (no networking, not even DNS)
+ * - `limited` — outbound DNS resolution plus an operator-configured egress
+ *   allowlist; everything else blocked. Providers without native support
+ *   approximate this (the docker provider uses a dedicated bridge network
+ *   with DNS plus documented allowlist plumbing) and MUST document their
+ *   approximation in the provider README.
+ * - `default` — normal outbound access.
+ */
 export type SandboxNetworkMode = "none" | "limited" | "default";
 
 /** Requested sandbox configuration, validated by providers at `create()`. */
