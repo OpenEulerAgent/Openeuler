@@ -7,6 +7,7 @@ import {
   deleteWorkflow,
   fetchAgentPresets,
   fetchDriverIds,
+  fetchDriverIdsResult,
   fetchWorkflow,
   fetchWorkflowForEditor,
   fetchWorkflows,
@@ -134,6 +135,29 @@ describe("fetchDriverIds", () => {
     expect(await fetchDriverIds(failing as unknown as WorkflowFetcher)).toEqual(["opencode"]);
     const empty = vi.fn().mockResolvedValue({ drivers: [] });
     expect(await fetchDriverIds(empty as unknown as WorkflowFetcher)).toEqual(["opencode"]);
+  });
+});
+
+describe("fetchDriverIdsResult (#74: fallback signal for the create form)", () => {
+  it("reports the registered ids without a fallback flag", async () => {
+    const fetcher = vi.fn().mockResolvedValue({ drivers: ["fake", "opencode"] });
+    expect(await fetchDriverIdsResult(fetcher as unknown as WorkflowFetcher)).toEqual({
+      ids: ["fake", "opencode"],
+      fallback: false,
+    });
+  });
+
+  it("flags the default-list fallback when the daemon is unreachable or empty", async () => {
+    const failing = vi.fn().mockRejectedValue(new Error("down"));
+    expect(await fetchDriverIdsResult(failing as unknown as WorkflowFetcher)).toEqual({
+      ids: ["opencode"],
+      fallback: true,
+    });
+    const empty = vi.fn().mockResolvedValue({ drivers: [] });
+    expect(await fetchDriverIdsResult(empty as unknown as WorkflowFetcher)).toEqual({
+      ids: ["opencode"],
+      fallback: true,
+    });
   });
 });
 
