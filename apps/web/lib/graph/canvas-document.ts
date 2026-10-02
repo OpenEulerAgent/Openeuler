@@ -107,8 +107,16 @@ export interface CreateAgentNodeOptions {
 }
 
 /**
+ * Default prompt for palette-dropped agent nodes (#68): mirrors the starter
+ * graph's implementer prompt so a dropped node is one connection away from
+ * valid. Users edit it freely in the inspector.
+ */
+export const DEFAULT_AGENT_PROMPT_TEMPLATE = "Work on the following task:\n\n{{task}}";
+
+/**
  * A fresh agent node as the palette creates it: default driver, `auto` mode,
- * empty prompt (validation flags it until the user fills one in).
+ * and the `{{task}}`-based default prompt (an empty prompt only appears if
+ * the user deliberately clears it — which then validates live).
  */
 export function createAgentNode(options: CreateAgentNodeOptions = {}): CanvasNode {
   return {
@@ -122,7 +130,7 @@ export function createAgentNode(options: CreateAgentNodeOptions = {}): CanvasNod
       config: {
         driver: options.driver ?? "opencode",
         mode: "auto",
-        promptTemplate: "",
+        promptTemplate: DEFAULT_AGENT_PROMPT_TEMPLATE,
         continueSession: false,
       },
     },
@@ -159,10 +167,14 @@ export interface CreatePresetAgentNodeOptions {
  * A fresh agent node preconfigured from a preset (#49): name = the preset's
  * name (uniquified against `takenNames`), config a deep copy of the preset's
  * config, and `presetId` carried for the inspector badge. Later preset edits
- * never reach this node unless the user clicks "Update from preset".
+ * never reach this node unless the user clicks "Update from preset". A
+ * preset whose config carries an empty prompt falls back to the default
+ * `{{task}}` template, so every drop path lands a runnable prompt (#68).
  */
 export function createPresetAgentNode(options: CreatePresetAgentNodeOptions): CanvasNode {
   const { preset } = options;
+  const config = structuredClone(preset.config);
+  if (config.promptTemplate.length === 0) config.promptTemplate = DEFAULT_AGENT_PROMPT_TEMPLATE;
   return {
     id: newCanvasNodeId(),
     type: "agent",
@@ -173,7 +185,7 @@ export function createPresetAgentNode(options: CreatePresetAgentNodeOptions): Ca
         ? uniqueNodeName(preset.name, options.takenNames)
         : preset.name,
       isEntry: false,
-      config: structuredClone(preset.config),
+      config,
       presetId: preset.id,
     },
   };

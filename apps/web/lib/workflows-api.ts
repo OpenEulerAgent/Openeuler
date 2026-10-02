@@ -1,20 +1,37 @@
-import type { AgentPreset, Run, StepConfig, Workflow, WorkflowGraph } from "@openeuler/core";
+import type {
+  AgentPreset,
+  GraphSummary,
+  Run,
+  StepConfig,
+  Workflow,
+  WorkflowGraph,
+} from "@openeuler/core";
 import { ApiError, apiFetch } from "./api";
 
 /** Injectable transport so submit flows are testable without a browser. */
 export type WorkflowFetcher = typeof apiFetch;
 
+/**
+ * A workflow row as the LIST serves it (#70): the row plus the
+ * daemon-computed graph summary of the latest revision (absent for legacy
+ * workflows that were never saved as revisions).
+ */
+export type WorkflowListed = Workflow & {
+  graphSummary?: GraphSummary;
+};
+
 /** A workflow row plus the latest-revision graph the daemon serves with it. */
 export type WorkflowWithGraph = Workflow & {
   latestRevision?: { id: string; number: number };
   graph?: WorkflowGraph;
+  graphSummary?: GraphSummary;
 };
 
 export async function fetchWorkflows(
   projectId: string,
   fetcher: WorkflowFetcher = apiFetch,
-): Promise<Workflow[]> {
-  const body = await fetcher<{ workflows: Workflow[] }>(
+): Promise<WorkflowListed[]> {
+  const body = await fetcher<{ workflows: WorkflowListed[] }>(
     `/api/workflows?projectId=${encodeURIComponent(projectId)}`,
   );
   return body.workflows;
@@ -55,18 +72,36 @@ export async function fetchWorkflowForEditor(
 /** Driver dropdown fallback when `GET /api/drivers` is unreachable or empty. */
 const DEFAULT_DRIVER_IDS: readonly string[] = ["opencode"];
 
+/** Driver ids plus whether the static default list had to stand in (#74). */
+export interface DriverIdsResult {
+  ids: string[];
+  /** True when `/api/drivers` was unreachable or empty and the defaults are used. */
+  fallback: boolean;
+}
+
+/**
+ * Registered driver ids from `GET /api/drivers`, reporting whether the
+ * static default list had to stand in (#74) so callers can warn.
+ */
+export async function fetchDriverIdsResult(
+  fetcher: WorkflowFetcher = apiFetch,
+): Promise<DriverIdsResult> {
+  try {
+    const body = await fetcher<{ drivers: string[] }>("/api/drivers");
+    if (body.drivers.length > 0) return { ids: body.drivers, fallback: false };
+    return { ids: [...DEFAULT_DRIVER_IDS], fallback: true };
+  } catch {
+    return { ids: [...DEFAULT_DRIVER_IDS], fallback: true };
+  }
+}
+
 /**
  * Registered driver ids for the step dropdown, from `GET /api/drivers`.
  * Falls back to the static default list when the daemon is unreachable or
  * reports none (older daemon without the endpoint).
  */
 export async function fetchDriverIds(fetcher: WorkflowFetcher = apiFetch): Promise<string[]> {
-  try {
-    const body = await fetcher<{ drivers: string[] }>("/api/drivers");
-    return body.drivers.length > 0 ? body.drivers : [...DEFAULT_DRIVER_IDS];
-  } catch {
-    return [...DEFAULT_DRIVER_IDS];
-  }
+  return (await fetchDriverIdsResult(fetcher)).ids;
 }
 
 export async function deleteWorkflow(
@@ -164,18 +199,25 @@ export interface SavedGraph {
 /**
  * Canvas save (#46): `PUT /api/workflows/:id/graph` — validates server-side
  * (422 details carry node/edge paths) and snapshots the graph as the next
- * immutable revision.
+ * immutable revision. `expectedRevision` (#76) optionally pins the revision
+ * the editor is based on; a mismatch answers 409 REVISION_CONFLICT instead
+ * of silently overwriting the newer revision.
  */
 export async function saveWorkflowGraph(options: {
   workflowId: string;
   graph: unknown;
+  /** The latest revision the client knows; omit to save unconditionally. */
+  expectedRevision?: number;
   fetcher?: WorkflowFetcher;
 }): Promise<SavedGraph> {
-  const { workflowId, graph, fetcher = apiFetch } = options;
+  const { workflowId, graph, expectedRevision, fetcher = apiFetch } = options;
   return fetcher<SavedGraph>(`/api/workflows/${encodeURIComponent(workflowId)}/graph`, {
     method: "PUT",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ graph }),
+    body: JSON.stringify({
+      graph,
+      ...(expectedRevision === undefined ? {} : { expectedRevision }),
+    }),
   });
 }
 
@@ -196,6 +238,27 @@ export async function createWorkflowWithGraph(options: {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ projectId, name, graph }),
   });
+}
+
+/** One revision row as the LIST serves it (#77): no graph blobs. */
+export interface WorkflowRevisionListed {
+  id: string;
+  number: number;
+  createdAt: string;
+}
+
+/**
+ * Revision history (#77): `GET /api/workflows/:id/revisions` — number +
+ * createdAt per immutable snapshot, no graph payloads.
+ */
+export async function fetchWorkflowRevisions(
+  workflowId: string,
+  fetcher: WorkflowFetcher = apiFetch,
+): Promise<WorkflowRevisionListed[]> {
+  const body = await fetcher<{ revisions: WorkflowRevisionListed[] }>(
+    `/api/workflows/${encodeURIComponent(workflowId)}/revisions`,
+  );
+  return body.revisions;
 }
 
 /**

@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import type { Run, Step, Workflow, WorkflowGraph } from "@openeuler/core";
+import type { GraphSummary, Run, Step, Workflow, WorkflowGraph } from "@openeuler/core";
 import {
   LoopBackSchema,
   StepSchema,
@@ -8,6 +8,7 @@ import {
   idSchema,
   linearToGraph,
   loopBackToStepIndexIssue,
+  summarizeGraph,
 } from "@openeuler/core";
 import type { Db, WorkflowRevision } from "@openeuler/db";
 import { branchForRun } from "@openeuler/engine";
@@ -82,8 +83,22 @@ const PatchWorkflowBodySchema = z.strictObject({
   loopBack: LoopBackSchema.nullable().optional(),
 });
 
-/** PUT /:id/graph body: the full graph (validated + snapshotted as a new revision). */
-const PutGraphBodySchema = z.strictObject({ graph: WorkflowGraphSchema });
+/**
+ * PUT /:id/graph body: the full graph (validated + snapshotted as a new
+ * revision) plus the optional concurrency guard (#76): `expectedRevision`
+ * pins the revision the client edited — a mismatch with the current latest
+ * refuses the save with 409 REVISION_CONFLICT instead of silently winning
+ * last-writer-wins. Absent = current behavior (no check), so older clients
+ * keep working.
+ */
+const PutGraphBodySchema = z.strictObject({
+  graph: WorkflowGraphSchema,
+  expectedRevision: z
+    .number({ message: "expectedRevision must be a number" })
+    .int("expectedRevision must be an integer")
+    .min(1, "expectedRevision must be >= 1")
+    .optional(),
+});
 
 const CreateWorkflowRunBodySchema = z.strictObject({
   task: z.string().min(1, "task must be a non-empty string"),
@@ -177,6 +192,22 @@ export function ensureLatestRevision(db: Db, workflow: Workflow): WorkflowRevisi
   );
 }
 
+/**
+ * Workflow list row (#70): the row plus a graph summary computed from the
+ * latest revision snapshot — NOT the legacy steps mirror, which goes stale
+ * for graphs the linear shape cannot represent (routers, branches). The
+ * summary is absent for never-saved legacy workflows without revisions;
+ * those keep the steps-based display. Full graph blobs stay off the list.
+ */
+export function workflowListBody(
+  db: Db,
+  workflow: Workflow,
+): Workflow & { graphSummary?: GraphSummary } {
+  const latest = db.workflowRevisions.latest(workflow.id);
+  if (latest === undefined) return { ...workflow };
+  return { ...workflow, graphSummary: summarizeGraph(latest.graph, latest.number) };
+}
+
 /** Workflow API body: the row plus its latest revision pointer and graph. */
 export function workflowBody(
   db: Db,
@@ -184,6 +215,7 @@ export function workflowBody(
 ): Workflow & {
   latestRevision?: { id: string; number: number };
   graph?: WorkflowGraph;
+  graphSummary?: GraphSummary;
 } {
   const latest = db.workflowRevisions.latest(workflow.id);
   if (latest === undefined) return { ...workflow };
@@ -191,6 +223,7 @@ export function workflowBody(
     ...workflow,
     latestRevision: { id: latest.id, number: latest.number },
     graph: latest.graph,
+    graphSummary: summarizeGraph(latest.graph, latest.number),
   };
 }
 
@@ -252,7 +285,10 @@ export function createWorkflowsRouter(): Hono<AppEnv> {
 
   workflows.get("/", (c) => {
     const db = requireDb(c);
-    return c.json({ workflows: db.workflows.list(c.req.query("projectId") || undefined) });
+    const workflows = db.workflows
+      .list(c.req.query("projectId") || undefined)
+      .map((workflow) => workflowListBody(db, workflow));
+    return c.json({ workflows });
   });
 
   workflows.get("/:id", (c) => {
@@ -307,6 +343,18 @@ export function createWorkflowsRouter(): Hono<AppEnv> {
     const id = c.req.param("id");
     requireWorkflow(db, id);
     const body = PutGraphBodySchema.parse(await parseJsonBody(c));
+    // Concurrency guard (#76): the client pinned the revision it edited;
+    // a newer revision elsewhere refuses the save (409) with the current
+    // number so the editor can offer reload vs save-anyway.
+    const currentRevision = db.workflowRevisions.latest(id)?.number ?? 0;
+    if (body.expectedRevision !== undefined && body.expectedRevision !== currentRevision) {
+      throw new HttpError(
+        409,
+        "REVISION_CONFLICT",
+        `workflow ${id} is at revision ${currentRevision}, not the expected ${body.expectedRevision}`,
+        { currentRevision },
+      );
+    }
     const revision = db.workflowRevisions.create(id, body.graph);
     mirrorGraphToSteps(db, id, body.graph);
     c.get("logger").info({ workflowId: id, revision: revision.number }, "workflow graph saved");

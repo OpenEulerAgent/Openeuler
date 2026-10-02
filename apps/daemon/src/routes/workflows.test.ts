@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import type { Run, Step, Workflow } from "@openeuler/core";
+import type { GraphSummary, Run, Step, Workflow } from "@openeuler/core";
 import type { Db } from "@openeuler/db";
 import { createDatabase } from "@openeuler/db";
 import { createDriverRegistry, createFakeDriver } from "@openeuler/drivers";
@@ -614,6 +614,7 @@ describe("graph revisions (PUT /:id/graph, GET /:id/revisions)", () => {
       workflow: Workflow & {
         latestRevision?: { id: string; number: number };
         graph?: { entryNodeId: string; nodes: unknown[] };
+        graphSummary?: GraphSummary;
       };
       revision: { id: string; number: number };
     };
@@ -622,6 +623,14 @@ describe("graph revisions (PUT /:id/graph, GET /:id/revisions)", () => {
     expect(body.workflow.graph?.entryNodeId).toBe("n1");
     // The legacy steps mirror round-trips the chain.
     expect(body.workflow.steps.map((step) => step.id)).toEqual(["n1", "n2"]);
+    // The summary describes revision 1 (a plain chain: no loop, no router).
+    expect(body.workflow.graphSummary).toEqual({
+      nodeCount: 3,
+      edgeCount: 2,
+      hasLoop: false,
+      hasRouter: false,
+      revision: 1,
+    });
 
     // GET detail carries the same latest revision + graph.
     const got = (await (await h.request(`/api/workflows/${body.workflow.id}`)).json()) as {
@@ -730,6 +739,55 @@ describe("graph revisions (PUT /:id/graph, GET /:id/revisions)", () => {
     expect(missing.status).toBe(404);
   });
 
+  it("guards concurrent saves via expectedRevision (#76)", async () => {
+    const h = setup();
+    const workflow = await createWorkflow(h, {
+      projectId: h.projectId,
+      name: "conflict",
+      steps: h.makeSteps("first"),
+    });
+    expect(h.db.workflows.get(workflow.id)?.latestRevisionNumber).toBe(1);
+
+    const put = (body: Record<string, unknown>): Promise<Response> =>
+      h.request(`/api/workflows/${workflow.id}/graph`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+
+    // Correct expectation: the save proceeds and mints the next revision.
+    const ok = await put({ graph: makeGraph(), expectedRevision: 1 });
+    expect(ok.status).toBe(200);
+    const okBody = (await ok.json()) as { revision: { number: number } };
+    expect(okBody.revision.number).toBe(2);
+
+    // Stale expectation: 409 REVISION_CONFLICT naming the current revision,
+    // and NO new revision is minted by the refused save.
+    const stale = await put({ graph: makeGraph(), expectedRevision: 1 });
+    expect(stale.status).toBe(409);
+    const conflictBody = (await stale.json()) as {
+      error: { code: string; message: string; details: { currentRevision: number } };
+    };
+    expect(conflictBody.error.code).toBe("REVISION_CONFLICT");
+    expect(conflictBody.error.message).toContain("revision 2");
+    expect(conflictBody.error.details.currentRevision).toBe(2);
+    expect(h.db.workflows.get(workflow.id)?.latestRevisionNumber).toBe(2);
+
+    // Absent param: current behavior — no check, plain last-writer-wins.
+    const plain = await put({ graph: makeGraph() });
+    expect(plain.status).toBe(200);
+    expect(((await plain.json()) as { revision: { number: number } }).revision.number).toBe(3);
+
+    // Invalid values are schema-level 422s, never conflict checks.
+    const stringy = await put({ graph: makeGraph(), expectedRevision: "3" });
+    expect(stringy.status).toBe(422);
+    expect(((await stringy.json()) as ErrorResponseBody).error.code).toBe("VALIDATION_ERROR");
+    const negative = await put({ graph: makeGraph(), expectedRevision: -1 });
+    expect(negative.status).toBe(422);
+    expect(((await negative.json()) as ErrorResponseBody).error.code).toBe("VALIDATION_ERROR");
+    expect(h.db.workflows.get(workflow.id)?.latestRevisionNumber).toBe(3);
+  });
+
   it("lists revisions without graph blobs and serves full snapshots", async () => {
     const h = setup();
     const workflow = await createWorkflow(h, {
@@ -754,6 +812,99 @@ describe("graph revisions (PUT /:id/graph, GET /:id/revisions)", () => {
 
     expect((await h.request(`/api/workflows/${workflow.id}/revisions/9`)).status).toBe(404);
     expect((await h.request(`/api/workflows/${workflow.id}/revisions/0`)).status).toBe(422);
+  });
+
+  // #70: the list/detail payloads summarize the LATEST revision snapshot,
+  // never the legacy steps mirror (which goes stale for branchy graphs).
+  const listedWorkflow = async (
+    h: ApiHarness,
+    workflowId: string,
+  ): Promise<Workflow & { graphSummary?: GraphSummary }> => {
+    const body = (await (await h.request(`/api/workflows?projectId=${h.projectId}`)).json()) as {
+      workflows: Array<Workflow & { graphSummary?: GraphSummary }>;
+    };
+    const listed = body.workflows.find((w) => w.id === workflowId);
+    expect(listed).toBeDefined();
+    return listed as Workflow & { graphSummary?: GraphSummary };
+  };
+
+  it("summarizes the current graph shape + revision on list and detail (#70)", async () => {
+    const h = setup();
+    const workflow = await createWorkflow(h, {
+      projectId: h.projectId,
+      name: "v1",
+      steps: h.makeSteps("first"),
+    });
+
+    // Branchy save (the #70 audit-probe scenario): router at n1 (conditional
+    // review edge + always exit) and a conditional back-edge n2→n1. The
+    // legacy mirror cannot represent it, so the steps stay stale — but the
+    // list must show the saved shape.
+    const branchy = makeGraph({
+      edges: [
+        {
+          id: "e-review",
+          source: "n1",
+          target: "n2",
+          condition: { type: "outputContains", pattern: "GO" },
+        },
+        { id: "e-exit", source: "n1", target: "exit" },
+        {
+          id: "e-loop",
+          source: "n2",
+          target: "n1",
+          condition: { type: "outputNotContains", pattern: "DONE" },
+        },
+      ],
+    });
+    const save = await putGraph(h, workflow.id, branchy);
+    expect(save.status).toBe(200);
+    expect(((await save.json()) as { revision: { number: number } }).revision.number).toBe(2);
+    // Stale mirror confirmed: still the single creation step.
+    expect(h.db.workflows.get(workflow.id)?.steps).toHaveLength(1);
+
+    const listed = await listedWorkflow(h, workflow.id);
+    expect(listed.graphSummary).toEqual({
+      nodeCount: 3,
+      edgeCount: 3,
+      hasLoop: true,
+      hasRouter: true,
+      revision: 2,
+    });
+
+    // Detail carries the same summary alongside the full graph.
+    const detail = (await (await h.request(`/api/workflows/${workflow.id}`)).json()) as {
+      workflow: Workflow & { graphSummary?: GraphSummary };
+    };
+    expect(detail.workflow.graphSummary).toEqual(listed.graphSummary);
+
+    // Revision increments per save and the summary tracks the latest shape:
+    // a plain linear graph has neither loop nor router.
+    const resave = await putGraph(h, workflow.id, makeGraph());
+    expect(((await resave.json()) as { revision: { number: number } }).revision.number).toBe(3);
+    const relisted = await listedWorkflow(h, workflow.id);
+    expect(relisted.graphSummary).toEqual({
+      nodeCount: 3,
+      edgeCount: 2,
+      hasLoop: false,
+      hasRouter: false,
+      revision: 3,
+    });
+  });
+
+  it("omits graphSummary for legacy workflows that have no revisions (#70)", async () => {
+    const h = setup();
+    // A pre-graph row written directly (as before revisions existed): the
+    // list keeps the steps-based display, with no summary key at all.
+    const legacy = h.db.workflows.create({
+      id: crypto.randomUUID(),
+      projectId: h.projectId,
+      name: "ancient",
+      steps: h.makeSteps("first", "second"),
+    });
+    const listed = await listedWorkflow(h, legacy.id);
+    expect("graphSummary" in listed).toBe(false);
+    expect(listed.steps).toHaveLength(2);
   });
 });
 

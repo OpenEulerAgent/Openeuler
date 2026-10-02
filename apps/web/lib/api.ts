@@ -13,18 +13,21 @@ export class ApiError extends Error {
   readonly status: number;
   /** Zod issue details when the daemon answered 422 VALIDATION_ERROR. */
   readonly details?: readonly ApiErrorDetail[];
+  /** Current revision named by a 409 REVISION_CONFLICT body (#76). */
+  readonly currentRevision?: number;
 
   constructor(
     code: string,
     message: string,
     status: number,
-    options?: { cause?: unknown; details?: readonly ApiErrorDetail[] },
+    options?: { cause?: unknown; details?: readonly ApiErrorDetail[]; currentRevision?: number },
   ) {
     super(message, options);
     this.name = "ApiError";
     this.code = code;
     this.status = status;
     this.details = options?.details;
+    this.currentRevision = options?.currentRevision;
   }
 }
 
@@ -71,6 +74,7 @@ async function toApiError(response: Response): Promise<ApiError> {
   let code = "HTTP_ERROR";
   let message = `Request failed with status ${response.status}`;
   let details: readonly ApiErrorDetail[] | undefined;
+  let currentRevision: number | undefined;
   try {
     const body: unknown = await response.json();
     const error = (body as { error?: { code?: unknown; message?: unknown } } | null)?.error;
@@ -85,9 +89,17 @@ async function toApiError(response: Response): Promise<ApiError> {
             typeof detail.path === "string" && typeof detail.message === "string",
         );
       if (parsed.length > 0) details = parsed;
+    } else if (
+      typeof rawDetails === "object" &&
+      rawDetails !== null &&
+      typeof (rawDetails as { currentRevision?: unknown }).currentRevision === "number"
+    ) {
+      // Structured details (409 REVISION_CONFLICT, #76): surface the
+      // server's current revision so the editor can offer reload vs force.
+      currentRevision = (rawDetails as { currentRevision: number }).currentRevision;
     }
   } catch {
     // Non-JSON error body — keep the fallback code/message.
   }
-  return new ApiError(code, message, response.status, { details });
+  return new ApiError(code, message, response.status, { details, currentRevision });
 }

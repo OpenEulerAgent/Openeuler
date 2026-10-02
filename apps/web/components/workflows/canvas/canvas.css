@@ -1,8 +1,8 @@
 /*
  * Canvas editor theming (#46): React Flow base styles are imported from
  * @xyflow/react; these layer the app's design tokens onto the canvas
- * (background, handles, controls, attribution) and animate node position
- * transitions while auto-layout runs.
+ * (background, handles, controls, attribution, minimap, edge hover) and
+ * animate node position transitions while auto-layout runs.
  */
 
 .canvas-layout-animating .react-flow__node {
@@ -50,8 +50,37 @@
   color: var(--muted-fg);
 }
 
+/* Edge hover affordance (#75): the 2px hairlines carry a wide invisible
+ * interaction stroke (interactionWidth 16, set per edge), and hovering
+ * widens + accents the visible stroke so the click target reads before
+ * the click. !important overrides the per-edge inline stroke styles
+ * derived from document state; the selected rule below keeps its accent. */
+.react-flow__edge:hover .react-flow__edge-path {
+  stroke: var(--accent) !important;
+  stroke-width: 3 !important;
+}
+
+.react-flow__edge:hover,
+.react-flow__edge .react-flow__edge-interaction {
+  cursor: pointer;
+}
+
 .react-flow__edge.selected .react-flow__edge-path {
   stroke: var(--accent);
+}
+
+/* Minimap (#75): themed onto the app tokens — dark surface, subtle border,
+ * inset margin so it floats clear of the pane's top-left corner (the
+ * palette lives outside the pane; attribution is top-right, Controls
+ * bottom-right, the ValidationPanel bottom-left). */
+.react-flow__minimap {
+  background-color: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 0.5rem;
+  box-shadow: var(--elevation-2);
+  margin: 0.75rem;
+  overflow: hidden;
+  --xy-minimap-mask-background-color: color-mix(in srgb, var(--bg) 55%, transparent);
 }
 
 .react-flow__selection {

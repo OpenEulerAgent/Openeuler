@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import "@xyflow/react/dist/style.css";
 import "./canvas.css";
@@ -9,6 +9,7 @@ import {
   BackgroundVariant,
   Controls,
   MarkerType,
+  MiniMap,
   ReactFlow,
   ReactFlowProvider,
   applyEdgeChanges,
@@ -17,13 +18,14 @@ import {
   type Connection,
   type Edge,
   type EdgeChange,
+  type Node,
   type NodeChange,
 } from "@xyflow/react";
 import type { AgentPreset, StepConfig } from "@openeuler/core";
-import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Dialog } from "@/components/ui/dialog";
 import { useToast } from "@/components/ui/toast";
+import { cn } from "@/lib/cn";
 import { ApiError } from "@/lib/api";
 import {
   canvasDocsEquivalent,
@@ -39,7 +41,23 @@ import {
   type CanvasEdge,
   type CanvasEdgeData,
   type CanvasNode,
+  type CanvasNodeData,
 } from "@/lib/graph/canvas-document";
+import { selectionModeReducer, shouldShowMiniMap } from "@/lib/graph/canvas-affordances";
+import {
+  docHasConfiguredPrompt,
+  loadDismissedCanvasHints,
+  saveDismissedCanvasHints,
+  visibleCanvasHints,
+} from "@/lib/graph/canvas-hints";
+import {
+  conflictBanner,
+  conflictFromError,
+  saveAfterConflict,
+  type SaveConflictAction,
+  type SaveConflictDialog,
+} from "@/lib/graph/save-conflict";
+import { saveStatus, type SaveStatusView } from "@/lib/graph/save-status";
 import {
   applyConnect,
   applyDelete,
@@ -62,13 +80,24 @@ import {
 import { applyLayout } from "@/lib/graph/layout";
 import { applyInspectorAction } from "@/lib/graph/inspector";
 import {
+  flowViewportBounds,
+  jitteredRectCenter,
+  shouldFocusNewNode,
+} from "@/lib/graph/canvas-focus";
+import { useUnsavedChanges } from "@/lib/use-unsaved-changes";
+import {
   applyEdgeInspectorAction,
-  conditionSummary,
+  edgeChipLabel,
   needsConditionConfig,
   routerFallbackWarnings,
 } from "@/lib/graph/edge-inspector";
 import {
+  classifyIssue,
+  clearIssuesIfStale,
+  dedupeIssues,
+  edgeTargetLabel,
   issuesFromApiDetails,
+  saveBlockMessage,
   validateCanvasDocument,
   type CanvasIssue,
 } from "@/lib/graph/validation";
@@ -77,13 +106,16 @@ import {
   createAgentPreset,
   deleteAgentPreset,
   fetchAgentPresets,
+  fetchWorkflow,
   saveWorkflowGraph,
   updateAgentPreset,
   type AgentPresetUpdatePatch,
   type WorkflowWithGraph,
 } from "@/lib/workflows-api";
+import { fetchWorkflowRevision } from "@/lib/run-graph/document";
 import {
   canvasNodeTypes,
+  NodeHintCountsContext,
   NodeIssueCountsContext,
   NodeWarningCountsContext,
   toFlowNodes,
@@ -91,8 +123,16 @@ import {
 } from "./canvas-nodes";
 import { EdgePropertiesDrawer } from "./EdgePropertiesDrawer";
 import { NodePropertiesDrawer } from "./NodePropertiesDrawer";
-import { Palette, type PaletteNodeKind, type PaletteSection, CANVAS_NODE_MIME, CANVAS_PRESET_MIME } from "./Palette";
+import {
+  Palette,
+  type PaletteNodeKind,
+  type PaletteSection,
+  CANVAS_NODE_MIME,
+  CANVAS_PRESET_MIME,
+} from "./Palette";
 import { PresetManagerDrawer } from "./PresetManagerDrawer";
+import { ReadOnlyRevisionView } from "./ReadOnlyRevisionView";
+import { RevisionHistoryDrawer } from "./RevisionHistoryDrawer";
 import { ShortcutsPopover } from "./ShortcutsPopover";
 import { ValidationPanel } from "./ValidationPanel";
 
@@ -100,6 +140,12 @@ import { ValidationPanel } from "./ValidationPanel";
 const EDIT_COMMIT_DEBOUNCE_MS = 500;
 /** How long node position transitions animate after auto-layout. */
 const LAYOUT_ANIMATION_MS = 320;
+/** How long the "Saved · revision N" chip keeps its vivid tone before
+ *  fading to muted (#75) — enough to register, not enough to nag. */
+const SAVE_STATUS_FADE_MS = 4_000;
+/** Invisible edge hit-area width (#75): a 16px stroke around the 2px
+ *  hairlines makes edges comfortable to click without looking chunky. */
+const EDGE_INTERACTION_WIDTH = 16;
 
 function isTypingTarget(target: EventTarget | null): boolean {
   return (
@@ -120,16 +166,26 @@ function positionsChanged(before: CanvasDocument, after: CanvasDocument): boolea
 }
 
 /**
- * Document → React Flow edges. Condition summaries label every router and
- * conditional edge (#48): conditional edges dashed in info blue, the
+ * Document → React Flow edges. Condition chips label every router and
+ * conditional edge (#48, #69): conditional edges dashed in info blue, the
  * `always` fallback of a router subtle and dotted, unconfigured
- * placeholder conditions in warning amber, validation-flagged edges red.
+ * placeholder conditions in warning amber with a "set condition…" chip
+ * (never an empty-pattern summary), blocker-flagged edges red.
+ * Hint-flagged edges (condition not set yet, #68) keep the amber tone.
  * Plain chain edges (a node's single unconditional outgoing edge) stay
- * unlabeled to keep linear graphs quiet.
+ * unlabeled to keep linear graphs quiet. Every edge also carries a wide
+ * invisible interaction stroke (#75) so clicks land on the first try.
  */
 function toFlowEdges(doc: CanvasDocument, issues: readonly CanvasIssue[]): Edge<CanvasEdgeData>[] {
-  const problematic = new Set(
-    issues.filter((issue) => issue.edgeId !== undefined).map((issue) => issue.edgeId),
+  const blockerEdges = new Set(
+    issues
+      .filter((issue) => issue.edgeId !== undefined && classifyIssue(issue) === "blocker")
+      .map((issue) => issue.edgeId),
+  );
+  const hintEdges = new Set(
+    issues
+      .filter((issue) => issue.edgeId !== undefined && classifyIssue(issue) === "hint")
+      .map((issue) => issue.edgeId),
   );
   const outgoing = new Map<string, number>();
   for (const edge of doc.edges) {
@@ -137,7 +193,8 @@ function toFlowEdges(doc: CanvasDocument, issues: readonly CanvasIssue[]): Edge<
   }
   return doc.edges.map((edge): Edge<CanvasEdgeData> => {
     const conditional = !isUnconditionalEdge(edge.data);
-    const invalid = problematic.has(edge.id);
+    const blocked = blockerEdges.has(edge.id);
+    const hinted = hintEdges.has(edge.id);
     const unconfigured = needsConditionConfig(edge.data);
     const router = (outgoing.get(edge.source) ?? 0) > 1;
 
@@ -147,7 +204,7 @@ function toFlowEdges(doc: CanvasDocument, issues: readonly CanvasIssue[]): Edge<
     if (conditional) {
       stroke = "var(--info)";
       dash = { strokeDasharray: "6 4" };
-      if (unconfigured) {
+      if (unconfigured || hinted) {
         stroke = "var(--warning)";
         strokeWidth = 2.5;
       }
@@ -155,25 +212,97 @@ function toFlowEdges(doc: CanvasDocument, issues: readonly CanvasIssue[]): Edge<
       strokeWidth = 1.5;
       dash = { strokeDasharray: "2 5" };
     }
-    if (invalid) {
+    if (blocked) {
       stroke = "var(--danger)";
       strokeWidth = 2.5;
     }
 
     return {
       ...edge,
-      label: conditional || router ? conditionSummary(edge.data) : undefined,
+      interactionWidth: EDGE_INTERACTION_WIDTH,
+      label: conditional || router ? edgeChipLabel(edge.data) : undefined,
       labelBgStyle: { fill: "var(--surface)" },
       labelBgPadding: [6, 3] as [number, number],
       labelBgBorderRadius: 4,
       labelStyle: {
-        fill: invalid ? "var(--danger)" : unconfigured ? "var(--warning)" : stroke,
+        fill: blocked ? "var(--danger)" : unconfigured || hinted ? "var(--warning)" : stroke,
         fontSize: "10px",
       },
       style: { stroke, strokeWidth, ...dash },
       markerEnd: { type: MarkerType.ArrowClosed, color: stroke },
     };
   });
+}
+
+/** Spinner glyph for the chip's "Saving…" state. */
+function ChipSpinner() {
+  return (
+    <svg aria-hidden viewBox="0 0 16 16" className="size-3 animate-spin" fill="none">
+      <circle cx="8" cy="8" r="6.5" stroke="currentColor" strokeOpacity="0.25" strokeWidth="2" />
+      <path
+        d="M8 1.5a6.5 6.5 0 0 1 6.5 6.5"
+        stroke="currentColor"
+        strokeWidth="2"
+        strokeLinecap="round"
+      />
+    </svg>
+  );
+}
+
+/**
+ * Persistent save-status chip (#75): always-visible feedback next to the
+ * Save button — "No changes" / "Unsaved changes" (amber) / "Saving…" /
+ * "Saved · revision N" (fades to muted) / "Save failed" (red). The status
+ * itself is the pure {@link saveStatus} derivation; only the fade timer
+ * lives in the editor component.
+ */
+function SaveStatusChip({ status, muted }: { status: SaveStatusView; muted: boolean }) {
+  const dotClass =
+    status.kind === "unsaved" ? "bg-warning" : status.kind === "error" ? "bg-danger" : "bg-success";
+  const toneClass =
+    status.kind === "unsaved"
+      ? "text-warning"
+      : status.kind === "error"
+        ? "text-danger"
+        : status.kind === "saving"
+          ? "text-info"
+          : status.kind === "saved" && !muted
+            ? "text-success"
+            : "text-muted-fg";
+  return (
+    <span
+      data-save-status={status.kind}
+      data-muted={muted || undefined}
+      role="status"
+      className={cn("inline-flex items-center gap-1.5 text-xs whitespace-nowrap", toneClass)}
+    >
+      {status.kind === "saving" ? (
+        <ChipSpinner />
+      ) : status.kind === "clean" ? null : (
+        <span aria-hidden className={cn("size-1.5 shrink-0 rounded-full", dotClass)} />
+      )}
+      {status.label}
+    </span>
+  );
+}
+
+/**
+ * Minimap node fill (#75), themed for the dark canvas from status and node
+ * kind: validation blockers red, hints amber, the entry node accent, exit
+ * terminals red, plain agents muted.
+ */
+function miniMapNodeColorFor(
+  issueCounts: ReadonlyMap<string, number>,
+  hintCounts: ReadonlyMap<string, number>,
+): (node: Node) => string {
+  return (node) => {
+    if ((issueCounts.get(node.id) ?? 0) > 0) return "var(--danger)";
+    if ((hintCounts.get(node.id) ?? 0) > 0) return "var(--warning)";
+    const data = node.data as CanvasNodeData;
+    if (data.kind === "exit") return "var(--danger)";
+    if (data.kind === "agent" && data.isEntry) return "var(--accent)";
+    return "var(--muted-fg)";
+  };
 }
 
 /**
@@ -205,7 +334,11 @@ function GraphCanvasInner({
 }) {
   const router = useRouter();
   const { toast } = useToast();
-  const { screenToFlowPosition, fitView } = useReactFlow();
+  const { screenToFlowPosition, fitView, getViewport } = useReactFlow();
+
+  /** The canvas pane element — its rect anchors click-add centering and
+   *  off-viewport detection (#72), never the window (palette + header). */
+  const canvasRef = useRef<HTMLDivElement | null>(null);
 
   const initialDoc = useMemo(() => workflowToCanvasDocument(workflow), [workflow]);
 
@@ -221,11 +354,16 @@ function GraphCanvasInner({
 
   // Preset roster ("your team", #49). Fetched for the project; the palette
   // and the inspector share it. Nodes only ever hold config COPIES — a
-  // missing preset (deleted) just means the badge stops resolving.
+  // missing preset (deleted) just means the badge stops resolving. While
+  // the first fetch is in flight the palette shows skeleton rows and
+  // drop/click-adds explain themselves instead of no-op'ing (#72).
   const [presets, setPresets] = useState<AgentPreset[]>([]);
+  const [presetsLoaded, setPresetsLoaded] = useState(false);
+  const rosterToastAtRef = useRef(0);
   const [managePresetsOpen, setManagePresetsOpen] = useState(false);
   useEffect(() => {
     let cancelled = false;
+    setPresetsLoaded(false);
     void fetchAgentPresets(workflow.projectId)
       .then((roster) => {
         if (!cancelled) setPresets(roster);
@@ -233,6 +371,11 @@ function GraphCanvasInner({
       .catch(() => {
         // Older daemon or transient failure: no roster, palette shows the
         // empty hint; creating nodes keeps working without presets.
+      })
+      .finally(() => {
+        // Failures settle the roster too — a stuck skeleton would read as
+        // "the palette is broken" (worse than an empty team list, #72).
+        if (!cancelled) setPresetsLoaded(true);
       });
     return () => {
       cancelled = true;
@@ -248,13 +391,78 @@ function GraphCanvasInner({
 
   const doc = history.present;
   const [savedDoc, setSavedDoc] = useState<CanvasDocument>(initialDoc);
-  const [issues, setIssues] = useState<CanvasIssue[]>([]);
+  const [serverIssues, setServerIssues] = useState<CanvasIssue[]>([]);
   const [revision, setRevision] = useState(workflow.latestRevision?.number);
   const [saving, setSaving] = useState(false);
+  // Persistent save-status chip inputs (#75): the revision minted by the
+  // last session save (drives "Saved · revision N"), whether the last
+  // attempt failed, and the post-save fade-to-muted tone.
+  const [savedRevision, setSavedRevision] = useState<number | null>(null);
+  const [saveFailed, setSaveFailed] = useState(false);
+  const [savedMuted, setSavedMuted] = useState(false);
+  // Marquee selection (#75): "Select area" toggles pointer drags between
+  // panning and painting a selection box; Escape resets to panning.
+  const [selectionMode, dispatchSelectionMode] = useReducer(selectionModeReducer, "pan");
   const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
   const [selectedEdgeId, setSelectedEdgeId] = useState<string | null>(null);
-  const [confirmLeave, setConfirmLeave] = useState(false);
   const [layoutAnimating, setLayoutAnimating] = useState(false);
+
+  // Onboarding coach hints (#77): per-hint dismissal persists in
+  // localStorage (`openeuler.canvasHints`); the visible set is re-derived
+  // from the document on every render and auto-hides when its condition
+  // clears.
+  const [dismissedHints, setDismissedHints] = useState<string[]>(() =>
+    typeof window === "undefined" ? [] : loadDismissedCanvasHints(window.localStorage),
+  );
+  const dismissHint = useCallback((hintId: string) => {
+    setDismissedHints((current) => {
+      if (current.includes(hintId)) return current;
+      const next = [...current, hintId];
+      saveDismissedCanvasHints(typeof window === "undefined" ? null : window.localStorage, next);
+      return next;
+    });
+  }, []);
+
+  // Revision history (#77): the header "rev N" chip opens the list drawer;
+  // "View" loads a snapshot into the read-only render. The editing canvas
+  // (history + dirty state) is only ever hidden, so Close restores it as-was.
+  const [revisionsOpen, setRevisionsOpen] = useState(false);
+  const [viewingRevision, setViewingRevision] = useState<{
+    number: number;
+    doc: CanvasDocument | null;
+  } | null>(null);
+  const viewRevisionCancelRef = useRef<(() => void) | null>(null);
+  const closeRevisionView = useCallback(() => {
+    viewRevisionCancelRef.current?.();
+    viewRevisionCancelRef.current = null;
+    setViewingRevision(null);
+  }, []);
+  const viewRevision = useCallback(
+    async (revisionNumber: number) => {
+      setRevisionsOpen(false);
+      setSelectedNodeId(null);
+      setSelectedEdgeId(null);
+      setViewingRevision({ number: revisionNumber, doc: null });
+      let cancelled = false;
+      viewRevisionCancelRef.current = () => {
+        cancelled = true;
+      };
+      try {
+        const graph = await fetchWorkflowRevision(workflow.id, revisionNumber);
+        if (cancelled) return;
+        setViewingRevision({ number: revisionNumber, doc: toCanvasDocument(graph) });
+      } catch (cause) {
+        if (cancelled) return;
+        setViewingRevision(null);
+        toast({
+          variant: "danger",
+          title: `Could not load revision ${revisionNumber}`,
+          description: cause instanceof ApiError ? cause.message : "Unexpected error",
+        });
+      }
+    },
+    [toast, workflow.id],
+  );
 
   // Node-drag + debounced-edit undo capture.
   const dragBeforeRef = useRef<CanvasDocument | null>(null);
@@ -265,13 +473,85 @@ function GraphCanvasInner({
   // `measured`, `dragging`, …) must never read as unsaved changes.
   const dirty = useMemo(() => !canvasDocsEquivalent(doc, savedDoc), [doc, savedDoc]);
 
-  // Live-refresh the validation overlay while issues are shown, so badges
-  // clear as the user fixes things.
+  // A failed save's error flag is only meaningful while the doc still differs
+  // from the saved snapshot — if the user undoes back to the saved state
+  // (clean-gated Save disabled), a stale "Save failed" chip would have no
+  // retry path.
   useEffect(() => {
-    if (issues.length === 0) return;
-    setIssues(validateCanvasDocument(historyRef.current.present));
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [doc]);
+    if (!dirty && !saving) setSaveFailed(false);
+  }, [dirty, saving]);
+
+  // Persistent save status (#75): a pure derivation over the save flags —
+  // the chip next to the Save button never goes stale the way a transient
+  // toast does.
+  const status = saveStatus({ dirty, saving, savedRevision, error: saveFailed });
+
+  // "Saved · revision N" keeps its vivid tone for a few seconds, then fades
+  // to muted so the steady-state header stays quiet. The timer resets on
+  // every new save (savedRevision changes restart the clock).
+  useEffect(() => {
+    if (status.kind !== "saved") return;
+    setSavedMuted(false);
+    const timer = window.setTimeout(() => setSavedMuted(true), SAVE_STATUS_FADE_MS);
+    return () => window.clearTimeout(timer);
+  }, [status.kind, savedRevision]);
+
+  // Route-exit guard (#67): beforeunload for real unloads, plus interception
+  // of client-side navigation (popstate Back, internal anchor clicks, and the
+  // guarded programmatic leaves below) through the shared confirm dialog.
+  const leaveGuard = useUnsavedChanges(dirty);
+
+  // Revision conflict (#76): the open conflict dialog (null = closed) and
+  // the focus-probe inputs for the dismissible "saved elsewhere" banner.
+  // `focusRevision` is the latest revision the last focus probe saw — the
+  // banner self-clears as soon as `revision` catches up (reload or save).
+  const [conflict, setConflict] = useState<SaveConflictDialog | null>(null);
+  const [focusRevision, setFocusRevision] = useState<number | null>(null);
+  const [dismissedRevision, setDismissedRevision] = useState<number | null>(null);
+  const banner =
+    conflict === null
+      ? conflictBanner({
+          latestRevisionNumber: focusRevision ?? undefined,
+          savedRevision: revision ?? null,
+          dismissedRevision,
+        })
+      : null;
+
+  // Focus probe (#76): when the tab regains focus with unsaved edits, ask
+  // the daemon whether the workflow moved on elsewhere — an early, cheap
+  // warning before the next save would 409. Failures stay silent.
+  useEffect(() => {
+    const onVisibility = (): void => {
+      if (document.visibilityState !== "visible" || !dirty || saving || conflict !== null) return;
+      void fetchWorkflow(workflow.id)
+        .then((fresh) => {
+          setFocusRevision(fresh.latestRevision?.number ?? null);
+        })
+        .catch(() => {
+          // Older daemon or offline: nothing to warn about.
+        });
+    };
+    document.addEventListener("visibilitychange", onVisibility);
+    return () => document.removeEventListener("visibilitychange", onVisibility);
+  }, [conflict, dirty, saving, workflow.id]);
+
+  // Always-on live validation (#68): the pure client-side mirror of the
+  // daemon's rules recomputes on every document change, so badges, the
+  // panel, and per-severity tones update BEFORE any save attempt. Daemon
+  // 422 mappings only supplement it until the next edit re-validates —
+  // cleared DURING render (not in a post-render effect) so the first
+  // paint of an edited doc never merges stale server findings, and via
+  // the identity-preserving guard so an already-empty list causes no
+  // redundant state churn / double validation run (#69 QA).
+  const [serverIssuesDoc, setServerIssuesDoc] = useState(doc);
+  if (serverIssuesDoc !== doc) {
+    setServerIssuesDoc(doc);
+    setServerIssues(clearIssuesIfStale);
+  }
+  const issues = useMemo(
+    () => dedupeIssues(validateCanvasDocument(doc), serverIssues),
+    [doc, serverIssues],
+  );
 
   const clearEditTimer = useCallback(() => {
     if (editTimerRef.current !== null) {
@@ -368,53 +648,186 @@ function GraphCanvasInner({
     pruneSelection(step.value);
   }, [flushPendingEdit, pruneSelection, updateHistory]);
 
-  const save = useCallback(async () => {
-    if (saving) return;
-    flushPendingEdit();
-    const clientIssues = validateCanvasDocument(historyRef.current.present);
-    setIssues(clientIssues);
-    if (clientIssues.length > 0) {
+  const save = useCallback(
+    async (options?: { force?: boolean }) => {
+      // Clean-gate (#71): a clean doc must never mint a redundant revision —
+      // the button disables and cmd+s no-ops here instead of firing the PUT.
+      if (saving || !dirty) return;
+      flushPendingEdit();
+      const clientIssues = validateCanvasDocument(historyRef.current.present);
+      if (clientIssues.length > 0) {
+        // Live validation already surfaced these; the toast just confirms the
+        // save is blocked, naming any edge that still needs its condition
+        // (hints included — they block like blockers do, #69).
+        toast({
+          variant: "danger",
+          title: "Cannot save yet",
+          description: saveBlockMessage(historyRef.current.present, clientIssues),
+        });
+        return;
+      }
+      setSaving(true);
+      setSaveFailed(false);
+      // 422 mapping (#73): the daemon validates THIS doc — `cause.details`
+      // indexes must resolve against it, never against whatever the user
+      // edits while the PUT is in flight.
+      const requestDoc = historyRef.current.present;
+      // Revision guard (#76): pin the revision this editor is based on so a
+      // concurrent save elsewhere answers 409 instead of silently losing;
+      // `force` (Save anyway) omits the pin and wins last-writer-wins.
+      const expectedRevision =
+        options?.force === true || revision === undefined ? undefined : revision;
+      try {
+        const result = await saveWorkflowGraph({
+          workflowId: workflow.id,
+          graph: fromCanvasDocument(requestDoc),
+          ...(expectedRevision === undefined ? {} : { expectedRevision }),
+        });
+        const normalized =
+          result.workflow.graph !== undefined
+            ? toCanvasDocument(result.workflow.graph)
+            : historyRef.current.present;
+        setSavedDoc(normalized);
+        updateHistory((current) => replacePresent(current, normalized));
+        setRevision(result.revision.number);
+        setSavedRevision(result.revision.number);
+        setSavedMuted(false);
+        setServerIssues([]);
+        toast({ variant: "success", title: `Saved revision ${result.revision.number}` });
+      } catch (cause) {
+        // The chip keeps reading "Save failed" until the next attempt (#75);
+        // toasts stay the detailed explanation channel.
+        setSaveFailed(true);
+        // 409 REVISION_CONFLICT (#76): the non-blocking conflict dialog
+        // replaces the generic failure toast — the user picks reload vs
+        // save-anyway instead of wondering why the save failed.
+        const conflictDialog = conflictFromError(cause, revision ?? null);
+        if (conflictDialog !== null) {
+          setConflict(conflictDialog);
+        } else if (
+          cause instanceof ApiError &&
+          cause.details !== undefined &&
+          cause.details.length > 0
+        ) {
+          const mapped = issuesFromApiDetails(
+            requestDoc,
+            historyRef.current.present,
+            cause.details,
+          );
+          if (mapped.length > 0) {
+            setServerIssues(mapped);
+            toast({
+              variant: "danger",
+              title: "The daemon rejected the graph",
+              description: "See the flagged nodes and edges.",
+            });
+          } else {
+            // Everything the daemon flagged was deleted mid-flight: nothing
+            // left to badge, so the rejection reads as a plain failure.
+            toast({
+              variant: "danger",
+              title: "Failed to save",
+              description: cause.message,
+            });
+          }
+        } else {
+          toast({
+            variant: "danger",
+            title: "Failed to save",
+            description: cause instanceof ApiError ? cause.message : "Unexpected error",
+          });
+        }
+      } finally {
+        setSaving(false);
+      }
+    },
+    [dirty, flushPendingEdit, revision, saving, toast, updateHistory, workflow.id],
+  );
+
+  /**
+   * Conflict → Reload (#76): discard local edits and re-base the editor on
+   * the server's latest revision — the same reset a fresh page load does
+   * (doc, savedDoc, undo history, revision pointers), leaving the doc clean
+   * so the route-exit guard stands down with it.
+   */
+  const reloadFromConflict = useCallback(async () => {
+    try {
+      const fresh = await fetchWorkflow(workflow.id);
+      const nextDoc = workflowToCanvasDocument(fresh);
+      clearEditTimer();
+      editBeforeRef.current = null;
+      setConflict(null);
+      setServerIssues([]);
+      setSavedDoc(nextDoc);
+      updateHistory(() => initHistory(nextDoc));
+      setRevision(fresh.latestRevision?.number);
+      // No session save minted this revision — the chip reads "No changes",
+      // which is exactly the truth after a reload.
+      setSavedRevision(null);
+      setSavedMuted(false);
+      setSaveFailed(false);
+      setFocusRevision(fresh.latestRevision?.number ?? null);
+      setDismissedRevision(null);
+      setSelectedNodeId(null);
+      setSelectedEdgeId(null);
+      toast({
+        variant: "info",
+        title: `Reloaded revision ${fresh.latestRevision?.number ?? 0}`,
+        description: "Local edits were discarded; the canvas matches the server again.",
+      });
+    } catch (cause) {
+      // Keep the dialog open: the reload itself failed, the user can retry
+      // or fall back to Save anyway.
       toast({
         variant: "danger",
-        title: "Cannot save yet",
-        description: `${clientIssues.length} issue${clientIssues.length === 1 ? "" : "s"} must be fixed — see the validation panel.`,
+        title: "Could not reload",
+        description: cause instanceof ApiError ? cause.message : "Unexpected error",
       });
-      return;
     }
-    setSaving(true);
-    try {
-      const result = await saveWorkflowGraph({
-        workflowId: workflow.id,
-        graph: fromCanvasDocument(historyRef.current.present),
-      });
-      const normalized =
-        result.workflow.graph !== undefined
-          ? toCanvasDocument(result.workflow.graph)
-          : historyRef.current.present;
-      setSavedDoc(normalized);
-      updateHistory((current) => replacePresent(current, normalized));
-      setRevision(result.revision.number);
-      setIssues([]);
-      toast({ variant: "success", title: `Saved revision ${result.revision.number}` });
-    } catch (cause) {
-      if (cause instanceof ApiError && cause.details !== undefined && cause.details.length > 0) {
-        setIssues(issuesFromApiDetails(historyRef.current.present, cause.details));
-        toast({
-          variant: "danger",
-          title: "The daemon rejected the graph",
-          description: "See the flagged nodes and edges.",
-        });
+  }, [clearEditTimer, toast, updateHistory, workflow.id]);
+
+  /** Conflict dialog actions (#76): Reload rebases, Save anyway force-saves. */
+  const resolveConflict = useCallback(
+    (action: SaveConflictAction) => {
+      if (saveAfterConflict(action).omitExpectedRevision) {
+        setConflict(null);
+        void save({ force: true });
       } else {
-        toast({
-          variant: "danger",
-          title: "Failed to save",
-          description: cause instanceof ApiError ? cause.message : "Unexpected error",
-        });
+        void reloadFromConflict();
       }
-    } finally {
-      setSaving(false);
-    }
-  }, [flushPendingEdit, saving, toast, updateHistory, workflow.id]);
+    },
+    [reloadFromConflict, save],
+  );
+
+  /**
+   * Off-viewport adds (#72): a node created outside the visible rect —
+   * typically auto-placed right of the rightmost node while the user is
+   * panned/zoomed elsewhere — scrolls into view instead of reading as
+   * "add didn't work". In-view adds never re-frame.
+   */
+  const focusNodeIfOffscreen = useCallback(
+    (node: CanvasNode) => {
+      const rect = canvasRef.current?.getBoundingClientRect();
+      if (rect === undefined || rect.width === 0) return;
+      if (!shouldFocusNewNode(flowViewportBounds(rect, getViewport()), node.position)) return;
+      void fitView({ nodes: [{ id: node.id }], duration: 300, maxZoom: 1, padding: 0.3 });
+    },
+    [fitView, getViewport],
+  );
+
+  /**
+   * Click-to-add drop point (#72): the CANVAS pane's center (the window's
+   * center is shifted right by the 240px palette and down by the header),
+   * with a small jitter so repeated adds don't stack exactly.
+   */
+  const clickAddSpot = useCallback((): { x: number; y: number } => {
+    const rect = canvasRef.current?.getBoundingClientRect();
+    const point =
+      rect !== undefined
+        ? jitteredRectCenter(rect)
+        : { x: window.innerWidth / 2, y: window.innerHeight / 2 };
+    return screenToFlowPosition(point);
+  }, [screenToFlowPosition]);
 
   const addNode = useCallback(
     (kind: PaletteNodeKind, position?: { x: number; y: number }) => {
@@ -434,23 +847,36 @@ function GraphCanvasInner({
       commitDoc({ nodes: [...current.nodes, node], edges: current.edges });
       setSelectedEdgeId(null);
       setSelectedNodeId(node.id);
+      focusNodeIfOffscreen(node);
     },
-    [commitDoc, drivers],
+    [commitDoc, drivers, focusNodeIfOffscreen],
   );
 
   /**
    * Creates a node preconfigured from a preset (#49): name = preset name,
    * config = deep copy, presetId carried for the badge. Position defaults
-   * to the viewport center (click-to-add); drags pass the drop point.
+   * to the canvas-pane center with jitter (#72); drags pass the drop point.
+   * While the roster fetch is still in flight, the add explains itself
+   * instead of silently no-op'ing (#72).
    */
   const addPresetNode = useCallback(
     (presetId: string, position?: { x: number; y: number }) => {
+      if (!presetsLoaded) {
+        const now = Date.now();
+        if (now - rosterToastAtRef.current > 2_000) {
+          rosterToastAtRef.current = now;
+          toast({
+            variant: "info",
+            title: "Team roster is still loading",
+            description: "Try again in a moment.",
+          });
+        }
+        return;
+      }
       const preset = presets.find((candidate) => candidate.id === presetId);
       if (preset === undefined) return;
       const current = historyRef.current.present;
-      const spot =
-        position ??
-        screenToFlowPosition({ x: window.innerWidth / 2, y: window.innerHeight / 2 });
+      const spot = position ?? clickAddSpot();
       const node = createPresetAgentNode({
         preset: asPresetSource(preset),
         position: spot,
@@ -459,8 +885,9 @@ function GraphCanvasInner({
       commitDoc({ nodes: [...current.nodes, node], edges: current.edges });
       setSelectedEdgeId(null);
       setSelectedNodeId(node.id);
+      focusNodeIfOffscreen(node);
     },
-    [commitDoc, presets, screenToFlowPosition],
+    [clickAddSpot, commitDoc, focusNodeIfOffscreen, presets, presetsLoaded, toast],
   );
 
   const onConnect = useCallback(
@@ -477,12 +904,28 @@ function GraphCanvasInner({
       }
       commitDoc(applyConnect(current, check));
       if (check.convertedEdgeId !== undefined) {
-        toast({
-          variant: "info",
-          title: "Edge added as conditional",
-          description:
-            "A node can keep only one always edge (its router fallback) — the new edge needs a condition before the graph can be saved.",
-        });
+        // Guided flow (#69): the born-conditional edge is selected and its
+        // drawer opens immediately — the pattern input is focused so the
+        // condition is configured in place, right where the eye lands.
+        // Self-loops (#73) join the same flow: their toast explains the
+        // repeat-while semantics instead of the router-fallback rule.
+        setSelectedNodeId(null);
+        setSelectedEdgeId(check.convertedEdgeId);
+        toast(
+          check.selfLoop === true
+            ? {
+                variant: "info",
+                title: "Self-loop added as conditional",
+                description:
+                  "A self-loop repeats this node while its condition holds — set the condition.",
+              }
+            : {
+                variant: "info",
+                title: "Edge added as conditional",
+                description:
+                  "A node can keep only one always edge (its router fallback) — the new edge needs a condition before the graph can be saved.",
+              },
+        );
       }
     },
     [commitDoc, toast],
@@ -527,9 +970,7 @@ function GraphCanvasInner({
   /** Preset provenance actions are discrete: one undo snapshot per click. */
   const detachPreset = useCallback(
     (nodeId: string) => {
-      commitDoc(
-        applyInspectorAction(historyRef.current.present, { type: "detachPreset", nodeId }),
-      );
+      commitDoc(applyInspectorAction(historyRef.current.present, { type: "detachPreset", nodeId }));
     },
     [commitDoc],
   );
@@ -625,8 +1066,18 @@ function GraphCanvasInner({
   );
 
   // Keyboard: cmd+s save, cmd+z/shift+cmd+z undo/redo, delete selection.
+  // The read-only revision view (#77) suspends every editing shortcut —
+  // its own Escape listener returns to the editor instead.
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent): void => {
+      // The read-only revision view (#77) suspends every editing shortcut —
+      // its own Escape listener returns to the editor instead. preventDefault
+      // first so a suspended cmd+s never falls through to the browser's
+      // native save-page dialog.
+      if (viewingRevision !== null) {
+        if (event.metaKey || event.ctrlKey) event.preventDefault();
+        return;
+      }
       const mod = event.metaKey || event.ctrlKey;
       if (mod && event.key.toLowerCase() === "s") {
         event.preventDefault();
@@ -642,22 +1093,17 @@ function GraphCanvasInner({
       if ((event.key === "Delete" || event.key === "Backspace") && !isTypingTarget(event.target)) {
         event.preventDefault();
         deleteSelection();
+        return;
+      }
+      // Escape always leaves marquee mode (#75) — never stuck painting
+      // selection boxes.
+      if (event.key === "Escape" && !isTypingTarget(event.target)) {
+        dispatchSelectionMode({ type: "reset" });
       }
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [deleteSelection, doRedo, doUndo, save]);
-
-  // Dirty-state guard: browser-level.
-  useEffect(() => {
-    if (!dirty) return;
-    const onBeforeUnload = (event: BeforeUnloadEvent): void => {
-      event.preventDefault();
-      event.returnValue = "";
-    };
-    window.addEventListener("beforeunload", onBeforeUnload);
-    return () => window.removeEventListener("beforeunload", onBeforeUnload);
-  }, [dirty]);
+  }, [deleteSelection, doRedo, doUndo, save, viewingRevision]);
 
   const onNodesChange = useCallback(
     (changes: NodeChange<CanvasFlowNode>[]) => {
@@ -668,6 +1114,10 @@ function GraphCanvasInner({
         (change): change is NodeChange<CanvasNode> =>
           change.type === "position" || change.type === "select",
       ) as unknown as NodeChange<CanvasNode>[];
+      // Measurement-only change bursts (dimensions) carry nothing to apply;
+      // skipping them keeps the document — and every node reference in it —
+      // untouched instead of churning a fresh array per ResizeObserver pass.
+      if (structural.length === 0) return;
       updateHistory((current) => ({
         ...current,
         present: {
@@ -711,26 +1161,74 @@ function GraphCanvasInner({
 
   const nodes = useMemo(() => toFlowNodes(doc.nodes), [doc.nodes]);
   const edges = useMemo(() => toFlowEdges(doc, issues), [doc, issues]);
-  const issueCounts = useMemo(() => {
-    const counts = new Map<string, number>();
+  // Per-node badge counts, split by severity (#68): red blockers vs amber
+  // hints (structural WIP like an unconnected dropped node). Both live.
+  // Identity-stable (#88): `issues` recomputes on every doc change (node
+  // drags included), so memoising on its identity alone would hand the
+  // badge contexts fresh Maps per edit and re-render every card. The maps
+  // are keyed on a cheap content signature instead — same counts, same
+  // Map objects; changed counts, fresh Maps.
+  const badgeCountsRef = useRef<{
+    signature: string;
+    blockers: ReadonlyMap<string, number>;
+    hints: ReadonlyMap<string, number>;
+  } | null>(null);
+  const badgeCounts = useMemo(() => {
+    const signature = issues
+      .filter((issue) => issue.nodeId !== undefined)
+      .map((issue) => `${issue.nodeId}:${classifyIssue(issue)}`)
+      .sort()
+      .join("|");
+    if (badgeCountsRef.current?.signature === signature) return badgeCountsRef.current;
+    const blockers = new Map<string, number>();
+    const hints = new Map<string, number>();
     for (const issue of issues) {
-      if (issue.nodeId !== undefined) counts.set(issue.nodeId, (counts.get(issue.nodeId) ?? 0) + 1);
+      if (issue.nodeId === undefined) continue;
+      const counts = classifyIssue(issue) === "blocker" ? blockers : hints;
+      counts.set(issue.nodeId, (counts.get(issue.nodeId) ?? 0) + 1);
     }
-    return counts;
+    badgeCountsRef.current = { signature, blockers, hints };
+    return badgeCountsRef.current;
   }, [issues]);
+  const issueCounts = badgeCounts.blockers;
+  const hintCounts = badgeCounts.hints;
+  // Minimap fill fn (#75): rebuilt when the badge-count maps change (fresh
+  // Map identities per doc change — the minimap re-renders on node moves
+  // regardless); kept memoized for stable identity between recompute.
+  const miniMapNodeColor = useMemo(
+    () => miniMapNodeColorFor(issueCounts, hintCounts),
+    [issueCounts, hintCounts],
+  );
   // Advisory warnings (router with no `always` fallback) are live, not
-  // save-gated — they should appear and clear as the user edits.
+  // save-gated — they should appear and clear as the user edits. Same
+  // signature-keyed identity trick as the badge counts above (#88).
   const warnings = useMemo(() => routerFallbackWarnings(doc), [doc]);
+  const warningCountsRef = useRef<{
+    signature: string;
+    counts: ReadonlyMap<string, number>;
+  } | null>(null);
   const warningCounts = useMemo(() => {
+    const signature = warnings
+      .map((warning) => `${warning.nodeId}:${warning.message}`)
+      .sort()
+      .join("|");
+    if (warningCountsRef.current?.signature === signature) return warningCountsRef.current.counts;
     const counts = new Map<string, number>();
     for (const warning of warnings) {
       counts.set(warning.nodeId, (counts.get(warning.nodeId) ?? 0) + 1);
     }
+    warningCountsRef.current = { signature, counts };
     return counts;
   }, [warnings]);
   const nodeNames = useMemo(
     () => new Map(doc.nodes.map((node) => [node.id, node.data.name])),
     [doc.nodes],
+  );
+  // Human-readable "source → target" names so panel rows and toasts call
+  // edges out by role, not raw id (#69).
+  const edgeLabels = useMemo(
+    () => new Map(doc.edges.map((edge) => [edge.id, edgeTargetLabel(doc, edge.id) ?? edge.id])),
+    [doc],
   );
 
   const selectedNode =
@@ -740,6 +1238,21 @@ function GraphCanvasInner({
 
   const isEmpty = doc.nodes.length <= 1 && doc.edges.length === 0;
   const basePath = `/projects/${encodeURIComponent(workflow.projectId)}/workflows`;
+
+  // Coach hints (#77): at most one card shows — the first hint of the
+  // onboarding order that still applies and wasn't dismissed. Conditions
+  // derive from the live document, so clearing a condition hides its card.
+  const visibleHints = useMemo(
+    () =>
+      visibleCanvasHints({
+        nodeCount: doc.nodes.length,
+        connectedOnce: doc.edges.length > 0,
+        hasConfiguredPrompt: docHasConfiguredPrompt(doc),
+        dismissed: dismissedHints,
+      }),
+    [doc, dismissedHints],
+  );
+  const coachHint = visibleHints[0] ?? null;
 
   const paletteSections: PaletteSection[] = [
     {
@@ -796,10 +1309,7 @@ function GraphCanvasInner({
     },
   ];
 
-  const requestBack = () => {
-    if (dirty) setConfirmLeave(true);
-    else router.push(basePath);
-  };
+  const requestBack = () => leaveGuard.requestLeave(() => router.push(basePath));
 
   const focusIssue = (issue: CanvasIssue) => {
     if (issue.nodeId !== undefined) {
@@ -836,8 +1346,42 @@ function GraphCanvasInner({
         <h1 className="min-w-0 truncate text-sm font-semibold text-fg" title={workflow.name}>
           {workflow.name}
         </h1>
-        {revision !== undefined ? <Badge variant="neutral">revision {revision}</Badge> : null}
-        {dirty ? <Badge variant="warning">unsaved changes</Badge> : null}
+        {/* Revision history affordance (#77): the "rev N" chip opens the
+            list drawer — the immutable-revision model becomes visible. */}
+        {revision !== undefined ? (
+          <button
+            type="button"
+            data-revision-chip={revision}
+            aria-label={`Revision history (currently revision ${revision})`}
+            title="Revision history"
+            onClick={() => setRevisionsOpen(true)}
+            className="inline-flex items-center rounded-full bg-elevated px-2.5 py-0.5 text-xs font-medium text-muted-fg transition-colors hover:text-fg focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
+          >
+            rev {revision}
+          </button>
+        ) : null}
+        {/* Focus-probe banner (#76): someone saved a newer revision while
+            this tab was away; dismissible, and it self-clears once the
+            editor catches up (reload or a successful save). */}
+        {banner !== null ? (
+          <span
+            role="status"
+            data-revision-banner={banner.revision}
+            className="inline-flex items-center gap-1 rounded-full border border-warning/50 bg-warning-subtle px-2 py-0.5 text-xs whitespace-nowrap text-warning"
+          >
+            {banner.message}
+            <button
+              type="button"
+              aria-label="Dismiss revision warning"
+              onClick={() => setDismissedRevision(banner.revision)}
+              className="rounded px-1 leading-none hover:bg-warning/20 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
+            >
+              ×
+            </button>
+          </span>
+        ) : null}
+        {/* The persistent save-status chip next to Save (#75) replaced the
+            old transient "unsaved changes" badge here. */}
         <div className="ml-auto flex items-center gap-2">
           <Button
             variant="secondary"
@@ -867,111 +1411,203 @@ function GraphCanvasInner({
           >
             Auto-layout
           </Button>
-          <Button size="sm" onClick={() => void save()} disabled={saving} loading={saving}>
+          <Button
+            variant="secondary"
+            size="sm"
+            aria-pressed={selectionMode === "marquee"}
+            onClick={() => dispatchSelectionMode({ type: "toggle" })}
+            className={
+              selectionMode === "marquee"
+                ? "border-accent bg-accent/10 text-accent hover:bg-accent/20"
+                : undefined
+            }
+            title="Drag to select multiple nodes (Esc returns to panning)"
+          >
+            Select area
+          </Button>
+          <SaveStatusChip status={status} muted={status.kind === "saved" && savedMuted} />
+          <Button
+            size="sm"
+            onClick={() => void save()}
+            disabled={saving || !dirty}
+            loading={saving}
+            aria-label={dirty ? "Save" : "No changes to save"}
+            title={dirty ? "Save (⌘/Ctrl+S)" : "No changes to save"}
+          >
             {saving ? "Saving…" : "Save"}
           </Button>
           <ShortcutsPopover />
         </div>
       </header>
 
-      <div className="flex min-h-0 flex-1">
-        <Palette
-          sections={paletteSections}
-          onAdd={(kind) => addNode(kind)}
-          presets={presets.map(toPalettePreset)}
-          onAddPreset={(presetId) => addPresetNode(presetId)}
-          onManagePresets={() => setManagePresetsOpen(true)}
+      {viewingRevision !== null ? (
+        <ReadOnlyRevisionView
+          revisionNumber={viewingRevision.number}
+          doc={viewingRevision.doc}
+          onExit={closeRevisionView}
         />
-
-        <div
-          className={
-            layoutAnimating
-              ? "relative min-w-0 flex-1 canvas-layout-animating"
-              : "relative min-w-0 flex-1"
-          }
-          onDrop={(event) => {
-            event.preventDefault();
-            const position = screenToFlowPosition({
-              x: event.clientX,
-              y: event.clientY,
-            });
-            const presetId = event.dataTransfer.getData(CANVAS_PRESET_MIME);
-            if (presetId.length > 0) {
-              addPresetNode(presetId, position);
-              return;
-            }
-            const kind = event.dataTransfer.getData(CANVAS_NODE_MIME);
-            if (kind !== "agent" && kind !== "exit") return;
-            addNode(kind, position);
-          }}
-          onDragOver={(event) => {
-            event.preventDefault();
-            event.dataTransfer.dropEffect = "move";
-          }}
-          data-canvas-canvas
-        >
-          <NodeIssueCountsContext.Provider value={issueCounts}>
-            <NodeWarningCountsContext.Provider value={warningCounts}>
-              <ReactFlow
-                nodes={nodes}
-                edges={edges}
-                nodeTypes={canvasNodeTypes}
-                onNodesChange={onNodesChange}
-                onEdgesChange={onEdgesChange}
-                onConnect={onConnect}
-                onNodeDragStart={onNodeDragStart}
-                onNodeDragStop={onNodeDragStop}
-                onNodeClick={(_, node) => {
-                  setSelectedEdgeId(null);
-                  setSelectedNodeId(node.id);
-                }}
-                onEdgeClick={(_, edge) => {
-                  setSelectedNodeId(null);
-                  setSelectedEdgeId(edge.id);
-                }}
-                onPaneClick={() => {
-                  setSelectedNodeId(null);
-                  setSelectedEdgeId(null);
-                }}
-                deleteKeyCode={null}
-                multiSelectionKeyCode={["Meta", "Shift"]}
-                minZoom={0.2}
-                maxZoom={2.5}
-                fitView
-                fitViewOptions={{ padding: 0.2, maxZoom: 1 }}
-                colorMode="dark"
-              >
-                <Background variant={BackgroundVariant.Dots} gap={24} size={1.5} />
-                <Controls showInteractive={false} />
-              </ReactFlow>
-            </NodeWarningCountsContext.Provider>
-          </NodeIssueCountsContext.Provider>
-
-          {isEmpty ? (
-            <div className="pointer-events-none absolute top-6 left-1/2 z-10 w-80 -translate-x-1/2 rounded-lg border border-border bg-surface p-3 text-center shadow-3">
-              <p className="text-sm font-medium text-fg">Start building your graph</p>
-              <p className="mt-1 text-xs text-muted-fg">
-                Drag an <span className="font-medium text-fg">Agent step</span> from the palette,
-                connect it to the pinned entry node, then add branches, loops, and an exit.
-              </p>
-            </div>
-          ) : null}
-
-          <ValidationPanel
-            issues={issues}
-            warnings={warnings}
-            nodeNames={nodeNames}
-            onFocusIssue={focusIssue}
-            className="absolute bottom-3 left-3 z-10 w-[28rem] max-w-[calc(100%-1.5rem)]"
+      ) : (
+        <div className="flex min-h-0 flex-1">
+          <Palette
+            sections={paletteSections}
+            onAdd={(kind) => addNode(kind)}
+            presets={presets.map(toPalettePreset)}
+            presetsLoading={!presetsLoaded}
+            onAddPreset={(presetId) => addPresetNode(presetId)}
+            onManagePresets={() => setManagePresetsOpen(true)}
           />
 
-          {dirty ? (
-            <p className="absolute bottom-3 right-14 z-10 text-xs text-muted-fg" role="status">
-              Unsaved changes — ⌘/Ctrl+S to save
-            </p>
-          ) : null}
+          <div
+            className={
+              layoutAnimating
+                ? "relative min-h-[480px] min-w-0 flex-1 canvas-layout-animating"
+                : "relative min-h-[480px] min-w-0 flex-1"
+            }
+            onDrop={(event) => {
+              event.preventDefault();
+              const position = screenToFlowPosition({
+                x: event.clientX,
+                y: event.clientY,
+              });
+              const presetId = event.dataTransfer.getData(CANVAS_PRESET_MIME);
+              if (presetId.length > 0) {
+                addPresetNode(presetId, position);
+                return;
+              }
+              const kind = event.dataTransfer.getData(CANVAS_NODE_MIME);
+              if (kind !== "agent" && kind !== "exit") return;
+              addNode(kind, position);
+            }}
+            onDragOver={(event) => {
+              event.preventDefault();
+              event.dataTransfer.dropEffect = "move";
+            }}
+            ref={canvasRef}
+            data-canvas-canvas
+          >
+            <NodeIssueCountsContext.Provider value={issueCounts}>
+              <NodeHintCountsContext.Provider value={hintCounts}>
+                <NodeWarningCountsContext.Provider value={warningCounts}>
+                  <ReactFlow
+                    nodes={nodes}
+                    edges={edges}
+                    nodeTypes={canvasNodeTypes}
+                    onNodesChange={onNodesChange}
+                    onEdgesChange={onEdgesChange}
+                    onConnect={onConnect}
+                    onNodeDragStart={onNodeDragStart}
+                    onNodeDragStop={onNodeDragStop}
+                    onNodeClick={(event, node) => {
+                      // Handle clicks drive connections (and the guided
+                      // edge flow, #69) — the bubbled node click must not
+                      // clobber the selection the connect just made.
+                      if (
+                        event.target instanceof Element &&
+                        event.target.closest(".react-flow__handle") !== null
+                      ) {
+                        return;
+                      }
+                      setSelectedEdgeId(null);
+                      setSelectedNodeId(node.id);
+                    }}
+                    onEdgeClick={(_, edge) => {
+                      setSelectedNodeId(null);
+                      setSelectedEdgeId(edge.id);
+                    }}
+                    onPaneClick={() => {
+                      setSelectedNodeId(null);
+                      setSelectedEdgeId(null);
+                    }}
+                    deleteKeyCode={null}
+                    multiSelectionKeyCode={["Shift"]}
+                    panOnScroll
+                    zoomOnScroll={false}
+                    zoomOnPinch
+                    selectionOnDrag={selectionMode === "marquee"}
+                    panOnDrag={selectionMode !== "marquee"}
+                    minZoom={0.2}
+                    maxZoom={2.5}
+                    fitView
+                    fitViewOptions={{ padding: 0.2, maxZoom: 1 }}
+                    colorMode="dark"
+                    attributionPosition="top-right"
+                  >
+                    <Background variant={BackgroundVariant.Dots} gap={24} size={1.5} />
+                    {/* Bottom-right (#72): the ValidationPanel owns bottom-left
+                      whenever issues/warnings render, and overlapped zoom
+                      buttons read as "the canvas is broken". The minimap
+                      (#75) takes top-left inside the pane (the palette is a
+                      sibling outside it) — clear of the top-right
+                      attribution and bottom-right Controls — and only
+                      appears once the graph is big enough to navigate. */}
+                    <Controls position="bottom-right" showInteractive={false} />
+                    {shouldShowMiniMap(doc.nodes.length) ? (
+                      <MiniMap
+                        position="top-left"
+                        pannable
+                        zoomable
+                        nodeColor={miniMapNodeColor}
+                        ariaLabel="Graph minimap"
+                      />
+                    ) : null}
+                  </ReactFlow>
+                </NodeWarningCountsContext.Provider>
+              </NodeHintCountsContext.Provider>
+            </NodeIssueCountsContext.Provider>
+
+            {isEmpty ? (
+              <div className="pointer-events-none absolute top-6 left-1/2 z-10 w-80 -translate-x-1/2 rounded-lg border border-border bg-surface p-3 text-center shadow-3">
+                <p className="text-sm font-medium text-fg">Start building your graph</p>
+                <p className="mt-1 text-xs text-muted-fg">
+                  Drag an <span className="font-medium text-fg">Agent step</span> from the palette,
+                  connect it to the pinned entry node, then add branches, loops, and an exit.
+                </p>
+              </div>
+            ) : null}
+
+            <ValidationPanel
+              issues={issues}
+              warnings={warnings}
+              nodeNames={nodeNames}
+              edgeLabels={edgeLabels}
+              onFocusIssue={focusIssue}
+              className="absolute bottom-3 left-3 z-10 w-[28rem] max-w-[calc(100%-1.5rem)]"
+            />
+
+            {dirty ? (
+              <p className="absolute bottom-3 right-14 z-10 text-xs text-muted-fg" role="status">
+                Unsaved changes — ⌘/Ctrl+S to save
+              </p>
+            ) : null}
+
+            {/* Coach hint card (#77): bottom-center keeps it clear of the
+              bottom-left ValidationPanel, bottom-right Controls, and the
+              top-center empty-state card. Dismissal persists per hint id. */}
+            {coachHint !== null ? (
+              <div
+                data-canvas-hint={coachHint.id}
+                role="status"
+                className="absolute bottom-3 left-1/2 z-10 flex -translate-x-1/2 items-center gap-2 rounded-lg border border-border bg-surface px-3 py-2 shadow-2"
+              >
+                <span className="text-xs text-fg">
+                  {coachHint.message}
+                  {coachHint.saveNote !== undefined ? (
+                    <span className="text-muted-fg"> — {coachHint.saveNote}</span>
+                  ) : null}
+                </span>
+                <button
+                  type="button"
+                  aria-label={`Dismiss hint: ${coachHint.id}`}
+                  onClick={() => dismissHint(coachHint.id)}
+                  className="rounded px-1 leading-none text-muted-fg transition-colors hover:bg-elevated hover:text-fg focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
+                >
+                  ×
+                </button>
+              </div>
+            ) : null}
+          </div>
         </div>
-      </div>
+      )}
 
       {selectedEdge !== null ? (
         <EdgePropertiesDrawer
@@ -1030,8 +1666,7 @@ function GraphCanvasInner({
                     toast({
                       variant: "danger",
                       title: "Could not save preset",
-                      description:
-                        cause instanceof ApiError ? cause.message : "Unexpected error",
+                      description: cause instanceof ApiError ? cause.message : "Unexpected error",
                     });
                   })
               : undefined
@@ -1058,7 +1693,11 @@ function GraphCanvasInner({
           onDelete={(presetId) =>
             removePreset(presetId)
               .then(() =>
-                toast({ variant: "success", title: "Preset deleted", description: "Nodes created from it keep their config copies." }),
+                toast({
+                  variant: "success",
+                  title: "Preset deleted",
+                  description: "Nodes created from it keep their config copies.",
+                }),
               )
               .catch((cause) => {
                 toast({
@@ -1072,20 +1711,53 @@ function GraphCanvasInner({
         />
       ) : null}
 
-      <Dialog open={confirmLeave} onClose={() => setConfirmLeave(false)} label="Unsaved changes">
+      <RevisionHistoryDrawer
+        open={revisionsOpen}
+        workflowId={workflow.id}
+        currentRevision={revision ?? null}
+        onClose={() => setRevisionsOpen(false)}
+        onView={(revisionNumber) => void viewRevision(revisionNumber)}
+      />
+
+      <Dialog open={leaveGuard.confirmOpen} onClose={leaveGuard.stay} label="Unsaved changes">
         <h2 className="text-title font-semibold text-fg">Leave with unsaved changes?</h2>
         <p className="mt-1 text-sm text-muted-fg">
           Your canvas edits have not been saved as a revision yet. Leaving discards them.
         </p>
         <div className="mt-4 flex justify-end gap-2">
-          <Button variant="secondary" onClick={() => setConfirmLeave(false)}>
+          <Button variant="secondary" onClick={leaveGuard.stay}>
             Keep editing
           </Button>
-          <Button variant="danger" onClick={() => router.push(basePath)}>
+          <Button variant="danger" onClick={leaveGuard.proceed}>
             Discard and leave
           </Button>
         </div>
       </Dialog>
+
+      {/* Revision conflict (#76): shown when the daemon refused a save with
+          409 REVISION_CONFLICT. Non-blocking on purpose — Escape/overlay
+          just closes it (local edits stay, the next save re-checks); the two
+          actions resolve it. Distinct from the leave guard above: this only
+          ever opens at save time, so the two dialogs never compete. */}
+      {conflict !== null ? (
+        <Dialog open onClose={() => setConflict(null)} label={conflict.title}>
+          <h2 className="text-title font-semibold text-fg">{conflict.title}</h2>
+          <p className="mt-1 text-sm text-muted-fg">{conflict.message}</p>
+          <p className="mt-1 text-sm text-muted-fg">
+            Reload discards your local edits and rebases on revision {conflict.currentRevision}.
+            Save anyway creates revision {conflict.currentRevision + 1} from your canvas, replacing
+            what was saved elsewhere.
+          </p>
+          <div className="mt-4 flex justify-end gap-2">
+            <Button variant="secondary" onClick={() => resolveConflict("save-anyway")}>
+              Save anyway
+            </Button>
+            <Button variant="danger" onClick={() => resolveConflict("reload")}>
+              Reload
+            </Button>
+          </div>
+        </Dialog>
+      ) : null}
     </div>
   );
 }

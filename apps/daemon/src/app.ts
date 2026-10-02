@@ -71,7 +71,12 @@ export interface DaemonApp {
 }
 
 export interface ErrorBody {
-  error: { code: string; message: string; details?: Array<{ path: string; message: string }> };
+  error: {
+    code: string;
+    message: string;
+    /** Zod 422 issue list, or a structured payload (e.g. REVISION_CONFLICT's currentRevision). */
+    details?: Array<{ path: string; message: string }> | Record<string, unknown>;
+  };
 }
 
 export function createApp(options: CreateAppOptions = {}): DaemonApp {
@@ -138,7 +143,13 @@ export function createApp(options: CreateAppOptions = {}): DaemonApp {
   app.onError((err, c) => {
     if (err instanceof HttpError) {
       return c.json(
-        { error: { code: err.code, message: err.message } } satisfies ErrorBody,
+        {
+          error: {
+            code: err.code,
+            message: err.message,
+            ...(err.details === undefined ? {} : { details: err.details }),
+          },
+        } satisfies ErrorBody,
         err.status as ContentfulStatusCode,
       );
     }

@@ -7,12 +7,15 @@ import {
   deleteWorkflow,
   fetchAgentPresets,
   fetchDriverIds,
+  fetchDriverIdsResult,
   fetchWorkflow,
   fetchWorkflowForEditor,
+  fetchWorkflowRevisions,
   fetchWorkflows,
   startWorkflowRun,
   updateAgentPreset,
   type WorkflowFetcher,
+  type WorkflowListed,
 } from "./workflows-api";
 
 /**
@@ -45,6 +48,22 @@ describe("fetchWorkflows", () => {
     expect(workflows).toHaveLength(1);
     expect(fetcher).toHaveBeenCalledWith("/api/workflows?projectId=p-1");
   });
+
+  it("passes the daemon graph summary through untouched (#70)", async () => {
+    const listed: WorkflowListed = {
+      ...fixtureWorkflow(),
+      graphSummary: { nodeCount: 3, edgeCount: 2, hasLoop: true, hasRouter: false, revision: 4 },
+    };
+    const fetcher = vi.fn().mockResolvedValue({ workflows: [listed] });
+    const workflows = await fetchWorkflows("p-1", fetcher as unknown as WorkflowFetcher);
+    expect(workflows[0]?.graphSummary).toEqual({
+      nodeCount: 3,
+      edgeCount: 2,
+      hasLoop: true,
+      hasRouter: false,
+      revision: 4,
+    });
+  });
 });
 
 describe("fetchWorkflow", () => {
@@ -60,6 +79,19 @@ describe("fetchWorkflow", () => {
     await expect(fetchWorkflow("x", fetcher as unknown as WorkflowFetcher)).rejects.toThrow(
       ApiError,
     );
+  });
+});
+
+describe("fetchWorkflowRevisions (#77)", () => {
+  it("lists revisions (number + createdAt, no graph blobs)", async () => {
+    const revisions = [
+      { id: "r1", number: 1, createdAt: "2026-01-02T10:00:00Z" },
+      { id: "r2", number: 2, createdAt: "2026-01-03T10:00:00Z" },
+    ];
+    const fetcher = vi.fn().mockResolvedValue({ revisions });
+    const listed = await fetchWorkflowRevisions("w-1", fetcher as unknown as WorkflowFetcher);
+    expect(listed).toEqual(revisions);
+    expect(fetcher).toHaveBeenCalledWith("/api/workflows/w-1/revisions");
   });
 });
 
@@ -120,6 +152,29 @@ describe("fetchDriverIds", () => {
   });
 });
 
+describe("fetchDriverIdsResult (#74: fallback signal for the create form)", () => {
+  it("reports the registered ids without a fallback flag", async () => {
+    const fetcher = vi.fn().mockResolvedValue({ drivers: ["fake", "opencode"] });
+    expect(await fetchDriverIdsResult(fetcher as unknown as WorkflowFetcher)).toEqual({
+      ids: ["fake", "opencode"],
+      fallback: false,
+    });
+  });
+
+  it("flags the default-list fallback when the daemon is unreachable or empty", async () => {
+    const failing = vi.fn().mockRejectedValue(new Error("down"));
+    expect(await fetchDriverIdsResult(failing as unknown as WorkflowFetcher)).toEqual({
+      ids: ["opencode"],
+      fallback: true,
+    });
+    const empty = vi.fn().mockResolvedValue({ drivers: [] });
+    expect(await fetchDriverIdsResult(empty as unknown as WorkflowFetcher)).toEqual({
+      ids: ["opencode"],
+      fallback: true,
+    });
+  });
+});
+
 describe("deleteWorkflow", () => {
   it("sends DELETE and tolerates the empty 204 body", async () => {
     const fetcher = vi.fn().mockResolvedValue(undefined);
@@ -171,7 +226,12 @@ describe("agent presets api (#49)", () => {
     expect(fetcher).toHaveBeenCalledWith("/api/projects/p-1/presets", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ name: "Senior Reviewer", description: "Reviews everything twice.", icon: "🔍", config }),
+      body: JSON.stringify({
+        name: "Senior Reviewer",
+        description: "Reviews everything twice.",
+        icon: "🔍",
+        config,
+      }),
     });
   });
 
@@ -218,9 +278,11 @@ describe("agent presets api (#49)", () => {
   });
 
   it("propagates daemon 422s (invalid config)", async () => {
-    const fetcher = vi.fn().mockRejectedValue(
-      new ApiError("VALIDATION_ERROR", "promptTemplate must be a non-empty string", 422),
-    );
+    const fetcher = vi
+      .fn()
+      .mockRejectedValue(
+        new ApiError("VALIDATION_ERROR", "promptTemplate must be a non-empty string", 422),
+      );
     await expect(
       createAgentPreset({
         projectId: "p-1",

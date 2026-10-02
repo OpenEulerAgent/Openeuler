@@ -16,11 +16,13 @@ import {
   EDGE_MAX_ITERATIONS_DEFAULT,
   EDGE_MAX_ITERATIONS_HARD_CAP,
   MISSING_FALLBACK_MESSAGE,
+  SET_CONDITION_LABEL,
   applyEdgeInspectorAction,
   clampMaxIterations,
   conditionForType,
   conditionSummary,
   cyclicEdgeIds,
+  edgeChipLabel,
   edgeFieldErrors,
   edgeInspectorReducer,
   moveRouterEdge,
@@ -125,6 +127,37 @@ describe("conditionForType", () => {
       pattern: "",
     });
     expect(conditionForType("outputMatches")).toEqual({ type: "outputMatches", regex: "" });
+  });
+});
+
+describe("edgeChipLabel (guided flow chips, #69)", () => {
+  it("shows the attention 'set condition…' chip for every unconfigured placeholder", () => {
+    expect(edgeChipLabel({ condition: { type: "outputContains", pattern: "" } })).toBe(
+      SET_CONDITION_LABEL,
+    );
+    expect(edgeChipLabel({ condition: { type: "outputNotContains", pattern: "" } })).toBe(
+      SET_CONDITION_LABEL,
+    );
+    expect(edgeChipLabel({ condition: { type: "outputMatches", regex: "" } })).toBe(
+      SET_CONDITION_LABEL,
+    );
+  });
+
+  it("never renders an empty-pattern summary", () => {
+    expect(edgeChipLabel({ condition: { type: "outputContains", pattern: "" } })).not.toBe(
+      'contains ""',
+    );
+  });
+
+  it("falls back to the regular summary once the condition is configured", () => {
+    expect(edgeChipLabel({ condition: { type: "always" } })).toBe("always");
+    expect(edgeChipLabel({ condition: { type: "outputContains", pattern: "LGTM" } })).toBe(
+      'contains "LGTM"',
+    );
+    expect(edgeChipLabel({ condition: { type: "outputMatches", regex: "^ok$", flags: "i" } })).toBe(
+      "matches ^ok$ [i]",
+    );
+    expect(edgeChipLabel({ condition: { type: "always" }, invert: true })).toBe("always ¬");
   });
 });
 

@@ -6,11 +6,24 @@ import {
   type CanvasDocument,
   type CanvasNode,
 } from "./canvas-document";
+import { applyConnect, checkConnect } from "./canvas-ops";
 import {
   validateCanvasDocument,
   issuesFromApiDetails,
   issuesForEdge,
   issuesForNode,
+  classifyIssue,
+  clearIssuesIfStale,
+  edgeTargetLabel,
+  issueHint,
+  dedupeIssues,
+  missingConditionEdgeLabels,
+  saveBlockMessage,
+  severitySummary,
+  splitIssuesBySeverity,
+  UNREACHABLE_HINT,
+  MISSING_CONDITION_HINT,
+  type CanvasIssue,
 } from "./validation";
 
 function node(
@@ -179,6 +192,297 @@ describe("validateCanvasDocument", () => {
   });
 });
 
+describe("classifyIssue (severity split, #68)", () => {
+  it("unreachable-from-entry nodes are hints", () => {
+    const doc: CanvasDocument = {
+      nodes: [
+        node("a", { isEntry: true }),
+        node("b", { position: { x: 300, y: 0 } }),
+        node("orphan", { position: { x: 0, y: 300 } }),
+        exit("x"),
+      ],
+      edges: [edge("a", "b", "always"), edge("b", "x", "always"), edge("orphan", "x", "always")],
+    };
+    const unreachable = validateCanvasDocument(doc).find((issue) =>
+      issue.message.includes("not reachable"),
+    );
+    expect(unreachable).toBeDefined();
+    expect(classifyIssue(unreachable as CanvasIssue)).toBe("hint");
+    expect(issueHint(unreachable as CanvasIssue)).toBe(UNREACHABLE_HINT);
+  });
+
+  it("edges missing their condition pattern are hints", () => {
+    const doc: CanvasDocument = {
+      nodes: [node("a", { isEntry: true }), exit("x")],
+      edges: [edge("a", "x", { pattern: "" })],
+    };
+    const missing = validateCanvasDocument(doc).find((issue) =>
+      issue.message.includes("pattern must be a non-empty string"),
+    );
+    expect(missing).toBeDefined();
+    expect(classifyIssue(missing as CanvasIssue)).toBe("hint");
+    expect(issueHint(missing as CanvasIssue)).toBe(MISSING_CONDITION_HINT);
+  });
+
+  it("edges with an empty regex placeholder are hints too", () => {
+    const doc: CanvasDocument = {
+      nodes: [node("a", { isEntry: true }), exit("x")],
+      edges: [
+        {
+          id: "e-a-x",
+          source: "a",
+          target: "x",
+          data: { condition: { type: "outputMatches", regex: "" } },
+        },
+      ],
+    };
+    const missing = validateCanvasDocument(doc).find((issue) =>
+      issue.message.includes("regex must be a non-empty string"),
+    );
+    expect(missing).toBeDefined();
+    expect(classifyIssue(missing as CanvasIssue)).toBe("hint");
+  });
+
+  it("a typed-but-broken regex is a blocker, not a hint", () => {
+    const doc: CanvasDocument = {
+      nodes: [node("a", { isEntry: true }), exit("x")],
+      edges: [
+        {
+          id: "e-a-x",
+          source: "a",
+          target: "x",
+          data: { condition: { type: "outputMatches", regex: "([a-z" } },
+        },
+      ],
+    };
+    const broken = validateCanvasDocument(doc).find((issue) =>
+      issue.message.includes("invalid regular expression"),
+    );
+    expect(broken).toBeDefined();
+    expect(classifyIssue(broken as CanvasIssue)).toBe("blocker");
+    expect(issueHint(broken as CanvasIssue)).toBeUndefined();
+  });
+
+  it("an empty prompt (user-cleared) is a blocker", () => {
+    const doc: CanvasDocument = {
+      nodes: [
+        node("a", { isEntry: true }),
+        node("b", { promptTemplate: "", position: { x: 300, y: 0 } }),
+      ],
+      edges: [edge("a", "b", "always")],
+    };
+    const emptyPrompt = validateCanvasDocument(doc).find((issue) =>
+      issue.message.includes("promptTemplate"),
+    );
+    expect(emptyPrompt).toBeDefined();
+    expect(classifyIssue(emptyPrompt as CanvasIssue)).toBe("blocker");
+  });
+
+  it("hard graph rules are blockers", () => {
+    const dualAlways: CanvasDocument = {
+      nodes: [
+        node("a", { isEntry: true }),
+        node("b", { position: { x: 300, y: -100 } }),
+        node("c", { position: { x: 300, y: 100 } }),
+      ],
+      edges: [edge("a", "b", "always"), edge("a", "c", "always")],
+    };
+    const dual = validateCanvasDocument(dualAlways).find((issue) =>
+      issue.message.includes("unconditional (always) outgoing edges"),
+    );
+    expect(classifyIssue(dual as CanvasIssue)).toBe("blocker");
+
+    const exitOutgoing: CanvasDocument = {
+      nodes: [node("a", { isEntry: true }), exit("x", { x: 300, y: 0 }), node("b")],
+      edges: [edge("a", "x", "always"), edge("x", "b", "always")],
+    };
+    const exitIssue = validateCanvasDocument(exitOutgoing).find((issue) =>
+      issue.message.includes("must not have outgoing edges"),
+    );
+    expect(classifyIssue(exitIssue as CanvasIssue)).toBe("blocker");
+
+    const badReference: CanvasDocument = {
+      nodes: [
+        node("a", { isEntry: true }),
+        node("b", { promptTemplate: "use {{output:ghost}}", position: { x: 300, y: 0 } }),
+      ],
+      edges: [edge("a", "b", "always")],
+    };
+    const reference = validateCanvasDocument(badReference).find((issue) =>
+      issue.message.includes("not an upstream node"),
+    );
+    expect(classifyIssue(reference as CanvasIssue)).toBe("blocker");
+  });
+});
+
+describe("live validation over a palette drop (#68)", () => {
+  const entry = node("a", { isEntry: true });
+  const dropped: CanvasNode = createAgentNode({
+    id: "dropped",
+    position: { x: 300, y: 0 },
+    name: "Agent 2",
+  });
+  const withPrompt = (prompt: string): CanvasNode => {
+    if (dropped.data.kind !== "agent") throw new Error("unreachable");
+    return {
+      ...dropped,
+      data: { ...dropped.data, config: { ...dropped.data.config, promptTemplate: prompt } },
+    };
+  };
+
+  it("a fresh palette drop (prefilled prompt) yields ONLY the unreachable hint", () => {
+    const doc: CanvasDocument = { nodes: [entry, dropped], edges: [] };
+    const issues = validateCanvasDocument(doc);
+    expect(issues).toHaveLength(1);
+    expect(classifyIssue(issues[0] as CanvasIssue)).toBe("hint");
+    expect(issues[0]?.nodeId).toBe("dropped");
+    expect(severitySummary(issues)).toBe("1 hint");
+  });
+
+  it("connecting the dropped node clears every issue (one connection from valid)", () => {
+    const doc: CanvasDocument = { nodes: [entry, dropped], edges: [] };
+    const check = checkConnect(doc, { source: "a", target: "dropped" });
+    if (!check.ok) throw new Error("expected connect to succeed");
+    const connected = applyConnect(doc, check);
+    expect(validateCanvasDocument(connected)).toEqual([]);
+  });
+
+  it("clearing the prompt manually turns the doc into a blocker", () => {
+    const cleared: CanvasDocument = {
+      nodes: [entry, withPrompt("")],
+      edges: [edge("a", "dropped", "always")],
+    };
+    const issues = validateCanvasDocument(cleared);
+    expect(issues).toHaveLength(1);
+    expect(classifyIssue(issues[0] as CanvasIssue)).toBe("blocker");
+  });
+
+  it("mixed docs split blockers-first and summarize with counts", () => {
+    const doc: CanvasDocument = {
+      nodes: [
+        node("a", { isEntry: true }),
+        { ...node("empty", { promptTemplate: "", position: { x: 300, y: 0 } }) },
+        node("orphan", { position: { x: 0, y: 300 } }),
+      ],
+      edges: [edge("a", "empty", "always")],
+    };
+    const issues = validateCanvasDocument(doc);
+    const { blockers, hints } = splitIssuesBySeverity(issues);
+    expect(blockers.length).toBe(1);
+    expect(hints.length).toBe(1);
+    expect(blockers[0]?.nodeId).toBe("empty");
+    expect(hints[0]?.nodeId).toBe("orphan");
+    expect(severitySummary(issues)).toBe("1 blocker · 1 hint");
+    expect(severitySummary([])).toBe("");
+    expect(severitySummary(blockers)).toBe("1 blocker");
+    expect(severitySummary(hints)).toBe("1 hint");
+  });
+
+  it("dedupeIssues collapses identical client + daemon findings", () => {
+    const client: CanvasIssue = {
+      nodeId: "b",
+      field: "config.promptTemplate",
+      message: "promptTemplate must be a non-empty string",
+    };
+    expect(dedupeIssues([client], [client, { nodeId: "z", message: "other" }])).toEqual([
+      client,
+      { nodeId: "z", message: "other" },
+    ]);
+  });
+});
+
+describe("save-block messaging naming edges (#69)", () => {
+  const routerDoc: CanvasDocument = {
+    nodes: [
+      node("a", { isEntry: true }),
+      node("review", { position: { x: 300, y: 0 } }),
+      node("fix", { position: { x: 600, y: 100 } }),
+    ],
+    edges: [edge("a", "review", "always"), edge("review", "fix", { pattern: "" })],
+  };
+
+  it("saveBlockMessage calls the unconfigured edge out by source → target names", () => {
+    const issues = validateCanvasDocument(routerDoc);
+    expect(issues).toHaveLength(1);
+    expect(saveBlockMessage(routerDoc, issues)).toBe(
+      "Set a condition on review → fix. 1 hint must be fixed — see the validation panel.",
+    );
+  });
+
+  it("missingConditionEdgeLabels lists every unconfigured edge once, in issue order", () => {
+    const doc: CanvasDocument = {
+      nodes: [
+        node("a", { isEntry: true }),
+        node("review", { position: { x: 300, y: 0 } }),
+        node("fix", { position: { x: 600, y: 100 } }),
+        node("retry", { position: { x: 600, y: -100 } }),
+      ],
+      edges: [
+        edge("a", "review", "always"),
+        edge("review", "fix", { pattern: "" }),
+        edge("review", "retry", { pattern: "" }),
+      ],
+    };
+    expect(missingConditionEdgeLabels(doc, validateCanvasDocument(doc))).toEqual([
+      "review → fix",
+      "review → retry",
+    ]);
+    expect(saveBlockMessage(doc, validateCanvasDocument(doc))).toBe(
+      "Set a condition on review → fix, review → retry. 2 hints must be fixed — see the validation panel.",
+    );
+  });
+
+  it("keeps the plain severity summary when no edge-condition hints exist", () => {
+    const blockerDoc: CanvasDocument = {
+      nodes: [
+        node("a", { isEntry: true }),
+        node("b", { promptTemplate: "", position: { x: 300, y: 0 } }),
+      ],
+      edges: [edge("a", "b", "always")],
+    };
+    expect(saveBlockMessage(blockerDoc, validateCanvasDocument(blockerDoc))).toBe(
+      "1 blocker must be fixed — see the validation panel.",
+    );
+    expect(missingConditionEdgeLabels(blockerDoc, validateCanvasDocument(blockerDoc))).toEqual([]);
+  });
+
+  it("edgeTargetLabel uses node names and falls back to undefined for unknown edges", () => {
+    expect(edgeTargetLabel(routerDoc, "e-review-fix")).toBe("review → fix");
+    const source = node("a", { isEntry: true });
+    if (source.data.kind !== "agent") throw new Error("unreachable");
+    const named: CanvasDocument = {
+      nodes: [
+        { ...source, data: { ...source.data, name: "implement" } },
+        { ...node("x"), id: "exit-1", data: { kind: "exit", name: "Done" } },
+      ],
+      edges: [
+        {
+          id: "e-a-exit-1",
+          source: "a",
+          target: "exit-1",
+          data: { condition: { type: "always" } },
+        },
+      ],
+    };
+    expect(edgeTargetLabel(named, "e-a-exit-1")).toBe("implement → Done");
+    expect(edgeTargetLabel(named, "e-nope")).toBeUndefined();
+  });
+});
+
+describe("clearIssuesIfStale (serverIssues functional guard, #69 QA)", () => {
+  it("preserves identity when the list is already empty (no state churn, React bails out)", () => {
+    const empty: CanvasIssue[] = [];
+    expect(clearIssuesIfStale(empty)).toBe(empty);
+  });
+
+  it("clears stale daemon findings with a fresh empty array", () => {
+    const stale: CanvasIssue[] = [{ nodeId: "b", message: "daemon rejected the driver" }];
+    const cleared = clearIssuesIfStale(stale);
+    expect(cleared).toEqual([]);
+    expect(cleared).not.toBe(stale);
+  });
+});
+
 describe("issuesFromApiDetails (daemon 422 path mapping)", () => {
   const doc: CanvasDocument = {
     nodes: [node("a", { isEntry: true }), node("b", { position: { x: 300, y: 0 } }), exit("x")],
@@ -192,7 +496,7 @@ describe("issuesFromApiDetails (daemon 422 path mapping)", () => {
         message: "promptTemplate must be a non-empty string",
       },
     ];
-    const issues = issuesFromApiDetails(doc, details);
+    const issues = issuesFromApiDetails(doc, doc, details);
     expect(issues).toHaveLength(1);
     expect(issues[0]).toMatchObject({
       nodeId: "b",
@@ -205,7 +509,7 @@ describe("issuesFromApiDetails (daemon 422 path mapping)", () => {
     const details: ApiErrorDetail[] = [
       { path: "graph.edges.0.condition.pattern", message: "pattern must be a non-empty string" },
     ];
-    const issues = issuesFromApiDetails(doc, details);
+    const issues = issuesFromApiDetails(doc, doc, details);
     expect(issues[0]).toMatchObject({ edgeId: "e-a-b", field: "condition.pattern" });
   });
 
@@ -213,7 +517,7 @@ describe("issuesFromApiDetails (daemon 422 path mapping)", () => {
     const details: ApiErrorDetail[] = [
       { path: "nodes.2", message: 'node "x" is not reachable from the entry node "a"' },
     ];
-    const issues = issuesFromApiDetails(doc, details);
+    const issues = issuesFromApiDetails(doc, doc, details);
     expect(issues[0]).toMatchObject({
       nodeId: "x",
       message: expect.stringContaining("not reachable"),
@@ -224,8 +528,90 @@ describe("issuesFromApiDetails (daemon 422 path mapping)", () => {
     const details: ApiErrorDetail[] = [
       { path: "graph.entryNodeId", message: 'entryNodeId "missing" does not reference any node' },
     ];
-    const issues = issuesFromApiDetails(doc, details);
+    const issues = issuesFromApiDetails(doc, doc, details);
     expect(issues[0]?.nodeId).toBe("a");
     expect(issues[0]?.field).toBe("entryNodeId");
+  });
+});
+
+describe("issuesFromApiDetails against the request doc (#73)", () => {
+  /** entry(0) → b(1) → exit(2); edges [e-a-b(0), e-b-x(1)] — what the PUT serialized. */
+  const requestDoc: CanvasDocument = {
+    nodes: [node("a", { isEntry: true }), node("b", { position: { x: 300, y: 0 } }), exit("x")],
+    edges: [edge("a", "b", "always"), edge("b", "x", "always")],
+  };
+
+  it("resolves node indexes against the REQUEST doc when a node was added mid-flight", () => {
+    // A node inserted before `b` shifts `graph.nodes.1`: mapping against
+    // the current doc would badge the newcomer, not `b`.
+    const currentDoc: CanvasDocument = {
+      nodes: [
+        node("a", { isEntry: true }),
+        node("new", { position: { x: 150, y: 200 } }),
+        node("b", { position: { x: 300, y: 0 } }),
+        exit("x"),
+      ],
+      edges: [...requestDoc.edges],
+    };
+    const issues = issuesFromApiDetails(requestDoc, currentDoc, [
+      {
+        path: "graph.nodes.1.config.promptTemplate",
+        message: "promptTemplate must be a non-empty string",
+      },
+    ]);
+    expect(issues).toHaveLength(1);
+    expect(issues[0]).toMatchObject({ nodeId: "b", field: "config.promptTemplate" });
+  });
+
+  it("resolves edge indexes against the REQUEST doc after an edge was inserted mid-flight", () => {
+    const currentDoc: CanvasDocument = {
+      nodes: [...requestDoc.nodes],
+      // e-a-x inserted at index 1 shifts e-b-x; `graph.edges.1` must still
+      // resolve to e-b-x (the request doc's index 1), not e-a-x.
+      edges: [edge("a", "b", "always"), edge("a", "x", "always"), edge("b", "x", "always")],
+    };
+    const issues = issuesFromApiDetails(requestDoc, currentDoc, [
+      { path: "graph.edges.1.condition.pattern", message: "pattern must be a non-empty string" },
+    ]);
+    expect(issues).toHaveLength(1);
+    expect(issues[0]).toMatchObject({ edgeId: "e-b-x", field: "condition.pattern" });
+  });
+
+  it("drops a deleted node's findings while keeping still-present targets", () => {
+    // `b` deleted mid-flight: its dangling edge e-b-x drops with it; the
+    // entry survives, so an entryNodeId finding still lands on `a`.
+    const currentDoc: CanvasDocument = {
+      nodes: [node("a", { isEntry: true }), exit("x")],
+      edges: [],
+    };
+    const issues = issuesFromApiDetails(requestDoc, currentDoc, [
+      { path: "graph.nodes.1.config.promptTemplate", message: "promptTemplate is empty" },
+      { path: "graph.edges.1.condition.pattern", message: "pattern is empty" },
+      { path: "graph.entryNodeId", message: 'entryNodeId "a" does not reference any node' },
+    ]);
+    expect(issues).toHaveLength(1);
+    expect(issues[0]).toMatchObject({ nodeId: "a", field: "entryNodeId" });
+  });
+
+  it("drops a deleted edge's finding while keeping a sibling edge's", () => {
+    const currentDoc: CanvasDocument = {
+      nodes: [...requestDoc.nodes],
+      edges: [edge("a", "b", "always")],
+    };
+    const issues = issuesFromApiDetails(requestDoc, currentDoc, [
+      { path: "graph.edges.0.condition.pattern", message: "pattern is empty" },
+      { path: "graph.edges.1.condition.pattern", message: "pattern is empty" },
+    ]);
+    expect(issues).toHaveLength(1);
+    expect(issues[0]).toMatchObject({ edgeId: "e-a-b" });
+  });
+
+  it("passes untargeted graph-level findings through even after deletions", () => {
+    const currentDoc: CanvasDocument = { nodes: [node("a", { isEntry: true })], edges: [] };
+    const issues = issuesFromApiDetails(requestDoc, currentDoc, [
+      { path: "graph", message: "something is wrong with the graph" },
+    ]);
+    expect(issues).toHaveLength(1);
+    expect(issues[0]).toMatchObject({ message: "something is wrong with the graph" });
   });
 });

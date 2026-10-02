@@ -3,6 +3,7 @@
 import type { ReactNode } from "react";
 import { cn } from "@/lib/cn";
 import type { PalettePreset } from "@/lib/graph/presets";
+import { Skeleton } from "@/components/ui/skeleton";
 
 /**
  * Left palette inside the canvas editor (#46): draggable node sources.
@@ -155,10 +156,36 @@ function PresetItem({
   );
 }
 
+/** Skeleton rows shaped like {@link PresetItem} while the roster fetches (#72). */
+function PresetSkeletonRows({ rows = 3 }: { rows?: number }) {
+  return (
+    <div
+      className="flex flex-col gap-2"
+      role="status"
+      aria-label="Loading team presets"
+      data-palette-skeleton
+    >
+      {Array.from({ length: rows }, (_, index) => (
+        <div
+          key={index}
+          className="flex items-start gap-2.5 rounded-lg border border-border bg-surface p-2.5"
+        >
+          <Skeleton className="mt-0.5 size-7 shrink-0 rounded-md" />
+          <span className="min-w-0 flex-1">
+            <Skeleton className={cn("h-3.5", index % 2 === 0 ? "w-2/3" : "w-1/2")} />
+            <Skeleton className="mt-1.5 h-2.5 w-full" />
+          </span>
+        </div>
+      ))}
+    </div>
+  );
+}
+
 export function Palette({
   sections,
   onAdd,
   presets = [],
+  presetsLoading = false,
   onAddPreset,
   onManagePresets,
   className,
@@ -167,6 +194,9 @@ export function Palette({
   onAdd: (kind: PaletteNodeKind) => void;
   /** The project's agent presets (#49): the "Your team" roster. */
   presets?: readonly PalettePreset[];
+  /** While the roster fetch is in flight (#72): skeleton rows instead of
+   *  a misleading "No presets yet" hint. */
+  presetsLoading?: boolean;
   /** Click-to-add: creates a preset node at the canvas center. */
   onAddPreset?: (presetId: string) => void;
   onManagePresets?: () => void;
@@ -215,7 +245,9 @@ export function Palette({
           ) : null}
         </header>
         <div className="flex flex-col gap-2">
-          {presets.length === 0 ? (
+          {presetsLoading ? (
+            <PresetSkeletonRows />
+          ) : presets.length === 0 ? (
             <p className="rounded-lg border border-dashed border-border p-2.5 text-xs text-muted-fg">
               No presets yet — configure a node, then use “Save as preset…” in its inspector.
             </p>
