@@ -59,6 +59,22 @@ export function conditionForType(type: ExitCondition["type"]): ExitCondition {
   return { type, pattern: "" };
 }
 
+/**
+ * Chip copy for an edge whose condition is still the empty placeholder
+ * (#69): an attention-grabbing call-to-action instead of a meaningless
+ * `contains ""` summary.
+ */
+export const SET_CONDITION_LABEL = "set condition…";
+
+/**
+ * The canvas chip label for an edge: {@link SET_CONDITION_LABEL} while the
+ * condition still needs configuring (amber attention tone, guided flow),
+ * otherwise the regular {@link conditionSummary}.
+ */
+export function edgeChipLabel(data: Pick<CanvasEdgeData, "condition" | "invert">): string {
+  return needsConditionConfig(data) ? SET_CONDITION_LABEL : conditionSummary(data);
+}
+
 /** Whether a conditional edge still carries its empty placeholder pattern. */
 export function needsConditionConfig(data: Pick<CanvasEdgeData, "condition">): boolean {
   const condition = data.condition;

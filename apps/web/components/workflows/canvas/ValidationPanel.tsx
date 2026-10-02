@@ -23,6 +23,7 @@ export function ValidationPanel({
   issues,
   warnings = [],
   nodeNames,
+  edgeLabels,
   onFocusIssue,
   className,
 }: {
@@ -30,6 +31,8 @@ export function ValidationPanel({
   /** Advisory findings shown below the blocking issues. */
   warnings?: readonly CanvasWarning[];
   nodeNames: ReadonlyMap<string, string>;
+  /** Human-readable "source → target" labels; ids are the fallback (#69). */
+  edgeLabels?: ReadonlyMap<string, string>;
   onFocusIssue: (issue: CanvasIssue) => void;
   className?: string;
 }) {
@@ -67,12 +70,14 @@ export function ValidationPanel({
                     className="flex w-full items-start gap-2 rounded-md px-1.5 py-1 text-left text-xs text-danger transition-colors hover:bg-danger/10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
                   >
                     <Badge variant="danger" className="mt-0.5 shrink-0 px-1.5 py-0 text-[10px]">
-                      {labelFor(issue, nodeNames)}
+                      {labelFor(issue, nodeNames, edgeLabels)}
                     </Badge>
                     <span className="min-w-0">
                       {issue.message}
                       {issue.field ? (
-                        <span className="block font-mono text-[10px] opacity-70">{issue.field}</span>
+                        <span className="block font-mono text-[10px] opacity-70">
+                          {issue.field}
+                        </span>
                       ) : null}
                     </span>
                   </button>
@@ -94,7 +99,7 @@ export function ValidationPanel({
                     className="flex w-full items-start gap-2 rounded-md px-1.5 py-1 text-left text-xs text-warning transition-colors hover:bg-warning/10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
                   >
                     <Badge variant="warning" className="mt-0.5 shrink-0 px-1.5 py-0 text-[10px]">
-                      {labelFor(issue, nodeNames)}
+                      {labelFor(issue, nodeNames, edgeLabels)}
                     </Badge>
                     <span className="min-w-0">
                       {issueHint(issue) ?? issue.message}
@@ -127,7 +132,7 @@ export function ValidationPanel({
                   className="flex w-full items-start gap-2 rounded-md px-1.5 py-1 text-left text-xs text-warning transition-colors hover:bg-warning/10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
                 >
                   <Badge variant="warning" className="mt-0.5 shrink-0 px-1.5 py-0 text-[10px]">
-                    {labelFor(warning, nodeNames)}
+                    {labelFor(warning, nodeNames, edgeLabels)}
                   </Badge>
                   <span className="min-w-0">{warning.message}</span>
                 </button>
@@ -143,8 +148,9 @@ export function ValidationPanel({
 function labelFor(
   issue: { nodeId?: string; edgeId?: string },
   nodeNames: ReadonlyMap<string, string>,
+  edgeLabels?: ReadonlyMap<string, string>,
 ): string {
   if (issue.nodeId !== undefined) return nodeNames.get(issue.nodeId) ?? issue.nodeId;
-  if (issue.edgeId !== undefined) return `edge ${issue.edgeId}`;
+  if (issue.edgeId !== undefined) return edgeLabels?.get(issue.edgeId) ?? `edge ${issue.edgeId}`;
   return "graph";
 }

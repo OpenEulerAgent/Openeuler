@@ -230,7 +230,63 @@ export function splitIssuesBySeverity(issues: readonly CanvasIssue[]): {
 export function severitySummary(issues: readonly CanvasIssue[]): string {
   const { blockers, hints } = splitIssuesBySeverity(issues);
   const parts: string[] = [];
-  if (blockers.length > 0) parts.push(`${blockers.length} blocker${blockers.length === 1 ? "" : "s"}`);
+  if (blockers.length > 0)
+    parts.push(`${blockers.length} blocker${blockers.length === 1 ? "" : "s"}`);
   if (hints.length > 0) parts.push(`${hints.length} hint${hints.length === 1 ? "" : "s"}`);
   return parts.join(" · ");
+}
+
+// ---------------------------------------------------------------------------
+// Save-block messaging + daemon-supplement clearing (#69)
+//
+
+/**
+ * "source → target" label for an edge (node names when they resolve, ids
+ * otherwise) — the human-readable way issues and toasts name an edge.
+ */
+export function edgeTargetLabel(doc: CanvasDocument, edgeId: string): string | undefined {
+  const edge = doc.edges.find((candidate) => candidate.id === edgeId);
+  if (edge === undefined) return undefined;
+  const nameOf = (id: string): string => doc.nodes.find((node) => node.id === id)?.data.name ?? id;
+  return `${nameOf(edge.source)} → ${nameOf(edge.target)}`;
+}
+
+/**
+ * Every edge the save-block should call out by name: the edges behind
+ * missing-condition hints, as `"source → target"` labels in issue order.
+ */
+export function missingConditionEdgeLabels(
+  doc: CanvasDocument,
+  issues: readonly CanvasIssue[],
+): string[] {
+  const labels: string[] = [];
+  for (const issue of issues) {
+    if (issue.edgeId === undefined || issueHint(issue) !== MISSING_CONDITION_HINT) continue;
+    const label = edgeTargetLabel(doc, issue.edgeId);
+    if (label !== undefined && !labels.includes(label)) labels.push(label);
+  }
+  return labels;
+}
+
+/**
+ * Save-block toast description (#69): the severity summary plus, when any
+ * edge still lacks its condition, an explicit "Set a condition on
+ * source → target" callout so the blocked user knows exactly which edge
+ * and what to do about it.
+ */
+export function saveBlockMessage(doc: CanvasDocument, issues: readonly CanvasIssue[]): string {
+  const base = `${severitySummary(issues)} must be fixed — see the validation panel.`;
+  const targets = missingConditionEdgeLabels(doc, issues);
+  if (targets.length === 0) return base;
+  return `Set a condition on ${targets.join(", ")}. ${base}`;
+}
+
+/**
+ * Functional updater for clearing daemon-supplement issues on doc change
+ * (#69 QA): identity-preserving when the list is already empty (React
+ * bails out — no redundant re-render, no double validation run) and a
+ * fresh empty array otherwise.
+ */
+export function clearIssuesIfStale(prev: CanvasIssue[]): CanvasIssue[] {
+  return prev.length > 0 ? [] : prev;
 }

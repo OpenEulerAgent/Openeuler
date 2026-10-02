@@ -13,8 +13,12 @@ import {
   issuesForEdge,
   issuesForNode,
   classifyIssue,
+  clearIssuesIfStale,
+  edgeTargetLabel,
   issueHint,
   dedupeIssues,
+  missingConditionEdgeLabels,
+  saveBlockMessage,
   severitySummary,
   splitIssuesBySeverity,
   UNREACHABLE_HINT,
@@ -384,6 +388,98 @@ describe("live validation over a palette drop (#68)", () => {
       client,
       { nodeId: "z", message: "other" },
     ]);
+  });
+});
+
+describe("save-block messaging naming edges (#69)", () => {
+  const routerDoc: CanvasDocument = {
+    nodes: [
+      node("a", { isEntry: true }),
+      node("review", { position: { x: 300, y: 0 } }),
+      node("fix", { position: { x: 600, y: 100 } }),
+    ],
+    edges: [edge("a", "review", "always"), edge("review", "fix", { pattern: "" })],
+  };
+
+  it("saveBlockMessage calls the unconfigured edge out by source → target names", () => {
+    const issues = validateCanvasDocument(routerDoc);
+    expect(issues).toHaveLength(1);
+    expect(saveBlockMessage(routerDoc, issues)).toBe(
+      "Set a condition on review → fix. 1 hint must be fixed — see the validation panel.",
+    );
+  });
+
+  it("missingConditionEdgeLabels lists every unconfigured edge once, in issue order", () => {
+    const doc: CanvasDocument = {
+      nodes: [
+        node("a", { isEntry: true }),
+        node("review", { position: { x: 300, y: 0 } }),
+        node("fix", { position: { x: 600, y: 100 } }),
+        node("retry", { position: { x: 600, y: -100 } }),
+      ],
+      edges: [
+        edge("a", "review", "always"),
+        edge("review", "fix", { pattern: "" }),
+        edge("review", "retry", { pattern: "" }),
+      ],
+    };
+    expect(missingConditionEdgeLabels(doc, validateCanvasDocument(doc))).toEqual([
+      "review → fix",
+      "review → retry",
+    ]);
+    expect(saveBlockMessage(doc, validateCanvasDocument(doc))).toBe(
+      "Set a condition on review → fix, review → retry. 2 hints must be fixed — see the validation panel.",
+    );
+  });
+
+  it("keeps the plain severity summary when no edge-condition hints exist", () => {
+    const blockerDoc: CanvasDocument = {
+      nodes: [
+        node("a", { isEntry: true }),
+        node("b", { promptTemplate: "", position: { x: 300, y: 0 } }),
+      ],
+      edges: [edge("a", "b", "always")],
+    };
+    expect(saveBlockMessage(blockerDoc, validateCanvasDocument(blockerDoc))).toBe(
+      "1 blocker must be fixed — see the validation panel.",
+    );
+    expect(missingConditionEdgeLabels(blockerDoc, validateCanvasDocument(blockerDoc))).toEqual([]);
+  });
+
+  it("edgeTargetLabel uses node names and falls back to undefined for unknown edges", () => {
+    expect(edgeTargetLabel(routerDoc, "e-review-fix")).toBe("review → fix");
+    const source = node("a", { isEntry: true });
+    if (source.data.kind !== "agent") throw new Error("unreachable");
+    const named: CanvasDocument = {
+      nodes: [
+        { ...source, data: { ...source.data, name: "implement" } },
+        { ...node("x"), id: "exit-1", data: { kind: "exit", name: "Done" } },
+      ],
+      edges: [
+        {
+          id: "e-a-exit-1",
+          source: "a",
+          target: "exit-1",
+          data: { condition: { type: "always" } },
+        },
+      ],
+    };
+    expect(edgeTargetLabel(named, "e-a-exit-1")).toBe("implement → Done");
+    expect(edgeTargetLabel(named, "e-nope")).toBeUndefined();
+  });
+});
+
+describe("clearIssuesIfStale (serverIssues functional guard, #69 QA)", () => {
+  it("preserves identity when the list is already empty (no state churn, React bails out)", () => {
+    const empty: CanvasIssue[] = [];
+    expect(clearIssuesIfStale(empty)).toBe(empty);
+  });
+
+  it("clears stale daemon findings with a fresh empty array", () => {
+    const stale: CanvasIssue[] = [{ nodeId: "b", message: "daemon rejected the driver" }];
+    const cleared = clearIssuesIfStale(stale);
+    expect(cleared).toEqual([]);
+    expect(cleared).not.toBe(stale);
   });
 });
 

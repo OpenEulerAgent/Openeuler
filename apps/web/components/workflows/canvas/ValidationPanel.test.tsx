@@ -52,7 +52,8 @@ describe("ValidationPanel severity grouping", () => {
     },
     {
       nodeId: "b",
-      message: 'node "b" has 2 unconditional (always) outgoing edges; at most one is allowed (as the router fallback)',
+      message:
+        'node "b" has 2 unconditional (always) outgoing edges; at most one is allowed (as the router fallback)',
     },
   ];
 
@@ -134,5 +135,29 @@ describe("ValidationPanel severity grouping", () => {
       createElement(ValidationPanel, { issues: [], nodeNames: new Map(), onFocusIssue: () => {} }),
     );
     expect(container?.textContent).toBe("");
+  });
+
+  it("labels edge rows with 'source → target' names when provided, ids otherwise (#69)", () => {
+    render(
+      createElement(ValidationPanel, {
+        issues: [issues[2] as CanvasIssue],
+        nodeNames: new Map(),
+        edgeLabels: new Map([["e-a-d", "review → fix"]]),
+        onFocusIssue: () => {},
+      }),
+    );
+    expect(container?.textContent).toContain("review → fix");
+    expect(container?.textContent).not.toContain("e-a-d");
+  });
+
+  it("falls back to the raw edge id badge without an edgeLabels map", () => {
+    render(
+      createElement(ValidationPanel, {
+        issues: [issues[2] as CanvasIssue],
+        nodeNames: new Map(),
+        onFocusIssue: () => {},
+      }),
+    );
+    expect(container?.textContent).toContain("edge e-a-d");
   });
 });
