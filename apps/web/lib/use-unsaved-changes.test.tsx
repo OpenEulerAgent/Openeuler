@@ -210,19 +210,16 @@ function GuardHost({ dirty, basePath }: { dirty: boolean; basePath: string }) {
       { type: "button", onClick: () => guard.requestLeave(() => routerMock.push(basePath)) },
       "Back",
     ),
-    createElement(Dialog, {
-      open: guard.confirmOpen,
-      onClose: guard.stay,
-      label: "Unsaved changes",
-      children: [
-        createElement("button", { key: "keep", type: "button", onClick: guard.stay }, "Keep editing"),
-        createElement(
-          "button",
-          { key: "discard", type: "button", onClick: guard.proceed },
-          "Discard and leave",
-        ),
-      ],
-    }),
+    createElement(
+      Dialog,
+      { open: guard.confirmOpen, onClose: guard.stay, label: "Unsaved changes" },
+      createElement("button", { key: "keep", type: "button", onClick: guard.stay }, "Keep editing"),
+      createElement(
+        "button",
+        { key: "discard", type: "button", onClick: guard.proceed },
+        "Discard and leave",
+      ),
+    ),
   );
 }
 
