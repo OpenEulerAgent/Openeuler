@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import type { Run, Step, Workflow, WorkflowGraph } from "@openeuler/core";
+import type { GraphSummary, Run, Step, Workflow, WorkflowGraph } from "@openeuler/core";
 import {
   LoopBackSchema,
   StepSchema,
@@ -8,6 +8,7 @@ import {
   idSchema,
   linearToGraph,
   loopBackToStepIndexIssue,
+  summarizeGraph,
 } from "@openeuler/core";
 import type { Db, WorkflowRevision } from "@openeuler/db";
 import { branchForRun } from "@openeuler/engine";
@@ -177,6 +178,22 @@ export function ensureLatestRevision(db: Db, workflow: Workflow): WorkflowRevisi
   );
 }
 
+/**
+ * Workflow list row (#70): the row plus a graph summary computed from the
+ * latest revision snapshot — NOT the legacy steps mirror, which goes stale
+ * for graphs the linear shape cannot represent (routers, branches). The
+ * summary is absent for never-saved legacy workflows without revisions;
+ * those keep the steps-based display. Full graph blobs stay off the list.
+ */
+export function workflowListBody(
+  db: Db,
+  workflow: Workflow,
+): Workflow & { graphSummary?: GraphSummary } {
+  const latest = db.workflowRevisions.latest(workflow.id);
+  if (latest === undefined) return { ...workflow };
+  return { ...workflow, graphSummary: summarizeGraph(latest.graph, latest.number) };
+}
+
 /** Workflow API body: the row plus its latest revision pointer and graph. */
 export function workflowBody(
   db: Db,
@@ -184,6 +201,7 @@ export function workflowBody(
 ): Workflow & {
   latestRevision?: { id: string; number: number };
   graph?: WorkflowGraph;
+  graphSummary?: GraphSummary;
 } {
   const latest = db.workflowRevisions.latest(workflow.id);
   if (latest === undefined) return { ...workflow };
@@ -191,6 +209,7 @@ export function workflowBody(
     ...workflow,
     latestRevision: { id: latest.id, number: latest.number },
     graph: latest.graph,
+    graphSummary: summarizeGraph(latest.graph, latest.number),
   };
 }
 
@@ -252,7 +271,10 @@ export function createWorkflowsRouter(): Hono<AppEnv> {
 
   workflows.get("/", (c) => {
     const db = requireDb(c);
-    return c.json({ workflows: db.workflows.list(c.req.query("projectId") || undefined) });
+    const workflows = db.workflows
+      .list(c.req.query("projectId") || undefined)
+      .map((workflow) => workflowListBody(db, workflow));
+    return c.json({ workflows });
   });
 
   workflows.get("/:id", (c) => {

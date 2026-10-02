@@ -409,6 +409,56 @@ export function findGraphNode(graph: WorkflowGraph, nodeId: string): GraphNode |
   return graph.nodes.find((node) => node.id === nodeId);
 }
 
+/**
+ * Read-model summary of a graph snapshot (#70): what the workflows list
+ * renders instead of the legacy steps mirror. `hasLoop` = the graph has a
+ * back-edge (an edge whose target can reach its source, closing a cycle;
+ * validation guarantees every cycle runs through a conditional edge);
+ * `hasRouter` = some node has more than one outgoing edge.
+ */
+export interface GraphSummary {
+  nodeCount: number;
+  edgeCount: number;
+  hasLoop: boolean;
+  hasRouter: boolean;
+  /** Revision number the summary was computed from. */
+  revision: number;
+}
+
+/** Computes the {@link GraphSummary} of a validated graph snapshot. */
+export function summarizeGraph(graph: WorkflowGraph, revision: number): GraphSummary {
+  const outgoing = new Map<string, string[]>();
+  for (const edge of graph.edges) {
+    const bucket = outgoing.get(edge.source);
+    if (bucket === undefined) outgoing.set(edge.source, [edge.target]);
+    else bucket.push(edge.target);
+  }
+  const reachCache = new Map<string, Set<string>>();
+  const reachable = (start: string): Set<string> => {
+    const cached = reachCache.get(start);
+    if (cached !== undefined) return cached;
+    const seen = new Set<string>();
+    const queue = [...(outgoing.get(start) ?? [])];
+    while (queue.length > 0) {
+      const next = queue.pop() as string;
+      if (seen.has(next)) continue;
+      seen.add(next);
+      queue.push(...(outgoing.get(next) ?? []));
+    }
+    reachCache.set(start, seen);
+    return seen;
+  };
+  const hasLoop = graph.edges.some((edge) => reachable(edge.target).has(edge.source));
+  const hasRouter = [...outgoing.values()].some((targets) => targets.length > 1);
+  return {
+    nodeCount: graph.nodes.length,
+    edgeCount: graph.edges.length,
+    hasLoop,
+    hasRouter,
+    revision,
+  };
+}
+
 // ---------------------------------------------------------------------------
 // Legacy (steps + loopBack) <-> graph translation.
 //

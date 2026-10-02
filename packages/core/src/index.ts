@@ -51,6 +51,7 @@ export {
   WorkflowGraphShapeSchema,
   graphToLinear,
   linearToGraph,
+  summarizeGraph,
   validateWorkflowGraph,
 } from "./graph.js";
 export type {
@@ -59,6 +60,7 @@ export type {
   GraphEdge,
   GraphNode,
   GraphNodePosition,
+  GraphSummary,
   GraphToLinearResult,
   GraphValidationIssue,
   WorkflowGraph,

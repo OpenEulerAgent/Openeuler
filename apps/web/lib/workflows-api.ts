@@ -1,20 +1,37 @@
-import type { AgentPreset, Run, StepConfig, Workflow, WorkflowGraph } from "@openeuler/core";
+import type {
+  AgentPreset,
+  GraphSummary,
+  Run,
+  StepConfig,
+  Workflow,
+  WorkflowGraph,
+} from "@openeuler/core";
 import { ApiError, apiFetch } from "./api";
 
 /** Injectable transport so submit flows are testable without a browser. */
 export type WorkflowFetcher = typeof apiFetch;
 
+/**
+ * A workflow row as the LIST serves it (#70): the row plus the
+ * daemon-computed graph summary of the latest revision (absent for legacy
+ * workflows that were never saved as revisions).
+ */
+export type WorkflowListed = Workflow & {
+  graphSummary?: GraphSummary;
+};
+
 /** A workflow row plus the latest-revision graph the daemon serves with it. */
 export type WorkflowWithGraph = Workflow & {
   latestRevision?: { id: string; number: number };
   graph?: WorkflowGraph;
+  graphSummary?: GraphSummary;
 };
 
 export async function fetchWorkflows(
   projectId: string,
   fetcher: WorkflowFetcher = apiFetch,
-): Promise<Workflow[]> {
-  const body = await fetcher<{ workflows: Workflow[] }>(
+): Promise<WorkflowListed[]> {
+  const body = await fetcher<{ workflows: WorkflowListed[] }>(
     `/api/workflows?projectId=${encodeURIComponent(projectId)}`,
   );
   return body.workflows;

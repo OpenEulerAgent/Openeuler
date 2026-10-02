@@ -13,6 +13,7 @@ import {
   startWorkflowRun,
   updateAgentPreset,
   type WorkflowFetcher,
+  type WorkflowListed,
 } from "./workflows-api";
 
 /**
@@ -44,6 +45,22 @@ describe("fetchWorkflows", () => {
     const workflows = await fetchWorkflows("p-1", fetcher as unknown as WorkflowFetcher);
     expect(workflows).toHaveLength(1);
     expect(fetcher).toHaveBeenCalledWith("/api/workflows?projectId=p-1");
+  });
+
+  it("passes the daemon graph summary through untouched (#70)", async () => {
+    const listed: WorkflowListed = {
+      ...fixtureWorkflow(),
+      graphSummary: { nodeCount: 3, edgeCount: 2, hasLoop: true, hasRouter: false, revision: 4 },
+    };
+    const fetcher = vi.fn().mockResolvedValue({ workflows: [listed] });
+    const workflows = await fetchWorkflows("p-1", fetcher as unknown as WorkflowFetcher);
+    expect(workflows[0]?.graphSummary).toEqual({
+      nodeCount: 3,
+      edgeCount: 2,
+      hasLoop: true,
+      hasRouter: false,
+      revision: 4,
+    });
   });
 });
 
@@ -171,7 +188,12 @@ describe("agent presets api (#49)", () => {
     expect(fetcher).toHaveBeenCalledWith("/api/projects/p-1/presets", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ name: "Senior Reviewer", description: "Reviews everything twice.", icon: "🔍", config }),
+      body: JSON.stringify({
+        name: "Senior Reviewer",
+        description: "Reviews everything twice.",
+        icon: "🔍",
+        config,
+      }),
     });
   });
 
@@ -218,9 +240,11 @@ describe("agent presets api (#49)", () => {
   });
 
   it("propagates daemon 422s (invalid config)", async () => {
-    const fetcher = vi.fn().mockRejectedValue(
-      new ApiError("VALIDATION_ERROR", "promptTemplate must be a non-empty string", 422),
-    );
+    const fetcher = vi
+      .fn()
+      .mockRejectedValue(
+        new ApiError("VALIDATION_ERROR", "promptTemplate must be a non-empty string", 422),
+      );
     await expect(
       createAgentPreset({
         projectId: "p-1",
