@@ -3,6 +3,7 @@
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { AuthStatusCard } from "@/components/settings/AuthStatusCard";
 import { useThemeContext } from "@/components/ThemeProvider";
 import { useSidebarPreference } from "@/components/shell/sidebar-preference";
 import { daemonBaseUrl } from "@/lib/api";
@@ -89,6 +90,8 @@ export default function SettingsPage() {
           </Button>
         </CardContent>
       </Card>
+
+      <AuthStatusCard />
 
       <Card>
         <CardHeader>

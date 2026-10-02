@@ -3,6 +3,7 @@
 import { useEffect, useRef } from "react";
 import type { RunStatus } from "@openeuler/core";
 import { apiFetch, daemonBaseUrl } from "./api";
+import { getStoredToken } from "./token";
 
 /**
  * Global run-status stream client (#51): `GET /api/runs/stream` pushes one
@@ -27,9 +28,19 @@ const RUN_STATUSES: readonly RunStatus[] = [
   "interrupted",
 ];
 
-/** Absolute SSE URL for the global run-status stream. */
-export function runsStreamUrl(baseUrl: string = daemonBaseUrl()): string {
-  return `${baseUrl}/api/runs/stream`;
+/**
+ * Absolute SSE URL for the global run-status stream. `EventSource` cannot
+ * set headers, so a stored daemon token (#92) rides along as `?token=` —
+ * the daemon accepts query tokens on its GET streaming routes only.
+ */
+export function runsStreamUrl(
+  baseUrl: string = daemonBaseUrl(),
+  token: string | null = getStoredToken(),
+): string {
+  const url = `${baseUrl}/api/runs/stream`;
+  return token !== null && token.trim().length > 0
+    ? `${url}?token=${encodeURIComponent(token.trim())}`
+    : url;
 }
 
 /** Parses one SSE `data` payload; null when malformed. */

@@ -6,6 +6,7 @@ import { usePathname } from "next/navigation";
 import { cn } from "@/lib/cn";
 import { Sidebar } from "./Sidebar";
 import { TopBar } from "./TopBar";
+import { TokenGate } from "@/components/auth/TokenGate";
 
 // The palette is only needed on ⌘K — keep it out of the first-load bundle.
 const CommandPalette = dynamic(() => import("./CommandPalette").then((mod) => mod.CommandPalette), {
@@ -60,6 +61,8 @@ export function AppShell({ children }: { children: ReactNode }) {
         </main>
       </div>
       <CommandPalette open={paletteOpen} onClose={closePalette} />
+      {/* 401 token gate (#92): opens itself when the daemon rejects a request. */}
+      <TokenGate />
     </div>
   );
 }

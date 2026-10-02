@@ -54,7 +54,7 @@ export async function main(): Promise<void> {
     );
   }
 
-  const { app, onShutdown, handleShutdown } = createApp({
+  const { app, onShutdown, handleShutdown, authRequired } = createApp({
     db,
     logger,
     executor,
@@ -87,7 +87,10 @@ export async function main(): Promise<void> {
   process.on("SIGTERM", onSignal);
   process.on("SIGINT", onSignal);
 
-  logger.info({ pid: process.pid, port, dbPath: db.path }, "daemon started");
+  logger.info(
+    { pid: process.pid, port, dbPath: db.path, ...(authRequired ? { auth: "token" } : {}) },
+    "daemon started",
+  );
 }
 
 main().catch((err) => {

@@ -7,12 +7,16 @@ import { Hono } from "hono";
 import type { AppEnv } from "../app.js";
 
 /**
- * `GET /api/system/check` (#53): the onboarding wizard's environment
- * preflight. Probes git, the opencode CLI (version + auth) and the worktree
- * store, returning actionable hints for every failure so the first-run UI can
- * tell the user exactly what to fix. Results are cached for a short TTL so
- * wizard re-opens and polling don't hammer the binaries; `?refresh=1`
- * bypasses the cache (the wizard's "Re-check" action).
+ * System API.
+ *
+ * - `GET /api/system/auth-status` (#92): `{authRequired}` — always open, so
+ *   the web can discover the auth mode before presenting a token.
+ * - `GET /api/system/check` (#53): the onboarding wizard's environment
+ *   preflight. Probes git, the opencode CLI (version + auth) and the worktree
+ *   store, returning actionable hints for every failure so the first-run UI can
+ *   tell the user exactly what to fix. Results are cached for a short TTL so
+ *   wizard re-opens and polling don't hammer the binaries; `?refresh=1`
+ *   bypasses the cache (the wizard's "Re-check" action).
  */
 
 const execFileAsync = promisify(execFile);
@@ -55,6 +59,12 @@ export interface SystemRouterOptions {
   opencodeBinary?: string;
   /** Worktree store root to check; defaults to the app's WorktreeManager. */
   storeRoot?: string;
+  /**
+   * Whether bearer-token auth is enabled (`OPENEULER_TOKEN` set, #92).
+   * Surfaced by the always-open `GET /api/system/auth-status` so the web
+   * settings page can show "Auth enabled/disabled" without a token.
+   */
+  authRequired?: boolean;
 }
 
 interface CommandOutcome {
@@ -183,6 +193,10 @@ export function createSystemRouter(options: SystemRouterOptions = {}): Hono<AppE
   let cached: { at: number; result: SystemCheckResult } | null = null;
 
   const system = new Hono<AppEnv>();
+
+  // Always open (exempt from the auth middleware, #92): the web app needs to
+  // discover the auth mode before it could ever present a token.
+  system.get("/auth-status", (c) => c.json({ authRequired: options.authRequired === true }));
 
   system.get("/check", async (c) => {
     const refresh = c.req.query("refresh") === "1";
