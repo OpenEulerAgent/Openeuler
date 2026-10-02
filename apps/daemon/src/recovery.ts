@@ -1,7 +1,7 @@
 import { TERMINAL_RUN_STATUSES } from "@openeuler/core";
 import type { Db } from "@openeuler/db";
 import type { WorktreeManager } from "@openeuler/engine";
-import { recordRunStatusActivity } from "./activity.js";
+import { recordRecoverySweepActivity, recordRunStatusActivity } from "./activity.js";
 import type { Executor } from "./executor.js";
 import type { Logger } from "./logger.js";
 import { redactorForProject } from "./secrets.js";
@@ -77,6 +77,13 @@ export async function sweepInterruptedRuns(options: SweepOptions): Promise<Sweep
       "orphaned worktrees detected (report-only; not removed automatically)",
     );
   }
+
+  // #94: the sweep itself is an ops event — the feed shows every boot's
+  // recovery outcome, zero counts included.
+  recordRecoverySweepActivity(db, {
+    interrupted: interruptedRunIds.length,
+    orphanedWorktrees: orphanedWorktrees.length,
+  });
 
   return { interruptedRunIds, orphanedWorktrees };
 }

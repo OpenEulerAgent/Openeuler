@@ -4,10 +4,12 @@ import { createDriverRegistry, createFakeDriver, createOpenCodeDriver } from "@o
 import { WorktreeManager } from "@openeuler/engine";
 import { dirname } from "node:path";
 import { createApp } from "./app.js";
+import { recordDaemonBootActivity } from "./activity.js";
 import { createExecutor } from "./executor.js";
 import { createLogger } from "./logger.js";
 import { sweepInterruptedRuns } from "./recovery.js";
 import { loadOrCreateSecretKey } from "./secrets-crypto.js";
+import { getVersion } from "./version.js";
 
 const DEFAULT_PORT = 8787;
 
@@ -19,6 +21,9 @@ function resolvePort(): number {
 export async function main(): Promise<void> {
   const logger = createLogger();
   const db = createDatabase();
+
+  // #94: ops event stream starts with the boot itself (versioned).
+  recordDaemonBootActivity(db, getVersion());
 
   // Master key for per-project secrets (#93): generated on first boot next
   // to the db (mode 600). Losing this file makes stored secrets
