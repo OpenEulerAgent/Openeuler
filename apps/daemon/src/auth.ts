@@ -19,14 +19,13 @@ export const AUTH_TOKEN_ENV = "OPENEULER_TOKEN";
 export const AUTH_STATUS_PATH = "/api/system/auth-status";
 
 /**
- * `GET` routes that may authenticate via `?token=` — the header-less
- * fallback, primarily because `EventSource` cannot set headers (SSE/streaming
- * routes), plus the read-only `/metrics` scrape endpoint for Prometheus
- * setups that cannot send headers. Every other route ignores query tokens.
- * The tradeoff: the token lands in access logs and proxies between browser
- * and daemon — acceptable on a LAN, which is what this auth mode protects.
+ * Streaming / scrape routes: the SSE endpoints, the (v0.2) preview streams
+ * and the Prometheus scrape endpoint. Originally defined for the `?token=`
+ * fallback below; also reused by the rate limiter (#97), which exempts these
+ * long-lived connections from request buckets, and by the payload cap,
+ * which never inspects them.
  */
-const QUERY_TOKEN_PATH_PATTERNS: readonly RegExp[] = [
+export const STREAM_ROUTE_PATTERNS: readonly RegExp[] = [
   // Global run-status stream (#51).
   /^\/api\/runs\/stream$/,
   // Per-run event stream (replay + tail).
@@ -37,6 +36,16 @@ const QUERY_TOKEN_PATH_PATTERNS: readonly RegExp[] = [
   // scraper configs cannot set headers, so it takes `?token=` like SSE.
   /^\/metrics$/,
 ];
+
+/**
+ * `GET` routes that may authenticate via `?token=` — the header-less
+ * fallback, primarily because `EventSource` cannot set headers (SSE/streaming
+ * routes), plus the read-only `/metrics` scrape endpoint for Prometheus
+ * setups that cannot send headers. Every other route ignores query tokens.
+ * The tradeoff: the token lands in access logs and proxies between browser
+ * and daemon — acceptable on a LAN, which is what this auth mode protects.
+ */
+const QUERY_TOKEN_PATH_PATTERNS: readonly RegExp[] = STREAM_ROUTE_PATTERNS;
 
 /** Whether a request may authenticate via `?token=` (GET streaming routes only). */
 export function acceptsQueryToken(method: string, path: string): boolean {

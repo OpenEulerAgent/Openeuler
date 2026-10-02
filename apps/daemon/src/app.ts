@@ -26,8 +26,18 @@ import type { SystemRouterOptions } from "./routes/system.js";
 import { createSystemRouter } from "./routes/system.js";
 import { createWorkflowsRouter } from "./routes/workflows.js";
 import { createActivityRouter } from "./routes/activity.js";
+import { createRateLimitMiddleware, resolveRateLimits, resolveTrustProxy } from "./rate-limit.js";
+import {
+  corsOriginSetting,
+  createPayloadCapMiddleware,
+  createSecurityHeadersMiddleware,
+  DEFAULT_CORS_ORIGIN,
+  parseCorsOrigins,
+  resolveFramePolicy,
+  resolveMaxBodyBytes,
+} from "./security.js";
 
-export const DEFAULT_CORS_ORIGIN = "http://localhost:3000";
+export { DEFAULT_CORS_ORIGIN } from "./security.js";
 
 export interface AppEnv {
   Variables: {
@@ -78,6 +88,31 @@ export interface CreateAppOptions {
    * runs execute without secret env injection.
    */
   secretsKey?: Buffer;
+  /**
+   * Rate limiting (#97): per-minute caps per route class, 0 disables a
+   * class. Defaults `$RATE_LIMIT_MUTATE`=120 (burst 30) /
+   * `$RATE_LIMIT_READ`=600; SSE/stream routes and `/metrics` are exempt.
+   */
+  rateLimit?: { mutatePerMin?: number; readPerMin?: number; mutateBurst?: number };
+  /**
+   * Trust `X-Forwarded-For` for rate-limit bucket keys (#97). Only enable
+   * behind a reverse proxy you control. Defaults to `$TRUST_PROXY=1`.
+   */
+  trustProxy?: boolean;
+  /** Request-body cap in bytes (#97): `/api/*` bodies above it answer 413. Defaults `$MAX_BODY_BYTES`=1 MiB. */
+  maxBodyBytes?: number;
+  /**
+   * Raw `frame-ancestors` sources (#97), used verbatim in the CSP header,
+   * e.g. `"'self' https://trusted.host"`. Defaults to `'none'`
+   * (+ `X-Frame-Options: DENY`); see `resolveFramePolicy`.
+   */
+  frameAncestors?: string;
+  /**
+   * M7 preview-iframe placeholder (#97): allow framing by the app itself
+   * and the CORS allowlist instead of denying framing outright. Defaults
+   * to `$PREVIEW_IFRAME=1`.
+   */
+  previewIframe?: boolean;
 }
 
 export interface DaemonApp {
@@ -103,7 +138,12 @@ export function createApp(options: CreateAppOptions = {}): DaemonApp {
   const db = options.db;
   const executor = options.executor;
   const worktrees = options.worktrees;
+  // CORS allowlist (#97): `CORS_ORIGIN` may be a comma-separated list;
+  // every entry must match a request's Origin exactly for the ACAO header
+  // to be sent (hono cors: string = single exact match, array = any exact
+  // match, unmatched origins get no ACAO at all).
   const corsOrigin = options.corsOrigin ?? process.env["CORS_ORIGIN"] ?? DEFAULT_CORS_ORIGIN;
+  const corsOrigins = parseCorsOrigins(corsOrigin);
   const maxConcurrentRuns =
     options.maxConcurrentRuns ?? resolveMaxConcurrentRuns(process.env["MAX_CONCURRENT_RUNS"]);
   // Explicit option wins over the env var; both go through the same
@@ -129,10 +169,29 @@ export function createApp(options: CreateAppOptions = {}): DaemonApp {
 
   const app = new Hono<AppEnv>();
 
+  // Hardening (#97). Security headers come first so even CORS preflight
+  // 204s carry them. Rate limits shed load before auth (brute-force
+  // attempts burn the attacker's own bucket); the payload cap rejects
+  // oversized bodies before any handler buffers them. Both cover /api/*
+  // only and leave stream routes (`/api/runs/*/events`, `/api/runs/stream`,
+  // previews, `/metrics`) untouched.
+  const frameAncestorsEnv = process.env["FRAME_ANCESTORS"]?.trim();
+  app.use(
+    "*",
+    createSecurityHeadersMiddleware(
+      resolveFramePolicy({
+        frameAncestors:
+          options.frameAncestors ?? (frameAncestorsEnv ? frameAncestorsEnv : undefined),
+        previewIframe: options.previewIframe ?? process.env["PREVIEW_IFRAME"]?.trim() === "1",
+        corsOrigins,
+      }),
+    ),
+  );
+
   app.use(
     "*",
     cors({
-      origin: corsOrigin,
+      origin: corsOriginSetting(corsOrigins),
       allowHeaders: ["Content-Type", "Authorization"],
       allowMethods: ["GET", "POST", "PATCH", "PUT", "DELETE", "OPTIONS"],
     }),
@@ -155,6 +214,26 @@ export function createApp(options: CreateAppOptions = {}): DaemonApp {
       "request",
     );
   });
+
+  // Rate limits + payload caps (#97) run before auth so brute-force and
+  // oversized requests are shed cheaply; see the hardening block above.
+  const rateLimits = { ...resolveRateLimits(process.env), ...(options.rateLimit ?? {}) };
+  const trustProxy = options.trustProxy ?? resolveTrustProxy(process.env);
+  app.use(
+    "/api/*",
+    createRateLimitMiddleware({
+      config: rateLimits,
+      mutateBurst: options.rateLimit?.mutateBurst,
+      trustProxy,
+      logger,
+    }),
+  );
+  app.use(
+    "/api/*",
+    createPayloadCapMiddleware({
+      maxBytes: options.maxBodyBytes ?? resolveMaxBodyBytes(process.env["MAX_BODY_BYTES"]),
+    }),
+  );
 
   // Bearer-token gate (#92): every /api/* route except the open auth-status
   // probe. No-op in open mode (no OPENEULER_TOKEN).
