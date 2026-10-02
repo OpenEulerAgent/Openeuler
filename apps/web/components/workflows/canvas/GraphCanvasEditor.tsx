@@ -45,6 +45,13 @@ import {
   type CanvasNodeData,
 } from "@/lib/graph/canvas-document";
 import { selectionModeReducer, shouldShowMiniMap } from "@/lib/graph/canvas-affordances";
+import {
+  conflictBanner,
+  conflictFromError,
+  saveAfterConflict,
+  type SaveConflictAction,
+  type SaveConflictDialog,
+} from "@/lib/graph/save-conflict";
 import { saveStatus, type SaveStatusView } from "@/lib/graph/save-status";
 import {
   applyConnect,
@@ -94,6 +101,7 @@ import {
   createAgentPreset,
   deleteAgentPreset,
   fetchAgentPresets,
+  fetchWorkflow,
   saveWorkflowGraph,
   updateAgentPreset,
   type AgentPresetUpdatePatch,
@@ -428,6 +436,40 @@ function GraphCanvasInner({
   // guarded programmatic leaves below) through the shared confirm dialog.
   const leaveGuard = useUnsavedChanges(dirty);
 
+  // Revision conflict (#76): the open conflict dialog (null = closed) and
+  // the focus-probe inputs for the dismissible "saved elsewhere" banner.
+  // `focusRevision` is the latest revision the last focus probe saw — the
+  // banner self-clears as soon as `revision` catches up (reload or save).
+  const [conflict, setConflict] = useState<SaveConflictDialog | null>(null);
+  const [focusRevision, setFocusRevision] = useState<number | null>(null);
+  const [dismissedRevision, setDismissedRevision] = useState<number | null>(null);
+  const banner =
+    conflict === null
+      ? conflictBanner({
+          latestRevisionNumber: focusRevision ?? undefined,
+          savedRevision: revision ?? null,
+          dismissedRevision,
+        })
+      : null;
+
+  // Focus probe (#76): when the tab regains focus with unsaved edits, ask
+  // the daemon whether the workflow moved on elsewhere — an early, cheap
+  // warning before the next save would 409. Failures stay silent.
+  useEffect(() => {
+    const onVisibility = (): void => {
+      if (document.visibilityState !== "visible" || !dirty || saving || conflict !== null) return;
+      void fetchWorkflow(workflow.id)
+        .then((fresh) => {
+          setFocusRevision(fresh.latestRevision?.number ?? null);
+        })
+        .catch(() => {
+          // Older daemon or offline: nothing to warn about.
+        });
+    };
+    document.addEventListener("visibilitychange", onVisibility);
+    return () => document.removeEventListener("visibilitychange", onVisibility);
+  }, [conflict, dirty, saving, workflow.id]);
+
   // Always-on live validation (#68): the pure client-side mirror of the
   // daemon's rules recomputes on every document change, so badges, the
   // panel, and per-severity tones update BEFORE any save attempt. Daemon
@@ -541,78 +583,156 @@ function GraphCanvasInner({
     pruneSelection(step.value);
   }, [flushPendingEdit, pruneSelection, updateHistory]);
 
-  const save = useCallback(async () => {
-    // Clean-gate (#71): a clean doc must never mint a redundant revision —
-    // the button disables and cmd+s no-ops here instead of firing the PUT.
-    if (saving || !dirty) return;
-    flushPendingEdit();
-    const clientIssues = validateCanvasDocument(historyRef.current.present);
-    if (clientIssues.length > 0) {
-      // Live validation already surfaced these; the toast just confirms the
-      // save is blocked, naming any edge that still needs its condition
-      // (hints included — they block like blockers do, #69).
-      toast({
-        variant: "danger",
-        title: "Cannot save yet",
-        description: saveBlockMessage(historyRef.current.present, clientIssues),
-      });
-      return;
-    }
-    setSaving(true);
-    setSaveFailed(false);
-    // 422 mapping (#73): the daemon validates THIS doc — `cause.details`
-    // indexes must resolve against it, never against whatever the user
-    // edits while the PUT is in flight.
-    const requestDoc = historyRef.current.present;
-    try {
-      const result = await saveWorkflowGraph({
-        workflowId: workflow.id,
-        graph: fromCanvasDocument(requestDoc),
-      });
-      const normalized =
-        result.workflow.graph !== undefined
-          ? toCanvasDocument(result.workflow.graph)
-          : historyRef.current.present;
-      setSavedDoc(normalized);
-      updateHistory((current) => replacePresent(current, normalized));
-      setRevision(result.revision.number);
-      setSavedRevision(result.revision.number);
-      setSavedMuted(false);
-      setServerIssues([]);
-      toast({ variant: "success", title: `Saved revision ${result.revision.number}` });
-    } catch (cause) {
-      // The chip keeps reading "Save failed" until the next attempt (#75);
-      // toasts stay the detailed explanation channel.
-      setSaveFailed(true);
-      if (cause instanceof ApiError && cause.details !== undefined && cause.details.length > 0) {
-        const mapped = issuesFromApiDetails(requestDoc, historyRef.current.present, cause.details);
-        if (mapped.length > 0) {
-          setServerIssues(mapped);
-          toast({
-            variant: "danger",
-            title: "The daemon rejected the graph",
-            description: "See the flagged nodes and edges.",
-          });
+  const save = useCallback(
+    async (options?: { force?: boolean }) => {
+      // Clean-gate (#71): a clean doc must never mint a redundant revision —
+      // the button disables and cmd+s no-ops here instead of firing the PUT.
+      if (saving || !dirty) return;
+      flushPendingEdit();
+      const clientIssues = validateCanvasDocument(historyRef.current.present);
+      if (clientIssues.length > 0) {
+        // Live validation already surfaced these; the toast just confirms the
+        // save is blocked, naming any edge that still needs its condition
+        // (hints included — they block like blockers do, #69).
+        toast({
+          variant: "danger",
+          title: "Cannot save yet",
+          description: saveBlockMessage(historyRef.current.present, clientIssues),
+        });
+        return;
+      }
+      setSaving(true);
+      setSaveFailed(false);
+      // 422 mapping (#73): the daemon validates THIS doc — `cause.details`
+      // indexes must resolve against it, never against whatever the user
+      // edits while the PUT is in flight.
+      const requestDoc = historyRef.current.present;
+      // Revision guard (#76): pin the revision this editor is based on so a
+      // concurrent save elsewhere answers 409 instead of silently losing;
+      // `force` (Save anyway) omits the pin and wins last-writer-wins.
+      const expectedRevision =
+        options?.force === true || revision === undefined ? undefined : revision;
+      try {
+        const result = await saveWorkflowGraph({
+          workflowId: workflow.id,
+          graph: fromCanvasDocument(requestDoc),
+          ...(expectedRevision === undefined ? {} : { expectedRevision }),
+        });
+        const normalized =
+          result.workflow.graph !== undefined
+            ? toCanvasDocument(result.workflow.graph)
+            : historyRef.current.present;
+        setSavedDoc(normalized);
+        updateHistory((current) => replacePresent(current, normalized));
+        setRevision(result.revision.number);
+        setSavedRevision(result.revision.number);
+        setSavedMuted(false);
+        setServerIssues([]);
+        toast({ variant: "success", title: `Saved revision ${result.revision.number}` });
+      } catch (cause) {
+        // The chip keeps reading "Save failed" until the next attempt (#75);
+        // toasts stay the detailed explanation channel.
+        setSaveFailed(true);
+        // 409 REVISION_CONFLICT (#76): the non-blocking conflict dialog
+        // replaces the generic failure toast — the user picks reload vs
+        // save-anyway instead of wondering why the save failed.
+        const conflictDialog = conflictFromError(cause, revision ?? null);
+        if (conflictDialog !== null) {
+          setConflict(conflictDialog);
+        } else if (
+          cause instanceof ApiError &&
+          cause.details !== undefined &&
+          cause.details.length > 0
+        ) {
+          const mapped = issuesFromApiDetails(
+            requestDoc,
+            historyRef.current.present,
+            cause.details,
+          );
+          if (mapped.length > 0) {
+            setServerIssues(mapped);
+            toast({
+              variant: "danger",
+              title: "The daemon rejected the graph",
+              description: "See the flagged nodes and edges.",
+            });
+          } else {
+            // Everything the daemon flagged was deleted mid-flight: nothing
+            // left to badge, so the rejection reads as a plain failure.
+            toast({
+              variant: "danger",
+              title: "Failed to save",
+              description: cause.message,
+            });
+          }
         } else {
-          // Everything the daemon flagged was deleted mid-flight: nothing
-          // left to badge, so the rejection reads as a plain failure.
           toast({
             variant: "danger",
             title: "Failed to save",
-            description: cause.message,
+            description: cause instanceof ApiError ? cause.message : "Unexpected error",
           });
         }
-      } else {
-        toast({
-          variant: "danger",
-          title: "Failed to save",
-          description: cause instanceof ApiError ? cause.message : "Unexpected error",
-        });
+      } finally {
+        setSaving(false);
       }
-    } finally {
-      setSaving(false);
+    },
+    [dirty, flushPendingEdit, revision, saving, toast, updateHistory, workflow.id],
+  );
+
+  /**
+   * Conflict → Reload (#76): discard local edits and re-base the editor on
+   * the server's latest revision — the same reset a fresh page load does
+   * (doc, savedDoc, undo history, revision pointers), leaving the doc clean
+   * so the route-exit guard stands down with it.
+   */
+  const reloadFromConflict = useCallback(async () => {
+    try {
+      const fresh = await fetchWorkflow(workflow.id);
+      const nextDoc = workflowToCanvasDocument(fresh);
+      clearEditTimer();
+      editBeforeRef.current = null;
+      setConflict(null);
+      setServerIssues([]);
+      setSavedDoc(nextDoc);
+      updateHistory(() => initHistory(nextDoc));
+      setRevision(fresh.latestRevision?.number);
+      // No session save minted this revision — the chip reads "No changes",
+      // which is exactly the truth after a reload.
+      setSavedRevision(null);
+      setSavedMuted(false);
+      setSaveFailed(false);
+      setFocusRevision(fresh.latestRevision?.number ?? null);
+      setDismissedRevision(null);
+      setSelectedNodeId(null);
+      setSelectedEdgeId(null);
+      toast({
+        variant: "info",
+        title: `Reloaded revision ${fresh.latestRevision?.number ?? 0}`,
+        description: "Local edits were discarded; the canvas matches the server again.",
+      });
+    } catch (cause) {
+      // Keep the dialog open: the reload itself failed, the user can retry
+      // or fall back to Save anyway.
+      toast({
+        variant: "danger",
+        title: "Could not reload",
+        description: cause instanceof ApiError ? cause.message : "Unexpected error",
+      });
     }
-  }, [dirty, flushPendingEdit, saving, toast, updateHistory, workflow.id]);
+  }, [clearEditTimer, toast, updateHistory, workflow.id]);
+
+  /** Conflict dialog actions (#76): Reload rebases, Save anyway force-saves. */
+  const resolveConflict = useCallback(
+    (action: SaveConflictAction) => {
+      if (saveAfterConflict(action).omitExpectedRevision) {
+        setConflict(null);
+        void save({ force: true });
+      } else {
+        void reloadFromConflict();
+      }
+    },
+    [reloadFromConflict, save],
+  );
 
   /**
    * Off-viewport adds (#72): a node created outside the visible rect —
@@ -1106,6 +1226,26 @@ function GraphCanvasInner({
           {workflow.name}
         </h1>
         {revision !== undefined ? <Badge variant="neutral">revision {revision}</Badge> : null}
+        {/* Focus-probe banner (#76): someone saved a newer revision while
+            this tab was away; dismissible, and it self-clears once the
+            editor catches up (reload or a successful save). */}
+        {banner !== null ? (
+          <span
+            role="status"
+            data-revision-banner={banner.revision}
+            className="inline-flex items-center gap-1 rounded-full border border-warning/50 bg-warning-subtle px-2 py-0.5 text-xs whitespace-nowrap text-warning"
+          >
+            {banner.message}
+            <button
+              type="button"
+              aria-label="Dismiss revision warning"
+              onClick={() => setDismissedRevision(banner.revision)}
+              className="rounded px-1 leading-none hover:bg-warning/20 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
+            >
+              ×
+            </button>
+          </span>
+        ) : null}
         {/* The persistent save-status chip next to Save (#75) replaced the
             old transient "unsaved changes" badge here. */}
         <div className="ml-auto flex items-center gap-2">
@@ -1417,6 +1557,31 @@ function GraphCanvasInner({
           </Button>
         </div>
       </Dialog>
+
+      {/* Revision conflict (#76): shown when the daemon refused a save with
+          409 REVISION_CONFLICT. Non-blocking on purpose — Escape/overlay
+          just closes it (local edits stay, the next save re-checks); the two
+          actions resolve it. Distinct from the leave guard above: this only
+          ever opens at save time, so the two dialogs never compete. */}
+      {conflict !== null ? (
+        <Dialog open onClose={() => setConflict(null)} label={conflict.title}>
+          <h2 className="text-title font-semibold text-fg">{conflict.title}</h2>
+          <p className="mt-1 text-sm text-muted-fg">{conflict.message}</p>
+          <p className="mt-1 text-sm text-muted-fg">
+            Reload discards your local edits and rebases on revision {conflict.currentRevision}.
+            Save anyway creates revision {conflict.currentRevision + 1} from your canvas, replacing
+            what was saved elsewhere.
+          </p>
+          <div className="mt-4 flex justify-end gap-2">
+            <Button variant="secondary" onClick={() => resolveConflict("save-anyway")}>
+              Save anyway
+            </Button>
+            <Button variant="danger" onClick={() => resolveConflict("reload")}>
+              Reload
+            </Button>
+          </div>
+        </Dialog>
+      ) : null}
     </div>
   );
 }

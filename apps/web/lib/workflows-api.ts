@@ -199,18 +199,25 @@ export interface SavedGraph {
 /**
  * Canvas save (#46): `PUT /api/workflows/:id/graph` — validates server-side
  * (422 details carry node/edge paths) and snapshots the graph as the next
- * immutable revision.
+ * immutable revision. `expectedRevision` (#76) optionally pins the revision
+ * the editor is based on; a mismatch answers 409 REVISION_CONFLICT instead
+ * of silently overwriting the newer revision.
  */
 export async function saveWorkflowGraph(options: {
   workflowId: string;
   graph: unknown;
+  /** The latest revision the client knows; omit to save unconditionally. */
+  expectedRevision?: number;
   fetcher?: WorkflowFetcher;
 }): Promise<SavedGraph> {
-  const { workflowId, graph, fetcher = apiFetch } = options;
+  const { workflowId, graph, expectedRevision, fetcher = apiFetch } = options;
   return fetcher<SavedGraph>(`/api/workflows/${encodeURIComponent(workflowId)}/graph`, {
     method: "PUT",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ graph }),
+    body: JSON.stringify({
+      graph,
+      ...(expectedRevision === undefined ? {} : { expectedRevision }),
+    }),
   });
 }
 
