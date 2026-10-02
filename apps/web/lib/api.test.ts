@@ -84,6 +84,27 @@ describe("apiFetch", () => {
     expect(error.status).toBe(404);
   });
 
+  it("carries currentRevision from a 409 REVISION_CONFLICT body (#76)", async () => {
+    fetchMock.mockResolvedValueOnce(
+      jsonResponse(
+        {
+          error: {
+            code: "REVISION_CONFLICT",
+            message: "workflow w1 is at revision 3, not the expected 1",
+            details: { currentRevision: 3 },
+          },
+        },
+        409,
+      ),
+    );
+
+    const error = await errorFrom(apiFetch("/api/workflows/w1/graph"));
+    expect(error.code).toBe("REVISION_CONFLICT");
+    expect(error.status).toBe(409);
+    expect(error.currentRevision).toBe(3);
+    expect(error.details).toBeUndefined();
+  });
+
   it("carries zod 422 validation details on ApiError", async () => {
     fetchMock.mockResolvedValueOnce(
       jsonResponse(

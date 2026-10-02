@@ -739,6 +739,55 @@ describe("graph revisions (PUT /:id/graph, GET /:id/revisions)", () => {
     expect(missing.status).toBe(404);
   });
 
+  it("guards concurrent saves via expectedRevision (#76)", async () => {
+    const h = setup();
+    const workflow = await createWorkflow(h, {
+      projectId: h.projectId,
+      name: "conflict",
+      steps: h.makeSteps("first"),
+    });
+    expect(h.db.workflows.get(workflow.id)?.latestRevisionNumber).toBe(1);
+
+    const put = (body: Record<string, unknown>): Promise<Response> =>
+      h.request(`/api/workflows/${workflow.id}/graph`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+
+    // Correct expectation: the save proceeds and mints the next revision.
+    const ok = await put({ graph: makeGraph(), expectedRevision: 1 });
+    expect(ok.status).toBe(200);
+    const okBody = (await ok.json()) as { revision: { number: number } };
+    expect(okBody.revision.number).toBe(2);
+
+    // Stale expectation: 409 REVISION_CONFLICT naming the current revision,
+    // and NO new revision is minted by the refused save.
+    const stale = await put({ graph: makeGraph(), expectedRevision: 1 });
+    expect(stale.status).toBe(409);
+    const conflictBody = (await stale.json()) as {
+      error: { code: string; message: string; details: { currentRevision: number } };
+    };
+    expect(conflictBody.error.code).toBe("REVISION_CONFLICT");
+    expect(conflictBody.error.message).toContain("revision 2");
+    expect(conflictBody.error.details.currentRevision).toBe(2);
+    expect(h.db.workflows.get(workflow.id)?.latestRevisionNumber).toBe(2);
+
+    // Absent param: current behavior — no check, plain last-writer-wins.
+    const plain = await put({ graph: makeGraph() });
+    expect(plain.status).toBe(200);
+    expect(((await plain.json()) as { revision: { number: number } }).revision.number).toBe(3);
+
+    // Invalid values are schema-level 422s, never conflict checks.
+    const stringy = await put({ graph: makeGraph(), expectedRevision: "3" });
+    expect(stringy.status).toBe(422);
+    expect(((await stringy.json()) as ErrorResponseBody).error.code).toBe("VALIDATION_ERROR");
+    const negative = await put({ graph: makeGraph(), expectedRevision: -1 });
+    expect(negative.status).toBe(422);
+    expect(((await negative.json()) as ErrorResponseBody).error.code).toBe("VALIDATION_ERROR");
+    expect(h.db.workflows.get(workflow.id)?.latestRevisionNumber).toBe(3);
+  });
+
   it("lists revisions without graph blobs and serves full snapshots", async () => {
     const h = setup();
     const workflow = await createWorkflow(h, {

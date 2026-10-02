@@ -83,8 +83,22 @@ const PatchWorkflowBodySchema = z.strictObject({
   loopBack: LoopBackSchema.nullable().optional(),
 });
 
-/** PUT /:id/graph body: the full graph (validated + snapshotted as a new revision). */
-const PutGraphBodySchema = z.strictObject({ graph: WorkflowGraphSchema });
+/**
+ * PUT /:id/graph body: the full graph (validated + snapshotted as a new
+ * revision) plus the optional concurrency guard (#76): `expectedRevision`
+ * pins the revision the client edited — a mismatch with the current latest
+ * refuses the save with 409 REVISION_CONFLICT instead of silently winning
+ * last-writer-wins. Absent = current behavior (no check), so older clients
+ * keep working.
+ */
+const PutGraphBodySchema = z.strictObject({
+  graph: WorkflowGraphSchema,
+  expectedRevision: z
+    .number({ message: "expectedRevision must be a number" })
+    .int("expectedRevision must be an integer")
+    .min(1, "expectedRevision must be >= 1")
+    .optional(),
+});
 
 const CreateWorkflowRunBodySchema = z.strictObject({
   task: z.string().min(1, "task must be a non-empty string"),
@@ -329,6 +343,18 @@ export function createWorkflowsRouter(): Hono<AppEnv> {
     const id = c.req.param("id");
     requireWorkflow(db, id);
     const body = PutGraphBodySchema.parse(await parseJsonBody(c));
+    // Concurrency guard (#76): the client pinned the revision it edited;
+    // a newer revision elsewhere refuses the save (409) with the current
+    // number so the editor can offer reload vs save-anyway.
+    const currentRevision = db.workflowRevisions.latest(id)?.number ?? 0;
+    if (body.expectedRevision !== undefined && body.expectedRevision !== currentRevision) {
+      throw new HttpError(
+        409,
+        "REVISION_CONFLICT",
+        `workflow ${id} is at revision ${currentRevision}, not the expected ${body.expectedRevision}`,
+        { currentRevision },
+      );
+    }
     const revision = db.workflowRevisions.create(id, body.graph);
     mirrorGraphToSteps(db, id, body.graph);
     c.get("logger").info({ workflowId: id, revision: revision.number }, "workflow graph saved");
