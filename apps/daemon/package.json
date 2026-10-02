@@ -17,6 +17,7 @@
     "@openeuler/db": "workspace:*",
     "@openeuler/drivers": "workspace:*",
     "@openeuler/engine": "workspace:*",
+    "@openeuler/sandbox": "workspace:*",
     "hono": "^4.7.0",
     "p-limit": "^7.3.3",
     "pino": "^10.0.0",
