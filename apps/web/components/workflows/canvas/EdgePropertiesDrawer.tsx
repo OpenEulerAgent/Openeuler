@@ -72,14 +72,15 @@ export function EdgePropertiesDrawer({
   const edgeHints = edgeIssues.filter((issue) => classifyIssue(issue) === "hint");
   const condition = edge.data.condition;
 
-  // Guided flow (#69): while the condition still needs configuring, keep
-  // the pattern/regex input focused — including the moment the drawer
-  // opens on a freshly auto-converted edge. Runs after the Drawer's own
-  // initial-focus effect (children mount before parents), so it wins.
+  // Guided flow (#69): when the drawer opens on an unconfigured condition
+  // (or the user switches the condition type), focus the pattern/regex
+  // input. Re-focusing on every data change would steal focus from the
+  // flags/negate/maxIterations fields while the condition is still empty.
   const conditionInputRef = useRef<HTMLInputElement | null>(null);
   useEffect(() => {
     if (needsConditionConfig(edge.data)) conditionInputRef.current?.focus();
-  }, [edge.data]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- focus only on drawer open, edge switch, or condition-type switch; re-focusing on every edit would steal focus from flags/negate/maxIterations
+  }, [edge.id, condition.type]);
 
   const source = doc.nodes.find((node) => node.id === edge.source);
   const target = doc.nodes.find((node) => node.id === edge.target);
