@@ -134,6 +134,13 @@ export function buildRunSandboxSpec(input: {
   worktreePath: string;
   /** Container env (NO secrets — those ride per-exec via the driver seam). */
   env?: Record<string, string>;
+  /**
+   * Container ports the run declares (#107): published to ephemeral host
+   * ports for the sandbox's lifetime, so declared services are previewable.
+   * Absent/empty = nothing published (v0.2 cut: undeclared ports detected
+   * from output are recorded but NOT published — declaring is the opt-in).
+   */
+  ports?: number[];
 }): SandboxSpec {
   return buildSandboxSpec(
     input.policy,
@@ -147,7 +154,7 @@ export function buildRunSandboxSpec(input: {
       },
     ],
     input.env ?? {},
-    [],
+    input.ports ?? [],
     {
       volumes: (input.policy.cachePaths ?? []).map((cachePath) => ({
         name: cacheVolumeName(input.projectId, cachePath),

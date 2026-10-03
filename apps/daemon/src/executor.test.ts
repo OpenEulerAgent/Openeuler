@@ -10,7 +10,12 @@ import type { FakeDriverOptions } from "@openeuler/drivers";
 import { createDriverRegistry, createFakeDriver } from "@openeuler/drivers";
 import { WorktreeManager } from "@openeuler/engine";
 import { createFakeSandboxProvider } from "@openeuler/sandbox";
-import { createExecutor, resolveExecutionMode } from "./executor.js";
+import {
+  createExecutor,
+  buildRunPortViews,
+  resolveExecutionMode,
+  UNDECLARED_PORT_HINT,
+} from "./executor.js";
 import type { Executor, ExecutorOptions } from "./executor.js";
 import { createLogger } from "./logger.js";
 
@@ -819,6 +824,127 @@ describe("createExecutor sandboxed execution (#102)", () => {
     await waitForStatus(h, runId, "success");
     await waitForIdle(h);
     expect(await h.executor.sandboxInfo(runId)).toBeUndefined();
+  });
+
+  it("declared ports reach the sandbox spec and map to live host ports (#107)", async () => {
+    const provider = createFakeSandboxProvider({ execDelayMs: 200 });
+    const h = setup(
+      {
+        events: [
+          { type: "message-delta", seq: 1, delta: "booting" },
+          { type: "message-delta", seq: 2, delta: "up" },
+        ],
+        delayMs: 120,
+        output: "Server listening on port 8000",
+      },
+      { sandbox: { provider, isDockerAvailable: async () => true } },
+    );
+    h.db.projects.setSandboxPolicy(h.projectId, sandboxPolicy);
+    // Run with a declared port (the enqueue helper has no ports param —
+    // create the row directly).
+    const runId = crypto.randomUUID();
+    const now = new Date().toISOString();
+    h.db.runs.create({
+      id: runId,
+      projectId: h.projectId,
+      status: "queued",
+      branch: `agentloop/${runId}`,
+      iteration: 0,
+      task: "serve something",
+      ports: [8000],
+      createdAt: now,
+      updatedAt: now,
+    });
+    h.db.stepRuns.create({
+      id: crypto.randomUUID(),
+      runId,
+      stepId: "adhoc",
+      iteration: 1,
+      status: "queued",
+      output: "",
+    });
+
+    h.executor.startRun(runId);
+    await waitForStatus(h, runId, "success");
+    await waitForIdle(h);
+
+    // The run sandbox published exactly the declared port.
+    expect(provider.createdSpecs).toHaveLength(1);
+    expect(provider.createdSpecs[0]?.ports).toEqual([8000]);
+
+    // Detection scanned the node output; declared port recorded as detected.
+    expect(h.db.runs.get(runId)).toMatchObject({ ports: [8000], detectedPorts: [8000] });
+
+    // sandboxInfo while alive mapped host ports (fake provider maps
+    // spec.ports to ephemeral hosts starting at 32768).
+    h.executor.startRun(runId); // duplicate start is ignored (terminal)
+    expect(await h.executor.sandboxInfo(runId)).toBeUndefined();
+  });
+
+  it("buildRunPortViews: declared order first, host only for mapped declared, hint for undeclared (#107)", () => {
+    expect(buildRunPortViews([3000, 8080], [3000, 5000], { 3000: 32768, 8080: 32769 })).toEqual([
+      { container: 3000, host: 32768, declared: true },
+      { container: 8080, host: 32769, declared: true },
+      { container: 5000, declared: false, hint: UNDECLARED_PORT_HINT },
+    ]);
+    // No live sandbox: declared ports keep their flag, no host.
+    expect(buildRunPortViews([3000], undefined, {})).toEqual([{ container: 3000, declared: true }]);
+    // Detected-only port carries the declare-to-preview hint.
+    expect(buildRunPortViews(undefined, [5173], {})).toEqual([
+      { container: 5173, declared: false, hint: UNDECLARED_PORT_HINT },
+    ]);
+    // Nothing declared or detected: empty (the API omits the field).
+    expect(buildRunPortViews(undefined, undefined, { 3000: 1 })).toEqual([]);
+    // Cap at 3: declared always fit (max 3 declared); extras dropped.
+    expect(buildRunPortViews([3000, 4000], [5000, 6000, 7000], { 3000: 32768 })).toEqual([
+      { container: 3000, host: 32768, declared: true },
+      { container: 4000, declared: true },
+      { container: 5000, declared: false, hint: UNDECLARED_PORT_HINT },
+    ]);
+  });
+
+  it("sandboxInfo carries live port views mid-run (#107)", async () => {
+    const provider = createFakeSandboxProvider();
+    const h = setup(
+      { events: [{ type: "message-delta", seq: 1, delta: "x" }], delayMs: 100 },
+      { sandbox: { provider, isDockerAvailable: async () => true } },
+    );
+    h.db.projects.setSandboxPolicy(h.projectId, sandboxPolicy);
+    const runId = crypto.randomUUID();
+    const now = new Date().toISOString();
+    h.db.runs.create({
+      id: runId,
+      projectId: h.projectId,
+      status: "queued",
+      branch: `agentloop/${runId}`,
+      iteration: 0,
+      task: "serve something",
+      ports: [8000],
+      createdAt: now,
+      updatedAt: now,
+    });
+    h.db.stepRuns.create({
+      id: crypto.randomUUID(),
+      runId,
+      stepId: "adhoc",
+      iteration: 1,
+      status: "queued",
+      output: "",
+    });
+
+    h.executor.startRun(runId);
+    const deadline = Date.now() + 5_000;
+    let info: Awaited<ReturnType<Executor["sandboxInfo"]>> = undefined;
+    while (Date.now() < deadline) {
+      info = await h.executor.sandboxInfo(runId);
+      if (info !== undefined) break;
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+    // Fake provider maps the first spec port to the first ephemeral port.
+    expect(info?.ports).toEqual([{ container: 8000, host: 32768, declared: true }]);
+
+    await waitForStatus(h, runId, "success");
+    await waitForIdle(h);
   });
 });
 

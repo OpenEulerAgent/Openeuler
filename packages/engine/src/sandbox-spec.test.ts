@@ -191,4 +191,32 @@ describe("buildRunSandboxSpec (#102)", () => {
       buildRunSandboxSpec({ policy, runId: "r", projectId: "p", worktreePath: "/w" }),
     ).toThrow(/sandbox execution needs an image/);
   });
+
+  it("publishes declared ports and omits the key when none are declared (#107)", () => {
+    const withPorts = buildRunSandboxSpec({
+      policy: basePolicy,
+      runId: "run-42",
+      projectId: "p1",
+      worktreePath: "/store/run-42",
+      ports: [3000, 8080],
+    });
+    expect(withPorts.ports).toEqual([3000, 8080]);
+
+    const withoutPorts = buildRunSandboxSpec({
+      policy: basePolicy,
+      runId: "run-42",
+      projectId: "p1",
+      worktreePath: "/store/run-42",
+    });
+    expect(withoutPorts.ports).toBeUndefined();
+
+    const emptyPorts = buildRunSandboxSpec({
+      policy: basePolicy,
+      runId: "run-42",
+      projectId: "p1",
+      worktreePath: "/store/run-42",
+      ports: [],
+    });
+    expect(emptyPorts.ports).toBeUndefined();
+  });
 });

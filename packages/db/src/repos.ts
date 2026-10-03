@@ -7,6 +7,7 @@ import {
   PersistedEventSchema,
   ProjectSandboxPolicySchema,
   ProjectSchema,
+  RunPortsSchema,
   RunSchema,
   RunStatusEventSchema,
   RunStatusSchema,
@@ -51,6 +52,8 @@ export type RunPatch = {
   iteration?: number;
   /** Replaces the execution breadcrumb (graph engine appends as it goes). */
   breadcrumb?: BreadcrumbEntry[];
+  /** Replaces the detected-ports list (#107; detection appends as it goes). */
+  detectedPorts?: number[];
 };
 
 /** Fields of a step run that may change after creation; `null` clears a field. */
@@ -702,6 +705,8 @@ export function createRunRepo(db: Db): RunRepo {
       ...(row.output === null ? {} : { output: row.output }),
       ...(row.error === null ? {} : { error: row.error }),
       ...((row.breadcrumb ?? []).length === 0 ? {} : { breadcrumb: row.breadcrumb ?? [] }),
+      ...((row.ports ?? []).length === 0 ? {} : { ports: row.ports ?? [] }),
+      ...((row.detectedPorts ?? []).length === 0 ? {} : { detectedPorts: row.detectedPorts ?? [] }),
       createdAt: row.createdAt,
       updatedAt: row.updatedAt,
     });
@@ -718,6 +723,8 @@ export function createRunRepo(db: Db): RunRepo {
     output: run.output ?? null,
     error: run.error ?? null,
     breadcrumb: run.breadcrumb ?? [],
+    ports: run.ports ?? null,
+    detectedPorts: run.detectedPorts ?? null,
     createdAt: run.createdAt,
     updatedAt: run.updatedAt,
   });
@@ -768,6 +775,9 @@ export function createRunRepo(db: Db): RunRepo {
           ...(patch.breadcrumb === undefined
             ? {}
             : { breadcrumb: z.array(BreadcrumbEntrySchema).parse(patch.breadcrumb) }),
+          ...(patch.detectedPorts === undefined
+            ? {}
+            : { detectedPorts: RunPortsSchema.parse(patch.detectedPorts) }),
           updatedAt: new Date().toISOString(),
         })
         .where(eq(schema.runs.id, id))

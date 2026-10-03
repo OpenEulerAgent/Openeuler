@@ -1430,3 +1430,138 @@ describe("createFlowEngine sandbox acquisition (#102)", () => {
     expect(call?.exec).toBe(seam);
   });
 });
+
+describe("createFlowEngine port detection (#107)", () => {
+  const seam: AgentExecSeam = {
+    kind: "sandbox",
+    run: async () => ({ code: 0, stdout: "", stderr: "" }),
+  };
+
+  it("sandboxed workflow runs record detected ports from step outputs (union, capped)", async () => {
+    const h = setup();
+    const server = createFakeDriver({
+      id: "server",
+      events: [{ type: "session", seq: 1, sessionId: "s-server" }],
+      output: "Server listening on port 3000",
+    });
+    h.registry.registerDriver(server);
+    const engine = createFlowEngine({
+      db: h.db,
+      worktrees: h.worktrees,
+      drivers: h.registry,
+      acquireRunSandbox: async () => ({ workspacePath: "/workspace", exec: seam }),
+    });
+    const workflow = h.makeWorkflow([
+      {
+        id: "s1",
+        name: "boot",
+        driver: "server",
+        mode: "auto",
+        promptTemplate: "Task: {{task}}",
+        continueSession: false,
+      },
+    ]);
+    const run = h.enqueueRun(workflow.id);
+
+    await engine.executeRun(run.id, noAbort);
+    await awaitStatus(h, run.id, "success");
+
+    expect(h.db.runs.get(run.id)?.detectedPorts).toEqual([3000]);
+  });
+
+  it("sandboxed graph-revision runs detect from node.completed outputs", async () => {
+    const h = setup();
+    const server = createFakeDriver({
+      id: "server",
+      events: [{ type: "session", seq: 1, sessionId: "s-server" }],
+      outputs: ["frontend ready on http://localhost:3000", "api listening on port 4000"],
+    });
+    h.registry.registerDriver(server);
+    const engine = createFlowEngine({
+      db: h.db,
+      worktrees: h.worktrees,
+      drivers: h.registry,
+      acquireRunSandbox: async () => ({ workspacePath: "/workspace", exec: seam }),
+    });
+    const workflow = h.makeWorkflow([
+      {
+        id: "s1",
+        name: "boot",
+        driver: "server",
+        mode: "auto",
+        promptTemplate: "Task: {{task}}",
+        continueSession: false,
+      },
+      {
+        id: "s2",
+        name: "api",
+        driver: "server",
+        mode: "auto",
+        promptTemplate: "Prev: {{prevOutput}}",
+        continueSession: false,
+      },
+    ]);
+    const revision = h.db.workflowRevisions.create(
+      workflow.id,
+      linearToGraph({ steps: workflow.steps, loopBack: workflow.loopBack }),
+    );
+    const run = h.enqueueRevisionRun(workflow.id, revision.id);
+
+    await engine.executeRun(run.id, noAbort);
+    await awaitStatus(h, run.id, "success");
+
+    expect(h.db.runs.get(run.id)?.detectedPorts).toEqual([3000, 4000]);
+  });
+
+  it("local runs never record detected ports (no preview surface)", async () => {
+    const h = setup();
+    const server = createFakeDriver({
+      id: "server",
+      events: [{ type: "session", seq: 1, sessionId: "s-server" }],
+      output: "Server listening on port 3000",
+    });
+    h.registry.registerDriver(server);
+    const workflow = h.makeWorkflow([
+      {
+        id: "s1",
+        name: "boot",
+        driver: "server",
+        mode: "auto",
+        promptTemplate: "Task: {{task}}",
+        continueSession: false,
+      },
+    ]);
+    const run = h.enqueueRun(workflow.id);
+
+    await h.engine.executeRun(run.id, noAbort);
+    await awaitStatus(h, run.id, "success");
+
+    expect(h.db.runs.get(run.id)?.detectedPorts).toBeUndefined();
+  });
+
+  it("output without listening lines records nothing", async () => {
+    const h = setup();
+    const engine = createFlowEngine({
+      db: h.db,
+      worktrees: h.worktrees,
+      drivers: h.registry,
+      acquireRunSandbox: async () => ({ workspacePath: "/workspace", exec: seam }),
+    });
+    const workflow = h.makeWorkflow([
+      {
+        id: "s1",
+        name: "implement",
+        driver: "impl",
+        mode: "auto",
+        promptTemplate: "Task: {{task}}",
+        continueSession: false,
+      },
+    ]);
+    const run = h.enqueueRun(workflow.id);
+
+    await engine.executeRun(run.id, noAbort);
+    await awaitStatus(h, run.id, "success");
+
+    expect(h.db.runs.get(run.id)?.detectedPorts).toBeUndefined();
+  });
+});

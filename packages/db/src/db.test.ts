@@ -108,13 +108,16 @@ describe("createDatabase", () => {
     db.close();
 
     // Rewind the file to its pre-0008 shape: forget the last applied
-    // migration and drop the column it added.
+    // migrations (0008 hwm + 0009 run ports) and drop the columns they
+    // added. (Journal rows carry no usable id — order by created_at.)
     const raw = new Database(join(dir, "test.db"));
     try {
       raw.exec(
-        "delete from __drizzle_migrations where created_at = (select max(created_at) from __drizzle_migrations)",
+        "delete from __drizzle_migrations where created_at >= (select distinct created_at from __drizzle_migrations order by created_at desc limit 1 offset 1)",
       );
       raw.exec("alter table runs drop column event_seq_hwm");
+      raw.exec("alter table runs drop column ports");
+      raw.exec("alter table runs drop column detected_ports");
     } finally {
       raw.close();
     }
@@ -347,6 +350,37 @@ describe("runs", () => {
     expect("output" in (cleared ?? {})).toBe(false);
     expect("error" in (cleared ?? {})).toBe(false);
     expect(db.runs.update(uuid(), { status: "success" })).toBeUndefined();
+  });
+
+  it("round-trips declared ports and grows detectedPorts via update (#107)", () => {
+    const project = db.projects.create(makeProject());
+    const run = db.runs.create(makeRun(project.id, { ports: [3000, 8080] }));
+    expect(db.runs.get(run.id)).toMatchObject({ ports: [3000, 8080] });
+
+    // Absent when never declared/detected (both columns NULL).
+    const bare = db.runs.create(makeRun(project.id));
+    expect("ports" in (db.runs.get(bare.id) ?? {})).toBe(false);
+    expect("detectedPorts" in (db.runs.get(bare.id) ?? {})).toBe(false);
+
+    // Detection appends through the patch path.
+    expect(db.runs.update(bare.id, { detectedPorts: [3000] })).toMatchObject({
+      detectedPorts: [3000],
+    });
+    expect(db.runs.update(bare.id, { detectedPorts: [3000, 4000] })).toMatchObject({
+      detectedPorts: [3000, 4000],
+    });
+  });
+
+  it("rejects invalid port lists on create and update (#107)", () => {
+    const project = db.projects.create(makeProject());
+    expect(() => db.runs.create(makeRun(project.id, { ports: [0] }))).toThrow();
+    expect(() => db.runs.create(makeRun(project.id, { ports: [65536] }))).toThrow();
+    expect(() => db.runs.create(makeRun(project.id, { ports: [3000, 3000] }))).toThrow();
+    expect(() =>
+      db.runs.create(makeRun(project.id, { ports: [3000, 4000, 5000, 6000] })),
+    ).toThrow();
+    const run = db.runs.create(makeRun(project.id));
+    expect(() => db.runs.update(run.id, { detectedPorts: [70000] })).toThrow();
   });
 });
 

@@ -125,6 +125,16 @@ export const runs = sqliteTable(
       .notNull()
       .default(sql`'[]'`),
     /**
+     * Container ports declared at run creation (#107), JSON int[]; NULL
+     * when none were declared. Published by the run's sandbox.
+     */
+    ports: text("ports", { mode: "json" }).$type<number[]>(),
+    /**
+     * Ports auto-detected from step/node outputs (#107), JSON int[]; NULL
+     * until detection first fires (sandboxed runs only).
+     */
+    detectedPorts: text("detected_ports", { mode: "json" }).$type<number[]>(),
+    /**
      * High-water mark of the event seqs assigned for this run (#149):
      * `events.append` sets seq = max(hwm, max(seq)) + 1 and raises hwm in
      * the same transaction, so ring eviction (`deleteOldestByType`) can

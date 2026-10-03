@@ -39,6 +39,8 @@ export {
 
 export { MAX_EDGE_ITERATIONS, executeGraphRun, type GraphEngineDeps } from "./graph-engine.js";
 
+export { detectPorts, mergeDetectedPorts, runPortList } from "./port-detect.js";
+
 export {
   DEFAULT_SANDBOX_CPUS,
   DEFAULT_SANDBOX_MEMORY_MB,

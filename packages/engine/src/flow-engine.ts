@@ -26,6 +26,7 @@ import {
   type ExitEvaluator,
 } from "./conditions.js";
 import { executeGraphRun, type GraphEngineDeps } from "./graph-engine.js";
+import { detectPorts, mergeDetectedPorts } from "./port-detect.js";
 import type { WorktreeManager } from "./worktree.js";
 
 /** Default driver id for ad-hoc runs (override per run via `OPENEULER_DRIVER`). */
@@ -666,6 +667,28 @@ export function createFlowEngine(options: FlowEngineOptions): FlowEngine {
     return outcome;
   }
 
+  /**
+   * #107: port detection over one completed step/node output — sandboxed
+   * runs only (local runs have no preview surface). Newly detected ports
+   * are merged into the run row's `detectedPorts` (dedup, cap
+   * {@link MAX_RUN_PORTS}); a detection failure never fails the run.
+   */
+  function recordDetectedPorts(runId: string, output: string): void {
+    if (runSandboxes.get(runId) === undefined) return;
+    try {
+      const detected = detectPorts(output);
+      if (detected.length === 0) return;
+      const row = db.runs.get(runId);
+      if (row === undefined) return;
+      const merged = mergeDetectedPorts(row.detectedPorts, detected);
+      if (merged.join(",") === (row.detectedPorts ?? []).join(",")) return;
+      db.runs.update(runId, { detectedPorts: merged });
+      log.info({ runId, detectedPorts: merged }, "ports detected from run output");
+    } catch (err) {
+      log.warn({ err, runId }, "port detection failed (continuing)");
+    }
+  }
+
   /** Shared machinery handed to the graph executor (#45). */
   const graphDeps: GraphEngineDeps = {
     db,
@@ -682,6 +705,8 @@ export function createFlowEngine(options: FlowEngineOptions): FlowEngine {
     runSecretsEnv: (runId) => runSecrets.get(runId)?.env,
     /** Per-run sandbox context (#102); undefined = local execution. */
     runSandbox: (runId) => runSandboxes.get(runId),
+    /** #107: port detection over each completed node's final output. */
+    recordDetectedPorts,
   };
 
   async function execute(
@@ -886,6 +911,7 @@ export function createFlowEngine(options: FlowEngineOptions): FlowEngine {
           prevOutput = outcome.output;
           prevSessionId = outcome.sessionId;
           runOutput = outcome.output;
+          recordDetectedPorts(runId, outcome.output);
           continue;
         }
 
