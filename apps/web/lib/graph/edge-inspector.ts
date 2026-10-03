@@ -393,11 +393,20 @@ export function routerFallbackWarnings(doc: CanvasDocument): CanvasWarning[] {
  */
 export function fanOutNotices(doc: CanvasDocument): CanvasWarning[] {
   const notices: CanvasWarning[] = [];
+  const joinIds = new Set(
+    doc.nodes.filter((node) => node.data.kind === "join").map((node) => node.id),
+  );
   for (const node of doc.nodes) {
     const unconditional = doc.edges.filter(
       (edge) => edge.source === node.id && isUnconditionalEdge(edge.data),
     );
     if (unconditional.length >= 2) {
+      // Already converged? A join receiving ≥2 of this node's branches
+      // means the diamond is complete — no nudge needed.
+      const converged = doc.edges.filter(
+        (edge) => edge.source === node.id && joinIds.has(edge.target),
+      ).length;
+      if (converged >= 2) continue;
       notices.push({ nodeId: node.id, message: FAN_OUT_NOTICE });
     }
   }

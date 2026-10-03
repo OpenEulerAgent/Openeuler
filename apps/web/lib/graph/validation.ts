@@ -204,14 +204,34 @@ function isMissingConditionIssue(issue: CanvasIssue): boolean {
 }
 
 /**
+ * Node-attributed "join still half-wired" finding: a join with fewer than
+ * two incoming edges — expected mid-editing while the user wires branches.
+ */
+function isHalfWiredJoinIssue(issue: CanvasIssue): boolean {
+  return (
+    issue.nodeId !== undefined &&
+    issue.edgeId === undefined &&
+    issue.message.includes("a join merges at least two branches")
+  );
+}
+
+const JOIN_HINT = "connect at least two branches into this join";
+
+/**
  * Pure severity mapping for an issue: `'hint'` for structural WIP
- * (unreachable node, edge missing its condition pattern), `'blocker'` for
- * everything else (empty prompt, bad regex, fan-out/router mixing,
- * exit-node outgoing edges, non-upstream `{{output:}}`, …). Purely tonal —
- * both severities block the save; see the editor's save gating.
+ * (unreachable node, edge missing its condition pattern, half-wired join),
+ * `'blocker'` for everything else (empty prompt, bad regex, fan-out/router
+ * mixing, exit-node outgoing edges, non-upstream `{{output:}}`, …). Purely
+ * tonal — both severities block the save; see the editor's save gating.
  */
 export function classifyIssue(issue: CanvasIssue): IssueSeverity {
-  if (isUnreachableIssue(issue) || isMissingConditionIssue(issue)) return "hint";
+  if (
+    isUnreachableIssue(issue) ||
+    isMissingConditionIssue(issue) ||
+    isHalfWiredJoinIssue(issue)
+  ) {
+    return "hint";
+  }
   return "blocker";
 }
 
@@ -219,6 +239,7 @@ export function classifyIssue(issue: CanvasIssue): IssueSeverity {
 export function issueHint(issue: CanvasIssue): string | undefined {
   if (isUnreachableIssue(issue)) return UNREACHABLE_HINT;
   if (isMissingConditionIssue(issue)) return MISSING_CONDITION_HINT;
+  if (isHalfWiredJoinIssue(issue)) return JOIN_HINT;
   return undefined;
 }
 
