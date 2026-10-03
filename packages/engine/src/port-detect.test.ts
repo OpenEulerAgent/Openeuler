@@ -37,6 +37,16 @@ describe("detectPorts (#107)", () => {
     // bare host:port mentions
     ["try it at localhost:3000", [3000]],
     ["the API is up at 127.0.0.1:8787", [8787]],
+    // IPv6 bracketed hosts (Vite IPv6-prefering machines, Puma)
+    ["Local:   http://[::1]:5173/", [5173]],
+    ["* Listening on http://[::]:3000", [3000]],
+    ["bare [::1]:3000 mention", [3000]],
+    ["[::]:8080 binding", [8080]],
+    // sentence-ending periods must not break detection
+    ["Server started on port 3000.", [3000]],
+    ["listening on :3000.", [3000]],
+    // decimals never match
+    ["port 3000.5 rejected", []],
     // weak pattern: :NNNN directly after serving/running/started
     ["dev server running :3000", [3000]],
     ["server started :8081", [8081]],

@@ -19,7 +19,10 @@ import { MAX_RUN_PORTS } from "@openeuler/core";
  * - the generic `port NNNN` phrase requires a 3-5 digit number, so
  *   "serial port 3"-style text never matches;
  * - dates (`2026-10-02`), timestamps (`05:30:44`), exit codes and
- *   port-less URLs match nothing.
+ *   port-less URLs match nothing;
+ * - bracketed IPv6 hosts (`http://[::1]:5173`, `[::]:3000`) are detected;
+ *   a decimal like `3000.5` never matches (the trailing-dot guard only
+ *   rejects a digit after the dot, so sentence-ending periods are fine).
  */
 
 /** Ports never reported: too false-positive-prone in real output (#107). */
@@ -31,23 +34,26 @@ const EXCLUDED_PORTS = new Set([0, 80, 443]);
  * value 1..65535 (minus {@link EXCLUDED_PORTS}) counts in these contexts.
  */
 const STRONG_PATTERNS: RegExp[] = [
-  // "listening on :3000"
-  /\blistening\s+on\s+:(\d{1,5})(?![\d.])/gi,
+  // "listening on :3000" — `(?![\d.])` must not reject a sentence-ending
+  // period ("listening on :3000."), only a following digit ("port 30005").
+  /\blistening\s+on\s+:(\d{1,5})(?!\d)(?!\.\d)/gi,
   // "listening on port 3000"
-  /\blistening\s+on\s+port\s+(\d{1,5})(?![\d.])/gi,
+  /\blistening\s+on\s+port\s+(\d{1,5})(?!\d)(?!\.\d)/gi,
   // "listening on tcp://0.0.0.0:3000" (Rails/Puma) — the listen phrase plus
   // a tcp URL; captured from the URL tail.
-  /\blistening\s+on\s+tcp:\/\/[^\s/:]+:(\d{1,5})(?![\d.])/gi,
+  /\blistening\s+on\s+tcp:\/\/[^\s/:]+:(\d{1,5})(?!\d)(?!\.\d)/gi,
   // "on port 3000" / "server started on port 8080"
-  /\bon\s+port\s+(\d{1,5})(?![\d.])/gi,
+  /\bon\s+port\s+(\d{1,5})(?!\d)(?!\.\d)/gi,
   // generic "port NNNN" (python http.server: "Serving HTTP on 0.0.0.0 port
   // 8000") — 3-5 digits only, killing "port 3"/"port 22" noise.
-  /\bport\s+(\d{3,5})(?![\d.])/gi,
-  // "http://localhost:3000" / "http://0.0.0.0:8000/" — any URL with a port.
-  /\bhttps?:\/\/[^\s/:?#]+:(\d{1,5})(?!\d)/gi,
+  /\bport\s+(\d{3,5})(?!\d)(?!\.\d)/gi,
+  // "http://localhost:3000" / "http://0.0.0.0:8000/" / "http://[::1]:5173/"
+  // (Vite IPv6) — any URL with a port; the host part admits bracketed IPv6.
+  /\bhttps?:\/\/[^\s/:?#]*(?:\[[^\]]*\])?[^\s/:?#]*:(\d{1,5})(?!\d)/gi,
   // bare "localhost:3000" / "127.0.0.1:5000" / "0.0.0.0:8000" / "[::1]:3000"
-  // / any IPv4 (also covers 192.168.x.y dev-server bindings).
-  /\b(?:localhost|127\.0\.0\.1|0\.0\.0\.0|\[::1?\]|(?:\d{1,3}\.){3}\d{1,3}):(\d{1,5})(?![\d.])/gi,
+  // / "[::]:3000" (Puma IPv6) / any IPv4. No leading \b before the bracket
+  // forms — `[` is a non-word char, so \b can never match after a space.
+  /(?:\b(?:localhost|127\.0\.0\.1|0\.0\.0\.0)|(?:\d{1,3}\.){3}\d{1,3}|\[::1?\]):(\d{1,5})(?!\d)(?!\.\d)/gi,
   // "PORT=3000" / "port=8000" env-style lines (case-insensitive).
   /\bport[=:](\d{1,5})(?!\d)/gi,
 ];
