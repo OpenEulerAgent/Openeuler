@@ -240,6 +240,48 @@ describe("filters", () => {
     expect(entryMatchesFilter(error, "tools")).toBe(false);
     expect(entryMatchesFilter(error, "all")).toBe(true);
   });
+
+  it("sandbox log events appear under All only — hidden from Messages and Tools (#104)", () => {
+    const withLogs = buildFeed([
+      { type: "started", seq: 0 },
+      { type: "sandbox.log", seq: 1, sandboxId: "sb-1", stream: "stdout", line: "building…" },
+      delta(2, "hi"),
+      { type: "sandbox.log", seq: 3, sandboxId: "sb-1", stream: "stderr", line: "warn" },
+      { type: "sandbox.log-truncated", seq: 4, sandboxId: "sb-1", dropped: 5, kept: 2000 },
+      { type: "done", seq: 5 },
+    ]);
+    // Their own rows under All (one event per line).
+    expect(filterFeed(withLogs, "all").map((entry) => entry.kind)).toEqual([
+      "event",
+      "event",
+      "message",
+      "event",
+      "event",
+      "event",
+    ]);
+    // Hidden from Messages (only the message block survives)…
+    expect(filterFeed(withLogs, "messages")).toEqual([
+      { kind: "message", id: "seq-2", text: "hi" },
+    ]);
+    // …and from Tools (no tool events in this stream).
+    expect(filterFeed(withLogs, "tools")).toEqual([]);
+
+    const logLine: FeedEntry = {
+      kind: "event",
+      id: "l",
+      event: { type: "sandbox.log", seq: 9, sandboxId: "sb-1", stream: "stdout", line: "x" },
+    };
+    const marker: FeedEntry = {
+      kind: "event",
+      id: "m",
+      event: { type: "sandbox.log-truncated", seq: 10, sandboxId: "sb-1", dropped: 1, kept: 1 },
+    };
+    expect(entryMatchesFilter(logLine, "all")).toBe(true);
+    expect(entryMatchesFilter(logLine, "messages")).toBe(false);
+    expect(entryMatchesFilter(logLine, "tools")).toBe(false);
+    expect(entryMatchesFilter(marker, "all")).toBe(true);
+    expect(entryMatchesFilter(marker, "tools")).toBe(false);
+  });
 });
 
 describe("formatElapsed", () => {

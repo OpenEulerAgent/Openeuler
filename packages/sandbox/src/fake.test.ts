@@ -193,6 +193,107 @@ describe("fake provider exec", () => {
   });
 });
 
+describe("fake provider execStream (#104)", () => {
+  it("streams scripted chunks in order and resolves exited with the scripted code", async () => {
+    const provider = createFakeSandboxProvider({
+      execStreams: [
+        {
+          chunks: [
+            { stream: "stdout", chunk: '{"type":"text"' },
+            { stream: "stderr", chunk: "warning\n" },
+            { stream: "stdout", chunk: ',"part":{}}\n' },
+          ],
+          code: 3,
+        },
+      ],
+    });
+    const handle = await provider.create(spec());
+    const stream = handle.execStream(["opencode", "run", "p"]);
+
+    const chunks: Array<{ stream: string; chunk: string }> = [];
+    for await (const chunk of stream.events)
+      chunks.push({ stream: chunk.stream, chunk: chunk.chunk });
+    const exit = await stream.exited;
+
+    expect(chunks).toEqual([
+      { stream: "stdout", chunk: '{"type":"text"' },
+      { stream: "stderr", chunk: "warning\n" },
+      { stream: "stdout", chunk: ',"part":{}}\n' },
+    ]);
+    expect(exit).toMatchObject({ code: 3 });
+    expect(exit.durationMs).toBeGreaterThanOrEqual(0);
+    expect(provider.execStreamCalls).toEqual([
+      { sandboxId: handle.id, cmd: ["opencode", "run", "p"], opts: undefined },
+    ]);
+    // The stream queue is independent of the exec script queue.
+    expect(provider.execCalls).toEqual([]);
+  });
+
+  it("falls back to a single-stdout-chunk echo when the script queue is empty", async () => {
+    const provider = createFakeSandboxProvider();
+    const handle = await provider.create(spec());
+    const stream = handle.execStream(["echo", "hi"]);
+    const chunks: Array<{ stream: string; chunk: string }> = [];
+    for await (const chunk of stream.events)
+      chunks.push({ stream: chunk.stream, chunk: chunk.chunk });
+    await expect(stream.exited).resolves.toMatchObject({ code: 0 });
+    expect(chunks).toEqual([{ stream: "stdout", chunk: "echo hi\n" }]);
+  });
+
+  it("rejects exited with SANDBOX_TIMEOUT when inter-chunk delays exceed timeoutMs", async () => {
+    const provider = createFakeSandboxProvider({
+      execStreams: [
+        {
+          chunks: [
+            { stream: "stdout", chunk: "one" },
+            { stream: "stdout", chunk: "two" },
+          ],
+          interChunkDelayMs: 5_000,
+        },
+      ],
+    });
+    const handle = await provider.create(spec());
+    const stream = handle.execStream(["slow"], { timeoutMs: 20 });
+    const failure = await stream.exited.then(
+      () => undefined,
+      (error: unknown) => error,
+    );
+    expect(failure).toBeInstanceOf(SandboxError);
+    expect(failure).toMatchObject({ code: "SANDBOX_TIMEOUT" });
+    // The events iteration ends promptly after the rejection.
+    for await (const chunk of stream.events) void chunk;
+  });
+
+  it("cancel() ends events and rejects exited with SANDBOX_UNAVAILABLE", async () => {
+    const provider = createFakeSandboxProvider({
+      execStreams: [
+        { chunks: [{ stream: "stdout", chunk: "a" }], interChunkDelayMs: 300, code: 0 },
+      ],
+    });
+    const handle = await provider.create(spec());
+    const stream = handle.execStream(["stuck"]);
+    const consumed = (async () => {
+      for await (const chunk of stream.events) void chunk;
+    })();
+    stream.cancel?.();
+    const failure = await stream.exited.then(
+      () => undefined,
+      (error: unknown) => error,
+    );
+    expect(failure).toMatchObject({ code: "SANDBOX_UNAVAILABLE" });
+    await Promise.race([consumed, new Promise((resolve) => setTimeout(resolve, 1_000))]);
+  });
+
+  it("rejects execStream synchronously on stopped sandboxes and bad cmds", async () => {
+    const provider = createFakeSandboxProvider();
+    const handle = await provider.create(spec());
+    await handle.stop();
+    expect(() => handle.execStream(["true"])).toThrow(SandboxError);
+    const stoppedHandle = await (await createFakeSandboxProvider()).create(spec());
+    expect(() => stoppedHandle.execStream([])).toThrow(/non-empty array of strings/);
+  });
+});
+
 describe("fake provider stop/destroy", () => {
   it("transitions running → stopped and records stop calls", async () => {
     const provider = createFakeSandboxProvider();
@@ -259,7 +360,11 @@ describe("fake provider ports", () => {
 });
 
 describe("fake provider logs", () => {
-  it("replays scripted lines in order and supports repeated iteration", async () => {
+  /** Expected log entries with the fake's synthetic `at` stamps (createdAt + index). */
+  const stamped = (createdAt: number, entries: SandboxLogEntry[]): SandboxLogEntry[] =>
+    entries.map((entry, index) => ({ ...entry, at: createdAt + index }));
+
+  it("replays scripted lines in order (with `at` stamps) and supports repeated iteration", async () => {
     const provider = createFakeSandboxProvider({ logLines });
     const handle = await provider.create(spec());
     const seen: SandboxLogEntry[][] = [];
@@ -268,7 +373,10 @@ describe("fake provider logs", () => {
       for await (const entry of handle.logs()) entries.push(entry);
       seen.push(entries);
     }
-    expect(seen).toEqual([logLines, logLines]);
+    expect(seen).toEqual([
+      stamped(handle.meta.createdAt, logLines),
+      stamped(handle.meta.createdAt, logLines),
+    ]);
   });
 
   it("waits logDelayMs between lines", async () => {
@@ -290,21 +398,22 @@ describe("fake provider logs", () => {
     const since = handle.meta.createdAt + 1;
     const entries: SandboxLogEntry[] = [];
     for await (const entry of handle.logs({ since })) entries.push(entry);
-    expect(entries).toEqual(logLines.slice(1));
+    expect(entries).toEqual(stamped(handle.meta.createdAt, logLines).slice(1));
   });
 
   it("composes since with tail (since first, then last N)", async () => {
     const provider = createFakeSandboxProvider({ logLines });
     const handle = await provider.create(spec());
+    const stampedAll = stamped(handle.meta.createdAt, logLines);
     const entries: SandboxLogEntry[] = [];
     for await (const entry of handle.logs({ since: handle.meta.createdAt, tail: 2 })) {
       entries.push(entry);
     }
-    expect(entries).toEqual(logLines.slice(-2));
+    expect(entries).toEqual(stampedAll.slice(-2));
 
     const all: SandboxLogEntry[] = [];
     for await (const entry of handle.logs({ tail: 100 })) all.push(entry);
-    expect(all).toEqual(logLines);
+    expect(all).toEqual(stampedAll);
 
     const none: SandboxLogEntry[] = [];
     for await (const entry of handle.logs({ tail: 0 })) none.push(entry);
@@ -317,7 +426,7 @@ describe("fake provider logs", () => {
     await stopped.stop();
     const entries: SandboxLogEntry[] = [];
     for await (const entry of stopped.logs()) entries.push(entry);
-    expect(entries).toEqual(logLines);
+    expect(entries).toEqual(stamped(stopped.meta.createdAt, logLines));
 
     const destroyed = await (await createFakeSandboxProvider({ logLines })).create(spec());
     await destroyed.destroy();

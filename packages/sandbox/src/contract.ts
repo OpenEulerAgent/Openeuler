@@ -1,6 +1,27 @@
 import { describe, expect, it } from "vitest";
 import { SandboxError } from "./error.js";
-import type { SandboxExecResult, SandboxLogEntry, SandboxProvider, SandboxSpec } from "./types.js";
+import type {
+  SandboxExecChunk,
+  SandboxExecResult,
+  SandboxLogEntry,
+  SandboxProvider,
+  SandboxSpec,
+} from "./types.js";
+
+/**
+ * Scripted `execStream` outcome (#104): `chunks` are streamed in order (with
+ * `interChunkDelayMs` between them), then `exited` resolves with `code`.
+ * Providers that run real commands compile the chunks into `printf`+
+ * `sleep` sequences; the fake replays them in memory.
+ */
+export interface SandboxExecStreamScript {
+  /** Chunks streamed in exact order (per-stream order pinned). */
+  chunks: Array<{ stream: "stdout" | "stderr"; chunk: string }>;
+  /** Exit code reported by `exited`. Default 0. */
+  code?: number;
+  /** Delay between chunks in ms; must exceed any test `timeoutMs`. Default 0. */
+  interChunkDelayMs?: number;
+}
 
 /**
  * Scenario knobs a provider under test must honor when run through
@@ -16,6 +37,12 @@ export interface SandboxContractScript {
    * with `code: 0`.
    */
   execResults?: Array<Partial<SandboxExecResult> | SandboxError>;
+  /**
+   * Scripted `execStream` outcomes served FIFO (#104). Exhausting the queue
+   * falls back to the provider's default streamed exec (code 0, echoing the
+   * joined command on stdout like the default `exec`).
+   */
+  execStreams?: SandboxExecStreamScript[];
   /** Simulated command duration in ms; must exceed any test `timeoutMs`. */
   execDelayMs?: number;
   /** Log lines `handle.logs()` must stream, exactly and in order. */
@@ -224,6 +251,93 @@ export function runSandboxContractTests(makeProvider: SandboxContractProviderMak
       expect(tailed).toHaveLength(2);
       const tailedStreams = new Set(tailed.map((e) => e.stream));
       expect(tailedStreams.size).toBeGreaterThan(0);
+    });
+
+    it("execStream streams chunks live, resolves exited with the code", async () => {
+      const provider = await makeProvider({
+        execStreams: [
+          {
+            chunks: [
+              { stream: "stdout", chunk: "partial-json-" },
+              { stream: "stderr", chunk: "warn\n" },
+              { stream: "stdout", chunk: "line\n" },
+            ],
+            code: 5,
+          },
+        ],
+      });
+      const sandbox = await provider.create(spec());
+      const stream = sandbox.execStream(["sh", "-c", "noisy"]);
+
+      const chunks: SandboxExecChunk[] = [];
+      for await (const chunk of stream.events) chunks.push(chunk);
+      const exit = await stream.exited;
+
+      // Chunk BOUNDARIES are transport-dependent (writes may coalesce); the
+      // contract pins per-stream content+order and the exit code.
+      expect(
+        chunks
+          .filter((c) => c.stream === "stdout")
+          .map((c) => c.chunk)
+          .join(""),
+      ).toBe("partial-json-line\n");
+      expect(
+        chunks
+          .filter((c) => c.stream === "stderr")
+          .map((c) => c.chunk)
+          .join(""),
+      ).toBe("warn\n");
+      expect(exit.code).toBe(5);
+      expect(exit.durationMs).toBeGreaterThanOrEqual(0);
+    });
+
+    it("execStream defaults to a code-0 result when the script queue is empty", async () => {
+      const provider = await makeProvider({});
+      const sandbox = await provider.create(spec());
+      const stream = sandbox.execStream(["echo", "hello"]);
+
+      const chunks: SandboxExecChunk[] = [];
+      for await (const chunk of stream.events) chunks.push(chunk);
+      const exit = await stream.exited;
+      expect(exit.code).toBe(0);
+      expect(
+        chunks
+          .filter((c) => c.stream === "stdout")
+          .map((c) => c.chunk)
+          .join(""),
+      ).not.toBe("");
+    });
+
+    it("execStream rejects exited with SANDBOX_TIMEOUT when timeoutMs is exceeded", async () => {
+      const provider = await makeProvider({
+        execStreams: [{ chunks: [{ stream: "stdout", chunk: "a" }], interChunkDelayMs: 120 }],
+      });
+      const sandbox = await provider.create(spec());
+      const stream = sandbox.execStream(["sleep", "60"], { timeoutMs: 10 });
+      const failure = await stream.exited.then(
+        () => undefined,
+        (error: unknown) => error,
+      );
+      expect(failure).toBeInstanceOf(SandboxError);
+      expect(failure).toMatchObject({ code: "SANDBOX_TIMEOUT" });
+      // The stream must end (no dangling iteration).
+      for await (const chunk of stream.events) void chunk;
+    });
+
+    it("execStream after stop rejects with SANDBOX_UNAVAILABLE", async () => {
+      const provider = await makeProvider({});
+      const sandbox = await provider.create(spec());
+      await sandbox.stop();
+      // Providers may throw synchronously (like `exec`) or reject `exited`.
+      const failure = await (async () => {
+        try {
+          return await sandbox.execStream(["true"]).exited;
+        } catch (error) {
+          return error;
+        }
+      })();
+      expect(failure).toBeInstanceOf(SandboxError);
+      expect(failure).toMatchObject({ code: "SANDBOX_UNAVAILABLE" });
     });
 
     it("rejects unknown images with SANDBOX_IMAGE_MISSING", async () => {

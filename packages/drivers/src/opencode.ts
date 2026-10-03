@@ -8,7 +8,9 @@ import type {
   AgentDriver,
   AgentExit,
   AgentHandle,
+  AgentExecOptions,
   AgentExecSeam,
+  AgentExecStream,
   AgentStartOpts,
 } from "./types.js";
 
@@ -584,9 +586,12 @@ export class OpenCodeAgentHandle implements AgentHandle {
  * Handle for one in-sandbox `opencode run` invocation (#102): the argv is
  * the same as the local path (`buildOpencodeArgs`, with `cwd` a container
  * path like `/workspace`), but the command runs through the run's exec
- * seam instead of a local spawn. Stdout NDJSON is parsed with the exact
- * same line parser; abort goes through `seam.stop()` (which must cancel
- * the in-flight `run()` — the rejection settles this handle as aborted).
+ * seam instead of a local spawn. When the seam provides `runStream` (#104)
+ * the NDJSON is parsed INCREMENTALLY as chunks arrive (live agent events +
+ * the sessionId captured mid-node); otherwise the batch `run()` result is
+ * parsed after completion. Abort goes through `seam.stop()` (which must
+ * cancel the in-flight command — the rejection settles this handle as
+ * aborted).
  */
 export class OpenCodeSandboxAgentHandle implements AgentHandle {
   readonly events: AsyncIterable<AgentEvent>;
@@ -600,6 +605,7 @@ export class OpenCodeSandboxAgentHandle implements AgentHandle {
   private readonly state: OpencodeParserState = createOpencodeParserState();
   private readonly stderrRing: StderrRing;
   private readonly stream: AsyncGenerator<AgentEvent, void>;
+  private stdoutRemainder = "";
   private resolveExited!: (exit: AgentExit) => void;
   private finished = false;
   private iterated = false;
@@ -619,7 +625,10 @@ export class OpenCodeSandboxAgentHandle implements AgentHandle {
     this.queue.push({ type: "started", seq: 0 });
     this.stream = this.streamEvents();
     this.events = { [Symbol.asyncIterator]: () => this[Symbol.asyncIterator]() };
-    void this.invoke();
+    // #104: prefer live streaming when the seam supports it; fall back to
+    // the batch run() otherwise (older seams / old test fakes).
+    if (this.seam.runStream !== undefined) void this.invokeStreaming();
+    else void this.invoke();
   }
 
   /** argv the seam is asked to run (`opencode run …`), for diagnostics/tests. */
@@ -663,37 +672,92 @@ export class OpenCodeSandboxAgentHandle implements AgentHandle {
     await Promise.race([this.exited, delay(this.config.killGraceMs)]);
   }
 
+  /** Options passed to the seam for the agent command (shared by both paths). */
+  private seamOpts(): AgentExecOptions {
+    return {
+      timeoutMs: this.config.sandboxExecTimeoutMs,
+      ...(this.env === undefined || Object.keys(this.env).length === 0
+        ? {}
+        : { env: { ...this.env } }),
+    };
+  }
+
   private async invoke(): Promise<void> {
     let result: Awaited<ReturnType<AgentExecSeam["run"]>> | null;
     let failure: unknown = null;
     try {
-      result = await this.seam.run(this.argv, {
-        timeoutMs: this.config.sandboxExecTimeoutMs,
-        ...(this.env === undefined || Object.keys(this.env).length === 0
-          ? {}
-          : { env: { ...this.env } }),
-      });
+      result = await this.seam.run(this.argv, this.seamOpts());
     } catch (err) {
       result = null;
       failure = err;
     }
     if (this.finished) return;
-    if (result !== null) this.stderrRing.append(Buffer.from(result.stderr, "utf8"));
-    this.finish(result, failure);
+    if (result !== null) {
+      this.feedStdout(result.stdout);
+      this.stderrRing.append(Buffer.from(result.stderr, "utf8"));
+    }
+    this.finish(result?.code ?? null, failure);
   }
 
-  private feedStdout(stdout: string): void {
-    const lines = stdout.split("\n");
-    if (lines.length > 0 && lines[lines.length - 1] === "") lines.pop();
-    for (const line of lines) {
-      const { events, skipped } = parseOpencodeLine(line, this.state);
-      if (skipped === "malformed") {
-        this.config.log(
-          `opencode driver "${this.config.id}": skipping malformed NDJSON line: ${line.slice(0, 200)}`,
-        );
-      }
-      for (const event of events) this.queue.push(event);
+  /**
+   * Streaming path (#104): consume chunks as they arrive — stdout feeds the
+   * incremental NDJSON parser (events stream live), stderr accumulates into
+   * the diagnostic ring — then settle on the seam's exit.
+   */
+  private async invokeStreaming(): Promise<void> {
+    const runStream = this.seam.runStream;
+    if (runStream === undefined) return this.invoke(); // unreachable (constructor guards)
+    let stream: AgentExecStream;
+    try {
+      stream = runStream.call(this.seam, this.argv, this.seamOpts());
+    } catch (err) {
+      this.finish(null, err);
+      return;
     }
+    let streamFailure: unknown = null;
+    const consumer = (async () => {
+      try {
+        for await (const chunk of stream.events) {
+          if (this.finished) break;
+          if (chunk.stream === "stdout") this.feedStdout(chunk.chunk);
+          else this.stderrRing.append(Buffer.from(chunk.chunk, "utf8"));
+        }
+      } catch (err) {
+        streamFailure = err;
+      }
+    })();
+    let code: number | null = null;
+    let failure: unknown = null;
+    try {
+      code = (await stream.exited).code;
+    } catch (err) {
+      failure = err;
+    }
+    // Well-behaved seams end `events` when the command closes (chunks stay
+    // buffered until consumed); bound a misbehaving one by the kill grace so
+    // the run still settles.
+    await Promise.race([consumer, delay(this.config.killGraceMs)]);
+    if (this.finished) return;
+    if (failure === null && streamFailure !== null) failure = streamFailure;
+    this.finish(code, failure);
+  }
+
+  /** Incremental NDJSON feed: buffers a partial line until its remainder arrives. */
+  private feedStdout(chunk: string): void {
+    this.stdoutRemainder += chunk;
+    const lines = this.stdoutRemainder.split("\n");
+    this.stdoutRemainder = lines.pop() ?? "";
+    for (const line of lines) this.feedLine(line);
+  }
+
+  private feedLine(line: string): void {
+    const { events, skipped } = parseOpencodeLine(line, this.state);
+    if (skipped === "malformed") {
+      this.config.log(
+        `opencode driver "${this.config.id}": skipping malformed NDJSON line: ${line.slice(0, 200)}`,
+      );
+    }
+    for (const event of events) this.queue.push(event);
   }
 
   private async *streamEvents(): AsyncGenerator<AgentEvent, void> {
@@ -704,12 +768,12 @@ export class OpenCodeSandboxAgentHandle implements AgentHandle {
     }
   }
 
-  private finish(
-    result: { code: number; stdout: string; stderr: string } | null,
-    failure: unknown,
-  ): void {
+  private finish(code: number | null, failure: unknown): void {
     if (this.finished) return;
     this.finished = true;
+
+    // Flush a trailing partial NDJSON line (a final line without newline).
+    if (this.stdoutRemainder.trim()) this.feedLine(this.stdoutRemainder);
 
     // Abort wins even if the command meanwhile produced a result: the run's
     // verdict is "aborted", with whatever output streamed so far.
@@ -729,16 +793,15 @@ export class OpenCodeSandboxAgentHandle implements AgentHandle {
       return;
     }
 
-    this.feedStdout(result?.stdout ?? "");
-
-    const exitCode = result?.code ?? null;
+    const exitCode = code;
+    const stderrText = this.stderrRing.toString();
     // Only a NON-ZERO exit may be classified as a missing binary — a
     // successful run whose stderr incidentally contains "not found" (grep
     // output, warnings) must not fail the step.
     if (
       exitCode !== null &&
       exitCode !== 0 &&
-      (exitCode === 127 || /(?:not found|ENOENT|no such file)/i.test(result?.stderr ?? ""))
+      (exitCode === 127 || /(?:not found|ENOENT|no such file)/i.test(stderrText))
     ) {
       const error = new OpenCodeDriverError(
         "OPENCODE_NOT_FOUND",

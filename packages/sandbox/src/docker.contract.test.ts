@@ -7,6 +7,7 @@ import { runSandboxContractTests, type SandboxContractScript } from "./contract.
 import type {
   SandboxExecOptions,
   SandboxExecResult,
+  SandboxExecStream,
   SandboxHandle,
   SandboxLogEntry,
   SandboxProvider,
@@ -53,8 +54,27 @@ function missingImage(): string {
   return `busybox:1.36-no-such-tag-${randomBytes(4).toString("hex")}`;
 }
 
+/** Compiles a scripted execStream outcome into a real time-separated `sh -c` command. */
+function compileStreamScript(script: {
+  chunks: Array<{ stream: "stdout" | "stderr"; chunk: string }>;
+  code?: number;
+  interChunkDelayMs?: number;
+}): string {
+  const parts: string[] = [];
+  const delaySeconds = Math.max(0, script.interChunkDelayMs ?? 0) / 1000;
+  // The delay runs BEFORE every chunk (mirroring the fake), so a short
+  // timeoutMs reliably beats the stream.
+  for (const chunk of script.chunks) {
+    if (delaySeconds > 0) parts.push(`sleep ${delaySeconds}`);
+    parts.push(`printf %s ${shQuote(chunk.chunk)}${chunk.stream === "stderr" ? " 1>&2" : ""}`);
+  }
+  parts.push(`exit ${script.code ?? 0}`);
+  return parts.join("; ");
+}
+
 interface ScriptedState {
   queue: Array<Partial<SandboxExecResult> | SandboxError>;
+  streamQueue: SandboxContractScript["execStreams"];
   failOnStop: boolean;
 }
 
@@ -79,6 +99,15 @@ function wrapHandle(
       }
       return handle.exec(cmd, opts);
     },
+    execStream(cmd: string[], opts?: SandboxExecOptions): SandboxExecStream {
+      const next = state.streamQueue?.shift();
+      // Scripted chunks compile into a real printf+sleep sequence, so the
+      // underlying stream reproduces them (per-stream order and the exit
+      // code) with real time separation; unscripted calls pass through.
+      return next === undefined
+        ? handle.execStream(cmd, opts)
+        : handle.execStream(["sh", "-c", compileStreamScript(next)], opts);
+    },
     logs: (opts) => handle.logs(opts),
     hostPorts: () => handle.hostPorts(),
     async stop(timeoutMs?: number): Promise<void> {
@@ -102,6 +131,7 @@ function makeDockerContractProvider(script: SandboxContractScript): SandboxProvi
   });
   const state: ScriptedState = {
     queue: [...(script.execResults ?? [])],
+    streamQueue: [...(script.execStreams ?? [])],
     failOnStop: script.failOnStop ?? false,
   };
   const imageById = new Map<string, string>();

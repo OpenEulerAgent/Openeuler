@@ -1,8 +1,11 @@
 export const PACKAGE_NAME = "@openeuler/sandbox";
 
 export type {
+  SandboxExecChunk,
+  SandboxExecExit,
   SandboxExecOptions,
   SandboxExecResult,
+  SandboxExecStream,
   SandboxHandle,
   SandboxHandleMeta,
   SandboxHostPorts,
@@ -35,9 +38,11 @@ export { createFakeSandboxProvider, FakeSandboxProvider } from "./fake.js";
 export type {
   FakeExecCall,
   FakeExecScriptEntry,
+  FakeExecStreamCall,
   FakeSandboxProviderOptions,
   FakeStopCall,
 } from "./fake.js";
+export type { SandboxExecStreamScript } from "./contract.js";
 
 export { createDockerSandboxProvider, DockerSandboxProvider } from "./docker.js";
 export type { DockerSandboxProviderOptions } from "./docker.js";

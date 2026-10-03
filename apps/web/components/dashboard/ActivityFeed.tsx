@@ -38,6 +38,7 @@ const TYPE_VARIANT: Record<ActivityType, BadgeVariant> = {
   "ops.gc": "neutral",
   "ops.image-pull": "neutral",
   "ops.image-build": "neutral",
+  "ops.sandbox-kept": "neutral",
 };
 
 const TYPE_ICON: Record<ActivityType, string> = {
@@ -53,6 +54,7 @@ const TYPE_ICON: Record<ActivityType, string> = {
   "ops.gc": "⚙",
   "ops.image-pull": "⬇",
   "ops.image-build": "⛏",
+  "ops.sandbox-kept": "▤",
 };
 
 /** Icon block for one feed item (text glyphs — no per-type art assets yet). */

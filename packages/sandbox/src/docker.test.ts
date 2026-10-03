@@ -832,6 +832,218 @@ describe("docker logs demux (fake spawner)", () => {
     const sandbox = await provider.create(baseSpec());
     expect(() => sandbox.logs({ follow: true } as never)).toThrow(SandboxError);
   });
+
+  it("exposes the parsed --timestamps prefix as `at`", async () => {
+    const provider = logsProvider(
+      ["2026-10-03T04:57:41.089908247Z l1\n", "no-timestamp-line\n"],
+      [],
+      0,
+    );
+    const sandbox = await provider.create(baseSpec());
+    const entries: SandboxLogEntry[] = [];
+    for await (const entry of sandbox.logs()) entries.push(entry);
+    expect(entries[0]).toMatchObject({ line: "l1", at: Date.parse("2026-10-03T04:57:41.089Z") });
+    expect(entries[1]).toMatchObject({ line: "no-timestamp-line" });
+    expect(entries[1]?.at).toBeUndefined();
+  });
+});
+
+describe("docker execStream (fake spawner, #104)", () => {
+  /**
+   * Scripted exec source: writes chunks (with optional pauses), then closes.
+   * Writing starts only when the FIRST listener attaches (constructing the
+   * source and calling `execStream` are separated by an `await` — a
+   * construction-time microtask would emit before listeners exist). A
+   * `spawnError` is likewise emitted after attachment (EventEmitter rethrows
+   * unhandled 'error' events).
+   */
+  function fakeExecSource(
+    script:
+      | { stdout: string[]; stderr: string[]; exitCode: number; chunkDelayMs?: number }
+      | { spawnError: Error },
+  ): DockerLogsSource & { killCalls: string[] } {
+    const stdout = new PassThrough();
+    const stderr = new PassThrough();
+    const emitter = new EventEmitter();
+    const killCalls: string[] = [];
+    let started = false;
+    const start = (): void => {
+      if (started) return;
+      started = true;
+      if ("spawnError" in script) {
+        const err = script.spawnError;
+        queueMicrotask(() => emitter.emit("error", err));
+        return;
+      }
+      queueMicrotask(() => {
+        const writeAll = async (): Promise<void> => {
+          for (const chunk of script.stdout) {
+            stdout.write(chunk);
+            if (script.chunkDelayMs) await new Promise((r) => setTimeout(r, script.chunkDelayMs));
+          }
+          stdout.end();
+          for (const chunk of script.stderr) stderr.write(chunk);
+          stderr.end();
+        };
+        void writeAll().then(() => emitter.emit("close", script.exitCode));
+      });
+    };
+    const source: DockerLogsSource & { killCalls: string[] } = {
+      stdout,
+      stderr,
+      on(event, listener) {
+        start();
+        emitter.on(event, listener as (...args: unknown[]) => void);
+        return undefined;
+      },
+      kill(signal?: NodeJS.Signals) {
+        killCalls.push(signal ?? "default");
+        stdout.destroy();
+        stderr.destroy();
+        emitter.emit("close", null);
+      },
+      killCalls,
+    };
+    return source;
+  }
+
+  function streamProvider(
+    source: ReturnType<typeof fakeExecSource>,
+    calls: string[][] = [],
+  ): {
+    provider: ReturnType<typeof createDockerSandboxProvider>;
+    runner: RecordingRunner;
+    calls: string[][];
+  } {
+    const runner = new RecordingRunner();
+    scriptCreate(runner);
+    const provider = createDockerSandboxProvider({
+      runner: (a) => runner.run(a),
+      execSpawner: (args) => {
+        calls.push([...args]);
+        return source;
+      },
+    });
+    return { provider, runner, calls };
+  }
+
+  const collectChunks = async (
+    stream: ReturnType<SandboxHandle["execStream"]>,
+  ): Promise<Array<{ stream: string; chunk: string }>> => {
+    const chunks: Array<{ stream: string; chunk: string }> = [];
+    for await (const chunk of stream.events) {
+      chunks.push({ stream: chunk.stream, chunk: chunk.chunk });
+    }
+    return chunks;
+  };
+
+  it("spawns docker exec with cwd/env args and streams both pipes live", async () => {
+    const calls: string[][] = [];
+    const source = fakeExecSource({
+      stdout: ['{"type":"text"', "…\n"],
+      stderr: ["warn\n"],
+      exitCode: 7,
+      chunkDelayMs: 30,
+    });
+    const { provider, calls: spawned } = streamProvider(source, calls);
+    const sandbox = await provider.create(baseSpec());
+    const stream = sandbox.execStream(["opencode", "run", "p"], {
+      cwd: "/workspace",
+      env: { TOKEN: "x" },
+    });
+
+    // LIVE delivery: the first chunk arrives while the source is still open
+    // (the second chunk waits chunkDelayMs), i.e. before close.
+    const first = await stream.events[Symbol.asyncIterator]().next();
+    expect(first.done).toBe(false);
+    expect(first.value).toEqual({ stream: "stdout", chunk: '{"type":"text"' });
+
+    const rest: Array<{ stream: string; chunk: string }> = [];
+    for await (const chunk of stream.events)
+      rest.push({ stream: chunk.stream, chunk: chunk.chunk });
+    const exit = await stream.exited;
+    expect(rest).toEqual([
+      { stream: "stdout", chunk: "…\n" },
+      { stream: "stderr", chunk: "warn\n" },
+    ]);
+    expect(exit).toMatchObject({ code: 7 });
+    expect(exit.durationMs).toBeGreaterThanOrEqual(0);
+    expect(spawned).toEqual([
+      ["exec", "-w", "/workspace", "-e", "TOKEN=x", sandbox.id, "opencode", "run", "p"],
+    ]);
+  });
+
+  it("rejects exited with SANDBOX_TIMEOUT and kills the CLI when timeoutMs fires", async () => {
+    // One chunk, then the source stays open (5s pause before close): the
+    // 20ms exec timeout must fire first and SIGKILL the CLI.
+    const source = fakeExecSource({ stdout: ["x"], stderr: [], exitCode: 0, chunkDelayMs: 5_000 });
+    const { provider } = streamProvider(source);
+    const sandbox = await provider.create(baseSpec());
+    const stream = sandbox.execStream(["sleep", "60"], { timeoutMs: 20 });
+    const failure = await stream.exited.then(
+      () => undefined,
+      (error: unknown) => error,
+    );
+    expect(failure).toBeInstanceOf(SandboxError);
+    expect(failure).toMatchObject({ code: "SANDBOX_TIMEOUT" });
+    expect(source.killCalls).toContain("SIGKILL");
+    for await (const chunk of stream.events) void chunk; // iteration ends
+  });
+
+  it("maps not-running stderr on close to SANDBOX_UNAVAILABLE", async () => {
+    const source = fakeExecSource({
+      stdout: [],
+      stderr: ["Error response from daemon: container x is not running\n"],
+      exitCode: 1,
+    });
+    const { provider } = streamProvider(source);
+    const sandbox = await provider.create(baseSpec());
+    const stream = sandbox.execStream(["true"]);
+    const failure = await stream.exited.then(
+      () => undefined,
+      (error: unknown) => error,
+    );
+    expect(failure).toMatchObject({ code: "SANDBOX_UNAVAILABLE" });
+  });
+
+  it("maps CLI spawn errors to SANDBOX_UNAVAILABLE", async () => {
+    const source = fakeExecSource({ spawnError: new Error("ENOENT docker") });
+    const { provider } = streamProvider(source);
+    const sandbox = await provider.create(baseSpec());
+    const stream = sandbox.execStream(["true"]);
+    const failure = await stream.exited.then(
+      () => undefined,
+      (error: unknown) => error,
+    );
+    expect(failure).toBeInstanceOf(SandboxError);
+    expect(failure).toMatchObject({ code: "SANDBOX_UNAVAILABLE" });
+    await collectChunks(stream);
+  });
+
+  it("cancel() kills the CLI, ends events and rejects exited", async () => {
+    const source = fakeExecSource({ stdout: ["x"], stderr: [], exitCode: 0, chunkDelayMs: 60_000 });
+    const { provider } = streamProvider(source);
+    const sandbox = await provider.create(baseSpec());
+    const stream = sandbox.execStream(["stuck"]);
+    stream.cancel?.();
+    const failure = await stream.exited.then(
+      () => undefined,
+      (error: unknown) => error,
+    );
+    expect(failure).toMatchObject({ code: "SANDBOX_UNAVAILABLE" });
+    expect(source.killCalls).toContain("SIGKILL");
+    await collectChunks(stream);
+  });
+
+  it("throws synchronously for invalid cmds and stopped sandboxes", async () => {
+    const source = fakeExecSource({ stdout: [], stderr: [], exitCode: 0 });
+    const { provider, runner } = streamProvider(source);
+    const sandbox = await provider.create(baseSpec());
+    expect(() => sandbox.execStream([])).toThrow(SandboxError);
+    runner.ok(""); // docker stop
+    await sandbox.stop();
+    expect(() => sandbox.execStream(["true"])).toThrow(/not running/);
+  });
 });
 
 describe("docker availability probe", () => {

@@ -21,6 +21,8 @@ export const RUN_EVENT_TYPES = [
   "node.completed",
   "edge.taken",
   "edge.cap-reached",
+  "sandbox.log",
+  "sandbox.log-truncated",
 ] as const;
 
 /** One frame off the wire: a driver event or an engine (run/step) event. */
