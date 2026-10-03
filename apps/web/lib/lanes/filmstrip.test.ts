@@ -96,6 +96,19 @@ describe("filmstripBlocks (proportional layout)", () => {
     expect(blocks.every((block) => block.widthPct === 25)).toBe(true);
   });
 
+  it("never produces NaN shares when every known duration is zero", () => {
+    const blocks = filmstripBlocks([
+      step({ id: "sr-1", stepId: "a", durationMs: 0 }),
+      step({ id: "sr-2", stepId: "b", durationMs: 0 }),
+    ]);
+    expect(blocks.length).toBe(2);
+    for (const block of blocks) {
+      expect(Number.isFinite(block.widthPct)).toBe(true);
+      expect(block.widthPct).toBeGreaterThan(0);
+      expect(block.widthPct).toBeLessThanOrEqual(100);
+    }
+  });
+
   it("returns [] for an empty step list", () => {
     expect(filmstripBlocks([])).toEqual([]);
   });

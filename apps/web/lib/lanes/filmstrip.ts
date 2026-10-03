@@ -81,7 +81,11 @@ export function filmstripBlocks(
   const known = durations.filter((value): value is number => value !== null);
   const fallback = known.length > 0 ? known.reduce((a, b) => a + b, 0) / known.length : 1;
   const effective = durations.map((value) => value ?? fallback);
-  const total = effective.reduce((a, b) => a + b, 0);
+  // All-zero durations (sub-millisecond nodes round to 0) must not produce
+  // 0/0 = NaN shares — fall back to an even split via total = 1 with the
+  // min-clamp still applying.
+  const rawTotal = effective.reduce((a, b) => a + b, 0);
+  const total = rawTotal > 0 ? rawTotal : 1;
 
   const shares = effective.map((value) => Math.max(value / total, minWidthPct / 100));
   const shareTotal = shares.reduce((a, b) => a + b, 0);
