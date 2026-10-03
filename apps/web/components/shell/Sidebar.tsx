@@ -2,7 +2,15 @@
 
 import Link from "next/link";
 import { usePathname } from "next/navigation";
-import { BoxIcon, DashboardIcon, FolderIcon, PanelLeftIcon, PlayIcon, SlidersIcon } from "./icons";
+import {
+  BoxIcon,
+  DashboardIcon,
+  FolderIcon,
+  LanesIcon,
+  PanelLeftIcon,
+  PlayIcon,
+  SlidersIcon,
+} from "./icons";
 import { SandboxCountChip } from "./SandboxCountChip";
 import { toggleSidebarPreference } from "@/lib/sidebar";
 import { useSidebarPreference } from "./sidebar-preference";
@@ -12,6 +20,7 @@ export const NAV_LINKS = [
   { href: "/", label: "Dashboard", Icon: DashboardIcon },
   { href: "/projects", label: "Projects", Icon: FolderIcon },
   { href: "/runs", label: "Runs", Icon: PlayIcon },
+  { href: "/lanes", label: "Lanes", Icon: LanesIcon },
   { href: "/settings", label: "Settings", Icon: SlidersIcon },
 ] as const;
 

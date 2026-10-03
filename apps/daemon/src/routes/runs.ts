@@ -125,12 +125,24 @@ function globalRunStatusFrame(event: RunStatusNotification): string {
 const isTerminalRunStatus = (status: RunStatus): status is TerminalRunStatus =>
   (TERMINAL_RUN_STATUSES as readonly string[]).includes(status);
 
+/**
+ * A StepRun as served by `GET /api/runs/:id`: the core row plus display
+ * enrichment (#113) — the node/step NAME and, for graph runs, the driver
+ * duration from the run's `node.completed` event (linear `step.completed`
+ * events carry no duration, so those steps keep `durationMs` unset).
+ * Deliberately NOT part of the persisted core StepRun schema.
+ */
+export type StepRunApiBody = StepRun & {
+  name?: string;
+  durationMs?: number;
+};
+
 /** Run detail payload: the run, its step runs (flat + grouped per iteration), and a small summary. */
 export interface RunDetailBody {
   run: RunApiBody;
-  steps: StepRun[];
+  steps: StepRunApiBody[];
   /** Step runs grouped by 1-based loop pass, ordered by iteration. */
-  iterations: Array<{ iteration: number; steps: StepRun[] }>;
+  iterations: Array<{ iteration: number; steps: StepRunApiBody[] }>;
   summary: { eventCount: number };
   /**
    * Live sandbox of the run, when it has one (#102): present only while the
@@ -347,8 +359,10 @@ function sseFrame(event: PersistedEvent): string {
 }
 
 /** Groups step runs by iteration (1-based), ordered by iteration. */
-function groupByIteration(steps: StepRun[]): Array<{ iteration: number; steps: StepRun[] }> {
-  const groups = new Map<number, StepRun[]>();
+function groupByIteration(
+  steps: StepRunApiBody[],
+): Array<{ iteration: number; steps: StepRunApiBody[] }> {
+  const groups = new Map<number, StepRunApiBody[]>();
   for (const step of steps) {
     const bucket = groups.get(step.iteration);
     if (bucket) bucket.push(step);
@@ -357,6 +371,51 @@ function groupByIteration(steps: StepRun[]): Array<{ iteration: number; steps: S
   return [...groups.entries()]
     .sort((a, b) => a[0] - b[0])
     .map(([iteration, grouped]) => ({ iteration, steps: grouped }));
+}
+
+/** Cache key of a step run enrichment: `<stepId|nodeId>#<iteration>`. */
+const stepEnrichmentKey = (stepId: string, iteration: number): string => `${stepId}#${iteration}`;
+
+/** Per-step-run display fields joined in from the event log (#113). */
+export interface StepRunEnrichment {
+  name?: string;
+  durationMs?: number;
+}
+
+/**
+ * Per-step-run display enrichment (#113) off the run's persisted event log:
+ * graph runs' `node.completed` events carry the node name AND the driver
+ * duration; linear runs' `step.completed` events carry the step name only.
+ * Keyed `${stepId}#${iteration}` — exactly how graph StepRun rows store
+ * `stepId = nodeId` with the per-node 1-based execution number.
+ */
+export function stepEnrichments(events: readonly PersistedEvent[]): Map<string, StepRunEnrichment> {
+  const byStepRun = new Map<string, StepRunEnrichment>();
+  for (const event of events) {
+    if (event.type === "node.completed") {
+      byStepRun.set(stepEnrichmentKey(event.nodeId, event.iteration), {
+        name: event.nodeName,
+        durationMs: event.durationMs,
+      });
+    } else if (event.type === "step.completed") {
+      const key = stepEnrichmentKey(event.stepId, event.iteration);
+      const existing = byStepRun.get(key);
+      byStepRun.set(key, { ...existing, name: event.stepName });
+    }
+  }
+  return byStepRun;
+}
+
+/** Attaches {@link stepEnrichments} lookups to each step run row (#113). */
+function enrichStepRuns(
+  steps: readonly StepRun[],
+  events: readonly PersistedEvent[],
+): StepRunApiBody[] {
+  const enrichments = stepEnrichments(events);
+  return steps.map((step) => {
+    const extra = enrichments.get(stepEnrichmentKey(step.stepId, step.iteration));
+    return extra === undefined ? (step as StepRunApiBody) : { ...step, ...extra };
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -667,11 +726,14 @@ export function createRunsRouter(options: CreateRunsRouterOptions = {}): Hono<Ap
         order = new Map(workflow.steps.map((step, index) => [step.id, index]));
       }
     }
-    const sorted = [...steps].sort((a, b) => {
-      const ai = order.get(a.stepId) ?? Number.MAX_SAFE_INTEGER;
-      const bi = order.get(b.stepId) ?? Number.MAX_SAFE_INTEGER;
-      return ai === bi ? a.stepId.localeCompare(b.stepId) : ai - bi;
-    });
+    const sorted = enrichStepRuns(
+      [...steps].sort((a, b) => {
+        const ai = order.get(a.stepId) ?? Number.MAX_SAFE_INTEGER;
+        const bi = order.get(b.stepId) ?? Number.MAX_SAFE_INTEGER;
+        return ai === bi ? a.stepId.localeCompare(b.stepId) : ai - bi;
+      }),
+      db.events.getSince(run.id, 0),
+    );
     // #102: live sandbox snapshot while the run executes sandboxed; absent
     // for local runs and after the sandbox's dispose.
     const executor = c.get("executor");

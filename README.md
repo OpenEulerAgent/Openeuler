@@ -75,6 +75,8 @@ The wizard has four steps, skippable at any time via **Skip setup** (bottom-left
 - **Diff** — per-step (per-node) incremental diffs and the cumulative run diff, split view.
 - **Timeline** — the execution breadcrumb as a flat list.
 
+**Watching the team** — the lanes page (`/lanes`) is the parallelism surface: one live column per active run (project, workflow + revision, status, executions, ticking elapsed), patched in place by the global run-status stream — new runs appear as they queue, finished lanes fade out after 5s. The **History** toggle swaps in a filmstrip of the last 20 terminal runs as swimlanes: one block per node execution, width proportional to its duration, colored by outcome, with a run-level start→end ruler. To watch wider batches, raise the daemon's `MAX_CONCURRENT_RUNS` (e.g. `MAX_CONCURRENT_RUNS=4` for a 4-lane demo) before starting runs.
+
 **Editing the team** — from the project's **Workflows** tab open a workflow's **Edit** page: the canvas. Drag **Agent step** / **Exit node** from the left palette's **Steps** section, or a preset from its **Your team** section, connect handles to draw edges, click a node or edge to edit it in the right drawer (prompt with insert-variable buttons and live preview, condition type + pattern + regex, router evaluation order, loop `maxIterations`, `invert`), then **Save** (⌘/Ctrl+S) — every save snapshots a new immutable revision. Keyboard shortcuts, validation badges on the canvas, and the presets manager (**Manage** next to "Your team") round it out; the `?` button in the toolbar lists all shortcuts.
 
 The same flow works headless against the API:
@@ -134,7 +136,7 @@ Read at process start (no `.env` file is loaded; export them or prefix the comma
 | `OPENEULER_DB`           | `@openeuler/db`         | `<repo>/data/openeuler.db` | SQLite database file path                                                                 |
 | `OPENEULER_WORKTREES`    | `@openeuler/engine`     | `~/.openeuler/worktrees`   | Root directory for per-run git worktrees                                                  |
 | `OPENEULER_DRIVER`       | daemon executor, engine | `fake`                     | Driver for **ad-hoc** runs (`POST /api/runs`); graph nodes carry their own `driver`       |
-| `MAX_CONCURRENT_RUNS`    | daemon executor         | `2`                        | Global cap on runs executing at once (integer ≥ 1; echoed by `/health`)                   |
+| `MAX_CONCURRENT_RUNS`    | daemon executor         | `2`                        | Global cap on runs executing at once (integer ≥ 1; bump to fill `/lanes`)                 |
 | `MAX_SANDBOXES`          | daemon executor         | `8`                        | Global cap on live run sandboxes (integer ≥ 2); sandbox runs above it stay queued (#105)  |
 | `PORT`                   | daemon                  | `8787`                     | Daemon HTTP port                                                                          |
 | `CORS_ORIGIN`            | daemon                  | `http://localhost:3000`    | Allowed browser origin(s), comma-separated allowlist (#97)                                |

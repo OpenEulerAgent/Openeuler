@@ -85,6 +85,17 @@ export function PanelLeftIcon({ className }: { className?: string }) {
   );
 }
 
+export function LanesIcon({ className }: { className?: string }) {
+  return (
+    <Icon className={className}>
+      <rect x="2" y="2" width="3" height="8.5" rx="1" />
+      <rect x="6.5" y="2" width="3" height="12" rx="1" />
+      <rect x="11" y="2" width="3" height="6" rx="1" />
+      <path d="M2 14h12" />
+    </Icon>
+  );
+}
+
 export function SunIcon({ className }: { className?: string }) {
   return (
     <Icon className={className}>
