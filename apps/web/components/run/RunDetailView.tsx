@@ -278,6 +278,7 @@ export function RunDetailView({ runId }: { runId: string }) {
       <LocalFallbackBanner
         projectId={detail.run.projectId}
         sandboxPresent={detail.sandbox !== undefined}
+        runStatus={live ? "running" : shownRun.status}
       />
 
       <InterruptedRunBanner run={shownRun} steps={steps} onChanged={() => void refresh()} />

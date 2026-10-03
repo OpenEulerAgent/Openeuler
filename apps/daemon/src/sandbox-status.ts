@@ -68,6 +68,8 @@ export function createDockerStatusService(
   const probe = options.isDockerAvailable ?? ((opts) => dockerAvailable(opts));
   const versionRunner = options.versionRunner ?? defaultDockerCliRunner;
   let cached: DockerStatus | null = null;
+  /** Single-flight: concurrent callers share one in-flight measurement. */
+  let inFlight: Promise<DockerStatus> | null = null;
 
   const measure = async (force: boolean): Promise<DockerStatus> => {
     const available = await probe(force ? { force: true } : {});
@@ -97,8 +99,17 @@ export function createDockerStatusService(
       if (!refresh && cached !== null && Date.now() - cached.checkedAt < ttlMs) {
         return cached;
       }
-      cached = await measure(refresh);
-      return cached;
+      if (inFlight === null) {
+        inFlight = measure(refresh)
+          .then((measured) => {
+            cached = measured;
+            return measured;
+          })
+          .finally(() => {
+            inFlight = null;
+          });
+      }
+      return inFlight;
     },
   };
 }

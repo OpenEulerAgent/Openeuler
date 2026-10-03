@@ -97,6 +97,13 @@ export interface LocalFallbackBannerInput {
   projectMode?: "local" | "sandbox" | "auto";
   /** Current docker availability from the status endpoint. */
   available: boolean;
+  /**
+   * Run status. Absence of sandbox info is only a valid local-run proxy
+   * while the run is EXECUTING — terminal runs drop sandbox info from the
+   * API, so a completed sandboxed run viewed after docker went down (or a
+   * fast-failed SANDBOX_UNAVAILABLE run) must not be mislabeled.
+   */
+  runStatus?: string;
 }
 
 /**
@@ -106,6 +113,9 @@ export interface LocalFallbackBannerInput {
  * local-policy projects are local by choice (no banner either).
  */
 export function showLocalFallbackBanner(input: LocalFallbackBannerInput): boolean {
+  if (input.runStatus !== undefined && input.runStatus !== "running" && input.runStatus !== "queued") {
+    return false;
+  }
   if (input.sandboxPresent) return false;
   if (input.projectMode !== "auto" && input.projectMode !== "sandbox") return false;
   return !input.available;

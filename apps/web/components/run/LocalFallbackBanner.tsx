@@ -12,10 +12,13 @@ import { fetchSandboxStatus, showLocalFallbackBanner, type SandboxStatus } from 
 export function LocalFallbackBanner({
   projectId,
   sandboxPresent,
+  runStatus,
 }: {
   projectId: string;
   /** True when the run detail payload carries live sandbox info. */
   sandboxPresent: boolean;
+  /** Current run status — the banner only describes EXECUTING runs. */
+  runStatus?: string;
 }) {
   const [status, setStatus] = useState<SandboxStatus | null>(null);
 
@@ -40,6 +43,7 @@ export function LocalFallbackBanner({
       sandboxPresent,
       projectMode: status.projectMode,
       available: status.available,
+      runStatus,
     })
   ) {
     return null;

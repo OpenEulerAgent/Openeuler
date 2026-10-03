@@ -300,6 +300,7 @@ function SandboxPolicySection({ projectId }: { projectId: string }) {
   const [error, setError] = useState<string | null>(null);
 
   const loadAll = useCallback(() => {
+    let cancelled = false;
     setLoad("loading");
     fetchProjectPolicy(projectId)
       .then((policy) => {
@@ -325,13 +326,18 @@ function SandboxPolicySection({ projectId }: { projectId: string }) {
       )
       .catch(() => setImages(null));
     fetchSandboxStatus(projectId)
-      .then((status) => setDockerStatus(status))
-      .catch(() => setDockerStatus(null));
+      .then((status) => {
+        if (!cancelled) setDockerStatus(status);
+      })
+      .catch(() => {
+        if (!cancelled) setDockerStatus(null);
+      });
+    return () => {
+      cancelled = true;
+    };
   }, [projectId]);
 
-  useEffect(() => {
-    loadAll();
-  }, [loadAll]);
+  useEffect(() => loadAll(), [loadAll]);
 
   const applySaved = (policy: ProjectSandboxPolicy): void => {
     setMode(policy.executionMode);
