@@ -46,7 +46,12 @@ export type { SandboxExecStreamScript } from "./contract.js";
 
 export { createDockerSandboxProvider, DockerSandboxProvider } from "./docker.js";
 export type { DockerSandboxProviderOptions } from "./docker.js";
-export { dockerAvailable, createDockerAvailabilityProbe, docker } from "./docker-cli.js";
+export {
+  dockerAvailable,
+  createDockerAvailabilityProbe,
+  docker,
+  defaultDockerCliRunner,
+} from "./docker-cli.js";
 export type { DockerCliResult, DockerCliRunner } from "./docker-cli.js";
 export type { DockerStdinCliRunner } from "./docker-cli.js";
 export {

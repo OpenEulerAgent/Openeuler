@@ -7,6 +7,7 @@ import type { Project } from "@openeuler/core";
 import { apiFetch } from "@/lib/api";
 import { activeRunsCounts, useActiveRuns } from "@/lib/active-runs";
 import { useThemeContext } from "@/components/ThemeProvider";
+import { DockerPill } from "@/components/DockerPill";
 import { HealthPill } from "@/components/HealthPill";
 import { MoonIcon, SearchIcon, SunIcon } from "./icons";
 
@@ -118,6 +119,8 @@ export function TopBar({ onOpenPalette }: { onOpenPalette: () => void }) {
       <div className="flex-1" />
 
       <RunningRunsIndicator />
+      {/* Docker availability next to daemon health (#106); polls every 60s. */}
+      <DockerPill />
       <HealthPill />
       <button
         type="button"

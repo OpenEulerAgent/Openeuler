@@ -196,7 +196,7 @@ The web renders these as the settings hub cards (System / Drivers / Concurrency 
 
 ### Sandbox image management (`/api/sandbox/*`, #100)
 
-What sandboxes run on, from the settings page's Sandbox section. The daemon composes a `DockerSandboxProvider` at boot and registers it on the sandbox package's default registry; image operations go through the same argv-only `docker` CLI wrapper (no shell, injectable runners for tests). `GET /api/sandbox/status` is a separate milestone (#106).
+What sandboxes run on, from the settings page's Sandbox section. The daemon composes a `DockerSandboxProvider` at boot and registers it on the sandbox package's default registry; image operations go through the same argv-only `docker` CLI wrapper (no shell, injectable runners for tests).
 
 - `GET /api/sandbox/images` → `{images: [{repository, tag, id, sizeBytes, createdAt, ours}]}` — the catalog is NOT every local image: only repositories under the `openeuler/` namespace (`ours: true`, the ownership marker — docker cannot label images) plus a curated common-base list (`node:22-alpine`, `python:3.12-slim`, `golang:1.23`, `alpine:3.20`, `busybox:musl`, `denoland/deno:2`, `ours: false`). Sizes/creation times are enriched by one batched `docker image inspect` (exact bytes + RFC3339), falling back to parsing the `docker images` rows (decimal size strings, offset-timestamps) when an image vanishes mid-listing.
 - `POST /api/sandbox/images/pull {ref}` → `202 {jobId}` — async; refs are grammar-validated first (`422`, same conservative rules as sandbox specs: no flags/whitespace/uppercase/host-port registries) then passed verbatim to `docker pull`. One completion event `ops.image-pull {ref, done, error?}` lands in the activity feed — no per-line progress events. Concurrent pulls of the same ref dedupe onto one job.
@@ -205,6 +205,15 @@ What sandboxes run on, from the settings page's Sandbox section. The daemon comp
 - `GET /api/sandbox/jobs/:id` → `{id, kind, ref, status: running|done|failed, error?, createdAt, finishedAt}` — in-memory job registry; jobs are lost on daemon restart (a vanished job is a 404, the image operation itself already completed or never started).
 
 The web client (`lib/sandbox-api.ts`) wraps these with `waitForSandboxJob` (1s poll loop); the Sandbox settings card renders the catalog table (repo:tag, size, age, ours/base badge), inline progress rows per running job, confirm-dialog deletes that surface 409s as danger toasts, and the pull/build forms (client-side name rule mirrored from the daemon).
+
+### Docker availability + local fallback (`GET /api/sandbox/status`, #106)
+
+Docker missing must not brick the product. A daemon-side service (`sandbox-status.ts`) resolves availability with the sandbox package's cached `dockerAvailable()` probe (one `docker info`, 30s internal cache) plus `docker --version` (answers without a daemon; a missing CLI just omits `version`), caches the combined payload for **60s**, and warms once at boot (fire-and-forget — a boot never blocks or fails on docker). `?refresh=1` bypasses the cache and forces the probe.
+
+- `GET /api/sandbox/status` → `{available, version?, mode: "docker"|"unavailable", checkedAt}`.
+- `GET /api/sandbox/status?projectId=<id>` adds `{projectMode, effective}` — the project's policy `executionMode` (`"local"` when no policy was saved) and the **same** `resolveExecutionMode` the executor applies at run time, so hints never disagree with actual placement. Unknown projects answer `404 PROJECT_NOT_FOUND`.
+
+The tradeoff: `executionMode: "auto"` trades isolation for availability — with docker down, auto runs execute **locally on the daemon host** (no sandboxing) instead of failing; explicit `"sandbox"` still fails fast with the typed `SANDBOX_UNAVAILABLE` error. The web makes the fallback visible instead of silent: a **Docker pill** next to the daemon health pill (60s poll; "Docker ready" / "Docker unavailable", muted while checking/unknown), a subtle **"Running locally — Docker unavailable"** banner on the run detail (only when the run has no live sandbox info, the policy is auto/sandbox, and docker is currently down — decision unit-tested in `lib/sandbox-api.ts`), and a live **effective-mode hint** under the execution-mode select in the project settings drawer (follows unsaved form state) and in the run-workflow modal (reflects the saved policy before launch).
 
 ## The web canvas
 

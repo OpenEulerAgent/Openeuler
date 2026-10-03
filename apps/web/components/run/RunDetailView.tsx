@@ -29,6 +29,7 @@ import {
 import { DiffsTab } from "./DiffsTab";
 import { EventFeed } from "./EventFeed";
 import { InterruptedRunBanner } from "./InterruptedRunBanner";
+import { LocalFallbackBanner } from "./LocalFallbackBanner";
 import { OutputPanel } from "./OutputPanel";
 import { RetryRunButton } from "./RetryRunButton";
 import { RunHeader } from "./RunHeader";
@@ -39,6 +40,8 @@ interface RunDetail {
   run: Run & { workflowRevision?: { id: string; number: number } };
   steps: StepRun[];
   summary: { eventCount: number };
+  /** Live sandbox snapshot while the run executes sandboxed (#102). */
+  sandbox?: { id: string; image: string; status: string };
 }
 
 type LoadState =
@@ -267,6 +270,15 @@ export function RunDetailView({ runId }: { runId: string }) {
           !live && shownRun.status !== "success" ? <RetryRunButton runId={shownRun.id} /> : null
         }
         onAborted={() => void refresh()}
+      />
+
+      {/* #106: local-fallback notice when the policy wants a sandbox but
+          docker is unavailable (auto-mode fallback; absent for sandboxed or
+          local-policy runs). */}
+      <LocalFallbackBanner
+        projectId={detail.run.projectId}
+        sandboxPresent={detail.sandbox !== undefined}
+        runStatus={live ? "running" : shownRun.status}
       />
 
       <InterruptedRunBanner run={shownRun} steps={steps} onChanged={() => void refresh()} />

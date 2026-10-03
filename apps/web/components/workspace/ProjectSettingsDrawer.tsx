@@ -10,7 +10,13 @@ import { Field, Input, Select } from "@/components/ui/input";
 import { useToast } from "@/components/ui/toast";
 import { ApiError } from "@/lib/api";
 import { fetchProjectPolicy, patchProjectPolicy, policyIssue } from "@/lib/policy-api";
-import { fetchSandboxImages, type SandboxImageEntry } from "@/lib/sandbox-api";
+import {
+  effectiveModeHint,
+  fetchSandboxImages,
+  fetchSandboxStatus,
+  type SandboxImageEntry,
+  type SandboxStatus,
+} from "@/lib/sandbox-api";
 import {
   deleteProjectSecret,
   fetchProjectSecrets,
@@ -279,6 +285,8 @@ function SandboxPolicySection({ projectId }: { projectId: string }) {
   const { toast } = useToast();
   const [load, setLoad] = useState<PolicyLoad>("loading");
   const [images, setImages] = useState<SandboxImageEntry[] | null>(null);
+  /** Daemon docker availability (#106) — powers the effective-mode hint. */
+  const [dockerStatus, setDockerStatus] = useState<SandboxStatus | null>(null);
   // v0.2 default: "local" — sandboxed execution is opt-in (#102).
   const [mode, setMode] = useState<ProjectSandboxPolicy["executionMode"]>("local");
   const [image, setImage] = useState("");
@@ -292,6 +300,7 @@ function SandboxPolicySection({ projectId }: { projectId: string }) {
   const [error, setError] = useState<string | null>(null);
 
   const loadAll = useCallback(() => {
+    let cancelled = false;
     setLoad("loading");
     fetchProjectPolicy(projectId)
       .then((policy) => {
@@ -316,11 +325,19 @@ function SandboxPolicySection({ projectId }: { projectId: string }) {
         ),
       )
       .catch(() => setImages(null));
+    fetchSandboxStatus(projectId)
+      .then((status) => {
+        if (!cancelled) setDockerStatus(status);
+      })
+      .catch(() => {
+        if (!cancelled) setDockerStatus(null);
+      });
+    return () => {
+      cancelled = true;
+    };
   }, [projectId]);
 
-  useEffect(() => {
-    loadAll();
-  }, [loadAll]);
+  useEffect(() => loadAll(), [loadAll]);
 
   const applySaved = (policy: ProjectSandboxPolicy): void => {
     setMode(policy.executionMode);
@@ -414,6 +431,16 @@ function SandboxPolicySection({ projectId }: { projectId: string }) {
             <p className="text-xs text-muted-fg" data-execution-mode-copy>
               {EXECUTION_MODE_COPY[mode] ?? ""}
             </p>
+            {/* #106: live effective-mode hint — follows the select and the
+                daemon's docker availability (60s-cached probe). */}
+            {dockerStatus !== null ? (
+              <p className="text-xs text-muted-fg" data-effective-mode-hint>
+                {effectiveModeHint({
+                  executionMode: mode,
+                  available: dockerStatus.available,
+                })}
+              </p>
+            ) : null}
           </Field>
 
           <Field

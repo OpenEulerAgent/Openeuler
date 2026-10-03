@@ -10,6 +10,7 @@ import { createExecutor } from "./executor.js";
 import { createLogger } from "./logger.js";
 import { sweepInterruptedRuns } from "./recovery.js";
 import { startPeriodicSandboxGc } from "./sandbox-gc.js";
+import { createDockerStatusService } from "./sandbox-status.js";
 import { loadOrCreateSecretKey } from "./secrets-crypto.js";
 import { getVersion } from "./version.js";
 
@@ -55,6 +56,28 @@ export async function main(): Promise<void> {
   // (`getSandboxProvider("docker")`).
   const sandboxProvider = createDockerSandboxProvider();
   registerSandboxProvider(sandboxProvider);
+
+  // Docker availability detection (#106): ONE service instance warms at boot
+  // (one `docker info` + `docker --version`) and backs
+  // `GET /api/sandbox/status` with a 60s cache. Warming is fire-and-forget —
+  // a missing docker must never block or fail the boot.
+  const dockerStatus = createDockerStatusService();
+  void dockerStatus.status().then(
+    (status) => {
+      if (status.available) {
+        logger.info(
+          { version: status.version ?? null, mode: status.mode },
+          "docker detected (sandboxed execution available)",
+        );
+      } else {
+        logger.warn(
+          { mode: status.mode },
+          "docker unavailable — auto-policy runs will execute locally",
+        );
+      }
+    },
+    () => undefined,
+  );
 
   const executor = createExecutor({
     db,
@@ -120,7 +143,7 @@ export async function main(): Promise<void> {
     worktrees,
     maxConcurrentRuns: executor.maxConcurrentRuns,
     secretsKey: secretKey.key,
-    sandbox: { provider: sandboxProvider },
+    sandbox: { provider: sandboxProvider, status: { service: dockerStatus } },
   });
 
   // LIFO: http-server → sandbox-gc → executor → db.

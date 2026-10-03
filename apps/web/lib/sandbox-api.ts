@@ -48,6 +48,99 @@ export interface SandboxBuildStarted {
 /** Default delay between job polls in {@link waitForSandboxJob}. */
 export const JOB_POLL_INTERVAL_MS = 1_000;
 
+/** `GET /api/sandbox/status` payload (#106); project fields with `?projectId=`. */
+export interface SandboxStatus {
+  /** True when `docker info` succeeded (CLI present + daemon reachable). */
+  available: boolean;
+  /** CLI version from `docker --version`; absent when the CLI is missing. */
+  version?: string;
+  mode: "docker" | "unavailable";
+  /** Epoch ms of the daemon-side probe. */
+  checkedAt: number;
+  /** With `?projectId=`: the project's policy executionMode ("local" when unset). */
+  projectMode?: "local" | "sandbox" | "auto";
+  /** With `?projectId=`: the resolved effective mode, same logic as the executor. */
+  effective?: "local" | "sandbox";
+}
+
+/**
+ * Docker availability + (optionally) a project's effective execution mode
+ * (#106). The daemon caches the probe for 60s.
+ */
+export async function fetchSandboxStatus(
+  projectId?: string,
+  fetcher: SandboxFetcher = apiFetch,
+): Promise<SandboxStatus> {
+  const query = projectId === undefined ? "" : `?projectId=${encodeURIComponent(projectId)}`;
+  return fetcher<SandboxStatus>(`/api/sandbox/status${query}`);
+}
+
+/**
+ * The executor's mode resolution (#102/#106), mirrored client-side so hints
+ * can react live to unsaved form state: sandbox stays sandbox, auto follows
+ * docker availability, everything else is local.
+ */
+export function resolveEffectiveMode(
+  executionMode: "local" | "sandbox" | "auto",
+  available: boolean,
+): "local" | "sandbox" {
+  if (executionMode === "sandbox") return "sandbox";
+  if (executionMode === "auto") return available ? "sandbox" : "local";
+  return "local";
+}
+
+/** Decision input for the run-detail local-fallback banner (#106). */
+export interface LocalFallbackBannerInput {
+  /** True when the run detail payload carries live sandbox info (#102). */
+  sandboxPresent: boolean;
+  /** Project policy executionMode; absent when no policy was saved. */
+  projectMode?: "local" | "sandbox" | "auto";
+  /** Current docker availability from the status endpoint. */
+  available: boolean;
+  /**
+   * Run status. Absence of sandbox info is only a valid local-run proxy
+   * while the run is EXECUTING — terminal runs drop sandbox info from the
+   * API, so a completed sandboxed run viewed after docker went down (or a
+   * fast-failed SANDBOX_UNAVAILABLE run) must not be mislabeled.
+   */
+  runStatus?: string;
+}
+
+/**
+ * True when a run is executing locally while its project's policy wants a
+ * sandbox and docker is unavailable — the "Running locally — Docker
+ * unavailable" case. A run WITH sandbox info executes sandboxed (no banner);
+ * local-policy projects are local by choice (no banner either).
+ */
+export function showLocalFallbackBanner(input: LocalFallbackBannerInput): boolean {
+  if (input.runStatus !== undefined && input.runStatus !== "running" && input.runStatus !== "queued") {
+    return false;
+  }
+  if (input.sandboxPresent) return false;
+  if (input.projectMode !== "auto" && input.projectMode !== "sandbox") return false;
+  return !input.available;
+}
+
+/**
+ * Effective-mode hint line (#106) for the settings drawer and the run modal:
+ * "effective: sandbox (Docker detected)" / "effective: local (Docker
+ * unavailable)" / the honest variants for the remaining corners.
+ */
+export function effectiveModeHint(input: {
+  executionMode: "local" | "sandbox" | "auto";
+  available: boolean;
+}): string {
+  const effective = resolveEffectiveMode(input.executionMode, input.available);
+  if (effective === "sandbox") {
+    return input.available
+      ? "effective: sandbox (Docker detected)"
+      : "effective: sandbox (Docker unavailable — sandbox runs will fail)";
+  }
+  return input.executionMode === "auto"
+    ? "effective: local (Docker unavailable)"
+    : "effective: local (policy: local)";
+}
+
 export async function fetchSandboxImages(
   fetcher: SandboxFetcher = apiFetch,
 ): Promise<SandboxImageEntry[]> {
