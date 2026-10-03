@@ -190,3 +190,20 @@ export function rowActionFor(status: RunStatus): "stop" | "retry" | null {
   }
   return null;
 }
+
+// ---------------------------------------------------------------------------
+// Compare selection (#114): per-row checkboxes → Compare at exactly two.
+
+/**
+ * Toggles one run id in the compare selection, keeping click order (the
+ * first ticked row becomes side A, the second side B). No cap — a third
+ * pick is allowed and simply disables the button until one is unticked.
+ */
+export function toggleCompareSelection(selected: readonly string[], runId: string): string[] {
+  return selected.includes(runId) ? selected.filter((id) => id !== runId) : [...selected, runId];
+}
+
+/** The Compare button navigates only at exactly two selected runs. */
+export function compareSelectionComplete(selected: readonly string[]): boolean {
+  return selected.length === 2;
+}

@@ -22,7 +22,9 @@ import { PlayIcon } from "@/components/shell/icons";
 import { apiFetch, ApiError } from "@/lib/api";
 import { isRunHosted } from "@/lib/hosting";
 import { fetchRuns, useRunStatusStream, type RunsApiRow } from "@/lib/runs-stream";
+import { compareHref } from "@/lib/run-compare";
 import {
+  compareSelectionComplete,
   decodeRunsFilters,
   encodeRunsFilters,
   filterRuns,
@@ -31,6 +33,7 @@ import {
   rowActionFor,
   RUNS_FILTER_STATUSES,
   runsTableReducer,
+  toggleCompareSelection,
   type StopConfirmState,
 } from "@/lib/runs-table";
 import { formatDuration, formatRelativeAge, isLiveStatus, runDuration } from "@/lib/time";
@@ -103,7 +106,8 @@ function StopCell({
  * Dashboard runs table (#51): project, workflow (+revision), status,
  * iterations, duration, age; status × project filters kept in the URL;
  * inline Stop (arm-confirm) and Retry (optimistic) actions; rows patched
- * live by the global run-status stream.
+ * live by the global run-status stream. Per-row compare checkboxes (#114)
+ * unlock a Compare button at exactly two selections → `/runs/compare`.
  */
 export function DashboardRunsTable() {
   const router = useRouter();
@@ -121,6 +125,12 @@ export function DashboardRunsTable() {
   const [projects, setProjects] = useState<Project[]>([]);
   const [stop, setStop] = useState<{ runId: string; state: StopConfirmState } | null>(null);
   const retryingRef = useRef(new Set<string>());
+  /** Compare selection (#114): ticked run ids in click order (A first, B second). */
+  const [compareSelection, setCompareSelection] = useState<string[]>([]);
+
+  const toggleCompare = useCallback((runId: string): void => {
+    setCompareSelection((current) => toggleCompareSelection(current, runId));
+  }, []);
 
   const setFilters = useCallback(
     (next: { statuses?: RunStatus[]; projectId?: string | undefined }) => {
@@ -306,9 +316,33 @@ export function DashboardRunsTable() {
             Every run on the daemon, newest first — updated live as statuses change.
           </CardDescription>
         </div>
-        <Button variant="secondary" size="sm" onClick={() => void loadRuns()}>
-          Refresh
-        </Button>
+        <div className="flex items-center gap-2">
+          {/* #114: compare entry point — appears once a row is ticked and
+              navigates at exactly two selected runs. */}
+          {compareSelection.length > 0 ? (
+            <Button
+              variant="secondary"
+              size="sm"
+              disabled={!compareSelectionComplete(compareSelection)}
+              title={
+                compareSelectionComplete(compareSelection)
+                  ? "Open the side-by-side comparison"
+                  : "Select exactly two runs to compare"
+              }
+              data-testid="compare-runs-button"
+              onClick={() => {
+                const [a, b] = compareSelection;
+                if (a === undefined || b === undefined) return;
+                router.push(compareHref(a, b));
+              }}
+            >
+              Compare ({compareSelection.length})
+            </Button>
+          ) : null}
+          <Button variant="secondary" size="sm" onClick={() => void loadRuns()}>
+            Refresh
+          </Button>
+        </div>
       </CardHeader>
       <CardContent>
         <div className="mb-4 flex flex-wrap items-center gap-3">
@@ -408,6 +442,9 @@ export function DashboardRunsTable() {
           <Table>
             <TableHeader>
               <TableRow>
+                <TableHead className="w-8">
+                  <span className="sr-only">Select to compare</span>
+                </TableHead>
                 <TableHead>Project</TableHead>
                 <TableHead>Workflow</TableHead>
                 <TableHead className="w-28">Status</TableHead>
@@ -422,6 +459,16 @@ export function DashboardRunsTable() {
                 const action = rowActionFor(run.status);
                 return (
                   <TableRow key={run.id}>
+                    <TableCell>
+                      <input
+                        type="checkbox"
+                        className="size-4 cursor-pointer rounded border-border accent-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
+                        checked={compareSelection.includes(run.id)}
+                        aria-label={`Compare ${run.branch}`}
+                        data-compare-check={run.id}
+                        onChange={() => toggleCompare(run.id)}
+                      />
+                    </TableCell>
                     <TableCell>
                       <Link
                         href={`/projects/${encodeURIComponent(run.projectId)}`}
