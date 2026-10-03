@@ -732,7 +732,14 @@ export class OpenCodeSandboxAgentHandle implements AgentHandle {
     this.feedStdout(result?.stdout ?? "");
 
     const exitCode = result?.code ?? null;
-    if (exitCode === 127 || /(?:not found|ENOENT|no such file)/i.test(result?.stderr ?? "")) {
+    // Only a NON-ZERO exit may be classified as a missing binary — a
+    // successful run whose stderr incidentally contains "not found" (grep
+    // output, warnings) must not fail the step.
+    if (
+      exitCode !== null &&
+      exitCode !== 0 &&
+      (exitCode === 127 || /(?:not found|ENOENT|no such file)/i.test(result?.stderr ?? ""))
+    ) {
       const error = new OpenCodeDriverError(
         "OPENCODE_NOT_FOUND",
         `opencode CLI not found inside the sandbox image (tried "${this.config.binary}", exit ${exitCode ?? "?"}). Install opencode in the sandbox image (e.g. add it to the image built via POST /api/sandbox/images/build) and retry.`,

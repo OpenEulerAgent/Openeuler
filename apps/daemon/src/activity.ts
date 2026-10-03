@@ -27,7 +27,12 @@ export type ActivityType =
  * `ops.image-pull` / `ops.image-build` (#100) record image-job completions.
  */
 export type OpsActivityType =
-  "ops.daemon-boot" | "ops.recovery-sweep" | "ops.gc" | "ops.image-pull" | "ops.image-build";
+  | "ops.daemon-boot"
+  | "ops.recovery-sweep"
+  | "ops.gc"
+  | "ops.image-pull"
+  | "ops.image-build"
+  | "ops.sandbox-kept";
 
 /** True for `ops.*` rows: rendered as small gray system lines in the web feed. */
 export function isOpsActivityType(type: ActivityType): type is OpsActivityType {
