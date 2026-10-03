@@ -2408,4 +2408,187 @@ describe("graph engine (parallel fan-out + join, #115)", () => {
     expect(dDriver.calls[0]?.prompt).toBe('D[{"b":"B-OUT","c":"C-OUT"}]');
     expect(h.db.runs.get(run.id)).toMatchObject({ status: "success", output: "D-OUT" });
   });
+
+  it("nested any-join with an inner loop: the outer join triggers exactly once per round (round identity is stable across inner loops)", async () => {
+    const h = setup();
+    h.registry.registerDriver(
+      createFakeDriver({
+        id: "d-b",
+        events: [{ type: "session", seq: 1, sessionId: "s-b" }],
+        output: "B-OUT",
+        delayMs: 150,
+      }),
+    );
+    h.registry.registerDriver(createFakeDriver({ id: "d-f", events: [], output: "F-OUT" }));
+    h.registry.registerDriver(createFakeDriver({ id: "d-x", events: [], output: "X-OUT" }));
+    h.registry.registerDriver(createFakeDriver({ id: "d-y", events: [], output: "Y-OUT" }));
+    const zCycler = createFakeDriver({
+      id: "d-z",
+      events: [],
+      outputs: ["LOOP", "DONE"],
+    });
+    h.registry.registerDriver(zCycler);
+    const dDriver = createFakeDriver({ id: "d-d", events: [], output: "D-OUT" });
+    h.registry.registerDriver(dDriver);
+
+    // a fans out to (b, f). f fans out to (x, y) → j2(any) → z, which
+    // loops back to f once (conditional contains LOOP) before finishing.
+    // j1(any) merges (b, z) → d → exit. b is SLOW: z's branch chain wins
+    // j1 first; b's later delivery must NOT re-trigger it — even though
+    // z's chain went through an inner loop (execution numbers diverge from
+    // the outer fan-out round; the round token must not).
+    const { revisionId } = h.pinGraph({
+      entryNodeId: "a",
+      nodes: [
+        agentNode("a", "impl"),
+        agentNode("b", "d-b", { y: -160 }),
+        agentNode("f", "d-f", { y: 160 }),
+        agentNode("x", "d-x", { y: 80 }),
+        agentNode("y", "d-y", { y: 240 }),
+        { id: "j2", type: "join", name: "inner", position: { x: 560, y: 160 }, config: { mode: "any" } },
+        agentNode("z", "d-z", { y: 160, continueSession: true }),
+        { id: "j1", type: "join", name: "outer", position: { x: 760, y: 0 }, config: { mode: "any" } },
+        agentNode("d", "d-d"),
+        exitNode(),
+      ],
+      edges: [
+        { id: "e-ab", source: "a", target: "b", condition: { type: "always" } },
+        { id: "e-af", source: "a", target: "f", condition: { type: "always" } },
+        { id: "e-fx", source: "f", target: "x", condition: { type: "always" } },
+        { id: "e-fy", source: "f", target: "y", condition: { type: "always" } },
+        { id: "e-xj2", source: "x", target: "j2", condition: { type: "always" } },
+        { id: "e-yj2", source: "y", target: "j2", condition: { type: "always" } },
+        { id: "e-j2z", source: "j2", target: "z", condition: { type: "always" } },
+        {
+          id: "e-zf",
+          source: "z",
+          target: "f",
+          condition: { type: "outputContains", pattern: "LOOP" },
+          maxIterations: 1,
+        },
+        { id: "e-zj1", source: "z", target: "j1", condition: { type: "always" } },
+        { id: "e-bj1", source: "b", target: "j1", condition: { type: "always" } },
+        { id: "e-j1d", source: "j1", target: "d", condition: { type: "always" } },
+        { id: "e-dexit", source: "d", target: "exit", condition: { type: "always" } },
+      ],
+    });
+    const run = h.enqueueRevisionRun(revisionId);
+
+    await h.engine.executeRun(run.id, noAbort);
+    await awaitStatus(h, run.id, "success");
+
+    // The outer join completed ONCE (z's chain triggered it; b's late
+    // delivery from the same round was suppressed), so d ran exactly once.
+    const outerCompleted = eventsOf(h, run.id, "node.completed").filter(
+      (event) => event.nodeId === "j1",
+    );
+    expect(outerCompleted).toHaveLength(1);
+    expect(dDriver.calls).toHaveLength(1);
+    expect(
+      h.db.stepRuns.listByRun(run.id).filter((row) => row.stepId === "d"),
+    ).toHaveLength(1);
+    expect(h.db.runs.get(run.id)).toMatchObject({ status: "success", output: "D-OUT" });
+    // The inner loop really ran (z twice, f twice) — execution numbers
+    // diverged from the round, which is exactly what this test pins.
+    console.log("TAKEN", takenEdges(h, run.id));
+    console.log("ROWS", h.db.stepRuns.listByRun(run.id).map((r) => [r.stepId, r.iteration, r.status]));
+    console.log("ZOUT", eventsOf(h, run.id, "node.completed").filter((e) => e.nodeId === "z").map((e) => [e.status, e.output]));
+console.log("ZPROMPTS", zCycler.calls.map((c) => c.prompt));
+    expect(zCycler.calls).toHaveLength(2);
+    expect(
+      h.db.stepRuns.listByRun(run.id).filter((row) => row.stepId === "f"),
+    ).toHaveLength(2);
+  });
+
+  it("legacy resume (round-less events): a triggered any-join still supersedes its interrupted sibling", async () => {
+    const h = setup();
+    const bDriver = createFakeDriver({
+      id: "d-b",
+      events: [],
+      outputs: ["RETRY", "B-OUT"],
+    });
+    h.registry.registerDriver(bDriver);
+    const cDriver = createFakeDriver({ id: "d-c", events: [], output: "C-OUT" });
+    h.registry.registerDriver(cDriver);
+    const dDriver = createFakeDriver({ id: "d-d", events: [], output: "D-OUT" });
+    h.registry.registerDriver(dDriver);
+
+    // b has a conditional self-loop (RETRY) before its always delivery to
+    // the any-join j. Pre-crash: a done, b#1 RETRY looped, b#2 B-OUT
+    // delivered and TRIGGERED j (join node entry persisted), j→d edge
+    // persisted, c interrupted mid-flight, d never started.
+    const { revisionId } = h.pinGraph({
+      entryNodeId: "a",
+      nodes: [
+        agentNode("a", "impl"),
+        agentNode("b", "d-b", { y: -120 }),
+        agentNode("c", "d-c", { y: 120 }),
+        { id: "j", type: "join", name: "merge", position: { x: 560, y: 0 }, config: { mode: "any" } },
+        agentNode("d", "d-d"),
+        exitNode(),
+      ],
+      edges: [
+        { id: "e-ab", source: "a", target: "b", condition: { type: "always" } },
+        { id: "e-ac", source: "a", target: "c", condition: { type: "always" } },
+        {
+          id: "e-bb",
+          source: "b",
+          target: "b",
+          condition: { type: "outputContains", pattern: "RETRY" },
+          maxIterations: 2,
+        },
+        { id: "e-bj", source: "b", target: "j", condition: { type: "always" } },
+        { id: "e-cj", source: "c", target: "j", condition: { type: "always" } },
+        { id: "e-jd", source: "j", target: "d", condition: { type: "always" } },
+        { id: "e-dexit", source: "d", target: "exit", condition: { type: "always" } },
+      ],
+    });
+    const run = h.enqueueRevisionRun(revisionId);
+
+    await h.worktrees.create(run.id, h.db.projects.get(h.projectId) as Project);
+    for (const [stepId, iteration, status, output] of [
+      ["a", 1, "success", "IMPL-OUT"],
+      ["b", 1, "success", "RETRY"],
+      ["b", 2, "success", "B-OUT"],
+      ["c", 1, "interrupted", "part"],
+    ] as const) {
+      h.db.stepRuns.create({
+        id: crypto.randomUUID(),
+        runId: run.id,
+        stepId,
+        iteration,
+        status,
+        output,
+      });
+    }
+    h.db.runs.update(run.id, {
+      status: "interrupted",
+      breadcrumb: [
+        { kind: "node", nodeId: "a", iteration: 1 },
+        { kind: "node", nodeId: "b", iteration: 1 },
+        { kind: "edge", edgeId: "e-bb", iteration: 1 },
+        { kind: "node", nodeId: "b", iteration: 2 },
+        { kind: "edge", edgeId: "e-bj", iteration: 2 },
+        { kind: "node", nodeId: "j", iteration: 1 },
+        { kind: "edge", edgeId: "e-jd", iteration: 1 },
+      ],
+    });
+    h.db.runs.updateStatus(run.id, "queued");
+
+    await h.engine.executeRun(run.id, noAbort);
+    await awaitStatus(h, run.id, "success");
+
+    // c is a round-1 loser of an already-triggered join: settled aborted,
+    // never re-run, its would-be delivery never re-triggers the join, and
+    // d executes exactly once.
+    expect(cDriver.calls).toHaveLength(0);
+    expect(dDriver.calls).toHaveLength(1);
+    expect(
+      eventsOf(h, run.id, "node.completed").filter((event) => event.nodeId === "j"),
+    ).toHaveLength(0);
+    expect(
+      h.db.stepRuns.listByRun(run.id).find((row) => row.stepId === "c"),
+    ).toMatchObject({ status: "aborted" });
+    expect(h.db.runs.get(run.id)).toMatchObject({ status: "success", output: "D-OUT" });
+  });
 });

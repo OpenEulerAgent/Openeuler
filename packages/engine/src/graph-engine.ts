@@ -249,6 +249,16 @@ interface ScheduledExec {
   restartSessionId: string | undefined;
   /** The fan-out branch edge this execution runs on (#115), when known. */
   viaEdgeId: string | undefined;
+  /**
+   * Fan-out LINEAGE (#115): the stack of `<sourceNodeId>#<sourceExecNumber>`
+   * tokens for every fan-out spawn this execution descends from (["root"]
+   * before any fan-out). Fan-out spawn PUSHES a token; routing/loops/joins
+   * inherit unchanged — so per-node execution numbers (which diverge inside
+   * looping branches) never feed the join single-trigger guard. A join
+   * compares the lineage element of ITS OWN feeding fan-out (see
+   * `joinRoundKey`), which nested fan-outs and inner loops leave stable.
+   */
+  rounds: string[];
 }
 
 /** Verdict of one completed in-flight execution, acted on by the scheduler. */
@@ -276,15 +286,15 @@ interface ExecContext {
  * Resolution of one incoming edge of a pending join since its last trigger
  * (fresh round = all `waiting`). `arrived` edges delivered their output;
  * `failed`/`missed` edges never will (source failed / routed elsewhere).
- * `arrivals` records each delivery's source execution number — the ROUND
- * identity behind the single-trigger-per-round guard.
+ * `arrivals` records each delivery's fan-out ROUND token — the identity
+ * behind the single-trigger-per-round guard (#115).
  */
 type JoinEdgeState = "waiting" | "arrived" | "failed" | "missed";
 
 interface JoinPending {
   states: Map<string, JoinEdgeState>;
-  /** edge id → source node execution number at arrival (round identity). */
-  arrivals: Map<string, number>;
+  /** edge id → delivering execution's fan-out round token (round identity). */
+  arrivals: Map<string, string>;
 }
 
 /** A fresh pending round: every incoming edge waiting, no arrivals. */
@@ -307,15 +317,18 @@ interface GraphRunState {
   /** Join id → per-incoming-edge satisfaction since its last trigger (#115). */
   joinPending: Map<string, JoinPending>;
   /**
-   * Join id → source-execution rounds that already triggered (#115): a
-   * join triggers at most once per round, so a stale delivery (a cancelled
-   * loser that exited naturally, or re-ran after a resume) is suppressed
-   * instead of re-triggering the downstream subgraph. Reconstructable from
-   * the breadcrumb: each trigger consumes its arrived edges' iterations.
+   * Join id → fan-out round tokens that already triggered (#115): a join
+   * triggers at most once per round, so a stale delivery (a cancelled loser
+   * that exited naturally, or re-ran after a resume) is suppressed instead
+   * of re-triggering the downstream subgraph. Rounds are stable across
+   * inner loops (they change only at fan-out spawn / join inheritance) and
+   * are reconstructable from `node.queued/started` event payloads.
    */
-  joinTriggeredRounds: Map<string, Set<number>>;
+  joinTriggeredRounds: Map<string, Set<string>>;
   /** Ordered breadcrumb, mirrored onto the run row on every append. */
   breadcrumb: BreadcrumbEntry[];
+  /** `nodeId#iteration` → the lineage stack that execution ran under (#115). */
+  execRounds: Map<string, string[]>;
   /** Output of the last successfully completed agent node (final run output). */
   runOutput: string;
   /** Total node executions started (defensive termination bound). */
@@ -554,13 +567,60 @@ function describeUnsatisfiedJoin(
   return `join node "${join.id}" (mode ${join.config.mode}) never triggered: ${parts.join("; ")}`;
 }
 
+
+/**
+ * The comparison key for one join (#115): the lineage element of the join's
+ * FEEDING fan-out (the shared unconditional parent of the join's direct
+ * incoming sources). Nested fan-outs and inner loops deeper in the lineage
+ * never change it; a new outer iteration does. Joins fed serially (no
+ * fan-out ancestor) get a per-delivery key — always fresh, matching the
+ * pre-#115 behavior for serial shapes.
+ */
+function joinRoundKey(topology: GraphTopology, joinId: string, rounds: readonly string[]): string {
+  const feeding = feedingFanOutOf(topology, joinId);
+  if (feeding === undefined) return `serial:${rounds[rounds.length - 1] ?? "root"}`;
+  const prefix = `${feeding}#`;
+  for (let i = rounds.length - 1; i >= 0; i -= 1) {
+    const token = rounds[i];
+    if (token !== undefined && token.startsWith(prefix)) return token;
+  }
+  return `serial:${rounds[rounds.length - 1] ?? "root"}`;
+}
+
+/**
+ * Feeding fan-out of a join: the node whose unconditional outgoing edges
+ * reach (a superset of) the join's direct incoming sources — i.e. the
+ * fan-out that spawned the join's sibling branches. `undefined` when the
+ * join is fed serially.
+ */
+function feedingFanOutOf(topology: GraphTopology, joinId: string): string | undefined {
+  const sources = new Set((topology.incoming.get(joinId) ?? []).map((edge) => edge.source));
+  for (const source of sources) {
+    const outs = topology.outgoing.get(source) ?? [];
+    const unconditional = outs.filter((edge) => isUnconditional(edge));
+    if (unconditional.length < 2) continue;
+    const targets = new Set(unconditional.map((edge) => edge.target));
+    let covers = true;
+    for (const sibling of sources) {
+      if (!targets.has(sibling)) {
+        covers = false;
+        break;
+      }
+    }
+    if (covers && targets.size >= sources.size) return source;
+  }
+  return undefined;
+}
+
 interface ResumeOutcome {
   state: GraphRunState;
   initial: ScheduledExec[];
   /** Advance to re-run for a completed node whose routing never persisted. */
-  redrive: { nodeId: string; output: string; iteration: number } | undefined;
+  redrive: { nodeId: string; output: string; iteration: number; rounds: string[] } | undefined;
   /** A join trigger whose execution never persisted. */
   pendingJoinTrigger: string | undefined;
+  /** Round key of the un-persisted trigger (follow execs inherit its lineage). */
+  pendingTriggerRounds: string[] | undefined;
 }
 
 function reconstructGraphResume(
@@ -595,6 +655,7 @@ function reconstructGraphResume(
     joinPending: new Map(),
     joinTriggeredRounds: new Map(),
     breadcrumb: entries,
+    execRounds: new Map(),
     runOutput: "",
     totalExecutions: 0,
     task: run.task ?? "",
@@ -616,6 +677,26 @@ function reconstructGraphResume(
    * join's node entry — or the live re-fired trigger — consumes it).
    */
   let pendingTriggerArrived: Set<string> | undefined;
+  /** Lineage of the un-persisted trigger (follow execs inherit it). */
+  let pendingTriggerRounds: string[] | undefined;
+  /**
+   * `nodeId#iteration` → lineage stack, from the persisted `node.queued/
+   * started` events (#115). Legacy events without lineage fall back to a
+   * single per-exec token (`<nodeId>#<iteration>`) — degenerating to the
+   * old execution-number behavior for pre-fix runs.
+   */
+  const roundsByExec = new Map<string, string[]>();
+  for (const event of deps.db.events.getSince(run.id)) {
+    if (
+      (event.type === "node.queued" || event.type === "node.started") &&
+      Array.isArray(event.rounds) &&
+      event.rounds.every((token: unknown) => typeof token === "string")
+    ) {
+      roundsByExec.set(`${event.nodeId}#${event.iteration}`, event.rounds as string[]);
+    }
+  }
+  const lineageOf = (nodeId: string, iteration: number): string[] =>
+    roundsByExec.get(`${nodeId}#${iteration}`) ?? [`${nodeId}#${iteration}`];
   const freshRound = (joinId: string): JoinPending => freshJoinPending(topology, joinId);
   const arrivedSet = (pending: JoinPending | undefined): Set<string> =>
     new Set(
@@ -665,20 +746,22 @@ function reconstructGraphResume(
         // Single trigger per round (#115): a delivery whose round already
         // triggered is stale — replay skips it exactly like the runtime
         // suppresses it, so a later resume never re-fires the trigger.
-        if (state.joinTriggeredRounds.get(edge.target)?.has(entry.iteration)) continue;
+        const round = joinRoundKey(topology, edge.target, lineageOf(edge.source, entry.iteration));
+        if (state.joinTriggeredRounds.get(edge.target)?.has(round)) continue;
         const pending = state.joinPending.get(edge.target) ?? freshRound(edge.target);
         pending.states.set(entry.edgeId, "arrived");
-        pending.arrivals.set(entry.edgeId, entry.iteration);
+        pending.arrivals.set(entry.edgeId, round);
         state.joinPending.set(edge.target, pending);
         if (joinTriggered(edge.target)) {
           // The trigger appends the join's node entry synchronously; if
           // that entry never persisted, resume must fire it on the still-
           // pending round. The consumed arrivals' rounds are recorded so
           // suppressed siblings of the same round cannot re-trigger it.
-          const rounds = state.joinTriggeredRounds.get(edge.target) ?? new Set<number>();
-          for (const iteration of new Set(pending.arrivals.values())) rounds.add(iteration);
+          const rounds = state.joinTriggeredRounds.get(edge.target) ?? new Set<string>();
+          for (const consumed of new Set(pending.arrivals.values())) rounds.add(consumed);
           state.joinTriggeredRounds.set(edge.target, rounds);
           pendingJoinTrigger = edge.target;
+          pendingTriggerRounds = lineageOf(edge.source, entry.iteration);
           pendingTriggerArrived = arrivedSet(pending);
         }
       }
@@ -689,7 +772,13 @@ function reconstructGraphResume(
     if (!state.joinPending.has(joinId)) state.joinPending.set(joinId, freshRound(joinId));
   }
 
-  const outcome: ResumeOutcome = { state, initial: [], redrive: undefined, pendingJoinTrigger };
+  const outcome: ResumeOutcome = {
+    state,
+    initial: [],
+    redrive: undefined,
+    pendingJoinTrigger,
+    pendingTriggerRounds,
+  };
 
   // Restart points: every non-terminal StepRun (in-flight or still queued).
   // The routing context comes from the last persisted traversal INTO the
@@ -723,10 +812,16 @@ function reconstructGraphResume(
   // resume settles it `aborted` (mirroring the live cancellation) instead
   // of re-running it.
   const isSupersededLoser = (nodeId: string, iteration: number): boolean => {
+    const key = `${nodeId}#${iteration}`;
     for (const [joinId, siblings] of topology.joinSiblings) {
-      if (siblings.has(nodeId) && state.joinTriggeredRounds.get(joinId)?.has(iteration)) {
-        return true;
-      }
+      if (!siblings.has(nodeId)) continue;
+      const triggered = state.joinTriggeredRounds.get(joinId);
+      if (triggered === undefined || triggered.size === 0) continue;
+      if (triggered.has(joinRoundKey(topology, joinId, lineageOf(nodeId, iteration)))) return true;
+      // Legacy logs (no lineage-bearing events): an interrupted DIRECT
+      // sibling of a join that already triggered is assumed superseded —
+      // exact round matching needs the lineage tokens new runs emit.
+      if (!roundsByExec.has(key)) return true;
     }
     return false;
   };
@@ -773,6 +868,7 @@ function reconstructGraphResume(
       prevSessionId: source === undefined ? undefined : state.sessions.get(source),
       restartSessionId: row.sessionId,
       viaEdgeId: queuedEdgeIds.get(`${row.stepId}#${row.iteration}`) ?? branchEdgeInto(row.stepId),
+      rounds: lineageOf(row.stepId, row.iteration),
     });
   }
 
@@ -800,6 +896,7 @@ function reconstructGraphResume(
             prevSessionId: state.sessions.get(edge.source),
             restartSessionId: undefined,
             viaEdgeId: undefined,
+            rounds: lineageOf(edge.source, last.iteration),
           });
         }
       }
@@ -811,6 +908,7 @@ function reconstructGraphResume(
       nodeId: last.nodeId,
       output: state.outputs.get(last.nodeId) ?? "",
       iteration: last.iteration,
+      rounds: lineageOf(last.nodeId, last.iteration),
     };
   }
 
@@ -851,6 +949,7 @@ async function runNode(
     nodeName: node.name,
     iteration,
     ...(exec.viaEdgeId === undefined ? {} : { edgeId: exec.viaEdgeId }),
+    rounds: exec.rounds,
   });
   deps.log.info({ runId, nodeId: node.id, iteration }, "node started");
 
@@ -1051,6 +1150,7 @@ export async function executeGraphRun(
     joinPending: new Map(),
     joinTriggeredRounds: new Map(),
     breadcrumb: [],
+    execRounds: new Map(),
     runOutput: "",
     totalExecutions: 0,
     task: run.task ?? "",
@@ -1080,6 +1180,7 @@ export async function executeGraphRun(
       exec.nodeId,
       Math.max(state.execCount.get(exec.nodeId) ?? 0, exec.iteration),
     );
+    state.execRounds.set(`${exec.nodeId}#${exec.iteration}`, exec.rounds);
     const adopted = deps.db.stepRuns
       .listByRun(runId)
       .find(
@@ -1096,6 +1197,7 @@ export async function executeGraphRun(
         nodeName: node.name,
         iteration: exec.iteration,
         ...(exec.viaEdgeId === undefined ? {} : { edgeId: exec.viaEdgeId }),
+        rounds: exec.rounds,
       });
     }
     ready.push(exec);
@@ -1210,6 +1312,7 @@ export async function executeGraphRun(
   const triggerJoin = (
     joinId: string,
     siblingsOf: (joinId: string) => void,
+    triggerRounds: readonly string[],
   ): ScheduledExec[] | undefined => {
     const join = topology.joins.get(joinId);
     if (join === undefined) return undefined;
@@ -1222,27 +1325,30 @@ export async function executeGraphRun(
     const arrived = new Set(
       [...pending.states.entries()].filter(([, s]) => s === "arrived").map(([id]) => id),
     );
-    // Single trigger per round (#115): the consumed arrivals' source
-    // execution numbers mark this round as triggered — any sibling delivery
-    // of the same round (a cancelled loser exiting naturally, or re-running
-    // after a resume) is suppressed from re-triggering.
-    const rounds = state.joinTriggeredRounds.get(joinId) ?? new Set<number>();
-    for (const iteration of new Set(pending.arrivals.values())) rounds.add(iteration);
+    // Single trigger per round (#115): the consumed arrivals' fan-out round
+    // tokens mark this round as triggered — any sibling delivery of the
+    // same round (a cancelled loser exiting naturally, or re-running after
+    // a resume) is suppressed from re-triggering.
+    const rounds = state.joinTriggeredRounds.get(joinId) ?? new Set<string>();
+    for (const consumed of new Set(pending.arrivals.values())) rounds.add(consumed);
     state.joinTriggeredRounds.set(joinId, rounds);
     const output = renderJoinOutput(topology, state, joinId, arrived);
     const iteration = (state.execCount.get(joinId) ?? 0) + 1;
     state.execCount.set(joinId, iteration);
+    state.execRounds.set(`${joinId}#${iteration}`, [...triggerRounds]);
     deps.appendEvent(runId, {
       type: "node.queued",
       nodeId: join.id,
       nodeName: join.name,
       iteration,
+      rounds: [...triggerRounds],
     });
     deps.appendEvent(runId, {
       type: "node.started",
       nodeId: join.id,
       nodeName: join.name,
       iteration,
+      rounds: [...triggerRounds],
     });
     deps.appendEvent(runId, {
       type: "node.completed",
@@ -1283,16 +1389,21 @@ export async function executeGraphRun(
         prevSessionId: state.sessions.get(joinId),
         restartSessionId: undefined,
         viaEdgeId: undefined,
+        rounds: [...triggerRounds],
       },
     ];
   };
 
   /**
    * Satisfies a join's incoming edge (delivered by the source's execution
-   * `sourceIteration` — the round identity); triggers the join per its
-   * mode, at most once per round.
+   * `sourceIteration` running in fan-out round `sourceRound`); triggers the
+   * join per its mode, at most once per round.
    */
-  const deliverToJoin = (edge: GraphEdge, sourceIteration: number): TaskVerdict => {
+  const deliverToJoin = (
+    edge: GraphEdge,
+    sourceIteration: number,
+    sourceRounds: readonly string[],
+  ): TaskVerdict => {
     const join = topology.joins.get(edge.target);
     if (join === undefined) {
       return failRun(`edge "${edge.id}" targets unknown join "${edge.target}"`);
@@ -1301,16 +1412,17 @@ export async function executeGraphRun(
     // fan-out round the join already triggered on — suppressed, never
     // re-triggered (the downstream subgraph must execute exactly once per
     // round even if the losing sibling exited naturally or re-ran).
-    if (state.joinTriggeredRounds.get(join.id)?.has(sourceIteration)) {
+    const roundKey = joinRoundKey(topology, join.id, sourceRounds);
+    if (state.joinTriggeredRounds.get(join.id)?.has(roundKey)) {
       deps.log.info(
-        { runId, joinId: join.id, edgeId: edge.id, iteration: sourceIteration },
+        { runId, joinId: join.id, edgeId: edge.id, round: roundKey },
         "stale join delivery suppressed (round already triggered)",
       );
       return { kind: "branch-done" };
     }
     const pending = state.joinPending.get(join.id) ?? freshRound(join.id);
     pending.states.set(edge.id, "arrived");
-    pending.arrivals.set(edge.id, sourceIteration);
+    pending.arrivals.set(edge.id, roundKey);
     state.joinPending.set(join.id, pending);
     const incoming = topology.incoming.get(join.id) ?? [];
     const arrivedCount = [...pending.states.values()].filter((s) => s === "arrived").length;
@@ -1318,16 +1430,25 @@ export async function executeGraphRun(
       join.config.mode === "any" ? arrivedCount >= 1 : arrivedCount >= incoming.length;
     if (!triggered) return { kind: "continue" }; // the join keeps waiting
 
-    const follow = triggerJoin(join.id, (scopeJoinId) => {
-      cancelExecutions((nodeId) => topology.failureScope.get(nodeId)?.joinId === scopeJoinId);
-    });
+    const follow = triggerJoin(
+      join.id,
+      (scopeJoinId) => {
+        cancelExecutions((nodeId) => topology.failureScope.get(nodeId)?.joinId === scopeJoinId);
+      },
+      sourceRounds,
+    );
     if (follow === undefined) return failRun(`join "${join.id}" could not execute`);
     for (const exec of follow) scheduleExec(exec);
     return { kind: "continue" };
   };
 
   /** Emits `edge.taken`, records the traversal and delivers to the target. */
-  const takeEdge = (edge: GraphEdge, output: string, sourceIteration: number): TaskVerdict => {
+  const takeEdge = (
+    edge: GraphEdge,
+    output: string,
+    sourceIteration: number,
+    sourceRounds: readonly string[],
+  ): TaskVerdict => {
     deps.appendEvent(runId, {
       type: "edge.taken",
       edgeId: edge.id,
@@ -1360,7 +1481,7 @@ export async function executeGraphRun(
       return { kind: "branch-done" };
     }
     if (target.type === "join") {
-      return deliverToJoin(edge, sourceIteration);
+      return deliverToJoin(edge, sourceIteration, sourceRounds);
     }
     scheduleExec({
       nodeId: target.id,
@@ -1369,6 +1490,7 @@ export async function executeGraphRun(
       prevSessionId: state.sessions.get(edge.source),
       restartSessionId: undefined,
       viaEdgeId: undefined,
+      rounds: [...sourceRounds],
     });
     return { kind: "continue" };
   };
@@ -1382,7 +1504,12 @@ export async function executeGraphRun(
    * only through resume re-derivation (their live advance happens inside
    * `triggerJoin`): their single unconditional edge delivers like a chain.
    */
-  const advance = (node: GraphNode, output: string, sourceIteration: number): TaskVerdict => {
+  const advance = (
+    node: GraphNode,
+    output: string,
+    sourceIteration: number,
+    sourceRounds: readonly string[],
+  ): TaskVerdict => {
     const siblings = topology.outgoing.get(node.id) ?? [];
     const unconditional = siblings.filter(isUnconditional);
     const conditional = siblings
@@ -1394,6 +1521,11 @@ export async function executeGraphRun(
     // edges are never guarded and emit no edge.taken — the branches are
     // reported by the targets' node.queued events carrying the branch edgeId.
     if (unconditional.length >= 2) {
+      // Fan-out lineage push (#115): every branch spawned by THIS source
+      // execution carries the token `<source>#<exec>` appended to the
+      // lineage — inner loops keep the lineage, and a later re-entry into
+      // the fan-out source mints a fresh token for its branches.
+      const branchLineage = [...sourceRounds, `${node.id}#${sourceIteration}`];
       for (const edge of unconditional) {
         const target = topology.nodesById.get(edge.target);
         if (target === undefined || target.type !== "agent") {
@@ -1408,6 +1540,7 @@ export async function executeGraphRun(
           prevSessionId: state.sessions.get(node.id),
           restartSessionId: undefined,
           viaEdgeId: edge.id,
+          rounds: [...branchLineage],
         });
       }
       deps.log.info(
@@ -1453,7 +1586,7 @@ export async function executeGraphRun(
           { runId, edgeId: winner.id, taken, max },
           "edge cycle guard reached; taking always fallback",
         );
-        return takeEdge(fallback, output, sourceIteration);
+        return takeEdge(fallback, output, sourceIteration, sourceRounds);
       }
     }
 
@@ -1465,7 +1598,7 @@ export async function executeGraphRun(
       if (unsatisfiable !== undefined) return failRun(unsatisfiable);
       return { kind: "branch-done" };
     }
-    return takeEdge(edge, output, sourceIteration);
+    return takeEdge(edge, output, sourceIteration, sourceRounds);
   };
 
   /** Processes one settled node execution into a scheduler verdict. */
@@ -1509,7 +1642,7 @@ export async function executeGraphRun(
     // runs only; persists detectedPorts on the run row as it goes).
     deps.recordDetectedPorts(runId, outcome.output);
 
-    return advance(node, outcome.output, iteration);
+    return advance(node, outcome.output, iteration, ctx.exec.rounds);
   };
 
   /** Runs one scheduled execution to its verdict (never rejects). */
@@ -1558,6 +1691,7 @@ export async function executeGraphRun(
       prevSessionId: undefined,
       restartSessionId: undefined,
       viaEdgeId: undefined,
+      rounds: ["root"],
     });
   } else {
     for (const exec of resumed.initial) scheduleExec(exec);
@@ -1572,7 +1706,12 @@ export async function executeGraphRun(
         });
         return;
       }
-      const verdict = advance(node, resumed.redrive.output, resumed.redrive.iteration);
+      const verdict = advance(
+        node,
+        resumed.redrive.output,
+        resumed.redrive.iteration,
+        resumed.redrive.rounds,
+      );
       if (verdict.kind === "fail-run" && terminal === undefined) {
         terminal = verdict;
       } else if (verdict.kind === "abort" && terminal === undefined) {
@@ -1585,9 +1724,13 @@ export async function executeGraphRun(
   // entry and the join execution) fires once the restart set is seeded,
   // with the SAME sibling cancellation a live trigger applies.
   if (resumed !== undefined && resumed.pendingJoinTrigger !== undefined) {
-    const follow = triggerJoin(resumed.pendingJoinTrigger, (scopeJoinId) => {
-      cancelExecutions((nodeId) => topology.failureScope.get(nodeId)?.joinId === scopeJoinId);
-    });
+    const follow = triggerJoin(
+      resumed.pendingJoinTrigger,
+      (scopeJoinId) => {
+        cancelExecutions((nodeId) => topology.failureScope.get(nodeId)?.joinId === scopeJoinId);
+      },
+      resumed.pendingTriggerRounds ?? ["root"],
+    );
     if (follow === undefined) {
       deps.finalizeRun(runId, "failed", {
         error: `join "${resumed.pendingJoinTrigger}" could not execute on resume`,

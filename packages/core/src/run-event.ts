@@ -103,6 +103,13 @@ export const NodeQueuedEventSchema = z.strictObject({
    * executions.
    */
   edgeId: idSchema.optional(),
+  /**
+   * Fan-out lineage (#115): the stack of `<sourceNodeId>#<sourceExecNumber>`
+   * tokens for every fan-out spawn this execution descends from (["root"]
+   * before any fan-out). Join single-trigger bookkeeping and resume
+   * reconstruction derive per-join round keys from it.
+   */
+  rounds: z.array(z.string().min(1)).optional(),
 });
 
 export type NodeQueuedEvent = z.infer<typeof NodeQueuedEventSchema>;
@@ -116,6 +123,8 @@ export const NodeStartedEventSchema = z.strictObject({
   iteration: iterationSchema,
   /** The branch edge this execution runs on (#115), when known. */
   edgeId: idSchema.optional(),
+  /** Fan-out lineage (#115) — see NodeQueuedEventSchema.rounds. */
+  rounds: z.array(z.string().min(1)).optional(),
 });
 
 export type NodeStartedEvent = z.infer<typeof NodeStartedEventSchema>;
