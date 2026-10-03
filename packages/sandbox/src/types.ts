@@ -244,6 +244,13 @@ export interface SandboxProvider {
    * garbage-collected by id.
    */
   destroy?(id: string): Promise<void>;
+  /**
+   * Graceful stop of a sandbox by `list()` id (#112, the sandboxes
+   * dashboard): stops the container but KEEPS it — still listed (as
+   * `stopped`) and inspectable. An already-stopped or missing id resolves,
+   * never rejects. Optional — providers without it cannot be stopped by id.
+   */
+  stop?(id: string): Promise<void>;
   /** Optional per-sandbox resource usage. */
   stats?(): Promise<SandboxUsage[]>;
 }

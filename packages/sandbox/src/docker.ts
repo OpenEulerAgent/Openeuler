@@ -1059,6 +1059,26 @@ export class DockerSandboxProvider implements SandboxProvider {
   }
 
   /**
+   * Graceful stop by `list()` id (#112, the sandboxes dashboard): same
+   * `docker stop -t <grace>` the handle's `stop()` builds; the container is
+   * kept (inspectable, listed as `stopped`). Stopping an already-stopped
+   * container is a docker no-op; a missing one resolves (idempotent).
+   */
+  async stop(id: string): Promise<void> {
+    const seconds = Math.max(0, Math.ceil(this.options.stopGraceMs / 1000));
+    const result = await docker(["stop", "-t", String(seconds), id], {
+      runner: this.options.runner,
+      timeoutMs: seconds * 1000 + this.options.opTimeoutMs,
+    });
+    if (result.code !== 0 && !isContainerMissingText(result.stderr)) {
+      throw new SandboxError(
+        "SANDBOX_STOP_FAILED",
+        `failed to stop sandbox "${id}": ${stderrTail(result.stderr)}`,
+      );
+    }
+  }
+
+  /**
    * Best-effort `rm -f` used by `create()` cleanup paths: the name is ours
    * and freshly generated, so removing it can never hit a foreign container;
    * every failure is swallowed (the original error is what matters).

@@ -88,17 +88,23 @@ describe.skipIf(!dockerLive)("sandbox image API integration (real daemon)", () =
     };
   });
 
-  it("lists an initially non-empty daemon host without guessing", async () => {
-    // Smoke: the catalog endpoint answers 200 with well-formed rows (whatever
-    // this host happens to have under openeuler/ or the curated bases).
-    const images = await catalog();
-    for (const image of images) {
-      expect(typeof image["repository"]).toBe("string");
-      expect(typeof image["tag"]).toBe("string");
-      expect(typeof image["ours"]).toBe("boolean");
-      expect(typeof image["sizeBytes"]).toBe("number");
-    }
-  });
+  it(
+    "lists an initially non-empty daemon host without guessing",
+    // Several docker CLI round-trips (images + batched inspect) can exceed
+    // the 5s default on a loaded host — same courtesy as the pull/build tests.
+    { timeout: 60_000 },
+    async () => {
+      // Smoke: the catalog endpoint answers 200 with well-formed rows (whatever
+      // this host happens to have under openeuler/ or the curated bases).
+      const images = await catalog();
+      for (const image of images) {
+        expect(typeof image["repository"]).toBe("string");
+        expect(typeof image["tag"]).toBe("string");
+        expect(typeof image["ours"]).toBe("boolean");
+        expect(typeof image["sizeBytes"]).toBe("number");
+      }
+    },
+  );
 
   it(
     "pulls busybox:musl via an async job and lists it as a common base",
@@ -193,7 +199,7 @@ describe.skipIf(!dockerLive)("sandbox image API integration (real daemon)", () =
     expect(build).toMatchObject({ ref: BUILD_TAG, name: BUILD_NAME, done: true });
   });
 
-  it("applies bearer auth when the daemon runs with a token", async () => {
+  it("applies bearer auth when the daemon runs with a token", { timeout: 60_000 }, async () => {
     const { app } = createApp({
       db: harness.db,
       logger: createLogger("silent"),

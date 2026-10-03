@@ -2,8 +2,10 @@ import { describe, expect, it, vi } from "vitest";
 import { ApiError } from "./api";
 import {
   deleteSandboxImage,
+  destroySandboxInstance,
   effectiveModeHint,
   fetchSandboxImages,
+  fetchSandboxInstances,
   fetchSandboxJob,
   fetchSandboxStatus,
   imageRefOf,
@@ -13,9 +15,11 @@ import {
   showLocalFallbackBanner,
   startSandboxImageBuild,
   startSandboxImagePull,
+  stopSandboxInstance,
   waitForSandboxJob,
   type SandboxFetcher,
   type SandboxImageEntry,
+  type SandboxInstance,
   type SandboxJob,
 } from "./sandbox-api";
 
@@ -260,5 +264,54 @@ describe("effectiveModeHint (#106)", () => {
     expect(effectiveModeHint({ executionMode: "local", available: false })).toBe(
       "effective: local (policy: local)",
     );
+  });
+});
+
+const instance = (overrides: Partial<SandboxInstance> = {}): SandboxInstance => ({
+  id: "openeuler-run-1-abc",
+  runId: "run-1",
+  image: "openeuler/worker:latest",
+  status: "running",
+  startedAt: 1_700_000_000_000,
+  usage: { cpuPercent: 12.5, memMb: 210, memLimitMb: 2048 },
+  run: { id: "run-1", status: "running", project: { id: "p1", name: "demo" } },
+  ...overrides,
+});
+
+describe("fetchSandboxInstances (#112)", () => {
+  it("GETs /api/sandbox/instances and returns the payload", async () => {
+    const fetcher = vi.fn(async () => ({
+      instances: [instance()],
+      checkedAt: 123,
+    }));
+    await expect(fetchSandboxInstances(asFetcher(fetcher))).resolves.toEqual({
+      instances: [instance()],
+      checkedAt: 123,
+    });
+    expect(fetcher).toHaveBeenCalledWith("/api/sandbox/instances");
+  });
+
+  it("renders malformed 200 payloads as an empty dashboard", async () => {
+    const fetcher = vi.fn(async () => ({ nope: true }));
+    await expect(fetchSandboxInstances(asFetcher(fetcher))).resolves.toEqual({
+      instances: [],
+      checkedAt: 0,
+    });
+  });
+});
+
+describe("stopSandboxInstance / destroySandboxInstance (#112)", () => {
+  it("POSTs the stop route with an encoded id", async () => {
+    const fetcher = vi.fn(async () => ({ stopped: "sb 1" }));
+    await expect(stopSandboxInstance("sb 1", asFetcher(fetcher))).resolves.toBeUndefined();
+    expect(fetcher).toHaveBeenCalledWith("/api/sandbox/instances/sb%201/stop", {
+      method: "POST",
+    });
+  });
+
+  it("DELETEs the destroy route with an encoded id", async () => {
+    const fetcher = vi.fn(async () => ({ deleted: "sb 1" }));
+    await expect(destroySandboxInstance("sb 1", asFetcher(fetcher))).resolves.toBeUndefined();
+    expect(fetcher).toHaveBeenCalledWith("/api/sandbox/instances/sb%201", { method: "DELETE" });
   });
 });

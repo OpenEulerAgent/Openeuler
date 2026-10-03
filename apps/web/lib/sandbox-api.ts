@@ -113,7 +113,11 @@ export interface LocalFallbackBannerInput {
  * local-policy projects are local by choice (no banner either).
  */
 export function showLocalFallbackBanner(input: LocalFallbackBannerInput): boolean {
-  if (input.runStatus !== undefined && input.runStatus !== "running" && input.runStatus !== "queued") {
+  if (
+    input.runStatus !== undefined &&
+    input.runStatus !== "running" &&
+    input.runStatus !== "queued"
+  ) {
     return false;
   }
   if (input.sandboxPresent) return false;
@@ -229,4 +233,72 @@ export function isImageInUseError(err: unknown): boolean {
 /** True when the daemon answered 404 IMAGE_NOT_FOUND. */
 export function isImageNotFoundError(err: unknown): boolean {
   return err instanceof ApiError && err.code === "IMAGE_NOT_FOUND";
+}
+
+/** Lifecycle status of a listed sandbox (`SandboxStatus` from the daemon). */
+export type SandboxInstanceStatus = "running" | "exited" | "stopped";
+
+/** Live usage snapshot of one sandbox (#112). */
+export interface SandboxInstanceUsage {
+  /** Host-relative CPU percent (0..100, one decimal). */
+  cpuPercent?: number;
+  /** Memory used in MiB. */
+  memMb?: number;
+  /** Soft reference cap (project policy memory, engine default fallback). */
+  memLimitMb?: number;
+}
+
+/** One `GET /api/sandbox/instances` row (#112). */
+export interface SandboxInstance {
+  id: string;
+  /** Owning run id from labels; null for unlabeled sandboxes. */
+  runId: string | null;
+  image: string;
+  status: SandboxInstanceStatus;
+  /** Epoch ms the sandbox was created. */
+  startedAt: number;
+  usage?: SandboxInstanceUsage;
+  /** Joined run row when the labeled run still exists (hosted runs too). */
+  run?: {
+    id: string;
+    status: string;
+    project?: { id: string; name: string };
+    hosted?: boolean;
+  };
+}
+
+/** `GET /api/sandbox/instances` payload (#112). */
+export interface SandboxInstancesPayload {
+  instances: SandboxInstance[];
+  checkedAt: number;
+}
+
+/**
+ * The provider's sandboxes, newest first (#112). Malformed 200 payloads
+ * render as an empty dashboard (same defensive stance as the image catalog).
+ */
+export async function fetchSandboxInstances(
+  fetcher: SandboxFetcher = apiFetch,
+): Promise<SandboxInstancesPayload> {
+  const body = await fetcher<SandboxInstancesPayload>("/api/sandbox/instances");
+  if (body === null || typeof body !== "object" || !Array.isArray(body.instances)) {
+    return { instances: [], checkedAt: 0 };
+  }
+  return body;
+}
+
+/** Graceful stop by id (#112): the sandbox is kept, listed as exited. */
+export async function stopSandboxInstance(
+  id: string,
+  fetcher: SandboxFetcher = apiFetch,
+): Promise<void> {
+  await fetcher(`/api/sandbox/instances/${encodeURIComponent(id)}/stop`, { method: "POST" });
+}
+
+/** Destroy by id (#112): typed destroy, idempotent server-side. */
+export async function destroySandboxInstance(
+  id: string,
+  fetcher: SandboxFetcher = apiFetch,
+): Promise<void> {
+  await fetcher(`/api/sandbox/instances/${encodeURIComponent(id)}`, { method: "DELETE" });
 }

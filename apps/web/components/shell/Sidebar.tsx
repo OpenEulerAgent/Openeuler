@@ -3,6 +3,7 @@
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 import { BoxIcon, DashboardIcon, FolderIcon, PanelLeftIcon, PlayIcon, SlidersIcon } from "./icons";
+import { SandboxCountChip } from "./SandboxCountChip";
 import { toggleSidebarPreference } from "@/lib/sidebar";
 import { useSidebarPreference } from "./sidebar-preference";
 import { cn } from "@/lib/cn";
@@ -28,7 +29,7 @@ export function isActive(pathname: string, href: string): boolean {
  * expanded; the React state mirrors the attribute for aria/title only.
  */
 const COLLAPSED_ONLY = "[:root[data-sidebar=expanded]_&]:hidden";
-const EXPANDED_ONLY = "[:root[data-sidebar=collapsed]_&]:hidden";
+export const EXPANDED_ONLY = "[:root[data-sidebar=collapsed]_&]:hidden";
 
 export function Sidebar() {
   const pathname = usePathname();
@@ -103,6 +104,9 @@ export function Sidebar() {
           );
         })}
       </nav>
+
+      {/* Sandboxes count chip (#112): links to the dashboard section. */}
+      <SandboxCountChip />
 
       <div className={cn(COLLAPSED_ONLY, "flex justify-center border-t border-border p-2")}>
         <button

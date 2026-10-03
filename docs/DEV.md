@@ -216,6 +216,16 @@ Docker missing must not brick the product. A daemon-side service (`sandbox-statu
 
 The tradeoff: `executionMode: "auto"` trades isolation for availability — with docker down, auto runs execute **locally on the daemon host** (no sandboxing) instead of failing; explicit `"sandbox"` still fails fast with the typed `SANDBOX_UNAVAILABLE` error. The web makes the fallback visible instead of silent: a **Docker pill** next to the daemon health pill (60s poll; "Docker ready" / "Docker unavailable", muted while checking/unknown), a subtle **"Running locally — Docker unavailable"** banner on the run detail (only when the run has no live sandbox info, the policy is auto/sandbox, and docker is currently down — decision unit-tested in `lib/sandbox-api.ts`), and a live **effective-mode hint** under the execution-mode select in the project settings drawer (follows unsaved form state) and in the run-workflow modal (reflects the saved policy before launch).
 
+### Sandboxes dashboard (`/api/sandbox/instances`, #112)
+
+The dashboard's active-containers view: every provider sandbox (`provider.list()`, newest first) with run joins and live usage, plus stop/destroy actions behind confirms.
+
+- `GET /api/sandbox/instances` → `{instances: [{id, runId, image, status: running|exited|stopped, startedAt, usage?, run?}], checkedAt}` — `runId` comes from the sandbox's `run` label (`null` for unlabeled sandboxes); `run` joins the labeled run row when it still exists (`{id, status, project: {id, name}, hosted?}` — hosted runs from #110 included); `usage` is one `provider.stats()` snapshot when the provider supports it (`{cpuPercent, memMb, memLimitMb}` — a stats hiccup omits the field, never fails the listing; `memLimitMb` is the project policy's memory cap, engine default fallback, as the soft reference for usage bars).
+- `POST /api/sandbox/instances/:id/stop` → `{stopped}` — graceful `docker stop` by `list()` id (new optional `SandboxProvider.stop(id)`; the fake and docker providers implement it, idempotent like destroy-by-id). The sandbox is KEPT: still listed (as `exited` — by-id stop cannot set the handle-level `stopped` marker) and inspectable. `404 SANDBOX_NOT_FOUND` for ids the provider does not list, `501 SANDBOX_STOP_UNSUPPORTED` for providers without stop-by-id.
+- `DELETE /api/sandbox/instances/:id` → `{deleted}` — typed destroy by id (#105's `provider.destroy`), idempotent; same 404/501 semantics.
+
+The web (`components/dashboard/SandboxesSection.tsx`) renders this between the project cards and the runs table: a card grid (image chip, status badge, run link, relative start age, live cpu/mem usage bars) with arm-confirm Stop/Destroy actions that update optimistically and surface failures as toasts; the header shows the running/total count next to the Docker pill. Polling lives in `lib/sandbox-instances.ts` (`startSandboxInstancesPolling`): 5s while the page is visible, paused on `visibilitychange` hidden, immediate refresh on return, full cleanup on unmount — docker-gated integration tests cover the real-provider path. The sidebar adds a cheap `SandboxCountChip` ("Sandboxes: N active", 30s poll, hidden at zero) linking to the dashboard's `#sandboxes` anchor.
+
 ### Port declaration + detection (#107)
 
 To preview agent-built servers the daemon must know their ports. Two sources, one run-row view:
