@@ -1,12 +1,12 @@
 "use client";
 
 import { useMemo, useRef, useState, type ComponentProps } from "react";
-import type { StepConfig } from "@openeuler/core";
+import type { SandboxOverrides, StepConfig } from "@openeuler/core";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Dialog } from "@/components/ui/dialog";
 import { Drawer } from "@/components/ui/drawer";
-import { Field, Input, Textarea } from "@/components/ui/input";
+import { Field, Input, Select, Textarea } from "@/components/ui/input";
 import type { AgentNodeData, CanvasDocument, CanvasNode } from "@/lib/graph/canvas-document";
 import {
   insertPromptVariable,
@@ -15,12 +15,7 @@ import {
   upstreamNodes,
   type InspectorFieldErrors,
 } from "@/lib/graph/inspector";
-import {
-  classifyIssue,
-  issueHint,
-  issuesForNode,
-  type CanvasIssue,
-} from "@/lib/graph/validation";
+import { classifyIssue, issueHint, issuesForNode, type CanvasIssue } from "@/lib/graph/validation";
 import { cn } from "@/lib/cn";
 
 /**
@@ -516,7 +511,163 @@ function AgentInspector({
           />
         </button>
       </div>
+
+      <SandboxOverridesSection
+        overrides={config.sandboxOverrides}
+        fieldErrors={fieldErrors}
+        onPatchAgent={onPatchAgent}
+      />
     </>
+  );
+}
+
+/**
+ * Per-node sandbox overrides (#101), collapsible: image / cpus / memory /
+ * network. Every field defaults to empty = "inherit from project" — the
+ * project sandbox policy applies, override fields win at run time. Patches
+ * flow through the ordinary config patch (graph save persists a new
+ * revision).
+ */
+function SandboxOverridesSection({
+  overrides,
+  fieldErrors,
+  onPatchAgent,
+}: {
+  overrides: SandboxOverrides | undefined;
+  fieldErrors: InspectorFieldErrors;
+  onPatchAgent: (patch: Partial<StepConfig>) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const activeCount =
+    overrides === undefined
+      ? 0
+      : [overrides.image, overrides.cpus, overrides.memoryMb, overrides.network].filter(
+          (field) => field !== undefined,
+        ).length;
+
+  /** Patches one field of the overrides object; empty input clears the field. */
+  const patchOverride = (field: keyof SandboxOverrides, value: number | string | undefined) => {
+    const next: SandboxOverrides = { ...(overrides ?? {}) };
+    if (value === undefined || value === "") {
+      delete next[field];
+    } else {
+      (next as Record<string, unknown>)[field] = value;
+    }
+    const hasFields = Object.values(next).some((entry) => entry !== undefined);
+    onPatchAgent({ sandboxOverrides: hasFields ? next : undefined });
+  };
+
+  return (
+    <div className="rounded-lg border border-border bg-elevated/40">
+      <button
+        type="button"
+        aria-expanded={open}
+        data-sandbox-overrides-toggle
+        onClick={() => setOpen((current) => !current)}
+        className="flex w-full items-center justify-between gap-2 rounded-lg px-3 py-2 text-left text-sm font-medium text-fg transition-colors hover:bg-elevated focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
+      >
+        <span>Sandbox overrides</span>
+        {activeCount > 0 ? (
+          <Badge variant="neutral">
+            {activeCount} override{activeCount === 1 ? "" : "s"}
+          </Badge>
+        ) : null}
+        <span aria-hidden className="text-muted-fg">
+          {open ? "−" : "+"}
+        </span>
+      </button>
+      {open ? (
+        <div className="flex flex-col gap-3 border-t border-border px-3 py-3">
+          <p className="text-xs text-muted-fg">
+            Empty fields inherit the project&apos;s sandbox policy (Project settings → Sandbox); set
+            fields here to override it for this step only.
+          </p>
+          <Field
+            label="Image"
+            hint="(inherit from project by default)"
+            htmlFor="node-sandbox-image"
+            error={fieldErrors["config.sandboxOverrides.image"]}
+          >
+            <Input
+              id="node-sandbox-image"
+              value={overrides?.image ?? ""}
+              invalid={fieldErrors["config.sandboxOverrides.image"] !== undefined}
+              onChange={(event) => patchOverride("image", event.target.value.trim())}
+              placeholder="openeuler/worker:latest"
+              className="font-mono"
+              spellCheck={false}
+              autoComplete="off"
+            />
+          </Field>
+          <div className="grid grid-cols-2 gap-3">
+            <Field
+              label="CPUs"
+              hint="(1–8)"
+              htmlFor="node-sandbox-cpus"
+              error={fieldErrors["config.sandboxOverrides.cpus"]}
+            >
+              <Input
+                id="node-sandbox-cpus"
+                type="number"
+                min={1}
+                max={8}
+                step={1}
+                value={overrides?.cpus ?? ""}
+                invalid={fieldErrors["config.sandboxOverrides.cpus"] !== undefined}
+                onChange={(event) => {
+                  const raw = event.target.value;
+                  patchOverride("cpus", raw === "" ? undefined : Number(raw));
+                }}
+                placeholder="inherit"
+              />
+            </Field>
+            <Field
+              label="Memory (MiB)"
+              hint="(512–8192)"
+              htmlFor="node-sandbox-memory"
+              error={fieldErrors["config.sandboxOverrides.memoryMb"]}
+            >
+              <Input
+                id="node-sandbox-memory"
+                type="number"
+                min={512}
+                max={8192}
+                step={256}
+                value={overrides?.memoryMb ?? ""}
+                invalid={fieldErrors["config.sandboxOverrides.memoryMb"] !== undefined}
+                onChange={(event) => {
+                  const raw = event.target.value;
+                  patchOverride("memoryMb", raw === "" ? undefined : Number(raw));
+                }}
+                placeholder="inherit"
+              />
+            </Field>
+          </div>
+          <Field
+            label="Network"
+            htmlFor="node-sandbox-network"
+            error={fieldErrors["config.sandboxOverrides.network"]}
+          >
+            <Select
+              id="node-sandbox-network"
+              value={overrides?.network ?? ""}
+              invalid={fieldErrors["config.sandboxOverrides.network"] !== undefined}
+              onChange={(event) => patchOverride("network", event.target.value)}
+            >
+              <option value="">inherit from project</option>
+              <option value="none">none — fully isolated</option>
+              <option value="limited">limited — dedicated bridge, DNS works</option>
+              <option value="default">default — normal outbound</option>
+            </Select>
+            {overrides?.network === "limited" ? (
+              <p className="text-xs text-warning">
+                v0.2 honesty: “limited” does not filter egress yet.
+              </p>
+            ) : null}
+          </Field>
+        </div>
+      ) : null}
+    </div>
   );
 }
 

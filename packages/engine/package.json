@@ -20,7 +20,8 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "@openeuler/core": "workspace:*"
+    "@openeuler/core": "workspace:*",
+    "@openeuler/sandbox": "workspace:*"
   },
   "devDependencies": {
     "@openeuler/db": "workspace:*",

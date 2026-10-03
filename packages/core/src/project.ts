@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { idSchema, timestampSchema } from "./common.js";
+import { ProjectSandboxPolicySchema } from "./policy.js";
 
 export const ProjectSchema = z.strictObject({
   id: idSchema,
@@ -11,6 +12,12 @@ export const ProjectSchema = z.strictObject({
   remoteUrl: z.string().min(1, "remoteUrl must be a non-empty string").optional(),
   /** Snapshot field: true when the working copy had uncommitted changes at registration. */
   dirty: z.boolean().optional(),
+  /**
+   * Per-project sandbox policy (#101); absent until first saved via
+   * `PATCH /api/projects/:id/policy`. Validated through the core schema on
+   * db write and read.
+   */
+  sandboxPolicy: ProjectSandboxPolicySchema.optional(),
   createdAt: timestampSchema,
 });
 

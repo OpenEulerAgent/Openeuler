@@ -1,6 +1,7 @@
 import { z } from "zod";
 import { idSchema } from "./common.js";
 import { isValidRegex } from "./regex.js";
+import { SandboxOverridesSchema } from "./policy.js";
 
 /**
  * Invocation config shared by linear steps and graph nodes: which driver
@@ -15,6 +16,13 @@ export const StepConfigSchema = z.strictObject({
   mode: z.enum(["auto", "ask"]),
   promptTemplate: z.string().min(1, "promptTemplate must be a non-empty string"),
   continueSession: z.boolean(),
+  /**
+   * Per-node sandbox overrides (#101), additive: absent on pre-#101
+   * revisions, unset fields inherit the project sandbox policy. Validated
+   * as part of the graph save (this schema); the merge into a SandboxSpec
+   * happens at run time (`buildSandboxSpec`).
+   */
+  sandboxOverrides: SandboxOverridesSchema.optional(),
 });
 
 export type StepConfig = z.infer<typeof StepConfigSchema>;

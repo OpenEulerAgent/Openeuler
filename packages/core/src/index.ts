@@ -9,6 +9,28 @@ export { idSchema, timestampSchema } from "./common.js";
 export { ProjectSchema } from "./project.js";
 export type { Project } from "./project.js";
 
+export {
+  EXECUTION_MODES,
+  ProjectSandboxPolicySchema,
+  SANDBOX_IMAGE_REF_ISSUE,
+  SANDBOX_IMAGE_REF_PATTERN,
+  SANDBOX_POLICY_CACHE_PATHS_MAX,
+  SANDBOX_POLICY_CPUS_MAX,
+  SANDBOX_POLICY_CPUS_MIN,
+  SANDBOX_POLICY_MEMORY_MB_MAX,
+  SANDBOX_POLICY_MEMORY_MB_MIN,
+  SandboxNetworkModeSchema,
+  SandboxOverridesSchema,
+  sandboxOverridesActive,
+} from "./policy.js";
+export type {
+  ExecutionMode,
+  ProjectSandboxPolicy,
+  ProjectSandboxPolicyInput,
+  SandboxNetworkMode,
+  SandboxOverrides,
+} from "./policy.js";
+
 export { AgentPresetSchema } from "./preset.js";
 export type { AgentPreset } from "./preset.js";
 

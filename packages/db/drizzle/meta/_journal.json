@@ -50,6 +50,13 @@
       "when": 1790958654798,
       "tag": "0006_gorgeous_glorian",
       "breakpoints": true
+    },
+    {
+      "idx": 7,
+      "version": "6",
+      "when": 1790983273506,
+      "tag": "0007_narrow_shinobi_shaw",
+      "breakpoints": true
     }
   ]
 }

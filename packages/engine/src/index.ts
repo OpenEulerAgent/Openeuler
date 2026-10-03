@@ -38,6 +38,14 @@ export {
 export { MAX_EDGE_ITERATIONS, executeGraphRun, type GraphEngineDeps } from "./graph-engine.js";
 
 export {
+  DEFAULT_SANDBOX_CPUS,
+  DEFAULT_SANDBOX_MEMORY_MB,
+  buildSandboxSpec,
+  mergeSandboxConfig,
+  type MergedSandboxConfig,
+} from "./sandbox-spec.js";
+
+export {
   compileExitCondition,
   describeCondition,
   evaluateExitCondition,

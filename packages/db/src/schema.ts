@@ -1,6 +1,13 @@
 import { index, integer, sqliteTable, text, uniqueIndex } from "drizzle-orm/sqlite-core";
 import { sql } from "drizzle-orm";
-import type { BreadcrumbEntry, LoopBack, Step, StepConfig, WorkflowGraph } from "@openeuler/core";
+import type {
+  BreadcrumbEntry,
+  LoopBack,
+  ProjectSandboxPolicy,
+  Step,
+  StepConfig,
+  WorkflowGraph,
+} from "@openeuler/core";
 
 /**
  * Physical schema. Domain validation lives in `@openeuler/core` zod schemas;
@@ -16,6 +23,12 @@ export const projects = sqliteTable("projects", {
   /** Nullable metadata snapshot columns; absent domain fields persist as NULL. */
   remoteUrl: text("remote_url"),
   dirty: integer("dirty", { mode: "boolean" }),
+  /**
+   * Per-project sandbox policy (#101) as JSON; NULL until first saved via
+   * `PATCH /api/projects/:id/policy`. Validated through the core schema on
+   * repo write and read.
+   */
+  sandboxPolicy: text("sandbox_policy", { mode: "json" }).$type<ProjectSandboxPolicy>(),
   createdAt: text("created_at").notNull(),
 });
 
