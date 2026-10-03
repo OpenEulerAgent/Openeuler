@@ -131,6 +131,11 @@ export interface GraphEngineDeps {
   runSecretsEnv(runId: string): Record<string, string> | undefined;
   /** Per-run sandbox context (#102); undefined = local execution. */
   runSandbox(runId: string): RunSandboxContext | undefined;
+  /**
+   * #107: port detection over one completed node's final output (sandboxed
+   * runs only; the flow engine's implementation no-ops local runs).
+   */
+  recordDetectedPorts(runId: string, output: string): void;
 }
 
 /** Terminal outcome of one node execution. */
@@ -810,6 +815,9 @@ export async function executeGraphRun(
     state.outputs.set(node.id, outcome.output);
     state.sessions.set(node.id, outcome.sessionId);
     state.runOutput = outcome.output;
+    // #107: scan the node's final output for listening ports (sandboxed
+    // runs only; persists detectedPorts on the run row as it goes).
+    deps.recordDetectedPorts(runId, outcome.output);
     cursor = {
       kind: "route",
       nodeId: node.id,

@@ -20,6 +20,31 @@ export type TerminalRunStatus = (typeof TERMINAL_RUN_STATUSES)[number];
 export const TerminalRunStatusSchema = z.enum(TERMINAL_RUN_STATUSES);
 
 /**
+ * Max ports a run tracks (#107), declared or detected: previews surface a
+ * handful of services, not a port scanner.
+ */
+export const MAX_RUN_PORTS = 3;
+
+const portNumberSchema = z
+  .number()
+  .int("port must be an integer")
+  .min(1, "port must be >= 1")
+  .max(65535, "port must be <= 65535");
+
+/**
+ * The port list a run carries (#107): unique integers 1..65535, at most
+ * {@link MAX_RUN_PORTS}. Shared by run-creation bodies (validated with
+ * actionable issues) and the stored `Run` row.
+ */
+export const RunPortsSchema = z
+  .array(portNumberSchema)
+  .max(MAX_RUN_PORTS, `at most ${MAX_RUN_PORTS} ports per run`)
+  .refine((ports) => new Set(ports).size === ports.length, "ports must be unique (no duplicates)");
+
+/** A run's declared or detected port list; empty is omitted on the row. */
+export type RunPorts = number[];
+
+/**
  * A single execution of a workflow (or an ad-hoc task) against a project's
  * working copy on its own branch.
  */
@@ -76,6 +101,18 @@ export const RunSchema = z.strictObject({
    * not traversed a graph yet (legacy/ad-hoc runs never populate it).
    */
   breadcrumb: z.array(BreadcrumbEntrySchema).optional(),
+  /**
+   * Container ports declared at creation (#107): published by the run's
+   * sandbox (`docker -p host::port`) so they are previewable while it
+   * lives. Absent = none declared.
+   */
+  ports: RunPortsSchema.optional(),
+  /**
+   * Ports auto-detected from step/node outputs during execution (#107),
+   * sandboxed runs only; grows as detection progresses. Detection of an
+   * UNdeclared port records the number but is not published (v0.2 cut).
+   */
+  detectedPorts: RunPortsSchema.optional(),
   createdAt: timestampSchema,
   updatedAt: timestampSchema,
 });

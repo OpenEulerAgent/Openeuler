@@ -46,7 +46,7 @@ interface Harness {
   provider: SandboxProvider;
   projectId: string;
   runIds: string[];
-  enqueue(): string;
+  enqueue(ports?: number[]): string;
 }
 
 const git = (cwd: string, ...args: string[]): string =>
@@ -94,7 +94,7 @@ const setup = (fakeOpts: Parameters<typeof createFakeDriver>[0]): Harness => {
     provider,
     projectId: project.id,
     runIds,
-    enqueue() {
+    enqueue(ports?: number[]) {
       const runId = crypto.randomUUID();
       const now = new Date().toISOString();
       db.runs.create({
@@ -104,6 +104,7 @@ const setup = (fakeOpts: Parameters<typeof createFakeDriver>[0]): Harness => {
         branch: `agentloop/${runId}`,
         iteration: 0,
         task: "make it green",
+        ...(ports === undefined || ports.length === 0 ? {} : { ports }),
         createdAt: now,
         updatedAt: now,
       });
@@ -208,7 +209,11 @@ describe.skipIf(!dockerLive)("executor sandbox e2e (real daemon, #102)", () => {
       onStart: async (opts) => {
         if (opts.exec === undefined) throw new Error("expected exec seam");
         if (markerOutputs.length === 0) {
-          await opts.exec.run(["sh", "-c", "mkdir -p /workspace/.cache-demo && echo hello > /workspace/.cache-demo/marker.txt"]);
+          await opts.exec.run([
+            "sh",
+            "-c",
+            "mkdir -p /workspace/.cache-demo && echo hello > /workspace/.cache-demo/marker.txt",
+          ]);
         } else {
           const read = await opts.exec.run(["cat", "/workspace/.cache-demo/marker.txt"]);
           markerOutputs.push(read.stdout.trim());
@@ -239,10 +244,9 @@ describe.skipIf(!dockerLive)("executor sandbox e2e (real daemon, #102)", () => {
       expect(await containersFor(runId)).toEqual([]);
     }
     // The named cache volume persists BY DESIGN; this suite removes its own.
-    await docker(
-      ["volume", "rm", "-f", cacheVolumeName(h.projectId, "/workspace/.cache-demo")],
-      { timeoutMs: 30_000 },
-    );
+    await docker(["volume", "rm", "-f", cacheVolumeName(h.projectId, "/workspace/.cache-demo")], {
+      timeoutMs: 30_000,
+    });
     h.db.close();
     rmSync(h.dir, { recursive: true, force: true });
     harness = null;
@@ -325,6 +329,127 @@ describe.skipIf(!dockerLive)("executor sandbox e2e (real daemon, #102)", () => {
     h.db.close();
     rmSync(h.dir, { recursive: true, force: true });
   }, 60_000);
+
+  it("declared port is published + detected: host mapping live, HTTP reachable, row recorded (#107)", async () => {
+    harness = setup({
+      events: [
+        { type: "message-delta", seq: 1, delta: "booting" },
+        { type: "message-delta", seq: 2, delta: "ready" },
+      ],
+      delayMs: 1_500,
+      output: "Serving HTTP on 0.0.0.0 port 8000 (http://0.0.0.0:8000/)",
+      onStart: async (opts) => {
+        // busybox httpd in the background inside the container; awaited so
+        // the server is up before any event streams (and thus before the
+        // run can finish).
+        await opts.exec?.run([
+          "sh",
+          "-c",
+          "httpd -f -p 8000 >/dev/null 2>&1 & sleep 0.5; echo started",
+        ]);
+      },
+    });
+    const h = harness;
+    h.db.projects.setSandboxPolicy(h.projectId, {
+      executionMode: "sandbox",
+      image: BUSYBOX,
+    });
+    const runId = h.enqueue([8000]);
+
+    h.executor.startRun(runId);
+    await waitForStatus(h, runId, "running");
+
+    // While the run executes: the declared port is published and the live
+    // sandbox info maps it to an ephemeral host port.
+    const deadline = Date.now() + 30_000;
+    let hostPort: number | undefined;
+    let liveDeclared: boolean | undefined;
+    while (Date.now() < deadline) {
+      const info = await h.executor.sandboxInfo(runId);
+      const view = info?.ports?.find((port) => port.container === 8000);
+      hostPort = view?.host;
+      liveDeclared = view?.declared;
+      if (hostPort !== undefined) break;
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    expect(hostPort).toBeDefined();
+    expect(liveDeclared).toBe(true);
+
+    // The published binding is reachable from the host (loopback publish).
+    // The mapping exists as soon as the sandbox is created — before the
+    // driver's onStart has booted httpd — so retry until it answers.
+    // busybox httpd returns 404 for / without an index; any HTTP response
+    // is the proof.
+    let response: Response | undefined;
+    const fetchDeadline = Date.now() + 30_000;
+    while (Date.now() < fetchDeadline) {
+      try {
+        response = await fetch(`http://127.0.0.1:${hostPort}/`);
+        break;
+      } catch {
+        await new Promise((resolve) => setTimeout(resolve, 250));
+      }
+    }
+    expect(response).toBeDefined();
+    expect(response?.status).toBeGreaterThan(0);
+    await response?.arrayBuffer();
+
+    await waitForStatus(h, runId, "success");
+    await waitForIdle(h);
+
+    // Detection scanned the node output (python http.server wording):
+    // declared port recorded as detected on the run row.
+    expect(h.db.runs.get(runId)).toMatchObject({ ports: [8000], detectedPorts: [8000] });
+    expect(await containersFor(runId)).toEqual([]);
+    h.db.close();
+    rmSync(h.dir, { recursive: true, force: true });
+    harness = null;
+  }, 180_000);
+
+  it("an UNdeclared listening port is detected but not published (hint only, #107 cut)", async () => {
+    harness = setup({
+      events: [
+        { type: "message-delta", seq: 1, delta: "booting" },
+        { type: "message-delta", seq: 2, delta: "ready" },
+      ],
+      delayMs: 1_500,
+      output: "dev server listening on :8001",
+      onStart: async (opts) => {
+        await opts.exec?.run([
+          "sh",
+          "-c",
+          "httpd -f -p 8001 >/dev/null 2>&1 & sleep 0.5; echo started",
+        ]);
+      },
+    });
+    const h = harness;
+    h.db.projects.setSandboxPolicy(h.projectId, {
+      executionMode: "sandbox",
+      image: BUSYBOX,
+    });
+    const runId = h.enqueue(); // nothing declared
+
+    h.executor.startRun(runId);
+    await waitForStatus(h, runId, "running");
+
+    // The sandbox publishes nothing (the run declared no ports): docker
+    // reports no port mappings for the container…
+    const during = await h.executor.sandboxInfo(runId);
+    expect(during?.ports).toBeUndefined();
+    const mappings = await docker(["port", during?.id ?? ""], { timeoutMs: 30_000 });
+    expect(mappings.stdout.trim()).toBe("");
+
+    await waitForStatus(h, runId, "success");
+    await waitForIdle(h);
+
+    const run = h.db.runs.get(runId);
+    expect(run?.ports).toBeUndefined();
+    expect(run?.detectedPorts).toEqual([8001]);
+    expect(await containersFor(runId)).toEqual([]);
+    h.db.close();
+    rmSync(h.dir, { recursive: true, force: true });
+    harness = null;
+  }, 180_000);
 
   it("keepForDebug keeps the container after the run (then cleanup)", async () => {
     harness = setup({ events: [{ type: "done", seq: 1, output: "done" }], output: "done" });

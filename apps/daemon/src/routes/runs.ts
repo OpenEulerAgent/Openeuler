@@ -7,7 +7,7 @@ import type {
   TerminalRunStatus,
   Workflow,
 } from "@openeuler/core";
-import { TERMINAL_RUN_STATUSES, RunStatusSchema } from "@openeuler/core";
+import { TERMINAL_RUN_STATUSES, RunPortsSchema, RunStatusSchema } from "@openeuler/core";
 import type { Db } from "@openeuler/db";
 import { DriverError } from "@openeuler/drivers";
 import { ADHOC_STEP_ID, branchForRun } from "@openeuler/engine";
@@ -17,6 +17,8 @@ import { streamSSE } from "hono/streaming";
 import { z } from "zod";
 import type { AppEnv } from "../app.js";
 import type { Executor, RunStatusNotification } from "../executor.js";
+import { buildRunPortViews } from "../executor.js";
+import type { RunPortView } from "../executor.js";
 import { HttpError } from "../errors.js";
 import { redactorForProject } from "../secrets.js";
 import { ensureLatestRevision } from "./workflows.js";
@@ -49,6 +51,11 @@ const CreateRunBodySchema = z.strictObject({
   prompt: z.string().min(1, "prompt must be a non-empty string"),
   model: z.string().min(1, "model must be a non-empty string").optional(),
   mode: z.enum(["auto", "ask"]).optional(),
+  /**
+   * Container ports the run declares (#107): unique integers 1..65535, at
+   * most 3, published by a sandboxed run's sandbox while it lives.
+   */
+  ports: RunPortsSchema.optional(),
 });
 
 /** Cursor for SSE resume: `?afterSeq=` or `Last-Event-ID` (a run event seq). */
@@ -106,6 +113,12 @@ export interface RunDetailBody {
    * run executes sandboxed (the sandbox is destroyed at terminal).
    */
   sandbox?: { id: string; image: string; status: string };
+  /**
+   * The run's previewable ports (#107): declared first (with a live host
+   * mapping while the sandbox is alive), then detected-undeclared ones
+   * (with the declare-to-preview hint). Absent when the run tracks none.
+   */
+  ports?: RunPortView[];
 }
 
 /** Run list payload: runs plus computed queue metadata for queued rows. */
@@ -446,6 +459,9 @@ export function createRunsRouter(options: CreateRunsRouterOptions = {}): Hono<Ap
       // shows the redacted task; agents consume secret values via env, not
       // via the prompt.
       task: redactorForProject(db, c.get("secretsKey"), project.id)(body.prompt),
+      // #107: declared container ports, persisted on the row; the run's
+      // sandbox publishes them for its lifetime.
+      ...(body.ports === undefined || body.ports.length === 0 ? {} : { ports: body.ports }),
       createdAt: now,
       updatedAt: now,
     };
@@ -628,12 +644,18 @@ export function createRunsRouter(options: CreateRunsRouterOptions = {}): Hono<Ap
     // for local runs and after the sandbox's dispose.
     const executor = c.get("executor");
     const sandbox = executor === undefined ? undefined : await executor.sandboxInfo(run.id);
+    // #107: port views. While the sandbox lives they carry live host
+    // mappings (from sandboxInfo); afterwards (or for local runs) the same
+    // list renders without hosts — declared ports keep the declare flag,
+    // detected-undeclared ones keep the hint.
+    const ports = sandbox?.ports ?? buildRunPortViews(run.ports, run.detectedPorts, {});
     const body: RunDetailBody = {
       run: decorateRun(db, run, queuePositionsByRunId(db)),
       steps: sorted,
       iterations: groupByIteration(sorted),
       summary: { eventCount: db.events.count(run.id) },
       ...(sandbox === undefined ? {} : { sandbox }),
+      ...(ports.length === 0 ? {} : { ports }),
     };
     return c.json(body);
   });
@@ -977,6 +999,8 @@ export function createRunsRouter(options: CreateRunsRouterOptions = {}): Hono<Ap
       ...(run.task === undefined
         ? {}
         : { task: redactorForProject(db, c.get("secretsKey"), run.projectId)(run.task) }),
+      // #107: declared ports carry over to the retry (detection restarts).
+      ...(run.ports === undefined || run.ports.length === 0 ? {} : { ports: run.ports }),
       createdAt: now,
       updatedAt: now,
     };

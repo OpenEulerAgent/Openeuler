@@ -10,11 +10,17 @@ import {
   createFlowEngine,
   buildRunSandboxSpec,
   DEFAULT_DRIVER_ID,
+  runPortList,
   SANDBOX_WORKSPACE_PATH,
 } from "@openeuler/engine";
 import type { RunSandboxAcquirer, WorktreeManager } from "@openeuler/engine";
 import { SandboxError, dockerAvailable } from "@openeuler/sandbox";
-import type { SandboxHandle, SandboxProvider, SandboxStatus } from "@openeuler/sandbox";
+import type {
+  SandboxHandle,
+  SandboxHostPorts,
+  SandboxProvider,
+  SandboxStatus,
+} from "@openeuler/sandbox";
 import pLimit from "p-limit";
 import { recordRunStatusActivity, recordSandboxKeptActivity } from "./activity.js";
 import {
@@ -51,6 +57,53 @@ export function resolveExecutionMode(
   return "local";
 }
 
+/**
+ * One previewable port on a run (#107), as served by `GET /api/runs/:id`:
+ * declared ports carry a live host mapping while the sandbox lives;
+ * detected-but-undeclared ports carry the declare-to-preview hint instead
+ * (v0.2 cut: only declared ports are published).
+ */
+export interface RunPortView {
+  /** Container-side port number. */
+  container: number;
+  /**
+   * Ephemeral host port, present only while the sandbox is alive AND the
+   * port is published (declared). Gone with the sandbox.
+   */
+  host?: number;
+  /** True when the port was declared on the run at creation. */
+  declared: boolean;
+  /** Present when the port cannot be previewed (not declared, v0.2). */
+  hint?: string;
+}
+
+/** Hint for a detected port that v0.2 cannot publish (#107 documented cut). */
+export const UNDECLARED_PORT_HINT =
+  "detected in run output; declare ports on the run to preview it (v0.2 publishes declared ports only)";
+
+/**
+ * Builds a run's port views (#107): declared ports first (declaration
+ * order), then detected-but-undeclared ones, capped at 3. `host` comes from
+ * the live sandbox's `hostPorts()` map (only declared ports are published);
+ * an empty map renders post-sandbox/undeclared views without a host. Pure.
+ */
+export function buildRunPortViews(
+  declared: readonly number[] | undefined,
+  detected: readonly number[] | undefined,
+  hostPorts: SandboxHostPorts,
+): RunPortView[] {
+  return runPortList(declared, detected).map((container) => {
+    const isDeclared = (declared ?? []).includes(container);
+    const host = hostPorts[container];
+    return {
+      container,
+      ...(isDeclared && host !== undefined ? { host } : {}),
+      declared: isDeclared,
+      ...(!isDeclared ? { hint: UNDECLARED_PORT_HINT } : {}),
+    };
+  });
+}
+
 /** Sandbox snapshot on the run detail payload (`GET /api/runs/:id`). */
 export interface RunSandboxInfo {
   /** Provider-scoped sandbox id (container name). */
@@ -59,6 +112,12 @@ export interface RunSandboxInfo {
   image: string;
   /** Lifecycle status when queried. */
   status: SandboxStatus;
+  /**
+   * Port views while the sandbox is alive (#107): declared ports with
+   * their live host mapping, detected-undeclared ones with the hint.
+   * Absent when the run tracks no ports at all.
+   */
+  ports?: RunPortView[];
 }
 
 /**
@@ -487,6 +546,8 @@ export function createExecutor(options: ExecutorOptions): Executor {
             projectId: project.id,
             worktreePath,
             env: { OPENEULER_RUN_ID: run.id, OPENEULER_PROJECT_ID: project.id },
+            // #107: declared ports are published for the sandbox's lifetime.
+            ports: run.ports,
           });
           const handle = await options.sandbox!.provider.create(spec);
           const entry: ActiveSandbox = {
@@ -930,7 +991,24 @@ export function createExecutor(options: ExecutorOptions): Executor {
         // Provider hiccup: report the last known lifecycle state.
         status = entry.stopped ? "stopped" : "running";
       }
-      return { id: entry.handle.id, image: entry.image, status };
+      // #107: live port views — declared ports mapped through the sandbox's
+      // hostPorts() (a stopped sandbox publishes nothing), detected-undeclared
+      // ones with the declare-to-preview hint.
+      let hostPorts: SandboxHostPorts = {};
+      if (!entry.stopped) {
+        hostPorts = await entry.handle.hostPorts().catch((err: unknown) => {
+          logger.warn({ err, runId }, "sandbox hostPorts() failed");
+          return {};
+        });
+      }
+      const run = db.runs.get(runId);
+      const ports = buildRunPortViews(run?.ports, run?.detectedPorts, hostPorts);
+      return {
+        id: entry.handle.id,
+        image: entry.image,
+        status,
+        ...(ports.length === 0 ? {} : { ports }),
+      };
     },
     maxConcurrentRuns,
   };

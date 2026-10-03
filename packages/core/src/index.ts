@@ -90,14 +90,23 @@ export type {
 } from "./graph.js";
 
 export {
+  BreadcrumbEntrySchema,
+  MAX_RUN_PORTS,
+  RunPortsSchema,
   RunSchema,
   RunStatusSchema,
   StepRunSchema,
-  BreadcrumbEntrySchema,
   TERMINAL_RUN_STATUSES,
   TerminalRunStatusSchema,
 } from "./run.js";
-export type { Run, RunStatus, StepRun, BreadcrumbEntry, TerminalRunStatus } from "./run.js";
+export type {
+  BreadcrumbEntry,
+  Run,
+  RunPorts,
+  RunStatus,
+  StepRun,
+  TerminalRunStatus,
+} from "./run.js";
 
 export {
   AgentDoneEventSchema,
