@@ -7,6 +7,7 @@ import {
   PersistedEventSchema,
   ProjectSandboxPolicySchema,
   ProjectSchema,
+  RunHostingOptionsSchema,
   RunPortsSchema,
   RunSchema,
   RunStatusEventSchema,
@@ -23,6 +24,7 @@ import type {
   Project,
   ProjectSandboxPolicy,
   Run,
+  RunHostingOptions,
   RunStatus,
   RunStatusEvent,
   Step,
@@ -54,6 +56,10 @@ export type RunPatch = {
   breadcrumb?: BreadcrumbEntry[];
   /** Replaces the detected-ports list (#107; detection appends as it goes). */
   detectedPorts?: number[];
+  /** Replaces the hosting request (#110); `null` clears it. */
+  hosting?: RunHostingOptions | null;
+  /** Hosting expiry timestamp (#110); `null` ends hosting on the row. */
+  hostedUntil?: string | null;
 };
 
 /** Fields of a step run that may change after creation; `null` clears a field. */
@@ -707,6 +713,8 @@ export function createRunRepo(db: Db): RunRepo {
       ...((row.breadcrumb ?? []).length === 0 ? {} : { breadcrumb: row.breadcrumb ?? [] }),
       ...((row.ports ?? []).length === 0 ? {} : { ports: row.ports ?? [] }),
       ...((row.detectedPorts ?? []).length === 0 ? {} : { detectedPorts: row.detectedPorts ?? [] }),
+      ...(row.hosting === null ? {} : { hosting: RunHostingOptionsSchema.parse(row.hosting) }),
+      ...(row.hostedUntil === null ? {} : { hostedUntil: row.hostedUntil }),
       createdAt: row.createdAt,
       updatedAt: row.updatedAt,
     });
@@ -725,6 +733,8 @@ export function createRunRepo(db: Db): RunRepo {
     breadcrumb: run.breadcrumb ?? [],
     ports: run.ports ?? null,
     detectedPorts: run.detectedPorts ?? null,
+    hosting: run.hosting ?? null,
+    hostedUntil: run.hostedUntil ?? null,
     createdAt: run.createdAt,
     updatedAt: run.updatedAt,
   });
@@ -778,6 +788,13 @@ export function createRunRepo(db: Db): RunRepo {
           ...(patch.detectedPorts === undefined
             ? {}
             : { detectedPorts: RunPortsSchema.parse(patch.detectedPorts) }),
+          ...(patch.hosting === undefined
+            ? {}
+            : {
+                hosting:
+                  patch.hosting === null ? null : RunHostingOptionsSchema.parse(patch.hosting),
+              }),
+          ...(patch.hostedUntil === undefined ? {} : { hostedUntil: patch.hostedUntil }),
           updatedAt: new Date().toISOString(),
         })
         .where(eq(schema.runs.id, id))

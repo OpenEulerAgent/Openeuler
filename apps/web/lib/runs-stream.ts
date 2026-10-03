@@ -260,6 +260,8 @@ export interface RunsApiRow {
   iteration: number;
   task?: string;
   breadcrumb?: unknown[];
+  /** Present while the run's sandbox is hosted past success (#110). */
+  hostedUntil?: string;
   createdAt: string;
   updatedAt: string;
   queuePosition?: number;

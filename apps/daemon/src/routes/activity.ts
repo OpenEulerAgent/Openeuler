@@ -112,6 +112,10 @@ function opsMessage(type: OpsActivityType, payload: Record<string, unknown> | un
       const image = typeof payload?.["image"] === "string" ? (payload["image"] as string) : "";
       return `Sandbox kept for debugging${image === "" ? "" : ` (${image})`}`;
     }
+    case "ops.hosting-expired": {
+      const until = typeof payload?.["until"] === "string" ? (payload["until"] as string) : "";
+      return `Hosted run expired${until === "" ? "" : ` (was live until ${until})`} — sandbox destroyed`;
+    }
   }
 }
 

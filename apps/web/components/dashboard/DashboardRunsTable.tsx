@@ -20,6 +20,7 @@ import {
 import { useToast } from "@/components/ui/toast";
 import { PlayIcon } from "@/components/shell/icons";
 import { apiFetch, ApiError } from "@/lib/api";
+import { isRunHosted } from "@/lib/hosting";
 import { fetchRuns, useRunStatusStream, type RunsApiRow } from "@/lib/runs-stream";
 import {
   decodeRunsFilters,
@@ -443,13 +444,24 @@ export function DashboardRunsTable() {
                     <TableCell>
                       <Link
                         href={`/runs/${encodeURIComponent(run.id)}`}
-                        className="inline-flex rounded-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
+                        className="inline-flex items-center gap-1.5 rounded-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
                       >
                         <StatusBadge status={run.status}>
                           {run.status === "queued" && run.queuePosition !== undefined
                             ? `Queued · #${run.queuePosition}`
                             : undefined}
                         </StatusBadge>
+                        {/* #110: hosted past success — the sandbox (and its
+                            previews) is still alive on a TTL. */}
+                        {isRunHosted(run) ? (
+                          <span
+                            className="rounded-full border border-success/50 bg-success-subtle px-2 py-0.5 text-xs font-medium text-success"
+                            title="Sandbox kept alive for previews (hosting)"
+                            data-hosted-badge
+                          >
+                            hosted
+                          </span>
+                        ) : null}
                       </Link>
                     </TableCell>
                     <TableCell className="text-right text-sm tabular-nums text-muted-fg">

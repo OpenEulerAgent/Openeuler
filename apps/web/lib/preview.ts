@@ -117,13 +117,17 @@ export function previewPillMeta(state: PreviewState): PreviewPillMeta {
 /**
  * Terminal-run teardown notice (#109): once a run finishes, its sandbox and
  * published ports are gone — the inline note says so when NO port carries a
- * host mapping anymore. (Hosted previews — keeping sandboxes alive after
- * the run — arrive with the next issue.)
+ * host mapping anymore. Hosted runs (#110) never show it: their sandbox is
+ * deliberately alive past success and the hosted banner carries the
+ * messaging (expiry countdown + extend/stop).
  */
 export function showTerminalPreviewNote(input: {
   terminal: boolean;
   ports: readonly PreviewPortView[];
+  /** True while the run's sandbox is hosted past success (#110). */
+  hosted?: boolean;
 }): boolean {
+  if (input.hosted === true) return false;
   return (
     input.terminal && input.ports.length > 0 && input.ports.every((port) => port.host === undefined)
   );

@@ -7,7 +7,12 @@ import type {
   TerminalRunStatus,
   Workflow,
 } from "@openeuler/core";
-import { TERMINAL_RUN_STATUSES, RunPortsSchema, RunStatusSchema } from "@openeuler/core";
+import {
+  TERMINAL_RUN_STATUSES,
+  RunHostingOptionsSchema,
+  RunPortsSchema,
+  RunStatusSchema,
+} from "@openeuler/core";
 import type { Db } from "@openeuler/db";
 import { DriverError } from "@openeuler/drivers";
 import { ADHOC_STEP_ID, branchForRun } from "@openeuler/engine";
@@ -17,8 +22,8 @@ import { streamSSE } from "hono/streaming";
 import { z } from "zod";
 import type { AppEnv } from "../app.js";
 import type { Executor, RunStatusNotification } from "../executor.js";
-import { buildRunPortViews } from "../executor.js";
-import type { RunPortView } from "../executor.js";
+import { buildRunPortViews, buildRunHostingView } from "../executor.js";
+import type { RunPortView, RunHostingView } from "../executor.js";
 import { HttpError } from "../errors.js";
 import { redactorForProject } from "../secrets.js";
 import { ensureLatestRevision } from "./workflows.js";
@@ -56,6 +61,25 @@ const CreateRunBodySchema = z.strictObject({
    * most 3, published by a sandboxed run's sandbox while it lives.
    */
   ports: RunPortsSchema.optional(),
+  /**
+   * Keep-alive hosting request (#110): on a SUCCESSFUL sandboxed run that
+   * declared ports, the sandbox stays up (previews live) for
+   * `keepAliveMinutes` (default 60, 5..1440). Aborted/failed runs never
+   * host; hosting applies to success only.
+   */
+  hosting: RunHostingOptionsSchema.optional(),
+});
+
+/**
+ * `POST /api/runs/:id/hosting/extend` body (#110): whole minutes to add to
+ * the hosted TTL (1..1440; the result is capped 24h from "now").
+ */
+const ExtendHostingBodySchema = z.strictObject({
+  minutes: z
+    .number({ message: "minutes must be a number" })
+    .int("minutes must be an integer")
+    .min(1, "minutes must be >= 1")
+    .max(1440, "minutes must be <= 1440 (24h)"),
 });
 
 /** Cursor for SSE resume: `?afterSeq=` or `Last-Event-ID` (a run event seq). */
@@ -119,6 +143,11 @@ export interface RunDetailBody {
    * (with the declare-to-preview hint). Absent when the run tracks none.
    */
   ports?: RunPortView[];
+  /**
+   * Hosting view while the run is hosted (#110): expiry timestamp + live
+   * host mappings of the kept sandbox. `null`/absent when not hosted.
+   */
+  hosting?: RunHostingView | null;
 }
 
 /** Run list payload: runs plus computed queue metadata for queued rows. */
@@ -462,6 +491,9 @@ export function createRunsRouter(options: CreateRunsRouterOptions = {}): Hono<Ap
       // #107: declared container ports, persisted on the row; the run's
       // sandbox publishes them for its lifetime.
       ...(body.ports === undefined || body.ports.length === 0 ? {} : { ports: body.ports }),
+      // #110: hosting request, persisted on the row; the executor arms it
+      // when the run turns success sandboxed with declared ports.
+      ...(body.hosting === undefined ? {} : { hosting: body.hosting }),
       createdAt: now,
       updatedAt: now,
     };
@@ -649,6 +681,9 @@ export function createRunsRouter(options: CreateRunsRouterOptions = {}): Hono<Ap
     // list renders without hosts — declared ports keep the declare flag,
     // detected-undeclared ones keep the hint.
     const ports = sandbox?.ports ?? buildRunPortViews(run.ports, run.detectedPorts, {});
+    // #110: hosting view — expiry + live host mappings while the hosted
+    // sandbox lives (null when the run is not hosted).
+    const hosting = buildRunHostingView(run, sandbox);
     const body: RunDetailBody = {
       run: decorateRun(db, run, queuePositionsByRunId(db)),
       steps: sorted,
@@ -656,6 +691,7 @@ export function createRunsRouter(options: CreateRunsRouterOptions = {}): Hono<Ap
       summary: { eventCount: db.events.count(run.id) },
       ...(sandbox === undefined ? {} : { sandbox }),
       ...(ports.length === 0 ? {} : { ports }),
+      hosting,
     };
     return c.json(body);
   });
@@ -912,6 +948,48 @@ export function createRunsRouter(options: CreateRunsRouterOptions = {}): Hono<Ap
     return c.json({ run: decorateRun(db, db.runs.get(id) as Run) });
   });
 
+  // Stop hosting NOW (#110): destroys the hosted sandbox, clears
+  // `hostedUntil` (the run stays `success` — previews die with the
+  // sandbox). 409 when the run is not currently hosted.
+  runs.post("/:id/hosting/stop", async (c) => {
+    const db = requireDb(c);
+    const executor = requireExecutor(c);
+    const id = c.req.param("id");
+    const run = requireRun(db, id);
+
+    const result = await executor.stopHosting(id);
+    if (result.outcome === "not_hosted") {
+      throw new HttpError(
+        409,
+        "RUN_NOT_HOSTED",
+        `run ${id} (status ${run.status}) is not currently hosted; only hosted runs can stop hosting`,
+      );
+    }
+    return c.json({ run: decorateRun(db, db.runs.get(id) as Run) });
+  });
+
+  // Extend a hosted run's TTL (#110): `hostedUntil += minutes`, capped 24h
+  // from now and never shrinking. 409 when the run is not currently
+  // hosted; 422 on invalid minutes.
+  runs.post("/:id/hosting/extend", async (c) => {
+    const db = requireDb(c);
+    const executor = requireExecutor(c);
+    const id = c.req.param("id");
+    const run = requireRun(db, id);
+    const body = ExtendHostingBodySchema.parse(await parseJsonBody(c));
+
+    const result = await executor.extendHosting(id, body.minutes);
+    if (result.outcome === "not_hosted") {
+      throw new HttpError(
+        409,
+        "RUN_NOT_HOSTED",
+        `run ${id} (status ${run.status}) is not currently hosted; only hosted runs can extend hosting`,
+      );
+    }
+    const sandbox = await executor.sandboxInfo(id);
+    return c.json({ hosting: buildRunHostingView(db.runs.get(id) as Run, sandbox) });
+  });
+
   // Resume an interrupted run in place: the engine continues from the current
   // step/iteration, restarting the interrupted step with its recorded
   // sessionId and reusing the existing worktree. Only possible when every
@@ -1001,6 +1079,9 @@ export function createRunsRouter(options: CreateRunsRouterOptions = {}): Hono<Ap
         : { task: redactorForProject(db, c.get("secretsKey"), run.projectId)(run.task) }),
       // #107: declared ports carry over to the retry (detection restarts).
       ...(run.ports === undefined || run.ports.length === 0 ? {} : { ports: run.ports }),
+      // #110: the hosting request carries over too (hostedUntil does NOT —
+      // the new run hosts fresh on its own success).
+      ...(run.hosting === undefined ? {} : { hosting: run.hosting }),
       createdAt: now,
       updatedAt: now,
     };

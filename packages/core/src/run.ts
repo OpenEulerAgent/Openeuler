@@ -45,6 +45,56 @@ export const RunPortsSchema = z
 export type RunPorts = number[];
 
 /**
+ * Default hosting keep-alive window (#110): how long a successfully hosted
+ * run's sandbox stays up past run success (minutes).
+ */
+export const DEFAULT_HOSTING_KEEP_ALIVE_MINUTES = 60;
+
+/** Smallest accepted `hosting.keepAliveMinutes` (#110). */
+export const MIN_HOSTING_KEEP_ALIVE_MINUTES = 5;
+
+/** Largest accepted `hosting.keepAliveMinutes` — 24h (#110). */
+export const MAX_HOSTING_KEEP_ALIVE_MINUTES = 24 * 60;
+
+/**
+ * Hard ceiling on `hostedUntil` relative to "now" when extending (#110):
+ * no amount of extends pushes a hosted sandbox more than 24h out.
+ */
+export const MAX_HOSTING_EXTEND_MINUTES = 24 * 60;
+
+const keepAliveMinutesSchema = z
+  .number()
+  .int("keepAliveMinutes must be an integer")
+  .min(
+    MIN_HOSTING_KEEP_ALIVE_MINUTES,
+    `keepAliveMinutes must be >= ${MIN_HOSTING_KEEP_ALIVE_MINUTES}`,
+  )
+  .max(
+    MAX_HOSTING_KEEP_ALIVE_MINUTES,
+    `keepAliveMinutes must be <= ${MAX_HOSTING_KEEP_ALIVE_MINUTES} (24h)`,
+  );
+
+/**
+ * The hosting option of a run-creation body (#110): keep the run's sandbox
+ * alive after a SUCCESSFUL sandboxed run that declared ports, so previews
+ * stay live for a TTL window. Aborted/failed runs never host — hosting
+ * applies to success only.
+ */
+export const RunHostingOptionsSchema = z.strictObject({
+  enabled: z.boolean(),
+  /** TTL in minutes; default {@link DEFAULT_HOSTING_KEEP_ALIVE_MINUTES}. */
+  keepAliveMinutes: keepAliveMinutesSchema.optional(),
+});
+
+/** `hosting` as persisted on the Run row. */
+export type RunHostingOptions = z.infer<typeof RunHostingOptionsSchema>;
+
+/** Effective keep-alive window of a hosting option (default 60 minutes). */
+export function hostingKeepAliveMinutes(hosting: RunHostingOptions | undefined): number {
+  return hosting?.keepAliveMinutes ?? DEFAULT_HOSTING_KEEP_ALIVE_MINUTES;
+}
+
+/**
  * A single execution of a workflow (or an ad-hoc task) against a project's
  * working copy on its own branch.
  */
@@ -113,6 +163,21 @@ export const RunSchema = z.strictObject({
    * UNdeclared port records the number but is not published (v0.2 cut).
    */
   detectedPorts: RunPortsSchema.optional(),
+  /**
+   * Hosting request persisted at creation (#110): when enabled, a
+   * SUCCESSFUL sandboxed run that declared ports keeps its sandbox alive
+   * for `keepAliveMinutes` (default 60) past success so previews stay
+   * live. Absent = hosting not requested.
+   */
+  hosting: RunHostingOptionsSchema.optional(),
+  /**
+   * While the run is hosted (#110): the ISO timestamp the hosted sandbox
+   * expires (set when hosting starts, bumped by extends, capped 24h from
+   * each extend's "now"). Cleared when hosting ends (expiry, Stop
+   * hosting, or the sandbox dying across a daemon restart); the run row
+   * itself stays `success`.
+   */
+  hostedUntil: timestampSchema.optional(),
   createdAt: timestampSchema,
   updatedAt: timestampSchema,
 });

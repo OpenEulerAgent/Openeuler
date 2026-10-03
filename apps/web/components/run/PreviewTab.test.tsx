@@ -314,6 +314,32 @@ describe("empty + terminal states (#109)", () => {
     await render(() => createElement(PreviewTab, { runId: "run-1", ports, terminal: false }));
     expect(document.querySelector("[data-preview-terminal-note]")).toBeNull();
   });
+
+  it("hosted runs never show the terminal note (#110) — the banner owns the messaging", async () => {
+    const hostedPorts = [{ container: 3000, host: 49153, declared: true }];
+    await render(() =>
+      createElement(PreviewTab, {
+        runId: "run-1",
+        ports: hostedPorts,
+        terminal: true,
+        hosted: true,
+      }),
+    );
+    expect(document.querySelector("[data-preview-terminal-note]")).toBeNull();
+    // The frame stays live (the sandbox — and its mapping — are alive).
+    expect(frame().getAttribute("src")).toBe("/previews/run-1/3000/");
+
+    // Hosted flag wins even in the degenerate case of no live mapping.
+    await render(() =>
+      createElement(PreviewTab, {
+        runId: "run-1",
+        ports: [{ container: 3000, declared: true }],
+        terminal: true,
+        hosted: true,
+      }),
+    );
+    expect(document.querySelector("[data-preview-terminal-note]")).toBeNull();
+  });
 });
 
 describe("poll lifecycle (#109)", () => {

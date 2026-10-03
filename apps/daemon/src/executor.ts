@@ -1,4 +1,5 @@
-import type { ProjectSandboxPolicy, RunStatus } from "@openeuler/core";
+import type { ProjectSandboxPolicy, Run, RunStatus } from "@openeuler/core";
+import { hostingKeepAliveMinutes, MAX_HOSTING_EXTEND_MINUTES } from "@openeuler/core";
 import type { Db } from "@openeuler/db";
 import type {
   AgentExecOptions,
@@ -121,6 +122,37 @@ export interface RunSandboxInfo {
 }
 
 /**
+ * Hosting view on the run detail payload (#110): present while the run is
+ * hosted (`hostedUntil` on the row) — the expiry timestamp plus the live
+ * host port mappings of the kept sandbox. `ports` is empty when this
+ * daemon no longer owns a handle (e.g. after a restart, until expiry).
+ */
+export interface RunHostingView {
+  /** ISO timestamp the hosted sandbox expires. */
+  until: string;
+  /** Live container→host mappings while the sandbox is alive. */
+  ports: Array<{ container: number; host: number }>;
+  /** True while the hosting can be extended (capped 24h from "now"). */
+  extendable: boolean;
+}
+
+/**
+ * Builds a run's hosting view (#110): `null` unless the row is hosted;
+ * otherwise the expiry plus whatever live mappings `sandboxInfo` reports.
+ * Pure — routes compose it with the executor's live snapshot.
+ */
+export function buildRunHostingView(
+  run: Run,
+  sandbox: RunSandboxInfo | undefined,
+): RunHostingView | null {
+  if (run.hostedUntil === undefined) return null;
+  const ports = (sandbox?.ports ?? [])
+    .filter((port) => port.host !== undefined)
+    .map((port) => ({ container: port.container, host: port.host as number }));
+  return { until: run.hostedUntil, ports, extendable: true };
+}
+
+/**
  * One global run-status transition, broadcast on the executor's listener
  * bus (#51): pushed on `GET /api/runs/stream`, recorded into the activity
  * feed when feed-worthy. `projectId` lets dashboards bucket without a row
@@ -146,6 +178,13 @@ export type AbortRunResult =
   | { outcome: "aborted" }
   | { outcome: "not_found" }
   | { outcome: "not_abortable"; status: RunStatus };
+
+/** Outcome of {@link Executor.stopHosting}; routes map this to HTTP statuses. */
+export type HostingStopResult = { outcome: "stopped" } | { outcome: "not_hosted" };
+
+/** Outcome of {@link Executor.extendHosting}; routes map this to HTTP statuses. */
+export type HostingExtendResult =
+  { outcome: "extended"; until: string } | { outcome: "not_hosted" };
 
 export interface Executor {
   /**
@@ -174,8 +213,22 @@ export interface Executor {
    * Live sandbox of a run, when it has one (#102): `{ id, image, status }`
    * looked up in the executor's active map (a sandbox lives exactly as long
    * as its run's execution). Undefined = local execution or no live run.
+   * A HOSTED sandbox (#110) stays in the map past run success until its
+   * TTL expires or Stop hosting fires, so previews keep resolving.
    */
   sandboxInfo(runId: string): Promise<RunSandboxInfo | undefined>;
+  /**
+   * Stops a hosted run's sandbox now (#110): destroys the container,
+   * clears `hostedUntil` (the run row stays `success`). `not_hosted`
+   * when the run is not currently hosted (409 at the route).
+   */
+  stopHosting(runId: string): Promise<HostingStopResult>;
+  /**
+   * Extends a hosted run's TTL (#110): `hostedUntil` moves to
+   * `min(now + minutes, now + 24h)` and never shrinks. `not_hosted`
+   * when the run is not currently hosted (409 at the route).
+   */
+  extendHosting(runId: string, minutes: number): Promise<HostingExtendResult>;
   /** Configured global concurrency cap (`MAX_CONCURRENT_RUNS`). */
   maxConcurrentRuns: number;
   /** Best-effort graceful stop: aborts active runs and waits briefly for them. */
@@ -271,6 +324,12 @@ interface ActiveSandbox {
   image: string;
   /** `policy.keepForDebug`: keep the container after the run turns terminal. */
   keepForDebug: boolean;
+  /**
+   * True once the sandbox was HOSTED past run success (#110): the entry
+   * stays in the map (previews keep resolving) until the TTL sweeper or
+   * Stop hosting destroys it.
+   */
+  hosted: boolean;
   /** True once the container has been asked to stop (idempotence guard). */
   stopped: boolean;
   /** In-flight exec cancellations (wired to the driver's exec seam). */
@@ -360,6 +419,8 @@ export function createExecutor(options: ExecutorOptions): Executor {
    * Live run sandboxes (#102): runId → the sandbox created for the current
    * execution. Populated by the engine's acquire hook, emptied by the
    * executor's dispose (terminal / abort), read by `sandboxInfo()`.
+   * #110: HOSTED sandboxes stay in the map past run success (until their
+   * TTL expires or Stop hosting fires) so previews keep resolving.
    */
   const activeSandboxes = new Map<string, ActiveSandbox>();
   const runStatusListeners = new Set<RunStatusListener>();
@@ -538,6 +599,25 @@ export function createExecutor(options: ExecutorOptions): Executor {
             // Unreachable (mode would be local); defensive.
             return undefined;
           }
+          // #110 restart hygiene: a sandbox left over from a pre-restart
+          // execution of this run (the daemon died mid-run; the recovery
+          // sweep marked it interrupted and the user resumed) must not
+          // linger beside the fresh one — both carry the same `run` label,
+          // which would confuse hosting stops and the GC. Best-effort
+          // destroy by label before creating (normally a no-op list).
+          try {
+            const stale = await options.sandbox!.provider.list({ run: run.id });
+            for (const summary of stale) {
+              if (options.sandbox!.provider.destroy === undefined) break;
+              await options.sandbox!.provider.destroy(summary.id);
+              logger.info(
+                { runId: run.id, sandbox: summary.id },
+                "stale pre-restart sandbox destroyed before re-acquire",
+              );
+            }
+          } catch (err) {
+            logger.warn({ err, runId: run.id }, "stale sandbox cleanup before acquire failed");
+          }
           // Container env deliberately carries NO secrets: they ride per-exec
           // through the seam (docker inspect must not leak secret values).
           const spec = buildRunSandboxSpec({
@@ -556,6 +636,7 @@ export function createExecutor(options: ExecutorOptions): Executor {
             handle,
             image: spec.image,
             keepForDebug: policy.keepForDebug === true,
+            hosted: false,
             stopped: false,
             execControllers: new Set(),
             // #104: tail container stdout/stderr into the run event log
@@ -590,10 +671,38 @@ export function createExecutor(options: ExecutorOptions): Executor {
    * still exists), then destroy the container, or keep it (ops-activity
    * recorded) when the policy says so. Best-effort — a failed destroy is
    * logged, never thrown into the caller.
+   *
+   * #110 hosting: a SUCCESSFUL sandboxed run that requested hosting AND
+   * declared ports keeps its sandbox alive instead — the entry stays in the
+   * active map (previews keep resolving through `sandboxInfo`), the tailer
+   * gets its final flush, and `hostedUntil` lands on the row. Aborted and
+   * failed runs NEVER host (hosting applies to success only); a hosting
+   * request without declared ports is silently ignored (nothing to preview).
    */
   async function disposeSandbox(runId: string): Promise<void> {
     const entry = activeSandboxes.get(runId);
     if (entry === undefined) return;
+    const run = db.runs.get(runId);
+    if (
+      run !== undefined &&
+      run.status === "success" &&
+      run.hosting?.enabled === true &&
+      (run.ports?.length ?? 0) > 0
+    ) {
+      entry.hosted = true;
+      await entry.tailer?.stop().catch((err: unknown) => {
+        logger.warn({ err, runId }, "sandbox log tailer stop failed");
+      });
+      const until = new Date(
+        Date.now() + hostingKeepAliveMinutes(run.hosting) * 60_000,
+      ).toISOString();
+      db.runs.update(runId, { hostedUntil: until });
+      logger.info(
+        { runId, sandbox: entry.handle.id, until },
+        "run hosted past success — sandbox kept alive for previews (TTL armed)",
+      );
+      return;
+    }
     activeSandboxes.delete(runId);
     await entry.tailer?.stop().catch((err: unknown) => {
       logger.warn({ err, runId }, "sandbox log tailer stop failed");
@@ -619,6 +728,82 @@ export function createExecutor(options: ExecutorOptions): Executor {
         "sandbox destroy failed (container may leak; check docker ps)",
       );
     }
+  }
+
+  /**
+   * Destroys every provider sandbox labeled with this run id (#110 stop
+   * fallback): used when the row is hosted but THIS executor holds no
+   * handle — i.e. the hosting outlived a daemon restart. Best-effort.
+   */
+  async function destroyProviderSandboxesFor(runId: string): Promise<void> {
+    if (options.sandbox === undefined) return;
+    try {
+      const summaries = await options.sandbox.provider.list({ run: runId });
+      for (const summary of summaries) {
+        if (options.sandbox.provider.destroy === undefined) {
+          logger.warn(
+            { runId, sandbox: summary.id },
+            "hosting stop: provider cannot destroy by id — sandbox left in place",
+          );
+          continue;
+        }
+        await options.sandbox.provider.destroy(summary.id).catch((err: unknown) => {
+          logger.warn({ err, runId, sandbox: summary.id }, "hosting stop: destroy failed");
+        });
+      }
+    } catch (err) {
+      logger.warn({ err, runId }, "hosting stop: provider list failed");
+    }
+  }
+
+  /**
+   * Stops a hosted run's sandbox now (#110): the row's `hostedUntil`
+   * clears first (the run stays `success`), then the container goes —
+   * through the executor-owned handle when there is one, else by label.
+   */
+  async function stopHosting(runId: string): Promise<HostingStopResult> {
+    const run = db.runs.get(runId);
+    if (run === undefined || run.hostedUntil === undefined) {
+      return { outcome: "not_hosted" };
+    }
+    db.runs.update(runId, { hostedUntil: null });
+    const entry = activeSandboxes.get(runId);
+    if (entry !== undefined && entry.hosted) {
+      activeSandboxes.delete(runId);
+      await entry.tailer?.stop().catch(() => {});
+      try {
+        await entry.handle.destroy();
+      } catch (err) {
+        logger.warn(
+          { err, runId, sandbox: entry.handle.id },
+          "hosted sandbox destroy failed (stop hosting)",
+        );
+      }
+    } else {
+      await destroyProviderSandboxesFor(runId);
+    }
+    logger.info({ runId }, "hosting stopped (manual) — sandbox destroyed, run stays success");
+    return { outcome: "stopped" };
+  }
+
+  /**
+   * Extends a hosted run's TTL (#110): `hostedUntil += minutes`, capped
+   * 24h from now (a fresh extend just re-arms the cap window) and never
+   * shrinking below the current expiry.
+   */
+  async function extendHosting(runId: string, minutes: number): Promise<HostingExtendResult> {
+    const run = db.runs.get(runId);
+    if (run === undefined || run.hostedUntil === undefined) {
+      return { outcome: "not_hosted" };
+    }
+    const now = Date.now();
+    const current = Date.parse(run.hostedUntil);
+    const base = Number.isFinite(current) ? current : now;
+    const next = Math.min(base + minutes * 60_000, now + MAX_HOSTING_EXTEND_MINUTES * 60_000);
+    const until = new Date(Math.max(base, next)).toISOString();
+    db.runs.update(runId, { hostedUntil: until });
+    logger.info({ runId, until, minutes }, "hosted run TTL extended");
+    return { outcome: "extended", until };
   }
 
   const engine = createFlowEngine({
@@ -1011,5 +1196,7 @@ export function createExecutor(options: ExecutorOptions): Executor {
       };
     },
     maxConcurrentRuns,
+    stopHosting,
+    extendHosting,
   };
 }

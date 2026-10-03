@@ -18,6 +18,7 @@ import {
 } from "@/components/ui/table";
 import { PlayIcon } from "@/components/shell/icons";
 import { apiFetch, ApiError } from "@/lib/api";
+import { isRunHosted } from "@/lib/hosting";
 import { useRunStats } from "@/lib/runs-stats";
 
 /** A run row as returned by the API: core Run plus computed queue metadata. */
@@ -143,7 +144,18 @@ export function RunsList({
                     </span>
                   </TableCell>
                   <TableCell className="text-right align-top">
-                    <StatusBadge status={run.status} />
+                    <span className="inline-flex items-center gap-1.5">
+                      <StatusBadge status={run.status} />
+                      {isRunHosted(run) ? (
+                        <span
+                          className="rounded-full border border-success/50 bg-success-subtle px-2 py-0.5 text-xs font-medium text-success"
+                          title="Sandbox kept alive for previews (hosting)"
+                          data-hosted-badge
+                        >
+                          hosted
+                        </span>
+                      ) : null}
+                    </span>
                   </TableCell>
                 </TableRow>
               ))}

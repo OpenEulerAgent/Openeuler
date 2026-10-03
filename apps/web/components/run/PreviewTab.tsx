@@ -27,18 +27,24 @@ import {
  * (`/previews/:runId/:port/*`, #108). Mounting IS activation — the run
  * detail only renders this component while the tab is active, so the frame
  * and the HEAD reachability poll start on selection and stop (interval +
- * in-flight abort) on leaving the tab or unmount.
+ * in-flight abort) on leaving the tab or unmount. A HOSTED run (#110)
+ * keeps its sandbox alive past success: the tab stays fully functional
+ * (hosts stay mapped) and the terminal teardown note is replaced by the
+ * hosted banner on the page above.
  */
 export function PreviewTab({
   runId,
   ports,
   terminal,
+  hosted = false,
 }: {
   runId: string;
   /** Port views from `GET /api/runs/:id` (#107); empty renders the empty state. */
   ports: PreviewPortView[];
   /** True once the run reached a terminal status (sandbox gone with it). */
   terminal: boolean;
+  /** True while the run's sandbox is hosted past success (#110). */
+  hosted?: boolean;
 }) {
   const [selected, setSelected] = useState<number | null>(() => defaultPreviewPort(ports));
   const [reloadKey, setReloadKey] = useState(0);
@@ -160,14 +166,14 @@ export function PreviewTab({
         })}
       </div>
 
-      {/* Terminal teardown (#109): hosted sandboxes land with the next
-          issue; until then previews die with the run's sandbox. */}
-      {showTerminalPreviewNote({ terminal, ports }) ? (
+      {/* Terminal teardown (#109): hosted runs (#110) show the hosted
+           banner above instead — their sandbox is alive on purpose. */}
+      {showTerminalPreviewNote({ terminal, ports, hosted }) ? (
         <p
           className="rounded-md border border-warning/40 bg-warning-subtle px-3 py-2 text-sm text-warning"
           data-preview-terminal-note
         >
-          Run finished — sandbox closed; declare hosting (next issue) to keep previews alive
+          Run finished — sandbox closed; start the run with hosting enabled to keep previews alive
         </p>
       ) : null}
 

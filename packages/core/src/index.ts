@@ -91,17 +91,24 @@ export type {
 
 export {
   BreadcrumbEntrySchema,
+  DEFAULT_HOSTING_KEEP_ALIVE_MINUTES,
+  MAX_HOSTING_EXTEND_MINUTES,
+  MAX_HOSTING_KEEP_ALIVE_MINUTES,
   MAX_RUN_PORTS,
+  MIN_HOSTING_KEEP_ALIVE_MINUTES,
+  RunHostingOptionsSchema,
   RunPortsSchema,
   RunSchema,
   RunStatusSchema,
   StepRunSchema,
   TERMINAL_RUN_STATUSES,
   TerminalRunStatusSchema,
+  hostingKeepAliveMinutes,
 } from "./run.js";
 export type {
   BreadcrumbEntry,
   Run,
+  RunHostingOptions,
   RunPorts,
   RunStatus,
   StepRun,

@@ -25,6 +25,7 @@ export type ActivityType =
  * run) emitted by boot/recovery/GC machinery. `ops.gc` is written by M6's
  * sandbox GC; the helper exists so the feed rendering is final now.
  * `ops.image-pull` / `ops.image-build` (#100) record image-job completions.
+ * `ops.hosting-expired` (#110) records a hosted run's TTL expiry.
  */
 export type OpsActivityType =
   | "ops.daemon-boot"
@@ -32,7 +33,8 @@ export type OpsActivityType =
   | "ops.gc"
   | "ops.image-pull"
   | "ops.image-build"
-  | "ops.sandbox-kept";
+  | "ops.sandbox-kept"
+  | "ops.hosting-expired";
 
 /** True for `ops.*` rows: rendered as small gray system lines in the web feed. */
 export function isOpsActivityType(type: ActivityType): type is OpsActivityType {
@@ -204,6 +206,31 @@ export function recordSandboxKeptActivity(db: Db, payload: SandboxKeptActivityPa
     db.activity.append({ type: "ops.sandbox-kept", runId: payload.runId, payload: { ...payload } });
   } catch {
     // Feed appends must never break the run's terminal transition.
+  }
+}
+
+/** Payload of {@link recordHostingExpiredActivity} (#110). */
+export interface HostingExpiredActivityPayload {
+  /** Run whose hosted sandbox expired. */
+  runId: string;
+  /** The expiry timestamp that fired (ISO). */
+  until: string;
+}
+
+/**
+ * Records a hosted run's TTL expiry (`ops.hosting-expired`, #110): the
+ * sandbox was destroyed and the run row stays `success`. Same never-throw
+ * guard as the other writers.
+ */
+export function recordHostingExpiredActivity(db: Db, payload: HostingExpiredActivityPayload): void {
+  try {
+    db.activity.append({
+      type: "ops.hosting-expired",
+      runId: payload.runId,
+      payload: { ...payload },
+    });
+  } catch {
+    // Feed appends must never break the sweep.
   }
 }
 
