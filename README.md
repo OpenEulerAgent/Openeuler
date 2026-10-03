@@ -135,6 +135,7 @@ Read at process start (no `.env` file is loaded; export them or prefix the comma
 | `OPENEULER_WORKTREES`    | `@openeuler/engine`     | `~/.openeuler/worktrees`   | Root directory for per-run git worktrees                                                  |
 | `OPENEULER_DRIVER`       | daemon executor, engine | `fake`                     | Driver for **ad-hoc** runs (`POST /api/runs`); graph nodes carry their own `driver`       |
 | `MAX_CONCURRENT_RUNS`    | daemon executor         | `2`                        | Global cap on runs executing at once (integer ≥ 1; echoed by `/health`)                   |
+| `MAX_SANDBOXES`          | daemon executor         | `8`                        | Global cap on live run sandboxes (integer ≥ 2); sandbox runs above it stay queued (#105)  |
 | `PORT`                   | daemon                  | `8787`                     | Daemon HTTP port                                                                          |
 | `CORS_ORIGIN`            | daemon                  | `http://localhost:3000`    | Allowed browser origin(s), comma-separated allowlist (#97)                                |
 | `OPENEULER_TOKEN`        | daemon                  | _(unset = open)_           | Bearer token required on every `/api` route (#92) — see "Token auth" below                |

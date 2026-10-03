@@ -128,7 +128,19 @@ Tests: `rate-limit.test.ts` (classification, env resolution, bucket refill/LRU/s
 
 - **Per-project gate** — only one active run per project (worktrees branch from the same HEAD, so siblings must not race). Later runs for the same project wait FIFO, staying `queued` in the db.
 - **Global semaphore** — `p-limit(MAX_CONCURRENT_RUNS)` (default 2, integer ≥ 1, echoed in `/health` as `maxConcurrentRuns`). Runs for _different_ projects execute in parallel up to the cap.
+- **Sandbox cap** (#105) — a sandbox-mode run dequeued while the provider sits at `MAX_SANDBOXES` (default 8, integer ≥ 2) live containers stays `queued` and re-enters the scheduler after 30s (delay-requeue; abort/shutdown cancel the retry). Local runs are never blocked.
 - A run stays `queued` until it holds both its project's turn and a slot; the engine flips it to `running` only when execution actually starts. Queued rows carry a computed `queuePosition` in list/detail responses (not persisted). `POST /api/runs/:id/abort` drops a queued run directly; aborting a running run frees the slot/turn for the next queued run.
+
+### Sandbox GC (boot sweep + every 10 minutes, #105)
+
+After the boot recovery sweep (before serving), and then every 10 minutes, `runSandboxGc` reconciles `provider.list()` (the docker provider scopes to its `openeuler.sandbox=1` label) with the run rows:
+
+- run **active** (in this executor, or row `queued`/`running`) → keep;
+- run **terminal** → destroy once the terminal age crosses the grace — 1h default, 4h for `keepForDebug` sandboxes (the feed's `ops.sandbox-kept` entry extends the grace too);
+- **no `run` label or unknown run** → orphan → destroy;
+- **orphan cache volumes** — named `openeuler-cache-*` volumes (engine `cacheVolumeName`) whose project no longer exists are pruned (they are never freed by run teardown). Project **delete** removes its cache volumes eagerly (best-effort).
+
+Each pass appends one `ops.gc` feed event with `{destroyed, kept, orphans, cacheVolumesPruned}` (boot sweeps always; periodic passes only when something was collected). The periodic tick also parses `docker system df` against the docker root filesystem: above 85% data usage it records an `ops.gc` **warning** event (no auto action). The interval timer is unref'd and cleared via the shutdown registry; provider failures degrade to zero counts and never throw.
 
 ### Boot recovery sweep
 
@@ -136,9 +148,9 @@ Before serving, `sweepInterruptedRuns` marks any run left `queued`/`running` by 
 
 ### Metrics (`GET /metrics`) & ops events
 
-- Hand-rolled Prometheus text exposition (0.0.4, no client dep), refreshed **on scrape** from cheap sqlite counts + in-memory state — no counters wired into the executor funnel; the db rows the funnel writes are the counter state. Families: `openeuler_runs_total{status}` (all six statuses, zeros included), `openeuler_runs_active` (executor's in-memory active set), `openeuler_queue_depth` (rows sitting in `queued`), `openeuler_event_log_rows`, `openeuler_worktrees_active` (live worktree metadata on disk), `openeuler_uptime_seconds`, `openeuler_info{version}`, and `openeuler_sandboxes_active` (placeholder `0` until M6).
+- Hand-rolled Prometheus text exposition (0.0.4, no client dep), refreshed **on scrape** from cheap sqlite counts + in-memory state — no counters wired into the executor funnel; the db rows the funnel writes are the counter state. Families: `openeuler_runs_total{status}` (all six statuses, zeros included), `openeuler_runs_active` (executor's in-memory active set), `openeuler_queue_depth` (rows sitting in `queued`), `openeuler_event_log_rows`, `openeuler_worktrees_active` (live worktree metadata on disk), `openeuler_uptime_seconds`, `openeuler_info{version}`, and `openeuler_sandboxes_active` (`provider.list()` count; reflects the GC's post-pass reality, #102/#105).
 - Auth: `/metrics` sits **outside** `/api` but follows the same mode — open when `OPENEULER_TOKEN` is unset; bearer header or `?token=` (GET only, like SSE) when set.
-- Ops events reuse the `activity` table with `ops.*` types (no project/run): `ops.daemon-boot {version}` (written by `main()`), `ops.recovery-sweep {interrupted, orphanedWorktrees}` (written by the sweep), `ops.gc` (helper ready; M6's sandbox GC emits). The feed API passes them through; the web renders them as small gray system lines.
+- Ops events reuse the `activity` table with `ops.*` types (no project/run): `ops.daemon-boot {version}` (written by `main()`), `ops.recovery-sweep {interrupted, orphanedWorktrees}` (written by the sweep), `ops.gc` (sandbox GC counts `{destroyed, kept, orphans, cacheVolumesPruned}` or a `disk-pressure` warning, #105). The feed API passes them through; the web renders them as small gray system lines.
 
 ### Resume & retry
 

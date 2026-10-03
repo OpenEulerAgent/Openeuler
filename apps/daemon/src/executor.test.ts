@@ -821,3 +821,130 @@ describe("createExecutor sandboxed execution (#102)", () => {
     expect(await h.executor.sandboxInfo(runId)).toBeUndefined();
   });
 });
+
+describe("createExecutor sandbox concurrency cap (#105)", () => {
+  const sandboxPolicy = {
+    executionMode: "sandbox" as const,
+    image: "busybox:1.36",
+  };
+
+  /** Pre-fills the fake provider to `count` live sandboxes. */
+  const fillToCap = async (
+    provider: ReturnType<typeof createFakeSandboxProvider>,
+    count: number,
+  ): Promise<void> => {
+    for (let i = 0; i < count; i += 1) {
+      await provider.create({
+        runId: `cap-filler-${i}`,
+        image: "busybox:1.36",
+        mounts: [],
+        env: {},
+        labels: { run: `cap-filler-${i}` },
+      });
+    }
+  };
+
+  it("a sandbox run stays queued at MAX_SANDBOXES and starts after a slot frees (delay retry)", async () => {
+    const provider = createFakeSandboxProvider();
+    await fillToCap(provider, 2);
+    const h = setup(
+      { events: [{ type: "done", seq: 1, output: "ok" }], output: "ok" },
+      {
+        sandbox: {
+          provider,
+          isDockerAvailable: async () => true,
+          maxSandboxes: 2,
+          capRetryMs: 25,
+        },
+      },
+    );
+    h.db.projects.setSandboxPolicy(h.projectId, sandboxPolicy);
+    const { runId } = h.enqueue();
+
+    h.executor.startRun(runId);
+    await new Promise((resolve) => setTimeout(resolve, 100));
+
+    // At cap: the run never left `queued`, no sandbox was created, the driver
+    // never started.
+    expect(h.db.runs.get(runId)?.status).toBe("queued");
+    expect(provider.createdSpecs).toHaveLength(2);
+    expect(h.driver.calls).toHaveLength(0);
+
+    // Free a slot: the delay-requeue re-enters the scheduler and the run
+    // executes normally.
+    const first = (await provider.list())[0];
+    await provider.destroy(first!.id);
+    await waitForStatus(h, runId, "success");
+    await waitForIdle(h);
+    expect(provider.createdSpecs).toHaveLength(3); // 2 fillers + the run's
+  }, 15_000);
+
+  it("aborting a cap-waiting run settles it without a retry firing later", async () => {
+    const provider = createFakeSandboxProvider();
+    await fillToCap(provider, 1);
+    const h = setup(
+      {},
+      {
+        sandbox: {
+          provider,
+          isDockerAvailable: async () => true,
+          maxSandboxes: 1,
+          capRetryMs: 120,
+        },
+      },
+    );
+    h.db.projects.setSandboxPolicy(h.projectId, sandboxPolicy);
+    const { runId } = h.enqueue();
+
+    h.executor.startRun(runId);
+    await new Promise((resolve) => setTimeout(resolve, 40));
+    expect(h.db.runs.get(runId)?.status).toBe("queued");
+
+    const abort = await h.executor.abortRun(runId);
+    expect(abort).toEqual({ outcome: "aborted" });
+    expect(h.db.runs.get(runId)?.status).toBe("aborted");
+
+    // Past capRetryMs: no retry fires (timer cleared on abort).
+    const created = provider.createdSpecs.length;
+    await new Promise((resolve) => setTimeout(resolve, 250));
+    expect(h.db.runs.get(runId)?.status).toBe("aborted");
+    expect(provider.createdSpecs).toHaveLength(created);
+    expect(h.driver.calls).toHaveLength(0);
+  }, 15_000);
+
+  it("local runs are never blocked by the sandbox cap", async () => {
+    const provider = createFakeSandboxProvider();
+    await fillToCap(provider, 2);
+    const h = setup(
+      { events: [{ type: "done", seq: 1, output: "ok" }], output: "ok" },
+      {
+        sandbox: {
+          provider,
+          isDockerAvailable: async () => true,
+          maxSandboxes: 2,
+          capRetryMs: 10_000,
+        },
+      },
+    );
+    // No sandbox policy → local execution regardless of the cap.
+    const { runId } = h.enqueue();
+
+    h.executor.startRun(runId);
+    await waitForStatus(h, runId, "success");
+    expect(h.driver.calls).toHaveLength(1);
+    expect(provider.createdSpecs).toHaveLength(2);
+  });
+
+  it("resolveMaxSandboxes: env integer >= 2 passes through, anything else falls back to 8", async () => {
+    const { DEFAULT_MAX_SANDBOXES, resolveMaxSandboxes } = await import("./concurrency.js");
+    expect(DEFAULT_MAX_SANDBOXES).toBe(8);
+    expect(resolveMaxSandboxes(undefined)).toBe(8);
+    expect(resolveMaxSandboxes("")).toBe(8);
+    expect(resolveMaxSandboxes("16")).toBe(16);
+    expect(resolveMaxSandboxes("2")).toBe(2);
+    expect(resolveMaxSandboxes("1")).toBe(8);
+    expect(resolveMaxSandboxes("0")).toBe(8);
+    expect(resolveMaxSandboxes("abc")).toBe(8);
+    expect(resolveMaxSandboxes("2.5")).toBe(8);
+  });
+});

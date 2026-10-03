@@ -3,6 +3,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import type { DockerCliRunner } from "@openeuler/sandbox";
 import type { Db } from "@openeuler/db";
 import { createDatabase } from "@openeuler/db";
 import { createApp } from "../app.js";
@@ -231,5 +232,80 @@ describe("project round-trip (curl-style e2e)", () => {
     expect(((await got.json()) as ErrorResponseBody).error.code).toBe("PROJECT_NOT_FOUND");
     const deleted = await app.request(`/api/projects/${unknown}`, { method: "DELETE" });
     expect(deleted.status).toBe(404);
+  });
+});
+
+describe("DELETE /api/projects cache-volume cleanup (#105, from #148 QA)", () => {
+  /** Scripted volume runner: `volume ls` serves `volumes`; `volume rm` mutates it. */
+  const volumeRunner = (volumes: string[]) => {
+    const calls: string[][] = [];
+    const live = new Set(volumes);
+    const run: DockerCliRunner = async (args) => {
+      calls.push([...args]);
+      if (args[0] === "volume" && args[1] === "ls") {
+        return { code: 0, stdout: [...live].join("\n"), stderr: "" };
+      }
+      if (args[0] === "volume" && args[1] === "rm") {
+        const name = args[2] ?? "";
+        if (!live.has(name)) {
+          return { code: 1, stdout: "", stderr: `Error: no such volume: ${name}` };
+        }
+        live.delete(name);
+        return { code: 0, stdout: name, stderr: "" };
+      }
+      return { code: 1, stdout: "", stderr: `unexpected call: ${args.join(" ")}` };
+    };
+    return { calls, live, run };
+  };
+
+  it("removes the project's openeuler-cache-* volumes on delete, keeps foreign ones", async () => {
+    const repo = makeRepo("volume-cleanup");
+    const created = await postProject(build(), repo);
+    const { project } = (await created.json()) as ProjectResponseBody;
+    const mine = `openeuler-cache-${project.id}-workspace-node_modules`;
+    const mine2 = `openeuler-cache-${project.id}-workspace-.pnpm-store`;
+    const foreign = `openeuler-cache-${crypto.randomUUID()}-workspace-node_modules`;
+    const runner = volumeRunner([mine, mine2, foreign]);
+
+    const app = createApp({
+      db,
+      logger: createLogger("silent"),
+      projects: { cacheVolumeRunner: runner.run },
+    }).app;
+    const deleted = await app.request(`/api/projects/${project.id}`, { method: "DELETE" });
+    expect(deleted.status).toBe(204);
+
+    expect(runner.calls).toContainEqual(["volume", "rm", mine]);
+    expect(runner.calls).toContainEqual(["volume", "rm", mine2]);
+    expect(runner.calls).not.toContainEqual(["volume", "rm", foreign]);
+    expect(runner.live.has(foreign)).toBe(true);
+
+    // One ops.gc feed entry records the cleanup.
+    const gc = db.activity
+      .list({ limit: 20 })
+      .filter((row) => row.type === "ops.gc")
+      .map((row) => row.payload ?? {});
+    expect(gc).toHaveLength(1);
+    expect(gc[0]).toMatchObject({
+      reason: "project-delete",
+      projectId: project.id,
+      cacheVolumesPruned: 2,
+    });
+  });
+
+  it("succeeds (204) with zero volumes removed and nothing recorded when none exist", async () => {
+    const repo = makeRepo("volume-cleanup-none");
+    const created = await postProject(build(), repo);
+    const { project } = (await created.json()) as ProjectResponseBody;
+    const runner = volumeRunner([]);
+
+    const app = createApp({
+      db,
+      logger: createLogger("silent"),
+      projects: { cacheVolumeRunner: runner.run },
+    }).app;
+    const deleted = await app.request(`/api/projects/${project.id}`, { method: "DELETE" });
+    expect(deleted.status).toBe(204);
+    expect(db.activity.list({ limit: 20 }).some((row) => row.type === "ops.gc")).toBe(false);
   });
 });

@@ -237,6 +237,13 @@ export interface SandboxProvider {
    * each sandbox's labels.
    */
   list(labelSelector?: Record<string, string>): Promise<SandboxSummary[]>;
+  /**
+   * Best-effort destroy of a sandbox by `list()` id (the GC path, #105).
+   * Stop + remove the sandbox; resolving means gone (an already-missing id
+   * resolves, never rejects). Optional — providers without it cannot be
+   * garbage-collected by id.
+   */
+  destroy?(id: string): Promise<void>;
   /** Optional per-sandbox resource usage. */
   stats?(): Promise<SandboxUsage[]>;
 }
