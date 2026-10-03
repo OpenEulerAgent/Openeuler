@@ -348,6 +348,9 @@ importers:
       '@openeuler/core':
         specifier: workspace:*
         version: link:../core
+      '@openeuler/sandbox':
+        specifier: workspace:*
+        version: link:../sandbox
     devDependencies:
       '@openeuler/db':
         specifier: workspace:*

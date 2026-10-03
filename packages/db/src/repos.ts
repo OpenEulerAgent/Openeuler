@@ -5,6 +5,7 @@ import {
   AgentPresetSchema,
   BreadcrumbEntrySchema,
   PersistedEventSchema,
+  ProjectSandboxPolicySchema,
   ProjectSchema,
   RunSchema,
   RunStatusEventSchema,
@@ -19,6 +20,7 @@ import type {
   LoopBack,
   PersistedEvent,
   Project,
+  ProjectSandboxPolicy,
   Run,
   RunStatus,
   RunStatusEvent,
@@ -65,6 +67,13 @@ export interface ProjectRepo {
   /** Bulk `get`: every existing row for the ids, in one query (#62). */
   getMany(ids: string[]): Project[];
   list(): Project[];
+  /**
+   * Replaces the project's sandbox policy (#101); returns the updated
+   * project, or undefined when the row does not exist. The policy is
+   * validated through the core schema on write; `get`/`list` re-validate
+   * on read so a corrupted column can never leak past the API.
+   */
+  setSandboxPolicy(id: string, policy: ProjectSandboxPolicy): Project | undefined;
   /** Deletes the project; returns true when a row was removed. */
   delete(id: string): boolean;
 }
@@ -244,6 +253,9 @@ export function createProjectRepo(db: Db): ProjectRepo {
       defaultBranch: row.defaultBranch,
       ...(row.remoteUrl === null ? {} : { remoteUrl: row.remoteUrl }),
       ...(row.dirty === null ? {} : { dirty: row.dirty }),
+      ...(row.sandboxPolicy === null
+        ? {}
+        : { sandboxPolicy: ProjectSandboxPolicySchema.parse(row.sandboxPolicy) }),
       createdAt: row.createdAt,
     });
 
@@ -258,6 +270,7 @@ export function createProjectRepo(db: Db): ProjectRepo {
           defaultBranch: value.defaultBranch,
           remoteUrl: value.remoteUrl ?? null,
           dirty: value.dirty ?? null,
+          sandboxPolicy: value.sandboxPolicy ?? null,
           createdAt: value.createdAt,
         })
         .run();
@@ -275,6 +288,16 @@ export function createProjectRepo(db: Db): ProjectRepo {
     list() {
       const rows = db.select().from(schema.projects).orderBy(schema.projects.createdAt).all();
       return rows.map(toDomain);
+    },
+    setSandboxPolicy(id, policy) {
+      const value = ProjectSandboxPolicySchema.parse(policy);
+      const row = db
+        .update(schema.projects)
+        .set({ sandboxPolicy: value })
+        .where(eq(schema.projects.id, id))
+        .returning()
+        .get();
+      return row ? toDomain(row) : undefined;
     },
     delete(id) {
       const result = db.delete(schema.projects).where(eq(schema.projects.id, id)).run();

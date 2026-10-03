@@ -181,6 +181,27 @@ Agents need credentials (npm tokens, API keys) without them landing in prompts, 
 - **Redaction**: every persisted write for a run — event payloads, StepRun output/diff, run output/error, activity feed payloads — replaces each value with `***NAME***` (case-sensitive substring, longest values first). Run-tagged structured log fields are redacted the same way; the snapshot is taken at run start, so a secret rotated mid-run stays redacted for that run. Pragmatic scope: a value that only appears in a non-run-tagged log line (e.g. a plain HTTP access log) is out of scope — secrets belong in outputs/events, which are fully covered.
 - **Failure mode is fail-closed**: if secrets cannot be decrypted (wrong/tampered key file → `SECRETS_KEY_UNREADABLE`), the run fails instead of executing without redaction.
 
+## Sandbox policy (per project, per node)
+
+Sandboxed runs (#99 provider, #100 images) read their defaults from a per-project policy (#101): `PATCH /api/projects/:id/policy` replaces the whole policy in one call; `GET /api/projects/:id` serves it inside the project payload (`project.sandboxPolicy`, absent until first saved).
+
+```json
+{
+  "executionMode": "auto", // local | sandbox | auto (default)
+  "image": "openeuler/worker:latest", // required for sandbox runs; see GET /api/sandbox/images
+  "cpus": 2, // whole cores, 1..8
+  "memoryMb": 2048, // whole MiB, 512..8192
+  "network": "limited", // none | limited | default (unset = provider default)
+  "cachePaths": ["/root/.cache"], // ≤ 5 absolute container paths
+  "keepForDebug": false // keep failed runs' sandboxes for inspection
+}
+```
+
+Out-of-range values answer 422 with the clamp message. The web editor is the project workspace drawer (gear → **Sandbox policy**): execution mode, image picker fed by the daemon catalog (ours first), CPU/memory sliders, network select, keep-for-debug.
+
+- **Node overrides**: any agent node may carry `sandboxOverrides {image?, cpus?, memoryMb?, network?}` (canvas inspector → _Sandbox overrides_, empty = inherit). Overrides validate as part of the graph save (422 otherwise) and win per field at run time; the merge is the pure `buildSandboxSpec(policy, overrides, …)` in `@openeuler/engine`, which fills defaults (2 CPUs / 2048 MiB) and throws a typed `SANDBOX_INVALID_SPEC` naming the image endpoints when sandboxing is requested without an image. Executor wiring lands in #102.
+- **Honest limits (v0.2)**: `network: "limited"` means a dedicated bridge network with working DNS — **egress is NOT filtered yet** (documented in the UI next to the option). `none` is fully isolated, `default` is normal outbound access.
+
 ## Project layout
 
 ```
