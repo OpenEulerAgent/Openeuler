@@ -30,7 +30,7 @@ runs 1──* events        activity (dashboard feed, no FKs)
 - **`projects`** — a registered local repo: `path` (repo root), `name`, `defaultBranch`, optional `remoteUrl`/`dirty` snapshot, `createdAt`.
 - **`workflows`** — `projectId` FK, `name`, `steps` + `loopBack` (the legacy mirror, refreshed on graph saves that round-trip), `latestRevisionNumber` (nullable; maintained by the revision repo).
 - **`workflow_revisions`** — immutable graph snapshots: `workflowId` FK, per-workflow `number` (unique, starting 1), `graph` (JSON `WorkflowGraph`), `createdAt`. Every save — canvas `PUT /graph` or a legacy steps write (auto-snapshotted) — appends the next revision; nothing ever mutates an existing row.
-- **`runs`** — `projectId` FK, nullable `workflowId` FK (absent = ad-hoc run driven by `task`), nullable `workflowRevisionId` FK (the snapshot the run is pinned to at creation; editing the workflow afterwards never affects it), `status` (`queued|running|success|failed|aborted|interrupted`), `branch` (always `agentloop/<runId>`), `iteration` (**0-based** current pass), `breadcrumb` (ordered graph-execution trail, see below), optional `task`/`output`/`error`.
+- **`runs`** — `projectId` FK, nullable `workflowId` FK (absent = ad-hoc run driven by `task`), nullable `workflowRevisionId` FK (the snapshot the run is pinned to at creation; editing the workflow afterwards never affects it), `status` (`queued|running|success|failed|aborted|interrupted`), `branch` (always `agentloop/<runId>`), `iteration` (**0-based** current pass), `breadcrumb` (ordered graph-execution trail, see below), nullable `ports`/`detectedPorts` (JSON int[] for #107: declared-at-creation / auto-detected-from-output ports), optional `task`/`output`/`error`.
 - **`step_runs`** — one row per (node, pass): `runId` FK, `stepId` (the **node id** on graph runs, `"adhoc"` for ad-hoc runs), `iteration` (**1-based**, matching `{{iterations}}`), nullable `sessionId` (agent session, recorded from the driver's `session` event), `status`, `output`, nullable `diff` (`stat\npatch`, see below).
 - **`events`** — append-only event log per run: `runId` FK, `seq`, `type`, `payload` (full event JSON without `seq`), `createdAt`.
 - **`agent_presets`** — the per-project roster (#49): `projectId` FK, `name`, `description`, optional `icon`, `config` (a full `StepConfig`), `builtin` flag, timestamps.
@@ -56,6 +56,7 @@ The canonical workflow shape is a **graph** (`WorkflowGraph` in `core/graph.ts`)
 - Anything persistable goes in the log (`PersistedEvent` union in `core/run-event.ts`): streamed **driver events** (`started`, `session`, `message-delta`, `tool-call`, `tool-output`, `done`, `error`) plus **engine-emitted lifecycle events** — `run.status` (every transition, exactly one terminal one per execution), and per executor:
   - **graph runs**: `node.queued` / `node.started` / `node.completed`, `edge.taken`, `edge.cap-reached` — **no** `step.*` / `loop.*` events (pinned by the graph-engine test "runs a chain start to exit: node events instead of step events, chained prompts, per-node StepRuns");
   - **legacy runs**: `step.started`, `step.completed`, `loop.iteration` (verdict: `continue` / `exit-condition-met` / `max-iterations` / `hard-cap`).
+  - **sandboxed runs** (#104): `sandbox.log {sandboxId, stream, line}` — the run's container stdout/stderr tailed by the executor (one event per line, in emission order, secret-redacted) while the run's sandbox exists; bounded to the last 2,000 lines per run (drop-oldest ring implemented via `events.deleteOldestByType`), with ONE terminal `sandbox.log-truncated {dropped, kept}` marker appended when the tailer stops. The web feed renders them as mono gray lines under "All" only; the graph fold and timeline ignore them (seq-cursor only).
 - Replaying `node.completed` + `edge.taken` in `seq` order reconstructs the persisted run `breadcrumb` exactly (asserted by `replayBreadcrumb` in every graph-engine test).
 
 ## Engine semantics
@@ -112,15 +113,44 @@ After every node/step the engine snapshots the worktree: `git add -A` → `diff`
 
 ## Daemon internals
 
+### Hardening middleware (#97)
+
+Middleware order in `createApp` (app.ts): **security headers** → CORS → request logger → **rate limit** → **payload cap** → auth (#92) → context → routes. Hardening layers run ahead of auth so brute-force and oversized requests are shed cheaply (they still burn the offender's own bucket).
+
+- **Rate limits** (`rate-limit.ts`): in-memory token buckets keyed `class:ip`. Classes: `mutate` (POST/PUT/PATCH/DELETE on `/api/*`, default 120/min burst 30), `read` (GET/HEAD/OPTIONS on `/api/*`, default 600/min, capacity = per-minute rate), `stream` (the routes in `STREAM_ROUTE_PATTERNS` — both SSE streams, previews, `/metrics`) and `other` (non-`/api`) are exempt. `429 RATE_LIMITED` + `Retry-After` seconds + `X-RateLimit-Remaining` (also sent on allowed requests). IPs come from the node-server socket (`c.env.incoming`); `X-Forwarded-For` only with `TRUST_PROXY=1`. `TokenBucketStore` takes an injected clock (`take(key, config, nowMs)`), bounds memory at 10k keys (Map order doubles as LRU touch order) and sweeps idle buckets on an unref'd 60s interval.
+- **Payload cap** (`security.ts`): `/api/*` bodies > `MAX_BODY_BYTES` (default 1 MiB) → `413 PAYLOAD_TOO_LARGE`. Fast path: declared `Content-Length`; fallback for missing lengths buffers the body once via hono's cached body read (`c.req.arrayBuffer()` — later `c.req.json()` in handlers reuses the cache). Stream routes exempt.
+- **CORS allowlist**: `parseCorsOrigins` splits `CORS_ORIGIN` on commas (trim/dedupe; `*` → wildcard). Hono's cors middleware does exact matching for both string and array origins — unmatched origins get no ACAO header at all, including preflights.
+- **Security headers** (`security.ts`): nosniff / Referrer-Policy `no-referrer` / minimal Permissions-Policy / CSP `frame-ancestors` + optional `X-Frame-Options: DENY` on **every** response (mounted before CORS so preflight 204s carry them; set after `next()` so error and 404 responses are covered too). Framing policy resolution (`resolveFramePolicy`): explicit `FRAME_ANCESTORS` wins (XFO only when the sources are `'none'`); else `PREVIEW_IFRAME=1` allows `'self'` + CORS allowlist (XFO dropped — it can't express lists, M7 previews placeholder); else deny. `/api/*` gets `Cache-Control: no-store` unless the handler set its own (SSE sends `no-cache`).
+
+Tests: `rate-limit.test.ts` (classification, env resolution, bucket refill/LRU/sweep with an injected clock, 429 + headers, stream exemptions, per-IP buckets with/without `TRUST_PROXY`) and `security.test.ts` (413 via declared and measured lengths, graph PUT coverage, CORS multi-origin + foreign-origin no-header, headers on `/health` / `/api` / 404 / 500, cache-control, frame-policy modes).
+
 ### Scheduler (two layers, lock order gate → slot)
 
 - **Per-project gate** — only one active run per project (worktrees branch from the same HEAD, so siblings must not race). Later runs for the same project wait FIFO, staying `queued` in the db.
 - **Global semaphore** — `p-limit(MAX_CONCURRENT_RUNS)` (default 2, integer ≥ 1, echoed in `/health` as `maxConcurrentRuns`). Runs for _different_ projects execute in parallel up to the cap.
+- **Sandbox cap** (#105) — a sandbox-mode run dequeued while the provider sits at `MAX_SANDBOXES` (default 8, integer ≥ 2) live containers stays `queued` and re-enters the scheduler after 30s (delay-requeue; abort/shutdown cancel the retry). Local runs are never blocked.
 - A run stays `queued` until it holds both its project's turn and a slot; the engine flips it to `running` only when execution actually starts. Queued rows carry a computed `queuePosition` in list/detail responses (not persisted). `POST /api/runs/:id/abort` drops a queued run directly; aborting a running run frees the slot/turn for the next queued run.
+
+### Sandbox GC (boot sweep + every 10 minutes, #105)
+
+After the boot recovery sweep (before serving), and then every 10 minutes, `runSandboxGc` reconciles `provider.list()` (the docker provider scopes to its `openeuler.sandbox=1` label) with the run rows:
+
+- run **active** (in this executor, or row `queued`/`running`) → keep;
+- run **terminal** → destroy once the terminal age crosses the grace — 1h default, 4h for `keepForDebug` sandboxes (the feed's `ops.sandbox-kept` entry extends the grace too);
+- **no `run` label or unknown run** → orphan → destroy;
+- **orphan cache volumes** — named `openeuler-cache-*` volumes (engine `cacheVolumeName`) whose project no longer exists are pruned (they are never freed by run teardown). Project **delete** removes its cache volumes eagerly (best-effort).
+
+Each pass appends one `ops.gc` feed event with `{destroyed, kept, orphans, cacheVolumesPruned}` (boot sweeps always; periodic passes only when something was collected). The periodic tick also parses `docker system df` against the docker root filesystem: above 85% data usage it records an `ops.gc` **warning** event (no auto action). The interval timer is unref'd and cleared via the shutdown registry; provider failures degrade to zero counts and never throw.
 
 ### Boot recovery sweep
 
 Before serving, `sweepInterruptedRuns` marks any run left `queued`/`running` by a **previous** daemon process as `interrupted` (steps too), persists a `run.status` event so SSE replay shows the transition, and prunes git worktree metadata across every referenced repo — orphaned worktree paths are **reported, not deleted** (a later `remove(runId)` can still clean the branch).
+
+### Metrics (`GET /metrics`) & ops events
+
+- Hand-rolled Prometheus text exposition (0.0.4, no client dep), refreshed **on scrape** from cheap sqlite counts + in-memory state — no counters wired into the executor funnel; the db rows the funnel writes are the counter state. Families: `openeuler_runs_total{status}` (all six statuses, zeros included), `openeuler_runs_active` (executor's in-memory active set), `openeuler_queue_depth` (rows sitting in `queued`), `openeuler_event_log_rows`, `openeuler_worktrees_active` (live worktree metadata on disk), `openeuler_uptime_seconds`, `openeuler_info{version}`, and `openeuler_sandboxes_active` (`provider.list()` count; reflects the GC's post-pass reality, #102/#105).
+- Auth: `/metrics` sits **outside** `/api` but follows the same mode — open when `OPENEULER_TOKEN` is unset; bearer header or `?token=` (GET only, like SSE) when set.
+- Ops events reuse the `activity` table with `ops.*` types (no project/run): `ops.daemon-boot {version}` (written by `main()`), `ops.recovery-sweep {interrupted, orphanedWorktrees}` (written by the sweep), `ops.gc` (sandbox GC counts `{destroyed, kept, orphans, cacheVolumesPruned}` or a `disk-pressure` warning, #105). The feed API passes them through; the web renders them as small gray system lines.
 
 ### Resume & retry
 
@@ -151,6 +181,63 @@ Before serving, `sweepInterruptedRuns` marks any run left `queued`/`running` by 
 ### System check (`GET /api/system/check`)
 
 The onboarding wizard's environment preflight (#53): probes git (`git --version`), the opencode CLI (`--version` + `opencode auth list`; exit 0 + non-empty output = authenticated) and the worktree store (created + writable), each with actionable hints. Results are cached for 30s (`?refresh=1` bypasses — the wizard's **Re-check** button); per-command timeout 5s. Tests: `system.test.ts` "caches probes: a second hit within the TTL does not re-spawn binaries", "?refresh=1 bypasses the cache and refreshes it", "unauthenticated opencode (auth list exits non-zero) surfaces the exact login command".
+
+### Settings hub (`GET /api/system/settings` + `POST /api/system/maintenance`)
+
+Read-only daemon facts for the settings page (#95), plus its danger-zone actions. Both auth-gated like every other `/api` route (only `auth-status` is exempt).
+
+- `GET /api/system/settings` → `{version, dbPath, dbBytes, worktreeRoot, worktreeBytes, drivers: [{id}], defaultDriver (first registered), maxConcurrentRuns, authEnabled, uptimeSeconds}`. `worktreeBytes` comes from `du -sb` over the store, cached 60s (`?refresh=1` bypasses); `du` missing/failing reports `null`, never 500s.
+- `POST /api/system/maintenance {action}` — idempotent, count-based results, typed errors only (`422` bad action/days, `503` missing db/worktree manager, `500 MAINTENANCE_FAILED` wrapping underlying failures):
+  - `prune-worktrees` → `{removed, remaining}`: runs `WorktreeManager.pruneAll` (git-side prune + orphan report), then deletes the reported orphan directories — store-root-confined (`relative()` check). Orphan metadata files are kept so a later `remove(runId)` can still drop the branch.
+  - `purge-events {days?}` (default 30) → `{deleted, dbBytes}`: deletes events of **terminal** runs whose `updated_at` is older than the cutoff (non-terminal and fresh runs untouched), then `wal_checkpoint(TRUNCATE)` so the space is actually returned.
+  - `vacuum` → `{dbBytes}`: rebuilds the SQLite file in place.
+
+The web renders these as the settings hub cards (System / Drivers / Concurrency / Storage with shared-scale usage bars, Danger zone); destructive actions confirm in a dialog — type-to-confirm (`purge`) plus a days input only for the purge — and report counts as toasts before refetching.
+
+### Sandbox image management (`/api/sandbox/*`, #100)
+
+What sandboxes run on, from the settings page's Sandbox section. The daemon composes a `DockerSandboxProvider` at boot and registers it on the sandbox package's default registry; image operations go through the same argv-only `docker` CLI wrapper (no shell, injectable runners for tests).
+
+- `GET /api/sandbox/images` → `{images: [{repository, tag, id, sizeBytes, createdAt, ours}]}` — the catalog is NOT every local image: only repositories under the `openeuler/` namespace (`ours: true`, the ownership marker — docker cannot label images) plus a curated common-base list (`node:22-alpine`, `python:3.12-slim`, `golang:1.23`, `alpine:3.20`, `busybox:musl`, `denoland/deno:2`, `ours: false`). Sizes/creation times are enriched by one batched `docker image inspect` (exact bytes + RFC3339), falling back to parsing the `docker images` rows (decimal size strings, offset-timestamps) when an image vanishes mid-listing.
+- `POST /api/sandbox/images/pull {ref}` → `202 {jobId}` — async; refs are grammar-validated first (`422`, same conservative rules as sandbox specs: no flags/whitespace/uppercase/host-port registries) then passed verbatim to `docker pull`. One completion event `ops.image-pull {ref, done, error?}` lands in the activity feed — no per-line progress events. Concurrent pulls of the same ref dedupe onto one job.
+- `POST /api/sandbox/images/build {name, dockerfileText?, baseRef?}` → `202 {jobId, tag}` — builds `openeuler/<name>:latest` (`name` must match `^[a-z0-9._-]+$`) by piping the Dockerfile to `docker build -` with an **empty context** (v0.2 constraint: `COPY`/`ADD` have no files and fail). An empty `dockerfileText` + `baseRef` synthesizes `FROM <baseRef>`. Completion emits `ops.image-build {ref, name, done, error?}`.
+- `DELETE /api/sandbox/images/:ref` (percent-encoded) → `{deleted}` — checks the provider's sandboxes first (`409 IMAGE_IN_USE` with `details.sandboxes` when one runs the image; refs normalize `:latest` before comparing), then `docker image inspect` (`404 IMAGE_NOT_FOUND`) and `docker rmi` (docker-side conflicts also map to `409`).
+- `GET /api/sandbox/jobs/:id` → `{id, kind, ref, status: running|done|failed, error?, createdAt, finishedAt}` — in-memory job registry; jobs are lost on daemon restart (a vanished job is a 404, the image operation itself already completed or never started).
+
+The web client (`lib/sandbox-api.ts`) wraps these with `waitForSandboxJob` (1s poll loop); the Sandbox settings card renders the catalog table (repo:tag, size, age, ours/base badge), inline progress rows per running job, confirm-dialog deletes that surface 409s as danger toasts, and the pull/build forms (client-side name rule mirrored from the daemon).
+
+### Docker availability + local fallback (`GET /api/sandbox/status`, #106)
+
+Docker missing must not brick the product. A daemon-side service (`sandbox-status.ts`) resolves availability with the sandbox package's cached `dockerAvailable()` probe (one `docker info`, 30s internal cache) plus `docker --version` (answers without a daemon; a missing CLI just omits `version`), caches the combined payload for **60s**, and warms once at boot (fire-and-forget — a boot never blocks or fails on docker). `?refresh=1` bypasses the cache and forces the probe.
+
+- `GET /api/sandbox/status` → `{available, version?, mode: "docker"|"unavailable", checkedAt}`.
+- `GET /api/sandbox/status?projectId=<id>` adds `{projectMode, effective}` — the project's policy `executionMode` (`"local"` when no policy was saved) and the **same** `resolveExecutionMode` the executor applies at run time, so hints never disagree with actual placement. Unknown projects answer `404 PROJECT_NOT_FOUND`.
+
+The tradeoff: `executionMode: "auto"` trades isolation for availability — with docker down, auto runs execute **locally on the daemon host** (no sandboxing) instead of failing; explicit `"sandbox"` still fails fast with the typed `SANDBOX_UNAVAILABLE` error. The web makes the fallback visible instead of silent: a **Docker pill** next to the daemon health pill (60s poll; "Docker ready" / "Docker unavailable", muted while checking/unknown), a subtle **"Running locally — Docker unavailable"** banner on the run detail (only when the run has no live sandbox info, the policy is auto/sandbox, and docker is currently down — decision unit-tested in `lib/sandbox-api.ts`), and a live **effective-mode hint** under the execution-mode select in the project settings drawer (follows unsaved form state) and in the run-workflow modal (reflects the saved policy before launch).
+
+### Port declaration + detection (#107)
+
+To preview agent-built servers the daemon must know their ports. Two sources, one run-row view:
+
+- **Declaration** — run creation accepts `ports: number[]` (`POST /api/runs` and `POST /api/workflows/:id/runs` alike): unique integers 1..65535, at most 3 (`RunPortsSchema` in core, shared by both bodies and the stored row; workflow-level defaults are deliberately absent — run-level only). Declared ports persist on the run row (`runs.ports`, JSON int[]) and are carried over by retry. When the run executes sandboxed, `buildRunSandboxSpec` puts them in `SandboxSpec.ports`, so the container publishes them (`-p 127.0.0.1::port`) for its lifetime — `handle.hostPorts()` maps container→ephemeral host.
+- **Detection** — the pure `detectPorts(text)` lib (`packages/engine/src/port-detect.ts`) scans each completed node/step's **final output** for real dev-server lines (Next `ready on http://localhost:3000`, Vite `Local: http://localhost:5173/`, Flask/Uvicorn `Running on http://127.0.0.1:5000`, Puma `Listening on tcp://0.0.0.0:3000`, `Serving HTTP on 0.0.0.0 port 8000`, `PORT=3000`, bare `:3000` after serving/running/started). Guards: ports 0/80/443 never count; the generic `port NNNN` phrase needs 3-5 digits; dates/timestamps/paths/exit codes match nothing. Runs **on sandboxed runs only** (local runs have no preview surface); the executor-side flow engine merges findings into `runs.detectedPorts` (dedup, cap 3) after every successful step/node completion.
+
+`GET /api/runs/:id` renders the merged view as `ports: [{container, host?, declared, hint?}]` — declared ports first (declaration order), then detected extras, capped at 3. `host` is present only while the run's sandbox is alive and published the port (the live mapping comes from the executor's `sandboxInfo`, which reads `hostPorts()`); after terminal the same list renders host-less.
+
+> **Documented v0.2 cut:** only **declared** ports are published. A port found by detection but not declared is recorded on the row and rendered with `hint: "detected in run output; declare ports on the run to preview it…"` — the sandbox cannot publish it retroactively (recreating the container mid-run to add a `-p` mapping was judged too heavy for v0.2). Detection of undeclared ports therefore reports the number and tells the user to declare it on the next run. Pinned by the docker-gated e2e (`executor.sandbox.integration.test.ts`, #107 tests: declared → mapped + HTTP-reachable + recorded; undeclared → detected, `docker port` empty).
+
+### Preview proxy (`/previews/:runId/…`, #108)
+
+Declared ports get a live reverse proxy while the sandbox runs. `preview-proxy.ts` holds the framework-free pieces (path parsing, port resolution, hop-by-hop filtering, the streaming `fetch`); `routes/previews.ts` is the hono wiring mounted at **both** `/previews` and `/api/previews` (method passthrough: GET/HEAD/POST/PUT/PATCH/DELETE).
+
+- **Port resolution** (path form wins): `/previews/:runId/:port/*` → `?port=` → the run's first declared port. The path form is canonical because naive relative links (`/app.js`) drop query params — with `?port=` the iframe must re-append it to every subresource. A non-numeric first path segment is treated as the subpath of the DEFAULT port, so default-port apps work with plain relative links. `?token=`/`?port=` are consumed by the proxy and never forwarded.
+- **Resolution matrix**: unknown run → `404 RUN_NOT_FOUND`; no live sandbox → `410 PREVIEW_GONE` (terminal vs local message); bad port → `422 INVALID_PORT`; undeclared port or declared-nothing-but-detected → `403 PREVIEW_PORT_NOT_DECLARED` (body carries the declare-to-preview hint, `details.detected`/`details.containerPort`); declared + live sandbox but mapping gone (stopping/exited) → `502 PREVIEW_UPSTREAM_UNAVAILABLE`. Resolution is the pure `resolvePreviewTarget(run, sandboxInfo, explicitPort)`.
+- **Streaming**: one `fetch` per request to `http://127.0.0.1:<hostPort><encoded path>` — request body forwarded as a stream (`duplex: "half"`), response status/headers/body passed through with **no content-length recompute**; multi-value `set-cookie` survives via `getSetCookie()`. Hop-by-hop headers (connection, keep-alive, te, trailer, transfer-encoding, upgrade, proxy-*; plus anything `Connection:` names; `host` on requests) are stripped both ways. `redirect: "manual"`: app redirects pass through for the iframe to follow (link rewriting is OFF — absolute-path redirects like `/dashboard` escape `/previews/:runId`; document the caveat, fix in v0.3 if ever).
+- **Timeouts**: 10s connect/headers window (an AbortController that fires unless headers arrive) composed with `AbortSignal.timeout(120s)` as the pragmatic overall cap (the ideal 60s idle-between-chunks needs undici dispatcher knobs the global fetch does not expose). Failures — connection refused (published port with no listener), timeout, mid-flight abort — synthesize `502` with `details {runId, containerPort, hostPort, reason, hint}` pointing at `GET /api/runs/:id` and the sandbox log.
+- **Smuggling**: the proxy never decodes the subpath — it is re-attached percent-encoded to the upstream request line (`parsePreviewPath` + `forwardableSearch` keep raw bytes; `?a=%20x` is forwarded byte-identical). Pinned by tests: `%0d%0a` reaches the target still encoded, no raw CR/LF anywhere.
+- **Auth/exemptions**: `/api/previews` sits behind the global `/api/*` gate; the bare `/previews` mount gets the same middleware in `app.ts`. `?token=` is GET-scoped (the iframe load); POST/PUT/… need `Authorization: Bearer`. Preview paths are stream routes (#97): exempt from rate limits and payload caps — proxied bodies are bounded by the sandbox, not the daemon.
+- **Frame headers**: nothing preview-specific — the global security middleware already handles `PREVIEW_IFRAME=1` (`frame-ancestors 'self' <CORS allowlist>`, no `X-Frame-Options`), which overrides the target app's own CSP on proxied responses (a v0.2-accepted consequence; without the flag previews are DENY-framed and only useful via direct navigation).
+- **Cuts**: WebSocket upgrades (v0.2 is plain HTTP; the browser console will show a failed `wss://` — noted as best-effort), link rewriting, per-run resolution caching (each proxied request does a live `sandboxInfo()`; cheap at iframe rates). Pinned by `routes/previews.test.ts` (matrix + stripping + smuggling + auth + load + timeouts, local echo target) and the docker-gated `routes/previews.integration.test.ts` (busybox `httpd` + CGI echo round-trip through the real published port, 404 passthrough, published-but-not-listening 502, stopped-container 502, post-terminal 410).
 
 ## The web canvas
 

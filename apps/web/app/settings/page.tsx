@@ -3,6 +3,8 @@
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { AuthStatusCard } from "@/components/settings/AuthStatusCard";
+import { SettingsHub } from "@/components/settings/SettingsHub";
 import { useThemeContext } from "@/components/ThemeProvider";
 import { useSidebarPreference } from "@/components/shell/sidebar-preference";
 import { daemonBaseUrl } from "@/lib/api";
@@ -12,8 +14,10 @@ import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
 
 /**
- * Settings shell (issue #50): theme toggle, sidebar preference and the daemon
- * URL the app talks to. More preferences land with later issues.
+ * Settings shell (issue #50 → hub in #95): local preferences (theme, sidebar,
+ * wizard rerun), the daemon access card (#92), the daemon facts hub
+ * (System / Drivers / Concurrency / Storage / Danger zone) and the API base
+ * URL in use.
  */
 export default function SettingsPage() {
   const router = useRouter();
@@ -30,7 +34,7 @@ export default function SettingsPage() {
       <div>
         <h1 className="text-display font-semibold text-fg">Settings</h1>
         <p className="mt-1 text-sm text-muted-fg">
-          Application preferences. More settings arrive with later releases.
+          Preferences and daemon facts. Danger zone actions maintain the local data.
         </p>
       </div>
 
@@ -106,6 +110,10 @@ export default function SettingsPage() {
           </p>
         </CardContent>
       </Card>
+
+      <AuthStatusCard />
+
+      <SettingsHub />
     </div>
   );
 }

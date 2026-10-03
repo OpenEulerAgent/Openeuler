@@ -1,6 +1,13 @@
 import { index, integer, sqliteTable, text, uniqueIndex } from "drizzle-orm/sqlite-core";
 import { sql } from "drizzle-orm";
-import type { BreadcrumbEntry, LoopBack, Step, StepConfig, WorkflowGraph } from "@openeuler/core";
+import type {
+  BreadcrumbEntry,
+  LoopBack,
+  ProjectSandboxPolicy,
+  Step,
+  StepConfig,
+  WorkflowGraph,
+} from "@openeuler/core";
 
 /**
  * Physical schema. Domain validation lives in `@openeuler/core` zod schemas;
@@ -16,6 +23,12 @@ export const projects = sqliteTable("projects", {
   /** Nullable metadata snapshot columns; absent domain fields persist as NULL. */
   remoteUrl: text("remote_url"),
   dirty: integer("dirty", { mode: "boolean" }),
+  /**
+   * Per-project sandbox policy (#101) as JSON; NULL until first saved via
+   * `PATCH /api/projects/:id/policy`. Validated through the core schema on
+   * repo write and read.
+   */
+  sandboxPolicy: text("sandbox_policy", { mode: "json" }).$type<ProjectSandboxPolicy>(),
   createdAt: text("created_at").notNull(),
 });
 
@@ -111,6 +124,24 @@ export const runs = sqliteTable(
       .$type<BreadcrumbEntry[]>()
       .notNull()
       .default(sql`'[]'`),
+    /**
+     * Container ports declared at run creation (#107), JSON int[]; NULL
+     * when none were declared. Published by the run's sandbox.
+     */
+    ports: text("ports", { mode: "json" }).$type<number[]>(),
+    /**
+     * Ports auto-detected from step/node outputs (#107), JSON int[]; NULL
+     * until detection first fires (sandboxed runs only).
+     */
+    detectedPorts: text("detected_ports", { mode: "json" }).$type<number[]>(),
+    /**
+     * High-water mark of the event seqs assigned for this run (#149):
+     * `events.append` sets seq = max(hwm, max(seq)) + 1 and raises hwm in
+     * the same transaction, so ring eviction (`deleteOldestByType`) can
+     * never make the next append reuse a seq — SSE Last-Event-ID cursors
+     * stay monotonic even after rows are deleted.
+     */
+    eventSeqHwm: integer("event_seq_hwm").notNull().default(0),
     createdAt: text("created_at").notNull(),
     updatedAt: text("updated_at").notNull(),
   },
@@ -139,9 +170,34 @@ export const stepRuns = sqliteTable(
 );
 
 /**
+ * Per-project secrets (#93): env-var-shaped credentials stored encrypted
+ * (AES-256-GCM, daemon-side key). `valueEnc` never leaves the db layer
+ * decrypted; the API exposes names only. One row per (project, name) —
+ * `set` upserts in place, keeping `createdAt`.
+ */
+export const projectSecrets = sqliteTable(
+  "project_secrets",
+  {
+    id: text("id").primaryKey(),
+    projectId: text("project_id")
+      .notNull()
+      .references(() => projects.id),
+    name: text("name").notNull(),
+    valueEnc: text("value_enc").notNull(),
+    createdAt: text("created_at").notNull(),
+    updatedAt: text("updated_at").notNull(),
+  },
+  (table) => [
+    uniqueIndex("project_secrets_project_id_name_unique").on(table.projectId, table.name),
+    index("project_secrets_project_id_idx").on(table.projectId),
+  ],
+);
+
+/**
  * Append-only agent event log. `seq` is assigned per run by the repository
- * (max(seq)+1 inside a transaction); `payload` stores the event JSON without
- * its `seq` so the column stays the single source of truth.
+ * (max(runs.event_seq_hwm, max(seq)) + 1 inside a transaction, then hwm is
+ * raised); `payload` stores the event JSON without its `seq` so the column
+ * stays the single source of truth.
  */
 export const events = sqliteTable(
   "events",

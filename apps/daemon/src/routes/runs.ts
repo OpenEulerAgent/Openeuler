@@ -7,7 +7,7 @@ import type {
   TerminalRunStatus,
   Workflow,
 } from "@openeuler/core";
-import { TERMINAL_RUN_STATUSES, RunStatusSchema } from "@openeuler/core";
+import { TERMINAL_RUN_STATUSES, RunPortsSchema, RunStatusSchema } from "@openeuler/core";
 import type { Db } from "@openeuler/db";
 import { DriverError } from "@openeuler/drivers";
 import { ADHOC_STEP_ID, branchForRun } from "@openeuler/engine";
@@ -17,7 +17,10 @@ import { streamSSE } from "hono/streaming";
 import { z } from "zod";
 import type { AppEnv } from "../app.js";
 import type { Executor, RunStatusNotification } from "../executor.js";
+import { buildRunPortViews } from "../executor.js";
+import type { RunPortView } from "../executor.js";
 import { HttpError } from "../errors.js";
+import { redactorForProject } from "../secrets.js";
 import { ensureLatestRevision } from "./workflows.js";
 
 /**
@@ -48,6 +51,11 @@ const CreateRunBodySchema = z.strictObject({
   prompt: z.string().min(1, "prompt must be a non-empty string"),
   model: z.string().min(1, "model must be a non-empty string").optional(),
   mode: z.enum(["auto", "ask"]).optional(),
+  /**
+   * Container ports the run declares (#107): unique integers 1..65535, at
+   * most 3, published by a sandboxed run's sandbox while it lives.
+   */
+  ports: RunPortsSchema.optional(),
 });
 
 /** Cursor for SSE resume: `?afterSeq=` or `Last-Event-ID` (a run event seq). */
@@ -100,6 +108,17 @@ export interface RunDetailBody {
   /** Step runs grouped by 1-based loop pass, ordered by iteration. */
   iterations: Array<{ iteration: number; steps: StepRun[] }>;
   summary: { eventCount: number };
+  /**
+   * Live sandbox of the run, when it has one (#102): present only while the
+   * run executes sandboxed (the sandbox is destroyed at terminal).
+   */
+  sandbox?: { id: string; image: string; status: string };
+  /**
+   * The run's previewable ports (#107): declared first (with a live host
+   * mapping while the sandbox is alive), then detected-undeclared ones
+   * (with the declare-to-preview hint). Absent when the run tracks none.
+   */
+  ports?: RunPortView[];
 }
 
 /** Run list payload: runs plus computed queue metadata for queued rows. */
@@ -433,7 +452,16 @@ export function createRunsRouter(options: CreateRunsRouterOptions = {}): Hono<Ap
       status: "queued",
       branch: branchForRun(runId),
       iteration: 0,
-      task: body.prompt,
+      // #93 redacted-at-rest: the task is free text a secret can be pasted
+      // into, and the row is served back verbatim by the API — so values are
+      // swapped for ***NAME*** markers BEFORE the row is written. Run detail
+      // (and the driver prompt, which renders this same text) therefore
+      // shows the redacted task; agents consume secret values via env, not
+      // via the prompt.
+      task: redactorForProject(db, c.get("secretsKey"), project.id)(body.prompt),
+      // #107: declared container ports, persisted on the row; the run's
+      // sandbox publishes them for its lifetime.
+      ...(body.ports === undefined || body.ports.length === 0 ? {} : { ports: body.ports }),
       createdAt: now,
       updatedAt: now,
     };
@@ -594,7 +622,7 @@ export function createRunsRouter(options: CreateRunsRouterOptions = {}): Hono<Ap
     });
   });
 
-  runs.get("/:id", (c) => {
+  runs.get("/:id", async (c) => {
     const db = requireDb(c);
     const run = requireRun(db, c.req.param("id"));
     const steps = db.stepRuns.listByRun(run.id);
@@ -612,11 +640,22 @@ export function createRunsRouter(options: CreateRunsRouterOptions = {}): Hono<Ap
       const bi = order.get(b.stepId) ?? Number.MAX_SAFE_INTEGER;
       return ai === bi ? a.stepId.localeCompare(b.stepId) : ai - bi;
     });
+    // #102: live sandbox snapshot while the run executes sandboxed; absent
+    // for local runs and after the sandbox's dispose.
+    const executor = c.get("executor");
+    const sandbox = executor === undefined ? undefined : await executor.sandboxInfo(run.id);
+    // #107: port views. While the sandbox lives they carry live host
+    // mappings (from sandboxInfo); afterwards (or for local runs) the same
+    // list renders without hosts — declared ports keep the declare flag,
+    // detected-undeclared ones keep the hint.
+    const ports = sandbox?.ports ?? buildRunPortViews(run.ports, run.detectedPorts, {});
     const body: RunDetailBody = {
       run: decorateRun(db, run, queuePositionsByRunId(db)),
       steps: sorted,
       iterations: groupByIteration(sorted),
       summary: { eventCount: db.events.count(run.id) },
+      ...(sandbox === undefined ? {} : { sandbox }),
+      ...(ports.length === 0 ? {} : { ports }),
     };
     return c.json(body);
   });
@@ -695,8 +734,20 @@ export function createRunsRouter(options: CreateRunsRouterOptions = {}): Hono<Ap
     const project = db.projects.get(run.projectId);
     const baseBranch = project?.defaultBranch ?? "HEAD";
     const { stat, patch } = await worktrees.diffVsBase(info.path, baseBranch);
-    const capped = capPatchLines(patch);
-    const body: RunDiffBody = { scope, stat, ...capped, maxLines: MAX_DIFF_PATCH_LINES };
+    // #93: the cumulative diff is computed live from the worktree on disk —
+    // the one diff surface that never passes through the engine's
+    // redacted-before-persist writes — so scrub it (stat too: a secret
+    // pasted into a file name would otherwise survive in the summary)
+    // before responding. Redact before capping so the cap counts the
+    // served lines.
+    const redact = redactorForProject(db, c.get("secretsKey"), run.projectId);
+    const capped = capPatchLines(redact(patch));
+    const body: RunDiffBody = {
+      scope,
+      stat: redact(stat),
+      ...capped,
+      maxLines: MAX_DIFF_PATCH_LINES,
+    };
     return c.json(body);
   });
 
@@ -942,7 +993,14 @@ export function createRunsRouter(options: CreateRunsRouterOptions = {}): Hono<Ap
       status: "queued",
       branch: branchForRun(runId),
       iteration: 0,
-      ...(run.task === undefined ? {} : { task: run.task }),
+      // #93: re-redact the copied task — normally already redacted at rest,
+      // but rows written before redaction-at-rest (or a secret added after
+      // the original run was stored) still get scrubbed on copy.
+      ...(run.task === undefined
+        ? {}
+        : { task: redactorForProject(db, c.get("secretsKey"), run.projectId)(run.task) }),
+      // #107: declared ports carry over to the retry (detection restarts).
+      ...(run.ports === undefined || run.ports.length === 0 ? {} : { ports: run.ports }),
       createdAt: now,
       updatedAt: now,
     };

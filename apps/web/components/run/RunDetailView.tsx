@@ -8,6 +8,7 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/com
 import { Tabs, type TabItem } from "@/components/ui/tabs";
 import { SkeletonLines } from "@/components/ui/skeleton";
 import { apiFetch, ApiError } from "@/lib/api";
+import type { PreviewPortView } from "@/lib/preview";
 import { connectRunEvents, type RunStreamEvent, type RunStreamState } from "@/lib/run-events";
 import {
   appendFeedEvent,
@@ -29,7 +30,9 @@ import {
 import { DiffsTab } from "./DiffsTab";
 import { EventFeed } from "./EventFeed";
 import { InterruptedRunBanner } from "./InterruptedRunBanner";
+import { LocalFallbackBanner } from "./LocalFallbackBanner";
 import { OutputPanel } from "./OutputPanel";
+import { PreviewTab } from "./PreviewTab";
 import { RetryRunButton } from "./RetryRunButton";
 import { RunHeader } from "./RunHeader";
 import { RunGraphTab } from "./graph/RunGraphTab";
@@ -39,6 +42,10 @@ interface RunDetail {
   run: Run & { workflowRevision?: { id: string; number: number } };
   steps: StepRun[];
   summary: { eventCount: number };
+  /** Live sandbox snapshot while the run executes sandboxed (#102). */
+  sandbox?: { id: string; image: string; status: string };
+  /** Previewable port views (#107/#109): declared + detected, host while the sandbox lives. */
+  ports?: PreviewPortView[];
 }
 
 type LoadState =
@@ -238,12 +245,20 @@ export function RunDetailView({ runId }: { runId: string }) {
   // revision or legacy chain); ad-hoc task runs start on Events. The URL is
   // the source of truth (`?tab=` deep links; `?stepRunId=` scopes Diff).
   const graphAvailable = detail.run.workflowId !== undefined;
+  // Preview (#109) is visible only when the run tracks ports at all —
+  // declared or detected (#107).
+  const previewAvailable = (detail.ports?.length ?? 0) > 0;
   const defaultTab: RunDetailTab = graphAvailable ? "graph" : "events";
-  // Guard: `?tab=graph` on an ad-hoc run (no workflow) falls back to Events.
+  // Guard: `?tab=graph` on an ad-hoc run (no workflow) and `?tab=preview`
+  // on a portless run fall back to the default tab.
   const activeTab: RunDetailTab =
-    query.tab === null || (query.tab === "graph" && !graphAvailable) ? defaultTab : query.tab;
+    query.tab === null ||
+    (query.tab === "graph" && !graphAvailable) ||
+    (query.tab === "preview" && !previewAvailable)
+      ? defaultTab
+      : query.tab;
   const tabs: ReadonlyArray<TabItem<RunDetailTab>> = RUN_DETAIL_TABS.filter((tab) =>
-    tab.id === "graph" ? graphAvailable : true,
+    tab.id === "graph" ? graphAvailable : tab.id === "preview" ? previewAvailable : true,
   );
 
   const selectTab = (tab: RunDetailTab, stepRunId?: string): void => {
@@ -267,6 +282,15 @@ export function RunDetailView({ runId }: { runId: string }) {
           !live && shownRun.status !== "success" ? <RetryRunButton runId={shownRun.id} /> : null
         }
         onAborted={() => void refresh()}
+      />
+
+      {/* #106: local-fallback notice when the policy wants a sandbox but
+          docker is unavailable (auto-mode fallback; absent for sandboxed or
+          local-policy runs). */}
+      <LocalFallbackBanner
+        projectId={detail.run.projectId}
+        sandboxPresent={detail.sandbox !== undefined}
+        runStatus={live ? "running" : shownRun.status}
       />
 
       <InterruptedRunBanner run={shownRun} steps={steps} onChanged={() => void refresh()} />
@@ -304,6 +328,16 @@ export function RunDetailView({ runId }: { runId: string }) {
         ) : null}
 
         {activeTab === "timeline" ? <TimelineTab state={foldState} /> : null}
+
+        {/* Preview (#109): mounted only while active — the iframe and its
+            HEAD poll are lazy by construction and torn down on switch. */}
+        {activeTab === "preview" ? (
+          <PreviewTab
+            runId={detail.run.id}
+            ports={detail.ports ?? []}
+            terminal={effectiveStatus !== undefined && !live}
+          />
+        ) : null}
       </div>
 
       {showPanels && output.length > 0 ? <OutputPanel output={output} /> : null}

@@ -1,16 +1,24 @@
 import { randomUUID } from "node:crypto";
-import { renderPromptTemplate } from "@openeuler/core";
+import { redactJson, redactSecrets, renderPromptTemplate } from "@openeuler/core";
 import type {
   LoopBack,
   LoopVerdict,
+  PersistedEvent,
   Run,
   RunStatus,
+  SecretForRedaction,
   Step,
   StepRun,
   WorkflowGraph,
 } from "@openeuler/core";
-import type { Db } from "@openeuler/db";
-import type { AgentDriver, AgentHandle, AgentMode, DriverRegistry } from "@openeuler/drivers";
+import type { Db, EventInput } from "@openeuler/db";
+import type {
+  AgentDriver,
+  AgentExecSeam,
+  AgentHandle,
+  AgentMode,
+  DriverRegistry,
+} from "@openeuler/drivers";
 import {
   compileExitCondition,
   describeCondition,
@@ -18,6 +26,7 @@ import {
   type ExitEvaluator,
 } from "./conditions.js";
 import { executeGraphRun, type GraphEngineDeps } from "./graph-engine.js";
+import { detectPorts, mergeDetectedPorts } from "./port-detect.js";
 import type { WorktreeManager } from "./worktree.js";
 
 /** Default driver id for ad-hoc runs (override per run via `OPENEULER_DRIVER`). */
@@ -74,6 +83,48 @@ export interface RunControl {
   onHandle?(handle: AgentHandle | undefined): void;
 }
 
+/**
+ * Per-run secret context (#93), resolved once at run start by the daemon:
+ * the decrypted env merged into every driver start, plus the name+value
+ * list used to redact everything the run persists (event payloads, outputs,
+ * diffs, errors, run-scoped log fields).
+ */
+export interface RunSecrets {
+  /** Secret env vars merged into every `driver.start` call for the run. */
+  env: Record<string, string>;
+  /** Decrypted secrets powering the redaction transform. */
+  secrets: ReadonlyArray<SecretForRedaction>;
+}
+
+/** Resolves a run's {@link RunSecrets}; undefined = no secrets configured. */
+export type RunSecretsLoader = (run: Run) => RunSecrets | undefined;
+
+/**
+ * Per-run sandbox execution context (#102). Resolved ONCE per execution
+ * after the run's worktree exists; every driver start for the run then
+ * executes inside the sandbox (`cwd` = `workspacePath`, commands through
+ * `exec`) instead of locally against the host worktree.
+ */
+export interface RunSandboxContext {
+  /** Container path the run's worktree is mounted at (driver `cwd`). */
+  workspacePath: string;
+  /** Exec seam drivers run their agent command through. */
+  exec: AgentExecSeam;
+}
+
+/**
+ * Acquires the run's sandbox (#102). Returns `undefined` when the run
+ * executes locally (no policy / mode resolved local); THROWS when sandboxed
+ * execution was wanted but the sandbox could not be created — the engine
+ * fails the run with the thrown (typed, actionable) error. The caller owns
+ * the sandbox's lifecycle: the engine only holds the returned context for
+ * the duration of the execution.
+ */
+export type RunSandboxAcquirer = (
+  run: Run,
+  worktreePath: string,
+) => Promise<RunSandboxContext | undefined>;
+
 export interface FlowEngineOptions {
   db: Db;
   worktrees: WorktreeManager;
@@ -87,6 +138,23 @@ export interface FlowEngineOptions {
    * hook failures are logged and never break execution.
    */
   onRunStatus?: (runId: string, status: RunStatus) => void;
+  /**
+   * Loads a run's project secrets at run start (#93). The returned env is
+   * merged into every driver start; every persisted write for the run
+   * (event payloads, StepRun output/diff, run output/error, run-scoped log
+   * fields) is redacted first. Loader errors fail the run (fail-closed:
+   * a run never executes with secrets it cannot redact).
+   */
+  loadRunSecrets?: RunSecretsLoader;
+  /**
+   * Acquires the run's sandbox after its worktree exists (#102). Absent =
+   * every run executes locally (the pre-v0.2 behavior, byte-identical).
+   * When present: returning a {@link RunSandboxContext} routes all driver
+   * starts of the run through the sandbox; returning `undefined` keeps the
+   * run local; THROWING fails the run with the typed error (e.g. sandbox
+   * creation failed, no image configured).
+   */
+  acquireRunSandbox?: RunSandboxAcquirer;
 }
 
 export interface FlowEngine {
@@ -174,17 +242,76 @@ export function createFlowEngine(options: FlowEngineOptions): FlowEngine {
   const { db, worktrees, drivers } = options;
   const logger = options.logger;
 
+  /**
+   * Per-run secret snapshots (#93): set once at run start, removed when the
+   * run settles. Keyed by runId so every append/write/log call site can
+   * redact without threading a closure through the whole engine.
+   */
+  const runSecrets = new Map<string, RunSecrets>();
+
+  /**
+   * Per-run sandbox contexts (#102): set once the worktree exists and the
+   * acquirer returned a context, removed when the run settles. Presence
+   * switches every driver start of the run to sandboxed execution.
+   */
+  const runSandboxes = new Map<string, RunSandboxContext>();
+
+  const secretsOf = (runId: string): ReadonlyArray<SecretForRedaction> =>
+    runSecrets.get(runId)?.secrets ?? [];
+
+  /** Redacts a run-scoped free-text value (output, diff, error message). */
+  const redactText = (runId: string, text: string): string => redactSecrets(text, secretsOf(runId));
+
+  /**
+   * Persists one event with run-scoped secret redaction applied to the
+   * payload (#93). Structural keys (`type`, `seq`, `status`, …) pass
+   * through untouched, so the repo's schema parse is unaffected.
+   */
+  const appendEvent = (runId: string, event: EventInput): PersistedEvent =>
+    db.events.append(runId, redactJson(event, secretsOf(runId)) as EventInput);
+
+  /**
+   * Redacts structured log fields for run-tagged lines (#93, pragmatic
+   * scope): the walk covers every enumerable string the caller passes
+   * (`delta`/`output`/`error` snippets and the like). `Error` values under
+   * an `err` key are flattened to plain objects FIRST — `redactJson`'s walk
+   * only sees enumerable fields, and an Error's `message`/`stack` are not,
+   * so they would otherwise be dropped instead of redacted — and the walk
+   * then scrubs them (pino's own err serializer prints the sanitized
+   * shape). Lines without a runId are passed through as-is.
+   */
+  const redactLogObj = (obj: object): object => {
+    const runId = (obj as { runId?: unknown }).runId;
+    if (typeof runId !== "string") return obj;
+    const secrets = secretsOf(runId);
+    if (secrets.length === 0) return obj;
+    const source = obj as Record<string, unknown>;
+    const err = source["err"];
+    const flattened =
+      err instanceof Error
+        ? {
+            ...source,
+            err: {
+              name: err.name,
+              message: err.message,
+              ...(err.stack === undefined ? {} : { stack: err.stack }),
+            },
+          }
+        : source;
+    return redactJson(flattened, secrets) as object;
+  };
+
   const log = {
-    info: (obj: object, msg: string): void => logger?.info(obj, msg),
-    warn: (obj: object, msg: string): void => logger?.warn(obj, msg),
-    error: (obj: object, msg: string): void => logger?.error(obj, msg),
+    info: (obj: object, msg: string): void => logger?.info(redactLogObj(obj), msg),
+    warn: (obj: object, msg: string): void => logger?.warn(redactLogObj(obj), msg),
+    error: (obj: object, msg: string): void => logger?.error(redactLogObj(obj), msg),
   };
 
   function emitRunStatus(runId: string, status: RunStatus, error?: string): void {
-    db.events.append(runId, {
+    appendEvent(runId, {
       type: "run.status",
       status,
-      ...(error === undefined ? {} : { error }),
+      ...(error === undefined ? {} : { error: redactText(runId, error) }),
     });
     if (options.onRunStatus !== undefined) {
       try {
@@ -231,19 +358,21 @@ export function createFlowEngine(options: FlowEngineOptions): FlowEngine {
     const run = db.runs.get(runId);
     if (!run) return;
     const finalStatus = isTerminal(run.status) ? run.status : status;
+    // Output/error are the run's persisted verdict text — redacted before
+    // they ever touch the row (#93).
+    const output = patch.output === undefined ? undefined : redactText(runId, patch.output);
+    const error = patch.error === undefined ? undefined : redactText(runId, patch.error);
     if (!isTerminal(run.status)) {
       db.runs.update(runId, {
         status,
-        ...(patch.output === undefined || patch.output.length === 0
-          ? {}
-          : { output: patch.output }),
-        ...(patch.error === undefined ? {} : { error: patch.error }),
+        ...(output === undefined || output.length === 0 ? {} : { output }),
+        ...(error === undefined ? {} : { error }),
       });
       settleStepRuns(runId, status);
-    } else if (patch.output !== undefined && patch.output.length > 0) {
-      db.runs.update(runId, { output: patch.output });
+    } else if (output !== undefined && output.length > 0) {
+      db.runs.update(runId, { output });
     }
-    emitRunStatus(runId, finalStatus, patch.error);
+    emitRunStatus(runId, finalStatus, error);
     log.info({ runId, status: finalStatus }, "run finished");
   }
 
@@ -251,15 +380,21 @@ export function createFlowEngine(options: FlowEngineOptions): FlowEngine {
    * Captures one step's incremental diff (`stat\npatch` combined, the stored
    * StepRun.diff shape) against `base.ref` and advances `base.ref` to the
    * fresh snapshot tree. Failing to capture never fails the run: the step
-   * just stores no diff (and the base stays put).
+   * just stores no diff (and the base stays put). The failure log carries
+   * `runId` so it lands inside the run-tagged log redaction (#93) — an
+   * untagged line would print the raw error (which may quote a secret).
    */
-  async function captureDiff(worktreePath: string, base: { ref: string }): Promise<string> {
+  async function captureDiff(
+    runId: string,
+    worktreePath: string,
+    base: { ref: string },
+  ): Promise<string> {
     try {
       const { stat, patch, tree } = await worktrees.stepDiff(worktreePath, base.ref);
       base.ref = tree;
       return [stat.trim(), patch].filter((part) => part.length > 0).join("\n");
     } catch (err) {
-      log.warn({ err, worktreePath }, "diff capture failed (continuing without diff)");
+      log.warn({ err, runId, worktreePath }, "diff capture failed (continuing without diff)");
       return "";
     }
   }
@@ -434,7 +569,7 @@ export function createFlowEngine(options: FlowEngineOptions): FlowEngine {
     });
 
     const stepRun = beginStepRun(runId, step, iteration);
-    db.events.append(runId, {
+    appendEvent(runId, {
       type: "step.started",
       stepId: step.stepId,
       stepName: step.stepName,
@@ -446,13 +581,23 @@ export function createFlowEngine(options: FlowEngineOptions): FlowEngine {
     // A restarted (resumed) step continues its own recorded session even when
     // the step is not configured continueSession; otherwise normal chaining.
     const sessionId = restartSessionId ?? (step.continueSession ? inheritedSessionId : undefined);
+    // Project secrets (#93): decrypted env merged into the driver process.
+    const secretEnv = runSecrets.get(runId)?.env;
+    // Sandboxed runs (#102): driver cwd becomes the CONTAINER workspace and
+    // the command runs through the sandbox exec seam; local runs keep the
+    // host worktree path and a local spawn.
+    const sandbox = runSandboxes.get(runId);
     const handle = driver.start({
-      cwd: worktreePath,
+      cwd: sandbox?.workspacePath ?? worktreePath,
       prompt,
       mode: step.mode,
       ...(step.model === undefined ? {} : { model: step.model }),
       ...(step.agent === undefined ? {} : { agent: step.agent }),
       ...(sessionId === undefined ? {} : { sessionId }),
+      ...(secretEnv === undefined || Object.keys(secretEnv).length === 0
+        ? {}
+        : { env: { ...secretEnv } }),
+      ...(sandbox === undefined ? {} : { exec: sandbox.exec }),
     });
     control.onHandle?.(handle);
 
@@ -460,7 +605,7 @@ export function createFlowEngine(options: FlowEngineOptions): FlowEngine {
     let sessionFromEvents: string | undefined;
     try {
       for await (const event of handle.events) {
-        db.events.append(runId, event);
+        appendEvent(runId, event);
         if (event.type === "session") {
           sessionFromEvents = event.sessionId;
           db.stepRuns.update(stepRun.id, { sessionId: event.sessionId });
@@ -476,7 +621,7 @@ export function createFlowEngine(options: FlowEngineOptions): FlowEngine {
 
     const exit = await handle.exited;
     control.onHandle?.(undefined);
-    const diff = await captureDiff(worktreePath, diffBase);
+    const diff = await captureDiff(runId, worktreePath, diffBase);
 
     let status: RunStatus;
     let error: string | undefined;
@@ -501,10 +646,10 @@ export function createFlowEngine(options: FlowEngineOptions): FlowEngine {
 
     db.stepRuns.update(stepRun.id, {
       status,
-      output: exit.output,
-      ...(diff.length > 0 ? { diff } : {}),
+      output: redactText(runId, exit.output),
+      ...(diff.length > 0 ? { diff: redactText(runId, diff) } : {}),
     });
-    db.events.append(runId, {
+    appendEvent(runId, {
       type: "step.completed",
       stepId: step.stepId,
       stepName: step.stepName,
@@ -522,6 +667,28 @@ export function createFlowEngine(options: FlowEngineOptions): FlowEngine {
     return outcome;
   }
 
+  /**
+   * #107: port detection over one completed step/node output — sandboxed
+   * runs only (local runs have no preview surface). Newly detected ports
+   * are merged into the run row's `detectedPorts` (dedup, cap
+   * {@link MAX_RUN_PORTS}); a detection failure never fails the run.
+   */
+  function recordDetectedPorts(runId: string, output: string): void {
+    if (runSandboxes.get(runId) === undefined) return;
+    try {
+      const detected = detectPorts(output);
+      if (detected.length === 0) return;
+      const row = db.runs.get(runId);
+      if (row === undefined) return;
+      const merged = mergeDetectedPorts(row.detectedPorts, detected);
+      if (merged.join(",") === (row.detectedPorts ?? []).join(",")) return;
+      db.runs.update(runId, { detectedPorts: merged });
+      log.info({ runId, detectedPorts: merged }, "ports detected from run output");
+    } catch (err) {
+      log.warn({ err, runId }, "port detection failed (continuing)");
+    }
+  }
+
   /** Shared machinery handed to the graph executor (#45). */
   const graphDeps: GraphEngineDeps = {
     db,
@@ -533,6 +700,13 @@ export function createFlowEngine(options: FlowEngineOptions): FlowEngine {
     abortRun,
     captureDiff,
     beginStepRun,
+    appendEvent,
+    redactText,
+    runSecretsEnv: (runId) => runSecrets.get(runId)?.env,
+    /** Per-run sandbox context (#102); undefined = local execution. */
+    runSandbox: (runId) => runSandboxes.get(runId),
+    /** #107: port detection over each completed node's final output. */
+    recordDetectedPorts,
   };
 
   async function execute(
@@ -552,6 +726,24 @@ export function createFlowEngine(options: FlowEngineOptions): FlowEngine {
     if (control.isAbortRequested()) {
       abortRun(runId);
       return;
+    }
+
+    // Project secrets snapshot (#93): resolved once, before anything runs,
+    // so every subsequent write can redact. Loader failures fail the run —
+    // never execute with secrets that cannot be redacted (fail-closed).
+    if (options.loadRunSecrets !== undefined) {
+      let loaded: RunSecrets | undefined;
+      try {
+        loaded = options.loadRunSecrets(run);
+      } catch (err) {
+        runSecrets.delete(runId);
+        finalizeRun(runId, "failed", {
+          error: `failed to load project secrets: ${describeError(err)}`,
+        });
+        return;
+      }
+      if (loaded === undefined) runSecrets.delete(runId);
+      else runSecrets.set(runId, loaded);
     }
 
     db.runs.updateStatus(runId, "running");
@@ -636,6 +828,29 @@ export function createFlowEngine(options: FlowEngineOptions): FlowEngine {
       return;
     }
 
+    // Sandbox acquisition (#102): ONE sandbox per run, created after the
+    // worktree exists (it is the bind-mount source) and before any step
+    // starts. `undefined` = local execution; a throw fails the run with the
+    // typed, actionable sandbox error. v0.2 deviation: the RUN sandbox is
+    // built from PROJECT policy only — per-node `sandboxOverrides` are
+    // validated/stored but do not fork per-node sandboxes (post-v0.2).
+    if (options.acquireRunSandbox !== undefined) {
+      let sandboxContext: RunSandboxContext | undefined;
+      try {
+        sandboxContext = await options.acquireRunSandbox(run, worktreePath);
+      } catch (err) {
+        finalizeRun(runId, "failed", { error: describeError(err) });
+        return;
+      }
+      if (sandboxContext !== undefined) {
+        runSandboxes.set(runId, sandboxContext);
+        log.info(
+          { runId, workspacePath: sandboxContext.workspacePath },
+          "run sandbox acquired (sandboxed execution)",
+        );
+      }
+    }
+
     // Graph dispatch: the serial DAG executor owns everything from here
     // (node.* / edge.* events, per-node StepRuns, breadcrumb, resume).
     if (graph !== undefined) {
@@ -696,6 +911,7 @@ export function createFlowEngine(options: FlowEngineOptions): FlowEngine {
           prevOutput = outcome.output;
           prevSessionId = outcome.sessionId;
           runOutput = outcome.output;
+          recordDetectedPorts(runId, outcome.output);
           continue;
         }
 
@@ -731,7 +947,7 @@ export function createFlowEngine(options: FlowEngineOptions): FlowEngine {
         detail = `${description} unmet; jumping back to step ${loopBack.toStepIndex + 1} of ${steps.length}`;
       }
 
-      db.events.append(runId, {
+      appendEvent(runId, {
         type: "loop.iteration",
         iteration,
         verdict,
@@ -760,10 +976,13 @@ export function createFlowEngine(options: FlowEngineOptions): FlowEngine {
         log.error({ err, runId }, "flow engine crashed unexpectedly");
         const run = db.runs.get(runId);
         if (run && !isTerminal(run.status)) {
-          db.runs.update(runId, { status: "failed", error: message });
+          db.runs.update(runId, { status: "failed", error: redactText(runId, message) });
           settleStepRuns(runId, "failed");
           emitRunStatus(runId, "failed", message);
         }
+      } finally {
+        runSecrets.delete(runId);
+        runSandboxes.delete(runId);
       }
     },
   };

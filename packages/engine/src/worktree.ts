@@ -322,6 +322,40 @@ export class WorktreeManager {
   }
 
   /**
+   * Host path a run's sandbox bind-mounts at `/workspace` (#102): the run's
+   * worktree when one exists, else `null` (nothing to mount). Pure lookup —
+   * the executor builds the run's `SandboxSpec` around it.
+   */
+  mountSource(runId: string): string | null {
+    try {
+      validateRunId(runId);
+    } catch {
+      return null;
+    }
+    const meta = this.#readMeta(runId);
+    if (meta === null || !existsSync(meta.worktreePath)) return null;
+    return meta.worktreePath;
+  }
+
+  /**
+   * Number of runs with a live worktree on disk: metadata records whose
+   * working copy still exists. A cheap filesystem scan (no git
+   * invocations), scraped by the daemon's `openeuler_worktrees_active`
+   * gauge (#94).
+   */
+  activeCount(): number {
+    const metaDir = join(this.#storeRoot, META_DIR);
+    if (!existsSync(metaDir)) return 0;
+    let count = 0;
+    for (const entry of readdirSync(metaDir)) {
+      if (!entry.endsWith(".json")) continue;
+      const meta = this.#readMeta(entry.slice(0, -".json".length));
+      if (meta !== null && existsSync(meta.worktreePath)) count += 1;
+    }
+    return count;
+  }
+
+  /**
    * Force-removes the run's worktree, prunes git's worktree metadata, deletes
    * the `agentloop/<runId>` branch ref if it still exists, and drops the run's
    * store metadata. Safe when the worktree and/or branch are already gone.

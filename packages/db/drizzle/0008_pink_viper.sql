@@ -1,0 +1,2 @@
+ALTER TABLE `runs` ADD `event_seq_hwm` integer DEFAULT 0 NOT NULL;--> statement-breakpoint
+UPDATE `runs` SET `event_seq_hwm` = COALESCE((SELECT MAX(`events`.`seq`) FROM `events` WHERE `events`.`run_id` = `runs`.`id`), 0);

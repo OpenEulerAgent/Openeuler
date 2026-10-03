@@ -105,7 +105,15 @@ export function previewPromptTemplate(
 }
 
 /** Fields of the inspected node the drawer flags inline. */
-export type InspectorField = "name" | "config.driver" | "config.model" | "config.promptTemplate";
+export type InspectorField =
+  | "name"
+  | "config.driver"
+  | "config.model"
+  | "config.promptTemplate"
+  | "config.sandboxOverrides.image"
+  | "config.sandboxOverrides.cpus"
+  | "config.sandboxOverrides.memoryMb"
+  | "config.sandboxOverrides.network";
 
 export type InspectorFieldErrors = Partial<Record<InspectorField, string>>;
 
@@ -136,6 +144,10 @@ export function inspectorFieldErrors(doc: CanvasDocument, nodeId: string): Inspe
       // The empty-prompt zod error; graph-level template checks below merge in.
       if (field === "config.promptTemplate") {
         errors[field] ??= issue.message;
+      }
+      // Sandbox overrides (#101): clamp/rule errors surface on their fields.
+      if (field.startsWith("config.sandboxOverrides.")) {
+        errors[field as InspectorField] ??= issue.message;
       }
     }
   }

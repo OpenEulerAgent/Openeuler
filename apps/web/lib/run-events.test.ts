@@ -91,6 +91,21 @@ describe("runEventsUrl", () => {
       "http://d:8787/api/runs/run-1/events?afterSeq=42",
     );
   });
+
+  it("appends the token (EventSource cannot set headers, #92) beside the cursor", () => {
+    expect(runEventsUrl("run-1", "http://d:8787", 42, "tok-en")).toBe(
+      "http://d:8787/api/runs/run-1/events?afterSeq=42&token=tok-en",
+    );
+    expect(runEventsUrl("run-1", "http://d:8787", undefined, "tok-en")).toBe(
+      "http://d:8787/api/runs/run-1/events?token=tok-en",
+    );
+  });
+
+  it("omits the token param when there is none", () => {
+    expect(runEventsUrl("run-1", "http://d:8787", 42, null)).toBe(
+      "http://d:8787/api/runs/run-1/events?afterSeq=42",
+    );
+  });
 });
 
 describe("parseRunStreamEvent", () => {
@@ -157,6 +172,46 @@ describe("parseRunStreamEvent", () => {
       verdict: "exit-condition-met",
     });
     expect(events).toHaveLength(1);
+  });
+
+  it("parses sandbox log events and registers them on the stream (#104)", () => {
+    const log = {
+      type: "sandbox.log",
+      seq: 11,
+      sandboxId: "openeuler-run-1-abc",
+      stream: "stdout" as const,
+      line: "make[1]: entering directory",
+    };
+    const marker = {
+      type: "sandbox.log-truncated",
+      seq: 12,
+      sandboxId: "openeuler-run-1-abc",
+      dropped: 100,
+      kept: 2000,
+    };
+    expect(parseRunStreamEvent(JSON.stringify(log))).toEqual(log);
+    expect(parseRunStreamEvent(JSON.stringify(marker))).toEqual(marker);
+
+    expect(RUN_EVENT_TYPES).toContain("sandbox.log");
+    expect(RUN_EVENT_TYPES).toContain("sandbox.log-truncated");
+    const events: RunStreamEvent[] = [];
+    const { source } = connect({ events });
+    source.simulateOpen();
+    source.simulateEvent({
+      type: "sandbox.log",
+      seq: 13,
+      sandboxId: "sb",
+      stream: "stderr",
+      line: "warn",
+    });
+    source.simulateEvent({
+      type: "sandbox.log-truncated",
+      seq: 14,
+      sandboxId: "sb",
+      dropped: 1,
+      kept: 2000,
+    });
+    expect(events).toHaveLength(2);
   });
 
   it("returns null for malformed or unknown payloads", () => {

@@ -22,6 +22,7 @@ import {
 import { FileTree } from "./FileTree";
 import { FileViewer } from "./FileViewer";
 import { NewRunModal } from "./NewRunModal";
+import { ProjectSettingsDrawer } from "./ProjectSettingsDrawer";
 import { WorkspaceHeader } from "./WorkspaceHeader";
 import { WorkspaceTabs, type WorkspaceTab } from "./WorkspaceTabs";
 
@@ -57,6 +58,7 @@ export function WorkspaceView({ projectId }: { projectId: string }) {
   const [tab, setTab] = useState<WorkspaceTab>("files");
   const [history, setHistory] = useState(initHistory<string>);
   const [showNewRun, setShowNewRun] = useState(false);
+  const [showSettings, setShowSettings] = useState(false);
 
   const refresh = useCallback(async (): Promise<void> => {
     setLoad(await fetchProject(projectId));
@@ -147,7 +149,11 @@ export function WorkspaceView({ projectId }: { projectId: string }) {
 
   return (
     <div className="flex flex-col gap-4">
-      <WorkspaceHeader project={project} onNewRun={() => setShowNewRun(true)} />
+      <WorkspaceHeader
+        project={project}
+        onNewRun={() => setShowNewRun(true)}
+        onSettings={() => setShowSettings(true)}
+      />
 
       <WorkspaceTabs active={tab} onChange={setTab} />
 
@@ -189,6 +195,10 @@ export function WorkspaceView({ projectId }: { projectId: string }) {
 
       {showNewRun ? (
         <NewRunModal projectId={project.id} onClose={() => setShowNewRun(false)} />
+      ) : null}
+
+      {showSettings ? (
+        <ProjectSettingsDrawer projectId={project.id} onClose={() => setShowSettings(false)} />
       ) : null}
     </div>
   );

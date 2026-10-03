@@ -61,4 +61,16 @@ describe("runsStreamUrl", () => {
   it("points at the daemon's global stream", () => {
     expect(runsStreamUrl("http://localhost:8787")).toBe("http://localhost:8787/api/runs/stream");
   });
+
+  it("appends ?token= when a token is given (EventSource cannot set headers, #92)", () => {
+    expect(runsStreamUrl("http://localhost:8787", "tok-en")).toBe(
+      "http://localhost:8787/api/runs/stream?token=tok-en",
+    );
+  });
+
+  it("encodes the token and omits the param when there is none", () => {
+    expect(runsStreamUrl("http://d:8787", "a b&c")).toBe("http://d:8787/api/runs/stream?token=a%20b%26c");
+    expect(runsStreamUrl("http://d:8787", null)).toBe("http://d:8787/api/runs/stream");
+    expect(runsStreamUrl("http://d:8787", "")).toBe("http://d:8787/api/runs/stream");
+  });
 });

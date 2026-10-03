@@ -1,3 +1,6 @@
+import { notifyUnauthorized, setPendingRetry } from "./auth-gate";
+import { authorizationHeaderValue, getStoredToken } from "./token";
+
 export const DEFAULT_DAEMON_URL = "http://localhost:8787";
 
 /** One zod validation issue from a daemon 422 response, keyed by field path. */
@@ -40,20 +43,33 @@ export function daemonBaseUrl(
 /**
  * Typed fetch wrapper for the daemon API: JSON request/response with every
  * failure mode (network, HTTP error, malformed body) normalized to `ApiError`.
+ * Injects the stored daemon token as `Authorization: Bearer …` when present
+ * (#92), and reports 401s to the token gate so it can prompt + retry.
  */
 export async function apiFetch<T>(path: string, init?: RequestInit): Promise<T> {
   const base = daemonBaseUrl();
+  const auth = authorizationHeaderValue(getStoredToken());
   let response: Response;
   try {
     response = await fetch(`${base}${path}`, {
       ...init,
-      headers: { Accept: "application/json", ...init?.headers },
+      headers: {
+        Accept: "application/json",
+        ...(auth === undefined ? {} : { Authorization: auth }),
+        ...init?.headers,
+      },
     });
   } catch (cause) {
     throw new ApiError("NETWORK_ERROR", `Could not reach daemon at ${base}`, 0, { cause });
   }
 
   if (!response.ok) {
+    if (response.status === 401) {
+      // Token gate (#92): remember how to replay this request (the retry
+      // re-reads the token from storage at call time), then prompt.
+      setPendingRetry(() => apiFetch<T>(path, init));
+      notifyUnauthorized();
+    }
     throw await toApiError(response);
   }
 

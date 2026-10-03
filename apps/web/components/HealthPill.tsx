@@ -45,12 +45,13 @@ function dotClassName(health: HealthState): string {
 }
 
 function pillLabel(health: HealthState): string {
-  switch (health.status) {
-    case "healthy":
-      return `Daemon v${health.version} · up ${formatUptime(health.uptime)}`;
-    case "degraded":
-      return "Daemon unreachable";
-    default:
-      return "Checking daemon…";
+  if (health.status === "healthy") {
+    // Uptime is absent when the daemon runs with auth enabled (minimal
+    // `/health`, #92) — version only then.
+    return health.uptime === undefined
+      ? `Daemon v${health.version}`
+      : `Daemon v${health.version} · up ${formatUptime(health.uptime)}`;
   }
+  if (health.status === "degraded") return "Daemon unreachable";
+  return "Checking daemon…";
 }

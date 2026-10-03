@@ -129,16 +129,83 @@ curl -sN localhost:8787/api/runs/<run-id>/events
 
 Read at process start (no `.env` file is loaded; export them or prefix the command):
 
-| Variable                 | Used by                 | Default                    | Meaning                                                                             |
-| ------------------------ | ----------------------- | -------------------------- | ----------------------------------------------------------------------------------- |
-| `OPENEULER_DB`           | `@openeuler/db`         | `<repo>/data/openeuler.db` | SQLite database file path                                                           |
-| `OPENEULER_WORKTREES`    | `@openeuler/engine`     | `~/.openeuler/worktrees`   | Root directory for per-run git worktrees                                            |
-| `OPENEULER_DRIVER`       | daemon executor, engine | `fake`                     | Driver for **ad-hoc** runs (`POST /api/runs`); graph nodes carry their own `driver` |
-| `MAX_CONCURRENT_RUNS`    | daemon executor         | `2`                        | Global cap on runs executing at once (integer ≥ 1; echoed by `/health`)             |
-| `PORT`                   | daemon                  | `8787`                     | Daemon HTTP port                                                                    |
-| `CORS_ORIGIN`            | daemon                  | `http://localhost:3000`    | Allowed browser origin                                                              |
-| `LOG_LEVEL`              | daemon                  | `info`                     | pino log level                                                                      |
-| `NEXT_PUBLIC_DAEMON_URL` | `@openeuler/web`        | `http://localhost:8787`    | Daemon base URL for the browser app                                                 |
+| Variable                 | Used by                 | Default                    | Meaning                                                                                   |
+| ------------------------ | ----------------------- | -------------------------- | ----------------------------------------------------------------------------------------- |
+| `OPENEULER_DB`           | `@openeuler/db`         | `<repo>/data/openeuler.db` | SQLite database file path                                                                 |
+| `OPENEULER_WORKTREES`    | `@openeuler/engine`     | `~/.openeuler/worktrees`   | Root directory for per-run git worktrees                                                  |
+| `OPENEULER_DRIVER`       | daemon executor, engine | `fake`                     | Driver for **ad-hoc** runs (`POST /api/runs`); graph nodes carry their own `driver`       |
+| `MAX_CONCURRENT_RUNS`    | daemon executor         | `2`                        | Global cap on runs executing at once (integer ≥ 1; echoed by `/health`)                   |
+| `MAX_SANDBOXES`          | daemon executor         | `8`                        | Global cap on live run sandboxes (integer ≥ 2); sandbox runs above it stay queued (#105)  |
+| `PORT`                   | daemon                  | `8787`                     | Daemon HTTP port                                                                          |
+| `CORS_ORIGIN`            | daemon                  | `http://localhost:3000`    | Allowed browser origin(s), comma-separated allowlist (#97)                                |
+| `OPENEULER_TOKEN`        | daemon                  | _(unset = open)_           | Bearer token required on every `/api` route (#92) — see "Token auth" below                |
+| `OPENEULER_SECRET_KEY`   | daemon                  | `<data>/secret.key`        | Path to the master key file for project secrets (#93) — see "Per-project secrets"         |
+| `RATE_LIMIT_MUTATE`      | daemon                  | `120`                      | `/api/*` POST/PUT/PATCH/DELETE cap per client per minute, burst 30; `0` disables (#97)    |
+| `RATE_LIMIT_READ`        | daemon                  | `600`                      | `/api/*` GET cap per client per minute; `0` disables (#97)                                |
+| `TRUST_PROXY`            | daemon                  | _(unset = off)_            | `1` = trust `X-Forwarded-For` for rate-limit keys — only behind a proxy you control (#97) |
+| `MAX_BODY_BYTES`         | daemon                  | `1048576`                  | Request-body cap for `/api/*` (1 MiB); larger bodies answer `413` (#97)                   |
+| `FRAME_ANCESTORS`        | daemon                  | _(see below)_              | Raw CSP `frame-ancestors` sources overriding the framing policy (#97)                     |
+| `PREVIEW_IFRAME`         | daemon                  | _(unset = deny)_           | `1` = allow framing by the app + CORS allowlist (placeholder for M7 previews) (#97)       |
+| `LOG_LEVEL`              | daemon                  | `info`                     | pino log level                                                                            |
+| `NEXT_PUBLIC_DAEMON_URL` | `@openeuler/web`        | `http://localhost:8787`    | Daemon base URL for the browser app                                                       |
+
+## Token auth (opt-in)
+
+Local-first defaults to **open** (no auth) for `localhost` dev; expose the daemon to a LAN and you want a gate. Set `OPENEULER_TOKEN` before starting the daemon:
+
+```bash
+OPENEULER_TOKEN=$(openssl rand -hex 32) pnpm dev
+```
+
+- Every `/api/*` route then requires `Authorization: Bearer <token>` (compared in constant time; a wrong/missing token answers `401 {"error":{"code":"UNAUTHORIZED"}}`).
+- **Web**: the browser stores the token in localStorage (`openeuler.token`). On the first 401 a full-page card asks for the token, saves it and retries the failed action; Settings shows whether the daemon runs with auth (`GET /api/system/auth-status`, always open).
+- **SSE streams** (`/api/runs/:id/events`, `/api/runs/stream`): `EventSource` cannot set headers, so these GET streaming routes (only these) also accept `?token=<token>`. The tradeoff: the token appears in URLs — visible to proxies between browser and daemon, which is why the fallback is scoped strictly to streaming routes and the daemon redacts `token=` from its logs.
+- **`/health`** stays open for liveness probes but answers minimal info (`ok` + version) while auth is on.
+- **Rotation**: change the env var and restart the daemon; in the web, save the new token when the 401 card appears (or hit **Forget token** in Settings first). No logout dance beyond that.
+
+## Hardening: rate limits, payload caps, CORS allowlist, security headers
+
+Before exposing the daemon beyond localhost, four middleware layers (#97) apply to every request — all on by default with generous local-dev values, no configuration needed:
+
+- **Rate limits** — per-client token buckets on `/api/*`, keyed by IP + route class: `mutate` (POST/PUT/PATCH/DELETE) 120/min with a burst of 30 (`RATE_LIMIT_MUTATE`), `read` (GET) 600/min (`RATE_LIMIT_READ`). `0` disables a class. SSE streams (`/api/runs/:id/events`, `/api/runs/stream`, previews) and `/metrics` are **exempt** — long-lived connections never get shed. Over the limit: `429 {"error":{"code":"RATE_LIMITED"}}` with a `Retry-After` (seconds) and `X-RateLimit-Remaining` headers. The client IP is the socket's remote address; `X-Forwarded-For` is honored **only** with `TRUST_PROXY=1` — never enable it on direct exposure, or clients can pick their own bucket key. Buckets live in memory, capped at 10k keys (idle entries swept, least-recently-touched evicted first).
+- **Payload cap** — `/api/*` bodies above 1 MiB (`MAX_BODY_BYTES`) answer `413 {"error":{"code":"PAYLOAD_TOO_LARGE"}}` before any handler runs; graph PUTs and prompt payloads are covered implicitly. The cheap path checks `Content-Length`; chunked bodies are measured (buffered once) instead.
+- **CORS allowlist** — `CORS_ORIGIN` accepts a comma-separated list (`http://localhost:3000,http://alt.origin`); a request's `Origin` must match an entry **exactly** for `Access-Control-Allow-Origin` to be sent at all. A lone `*` restores wildcard mode.
+- **Security headers** — every response carries `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer`, a minimal `Permissions-Policy`, and a framing policy; `/api/*` responses add `Cache-Control: no-store` (handler-chosen directives like SSE's `no-cache` win). Framing is denied outright by default (`X-Frame-Options: DENY` + `Content-Security-Policy: frame-ancestors 'none'`) — nothing legitimately frames the daemon today. `PREVIEW_IFRAME=1` (placeholder for the M7 `/previews` iframe proxy) switches to `frame-ancestors 'self' <CORS allowlist>` and drops XFO; `FRAME_ANCESTORS` sets the CSP sources verbatim (XFO is then only sent for `'none'`).
+
+## Per-project secrets (redacted everywhere)
+
+Agents need credentials (npm tokens, API keys) without them landing in prompts, events, or logs. Register them per project and every run of that project receives them as env vars — while the daemon scrubs the values from everything it persists.
+
+- **Storage**: `PUT /api/projects/:id/secrets {name, value}` upserts (same name = rotate). Values are encrypted at rest with AES-256-GCM using a master key file generated on first boot (`<data>/secret.key`, mode 600; override the path with `OPENEULER_SECRET_KEY`). **Back the key up with your database — losing it makes stored secrets undecryptable.** The API only ever lists names (`GET …/secrets` → `[{name, createdAt}]`); values are write-only over the wire, and the web UI (project workspace → header gear → Settings) shows write-only inputs.
+- **Names** follow env-var rules: `^[A-Z_][A-Z0-9_]*$`, ≤ 64 chars (422 otherwise). Values shorter than 4 characters are not redacted (they would match unrelated text).
+- **Injection**: at run start the executor decrypts the project's secrets and merges them into every agent process env (`{...process.env, ...secrets}` in the `opencode` driver).
+- **Redaction**: every persisted write for a run — event payloads, StepRun output/diff, run output/error, activity feed payloads — replaces each value with `***NAME***` (case-sensitive substring, longest values first). Run-tagged structured log fields are redacted the same way; the snapshot is taken at run start, so a secret rotated mid-run stays redacted for that run. Pragmatic scope: a value that only appears in a non-run-tagged log line (e.g. a plain HTTP access log) is out of scope — secrets belong in outputs/events, which are fully covered.
+- **Failure mode is fail-closed**: if secrets cannot be decrypted (wrong/tampered key file → `SECRETS_KEY_UNREADABLE`), the run fails instead of executing without redaction.
+
+## Sandbox policy (per project, per node)
+
+Sandboxed runs (#99 provider, #100 images) read their defaults from a per-project policy (#101): `PATCH /api/projects/:id/policy` replaces the whole policy in one call; `GET /api/projects/:id` serves it inside the project payload (`project.sandboxPolicy`, absent until first saved).
+
+```json
+{
+  "executionMode": "auto", // local | sandbox | auto (default)
+  "image": "openeuler/worker:latest", // required for sandbox runs; see GET /api/sandbox/images
+  "cpus": 2, // whole cores, 1..8
+  "memoryMb": 2048, // whole MiB, 512..8192
+  "network": "limited", // none | limited | default (unset = provider default)
+  "cachePaths": ["/root/.cache"], // ≤ 5 absolute container paths
+  "keepForDebug": false // keep failed runs' sandboxes for inspection
+}
+```
+
+Out-of-range values answer 422 with the clamp message. The web editor is the project workspace drawer (gear → **Sandbox policy**): execution mode, image picker fed by the daemon catalog (ours first), CPU/memory sliders, network select, keep-for-debug.
+
+- **Node overrides**: any agent node may carry `sandboxOverrides {image?, cpus?, memoryMb?, network?}` (canvas inspector → _Sandbox overrides_, empty = inherit). Overrides validate as part of the graph save (422 otherwise) and win per field at run time; the merge is the pure `buildSandboxSpec(policy, overrides, …)` in `@openeuler/engine`, which fills defaults (2 CPUs / 2048 MiB) and throws a typed `SANDBOX_INVALID_SPEC` naming the image endpoints when sandboxing is requested without an image. Executor wiring lands in #102.
+- **Honest limits (v0.2)**: `network: "limited"` means a dedicated bridge network with working DNS — **egress is NOT filtered yet** (documented in the UI next to the option). `none` is fully isolated, `default` is normal outbound access.
+
+## Run previews (sandbox proxy)
+
+While a sandboxed run executes, its **declared** ports (#107) are previewable through the daemon (#108): `/previews/:runId[/:port]/*` (alias `/api/previews/…`) is a streaming reverse proxy to the run's sandbox port — method passthrough (GET/HEAD/POST/PUT/PATCH/DELETE), bodies and responses streamed, hop-by-hop headers stripped, timeouts (10s connect / 120s overall) with an actionable `502 PREVIEW_UPSTREAM_UNAVAILABLE` when the sandbox app is down. Port resolution: the path form (`/previews/:runId/3000/app.js` — canonical, survives relative links) → `?port=` → the first declared port. Undeclared ports answer `403` with the declare-to-preview hint; finished/local runs answer `410 PREVIEW_GONE`; unknown runs `404`. Auth applies on both mounts (`?token=` works for GET iframes); with `PREVIEW_IFRAME=1` the responses are framable (`frame-ancestors 'self' <CORS allowlist>`, no `X-Frame-Options`). Link rewriting and WebSocket upgrades are documented v0.2 cuts. Details: **[docs/DEV.md](docs/DEV.md)**.
 
 ## Project layout
 

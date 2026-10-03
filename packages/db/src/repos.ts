@@ -5,7 +5,9 @@ import {
   AgentPresetSchema,
   BreadcrumbEntrySchema,
   PersistedEventSchema,
+  ProjectSandboxPolicySchema,
   ProjectSchema,
+  RunPortsSchema,
   RunSchema,
   RunStatusEventSchema,
   RunStatusSchema,
@@ -19,6 +21,7 @@ import type {
   LoopBack,
   PersistedEvent,
   Project,
+  ProjectSandboxPolicy,
   Run,
   RunStatus,
   RunStatusEvent,
@@ -49,6 +52,8 @@ export type RunPatch = {
   iteration?: number;
   /** Replaces the execution breadcrumb (graph engine appends as it goes). */
   breadcrumb?: BreadcrumbEntry[];
+  /** Replaces the detected-ports list (#107; detection appends as it goes). */
+  detectedPorts?: number[];
 };
 
 /** Fields of a step run that may change after creation; `null` clears a field. */
@@ -65,6 +70,13 @@ export interface ProjectRepo {
   /** Bulk `get`: every existing row for the ids, in one query (#62). */
   getMany(ids: string[]): Project[];
   list(): Project[];
+  /**
+   * Replaces the project's sandbox policy (#101); returns the updated
+   * project, or undefined when the row does not exist. The policy is
+   * validated through the core schema on write; `get`/`list` re-validate
+   * on read so a corrupted column can never leak past the API.
+   */
+  setSandboxPolicy(id: string, policy: ProjectSandboxPolicy): Project | undefined;
   /** Deletes the project; returns true when a row was removed. */
   delete(id: string): boolean;
 }
@@ -122,6 +134,42 @@ export interface WorkflowRevisionRepo {
   deleteAllForWorkflow(workflowId: string): number;
 }
 
+/** One stored project secret; the value stays encrypted (`valueEnc`). */
+export interface ProjectSecret {
+  id: string;
+  projectId: string;
+  name: string;
+  /** AES-256-GCM ciphertext envelope (`v1:<iv>:<tag>:<cipher>`, base64 parts). */
+  valueEnc: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+/** Name-only projection the API may safely return (values never leave the daemon). */
+export interface ProjectSecretName {
+  name: string;
+  createdAt: string;
+}
+
+export interface ProjectSecretRepo {
+  /**
+   * Upserts the (projectId, name) secret to `valueEnc`; the creating insert
+   * keeps its `createdAt`, an update only bumps `updatedAt`. The repo mints
+   * the id.
+   */
+  set(projectId: string, name: string, valueEnc: string): ProjectSecret;
+  /** Deletes the named secret; true when a row was removed. */
+  delete(projectId: string, name: string): boolean;
+  /** Names + createdAt for a project, ordered by name. Values never included. */
+  listNames(projectId: string): ProjectSecretName[];
+  /** Full row (encrypted value) for one secret, for the executor's decrypt path. */
+  get(projectId: string, name: string): ProjectSecret | undefined;
+  /** Every full row for a project (encrypted values), for run-start loading. */
+  list(projectId: string): ProjectSecret[];
+  /** Deletes every secret of a project (project delete path). Returns rows removed. */
+  deleteAllForProject(projectId: string): number;
+}
+
 /** Fields of an agent preset that may change after creation; `null` clears `icon`. */
 export type AgentPresetPatch = {
   name?: string;
@@ -163,12 +211,26 @@ export interface StepRunRepo {
 }
 
 export interface EventRepo {
-  /** Assigns `seq = max(seq) + 1` for the run atomically; returns the stored event. */
+  /**
+   * Assigns `seq = max(runs.event_seq_hwm, max(seq)) + 1` for the run
+   * atomically and raises the high-water mark to the new seq (#149:
+   * monotonic even after `deleteOldestByType` evicts the max-seq rows, so
+   * SSE Last-Event-ID cursors never miss or rebind events). Returns the
+   * stored event.
+   */
   append(runId: string, event: EventInput): PersistedEvent;
   /** Events for the run with `seq > afterSeq`, in seq order. */
   getSince(runId: string, afterSeq?: number): PersistedEvent[];
   /** Number of events persisted for the run. */
   count(runId: string): number;
+  /**
+   * Deletes the `count` oldest events of exactly `type` for the run (by
+   * ascending seq) and returns how many rows were removed (#104: keeps the
+   * persisted `sandbox.log` ring bounded — the caller's in-memory counters
+   * stay authoritative because it is the sole writer of that type; seq
+   * monotonicity survives deletion via `runs.event_seq_hwm`, #149).
+   */
+  deleteOldestByType(runId: string, type: string, count: number): number;
   /** Latest persisted `run.status` event for the run, if any (terminal-close detection). */
   lastRunStatus(runId: string): RunStatusEvent | undefined;
 }
@@ -208,6 +270,9 @@ export function createProjectRepo(db: Db): ProjectRepo {
       defaultBranch: row.defaultBranch,
       ...(row.remoteUrl === null ? {} : { remoteUrl: row.remoteUrl }),
       ...(row.dirty === null ? {} : { dirty: row.dirty }),
+      ...(row.sandboxPolicy === null
+        ? {}
+        : { sandboxPolicy: ProjectSandboxPolicySchema.parse(row.sandboxPolicy) }),
       createdAt: row.createdAt,
     });
 
@@ -222,6 +287,7 @@ export function createProjectRepo(db: Db): ProjectRepo {
           defaultBranch: value.defaultBranch,
           remoteUrl: value.remoteUrl ?? null,
           dirty: value.dirty ?? null,
+          sandboxPolicy: value.sandboxPolicy ?? null,
           createdAt: value.createdAt,
         })
         .run();
@@ -239,6 +305,16 @@ export function createProjectRepo(db: Db): ProjectRepo {
     list() {
       const rows = db.select().from(schema.projects).orderBy(schema.projects.createdAt).all();
       return rows.map(toDomain);
+    },
+    setSandboxPolicy(id, policy) {
+      const value = ProjectSandboxPolicySchema.parse(policy);
+      const row = db
+        .update(schema.projects)
+        .set({ sandboxPolicy: value })
+        .where(eq(schema.projects.id, id))
+        .returning()
+        .get();
+      return row ? toDomain(row) : undefined;
     },
     delete(id) {
       const result = db.delete(schema.projects).where(eq(schema.projects.id, id)).run();
@@ -526,6 +602,95 @@ export function createAgentPresetRepo(db: Db): AgentPresetRepo {
   };
 }
 
+export function createProjectSecretRepo(db: Db): ProjectSecretRepo {
+  return {
+    set(projectId, name, valueEnc) {
+      const now = new Date().toISOString();
+      return db.transaction((tx) => {
+        const existing = tx
+          .select()
+          .from(schema.projectSecrets)
+          .where(
+            and(
+              eq(schema.projectSecrets.projectId, projectId),
+              eq(schema.projectSecrets.name, name),
+            ),
+          )
+          .get();
+        if (existing !== undefined) {
+          const row = tx
+            .update(schema.projectSecrets)
+            .set({ valueEnc, updatedAt: now })
+            .where(eq(schema.projectSecrets.id, existing.id))
+            .returning()
+            .get();
+          return row as typeof schema.projectSecrets.$inferSelect;
+        }
+        const row = tx
+          .insert(schema.projectSecrets)
+          .values({
+            id: crypto.randomUUID(),
+            projectId,
+            name,
+            valueEnc,
+            createdAt: now,
+            updatedAt: now,
+          })
+          .returning()
+          .get();
+        return row as typeof schema.projectSecrets.$inferSelect;
+      });
+    },
+    delete(projectId, name) {
+      const result = db
+        .delete(schema.projectSecrets)
+        .where(
+          and(eq(schema.projectSecrets.projectId, projectId), eq(schema.projectSecrets.name, name)),
+        )
+        .run();
+      return result.changes > 0;
+    },
+    listNames(projectId) {
+      const rows = db
+        .select({ name: schema.projectSecrets.name, createdAt: schema.projectSecrets.createdAt })
+        .from(schema.projectSecrets)
+        .where(eq(schema.projectSecrets.projectId, projectId))
+        .orderBy(schema.projectSecrets.name)
+        .all();
+      return rows;
+    },
+    get(projectId, name) {
+      return (
+        db
+          .select()
+          .from(schema.projectSecrets)
+          .where(
+            and(
+              eq(schema.projectSecrets.projectId, projectId),
+              eq(schema.projectSecrets.name, name),
+            ),
+          )
+          .get() ?? undefined
+      );
+    },
+    list(projectId) {
+      return db
+        .select()
+        .from(schema.projectSecrets)
+        .where(eq(schema.projectSecrets.projectId, projectId))
+        .orderBy(schema.projectSecrets.name)
+        .all();
+    },
+    deleteAllForProject(projectId) {
+      const result = db
+        .delete(schema.projectSecrets)
+        .where(eq(schema.projectSecrets.projectId, projectId))
+        .run();
+      return result.changes;
+    },
+  };
+}
+
 export function createRunRepo(db: Db): RunRepo {
   const toDomain = (row: typeof schema.runs.$inferSelect): Run =>
     RunSchema.parse({
@@ -540,6 +705,8 @@ export function createRunRepo(db: Db): RunRepo {
       ...(row.output === null ? {} : { output: row.output }),
       ...(row.error === null ? {} : { error: row.error }),
       ...((row.breadcrumb ?? []).length === 0 ? {} : { breadcrumb: row.breadcrumb ?? [] }),
+      ...((row.ports ?? []).length === 0 ? {} : { ports: row.ports ?? [] }),
+      ...((row.detectedPorts ?? []).length === 0 ? {} : { detectedPorts: row.detectedPorts ?? [] }),
       createdAt: row.createdAt,
       updatedAt: row.updatedAt,
     });
@@ -556,6 +723,8 @@ export function createRunRepo(db: Db): RunRepo {
     output: run.output ?? null,
     error: run.error ?? null,
     breadcrumb: run.breadcrumb ?? [],
+    ports: run.ports ?? null,
+    detectedPorts: run.detectedPorts ?? null,
     createdAt: run.createdAt,
     updatedAt: run.updatedAt,
   });
@@ -606,6 +775,9 @@ export function createRunRepo(db: Db): RunRepo {
           ...(patch.breadcrumb === undefined
             ? {}
             : { breadcrumb: z.array(BreadcrumbEntrySchema).parse(patch.breadcrumb) }),
+          ...(patch.detectedPorts === undefined
+            ? {}
+            : { detectedPorts: RunPortsSchema.parse(patch.detectedPorts) }),
           updatedAt: new Date().toISOString(),
         })
         .where(eq(schema.runs.id, id))
@@ -678,12 +850,19 @@ export function createEventRepo(db: Db): EventRepo {
       const body: Record<string, unknown> = { ...event };
       delete body["seq"];
       return db.transaction((tx) => {
-        const row = tx
+        // max(hwm, max(seq)) + 1: the high-water mark keeps seq monotonic
+        // even when the ring has evicted the rows that held the max seq.
+        const runRow = tx
+          .select({ hwm: schema.runs.eventSeqHwm })
+          .from(schema.runs)
+          .where(eq(schema.runs.id, runId))
+          .get();
+        const seqRow = tx
           .select({ maxSeq: sql<number | null>`max(${schema.events.seq})` })
           .from(schema.events)
           .where(eq(schema.events.runId, runId))
           .get();
-        const seq = (row?.maxSeq ?? 0) + 1;
+        const seq = Math.max(runRow?.hwm ?? 0, seqRow?.maxSeq ?? 0) + 1;
         const stored = PersistedEventSchema.parse({ ...body, seq });
         tx.insert(schema.events)
           .values({
@@ -694,6 +873,7 @@ export function createEventRepo(db: Db): EventRepo {
             createdAt: new Date().toISOString(),
           })
           .run();
+        tx.update(schema.runs).set({ eventSeqHwm: seq }).where(eq(schema.runs.id, runId)).run();
         return stored;
       });
     },
@@ -715,6 +895,30 @@ export function createEventRepo(db: Db): EventRepo {
         .where(eq(schema.events.runId, runId))
         .get();
       return row?.total ?? 0;
+    },
+    deleteOldestByType(runId, type, count) {
+      const limit = Math.max(0, Math.trunc(count));
+      if (limit === 0) return 0;
+      const oldest = db
+        .select({ seq: schema.events.seq })
+        .from(schema.events)
+        .where(and(eq(schema.events.runId, runId), eq(schema.events.type, type)))
+        .orderBy(schema.events.seq)
+        .limit(limit)
+        .all();
+      if (oldest.length === 0) return 0;
+      db.delete(schema.events)
+        .where(
+          and(
+            eq(schema.events.runId, runId),
+            inArray(
+              schema.events.seq,
+              oldest.map((row) => row.seq),
+            ),
+          ),
+        )
+        .run();
+      return oldest.length;
     },
     lastRunStatus(runId) {
       const row = db

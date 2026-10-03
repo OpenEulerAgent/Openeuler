@@ -9,6 +9,8 @@ import type {
   NodeQueuedEvent,
   NodeStartedEvent,
   RunStatusEvent,
+  SandboxLogEvent,
+  SandboxLogTruncatedEvent,
 } from "@openeuler/core";
 import type { ReactNode } from "react";
 import type { StepCompletedEvent, StepStartedEvent } from "@openeuler/core";
@@ -154,6 +156,34 @@ function EdgeCapReachedItem({ event }: { event: EdgeCapReachedEvent }) {
   );
 }
 
+// --- sandbox log events (#104): quiet mono gray lines; the run feed shows
+// them under "All" only (filters hide them), the graph fold ignores them. ---
+
+function SandboxLogItem({ event }: { event: SandboxLogEvent }) {
+  return (
+    <p
+      className={cn(
+        "whitespace-pre-wrap break-all px-1 py-px font-mono text-xs",
+        event.stream === "stderr" ? "text-warning/80" : "text-muted-fg",
+      )}
+    >
+      {event.stream === "stderr" ? "[stderr] " : ""}
+      {event.line}
+    </p>
+  );
+}
+
+function SandboxLogTruncatedItem({ event }: { event: SandboxLogTruncatedEvent }) {
+  return (
+    <SystemLine>
+      <span className="text-warning">
+        sandbox logs truncated — showing the last {event.kept} of {event.kept + event.dropped} lines
+        ({event.dropped} dropped)
+      </span>
+    </SystemLine>
+  );
+}
+
 /** Render one feed row, styled per event type. */
 export function FeedItem({ entry }: { entry: FeedEntry }) {
   if (entry.kind === "message") {
@@ -206,5 +236,9 @@ export function FeedItem({ entry }: { entry: FeedEntry }) {
       return <EdgeTakenItem event={event} />;
     case "edge.cap-reached":
       return <EdgeCapReachedItem event={event} />;
+    case "sandbox.log":
+      return <SandboxLogItem event={event} />;
+    case "sandbox.log-truncated":
+      return <SandboxLogTruncatedItem event={event} />;
   }
 }

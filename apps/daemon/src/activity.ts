@@ -17,7 +17,27 @@ export type ActivityType =
   | "run.completed"
   | "run.failed"
   | "run.aborted"
-  | "run.interrupted";
+  | "run.interrupted"
+  | OpsActivityType;
+
+/**
+ * Daemon-level ops events (#94): system lines in the feed (no project, no
+ * run) emitted by boot/recovery/GC machinery. `ops.gc` is written by M6's
+ * sandbox GC; the helper exists so the feed rendering is final now.
+ * `ops.image-pull` / `ops.image-build` (#100) record image-job completions.
+ */
+export type OpsActivityType =
+  | "ops.daemon-boot"
+  | "ops.recovery-sweep"
+  | "ops.gc"
+  | "ops.image-pull"
+  | "ops.image-build"
+  | "ops.sandbox-kept";
+
+/** True for `ops.*` rows: rendered as small gray system lines in the web feed. */
+export function isOpsActivityType(type: ActivityType): type is OpsActivityType {
+  return type.startsWith("ops.");
+}
 
 /** Map a run status to its feed type; `queued` never enters the feed. */
 export function runActivityType(status: RunStatus): ActivityType | null {
@@ -50,8 +70,16 @@ export function isTerminalStatus(status: RunStatus): boolean {
  * driver stalls mid-stream), and the engine's later closing event must not
  * duplicate the feed entry. Never throws into the caller: a failed append
  * is a lost feed entry, not a lost run.
+ *
+ * `redact` (#93), when provided, scrubs secret values from the payload's
+ * free text (`task`) before it is persisted.
  */
-export function recordRunStatusActivity(db: Db, runId: string, status: RunStatus): void {
+export function recordRunStatusActivity(
+  db: Db,
+  runId: string,
+  status: RunStatus,
+  redact?: (text: string) => string,
+): void {
   const type = runActivityType(status);
   if (type === null) return;
   try {
@@ -69,7 +97,9 @@ export function recordRunStatusActivity(db: Db, runId: string, status: RunStatus
       payload: {
         status,
         branch: run.branch,
-        ...(run.task === undefined || run.task.length === 0 ? {} : { task: run.task }),
+        ...(run.task === undefined || run.task.length === 0
+          ? {}
+          : { task: redact === undefined ? run.task : redact(run.task) }),
       },
     });
   } catch {
@@ -104,5 +134,108 @@ export function recordWorkflowCreatedActivity(db: Db, workflow: Workflow): void 
     });
   } catch {
     // Feed appends must never break the workflow creation itself.
+  }
+}
+
+/**
+ * Records the daemon boot (`ops.daemon-boot`, #94) with the running
+ * version. Never throws into the caller: a failed append is a lost feed
+ * entry, not a lost boot.
+ */
+export function recordDaemonBootActivity(db: Db, version: string): void {
+  try {
+    db.activity.append({ type: "ops.daemon-boot", payload: { version } });
+  } catch {
+    // Feed appends must never break the boot itself.
+  }
+}
+
+/** Payload snapshot of {@link recordRecoverySweepActivity}. */
+export interface RecoverySweepActivityPayload {
+  /** Runs the sweep transitioned to `interrupted`. */
+  interrupted: number;
+  /** Orphaned worktree paths reported (report-only, nothing deleted). */
+  orphanedWorktrees: number;
+}
+
+/**
+ * Records the boot recovery sweep outcome (`ops.recovery-sweep`, #94).
+ * Same never-throw guard as the other writers.
+ */
+export function recordRecoverySweepActivity(db: Db, payload: RecoverySweepActivityPayload): void {
+  try {
+    db.activity.append({ type: "ops.recovery-sweep", payload: { ...payload } });
+  } catch {
+    // Feed appends must never break the sweep itself.
+  }
+}
+
+/**
+ * Records a garbage-collection pass (`ops.gc`, #94/#105): sandbox counts
+ * (`destroyed`/`kept`/`orphans`/`cacheVolumesPruned`), a disk-pressure
+ * `warning`, or a project-delete cache-volume cleanup (`reason`:
+ * "project-delete"). Same never-throw guard as the other writers.
+ */
+export function recordGcActivity(db: Db, payload: Record<string, unknown> = {}): void {
+  try {
+    db.activity.append({ type: "ops.gc", payload });
+  } catch {
+    // Feed appends must never break the GC pass itself.
+  }
+}
+
+/** Payload of {@link recordSandboxKeptActivity} (#102). */
+export interface SandboxKeptActivityPayload {
+  /** Run whose sandbox was kept. */
+  runId: string;
+  /** Container id/name to remove manually when debugging is done. */
+  container: string;
+  /** Image the sandbox runs. */
+  image: string;
+}
+
+/**
+ * Records that a run's sandbox was kept for debugging (`ops.sandbox-kept`,
+ * #102 `policy.keepForDebug`) — the feed is the reminder to remove the
+ * container manually. Same never-throw guard as the other writers.
+ */
+export function recordSandboxKeptActivity(db: Db, payload: SandboxKeptActivityPayload): void {
+  try {
+    db.activity.append({ type: "ops.sandbox-kept", runId: payload.runId, payload: { ...payload } });
+  } catch {
+    // Feed appends must never break the run's terminal transition.
+  }
+}
+
+/** Payload of an image-job completion event (#100). */
+export interface ImageJobActivityPayload {
+  /** Pulled ref or built `openeuler/<name>:latest` tag. */
+  ref: string;
+  /** Build name (`ops.image-build` only). */
+  name?: string;
+  /** True when the job finished successfully. */
+  done: boolean;
+  /** Failure message when `done` is false. */
+  error?: string;
+}
+
+/**
+ * Records an image pull/build completion (`ops.image-pull` / `ops.image-build`,
+ * #100). One event per job, emitted at completion (no per-line progress).
+ * Same never-throw guard as the other writers.
+ */
+export function recordImageJobActivity(
+  db: Db | undefined,
+  type: "ops.image-pull" | "ops.image-build",
+  payload: ImageJobActivityPayload,
+): void {
+  if (db === undefined) return;
+  try {
+    db.activity.append({
+      type,
+      payload: { ...payload, ...(payload.error === undefined ? {} : { error: payload.error }) },
+    });
+  } catch {
+    // Feed appends must never break the image job itself.
   }
 }

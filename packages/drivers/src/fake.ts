@@ -1,6 +1,12 @@
 import type { AgentEvent } from "@openeuler/core";
 import { DriverError } from "./error.js";
-import type { AgentDriver, AgentExit, AgentHandle, AgentStartOpts } from "./types.js";
+import type {
+  AgentDriver,
+  AgentExit,
+  AgentHandle,
+  AgentExecSeam,
+  AgentStartOpts,
+} from "./types.js";
 
 /** Construction options for {@link createFakeDriver}. */
 export interface FakeDriverOptions {
@@ -39,6 +45,8 @@ interface FakeHandleConfig {
   exitCode?: number;
   failOnAbort: boolean;
   started: Promise<void>;
+  /** Sandbox exec seam from the start opts (#102); abort() cancels through it. */
+  exec: AgentExecSeam | undefined;
 }
 
 type HandleState = "running" | "completed" | "aborted";
@@ -83,6 +91,13 @@ class FakeAgentHandle implements AgentHandle {
       );
     }
     this.state = "aborted";
+    // Sandbox runs (#102): cancel the in-flight seam command so the sandbox
+    // side settles, mirroring the opencode sandbox handle's abort path.
+    try {
+      await this.config.exec?.stop?.();
+    } catch {
+      // Best-effort: abort must proceed regardless.
+    }
     this.interruptSleep();
     this.resolveExit({ code: null, reason: "aborted", output: this.outputSoFar });
   }
@@ -185,6 +200,9 @@ export class FakeDriver implements AgentDriver {
       exitCode: this.options.exitCode,
       failOnAbort: this.options.failOnAbort ?? false,
       started,
+      // Recorded on the handle so tests can drive it and abort() can stop
+      // in-flight sandbox commands (#102).
+      exec: opts.exec,
     });
   }
 }

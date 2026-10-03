@@ -3,8 +3,9 @@ import type { Db } from "@openeuler/db";
 import { Hono, type Context } from "hono";
 import { z } from "zod";
 import type { AppEnv } from "../app.js";
-import type { ActivityType } from "../activity.js";
+import { type ActivityType, isOpsActivityType, type OpsActivityType } from "../activity.js";
 import { HttpError } from "../errors.js";
+import { getVersion } from "../version.js";
 
 /**
  * Activity feed API (#51): `GET /api/activity?cursor=<id>&limit=20` — an
@@ -66,14 +67,64 @@ function runLabel(
   return run?.branch ?? "run";
 }
 
+/** `n <label>` / `n <label>s` — keeps count-bearing messages readable. */
+function plural(count: number, label: string): string {
+  return `${count} ${label}${count === 1 ? "" : "s"}`;
+}
+
+function opsMessage(type: OpsActivityType, payload: Record<string, unknown> | undefined): string {
+  const numberish = (value: unknown): number =>
+    typeof value === "number" && Number.isFinite(value) ? value : 0;
+  switch (type) {
+    case "ops.daemon-boot": {
+      const version =
+        typeof payload?.["version"] === "string" ? (payload["version"] as string) : getVersion();
+      return `Daemon v${version} started`;
+    }
+    case "ops.recovery-sweep":
+      return `Boot recovery sweep: ${plural(
+        numberish(payload?.["interrupted"]),
+        "interrupted run",
+      )}, ${plural(numberish(payload?.["orphanedWorktrees"]), "orphaned worktree")}`;
+    case "ops.gc": {
+      const destroyed = numberish(payload?.["destroyed"]) + numberish(payload?.["orphans"]);
+      const volumes = numberish(payload?.["cacheVolumesPruned"]);
+      const warning = typeof payload?.["warning"] === "string" ? payload["warning"] : undefined;
+      const parts: string[] = [];
+      if (destroyed > 0) parts.push(`${plural(destroyed, "sandbox")} destroyed`);
+      if (volumes > 0) parts.push(`${plural(volumes, "cache volume")} pruned`);
+      if (parts.length === 0 && warning === undefined) return "Garbage collection ran";
+      if (parts.length === 0)
+        return `Garbage collection warning: ${warning ?? "check daemon logs"}`;
+      return `Garbage collection ran: ${parts.join(", ")}${
+        warning === undefined ? "" : ` — ${warning}`
+      }`;
+    }
+    case "ops.image-pull": {
+      const ref = typeof payload?.["ref"] === "string" ? (payload["ref"] as string) : "image";
+      return payload?.["done"] === false ? `Image pull failed: ${ref}` : `Image pulled: ${ref}`;
+    }
+    case "ops.image-build": {
+      const ref = typeof payload?.["ref"] === "string" ? (payload["ref"] as string) : "image";
+      return payload?.["done"] === false ? `Image build failed: ${ref}` : `Image built: ${ref}`;
+    }
+    case "ops.sandbox-kept": {
+      const image = typeof payload?.["image"] === "string" ? (payload["image"] as string) : "";
+      return `Sandbox kept for debugging${image === "" ? "" : ` (${image})`}`;
+    }
+  }
+}
+
 function activityMessage(
   type: ActivityType,
   refs: {
     projectName?: string;
     workflowName?: string;
     run?: { branch: string; task?: string };
+    payload?: Record<string, unknown>;
   },
 ): string {
+  if (isOpsActivityType(type)) return opsMessage(type, refs.payload);
   switch (type) {
     case "project.created":
       return `Project ${refs.projectName ?? "unknown"} registered`;
@@ -158,6 +209,9 @@ export function createActivityRouter(): Hono<AppEnv> {
             runSummary === undefined
               ? undefined
               : { branch: runSummary.branch, ...(task === undefined ? {} : { task }) },
+          // ops.* rows carry their message inputs (version, sweep counts) in
+          // the payload; entity rows ignore it (#94).
+          payload: row.payload,
         }),
       } satisfies ActivityApiItem;
     });

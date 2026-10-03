@@ -1,14 +1,16 @@
 import { randomUUID } from "node:crypto";
 import { stat } from "node:fs/promises";
 import { basename } from "node:path";
-import type { Project } from "@openeuler/core";
+import type { DockerCliRunner } from "@openeuler/sandbox";
+import { ProjectSandboxPolicySchema, type Project } from "@openeuler/core";
 import type { Db } from "@openeuler/db";
 import { Hono, type Context } from "hono";
 import { z } from "zod";
 import type { AppEnv } from "../app.js";
-import { recordProjectCreatedActivity } from "../activity.js";
+import { recordGcActivity, recordProjectCreatedActivity } from "../activity.js";
 import { HttpError } from "../errors.js";
 import { GitError, gitExec } from "../git.js";
+import { removeProjectCacheVolumes } from "../sandbox-gc.js";
 import { seedBuiltinPresets } from "./presets.js";
 
 export const NO_COMMITS_WARNING =
@@ -135,7 +137,16 @@ async function parseJsonBody(c: Context<AppEnv>): Promise<unknown> {
   }
 }
 
-export function createProjectsRouter(): Hono<AppEnv> {
+/** Options for {@link createProjectsRouter}. */
+export interface ProjectsRouterOptions {
+  /**
+   * Docker CLI runner for the project-delete cache-volume cleanup (#105,
+   * #148 QA); tests script this. Default: the real `docker` CLI.
+   */
+  cacheVolumeRunner?: DockerCliRunner;
+}
+
+export function createProjectsRouter(options: ProjectsRouterOptions = {}): Hono<AppEnv> {
   const projects = new Hono<AppEnv>();
 
   projects.post("/", async (c) => {
@@ -174,17 +185,57 @@ export function createProjectsRouter(): Hono<AppEnv> {
     return c.json({ project });
   });
 
-  projects.delete("/:id", (c) => {
+  // Sandbox policy (#101): whole-policy replace. The body IS the new policy
+  // (missing `executionMode` defaults to "auto"); out-of-range values answer
+  // 422 with the zod clamp messages via the app-wide error handler. GET
+  // serves the policy inside the project payload (`project.sandboxPolicy`,
+  // absent until first saved).
+  projects.patch("/:id/policy", async (c) => {
+    const db = requireDb(c);
+    const id = c.req.param("id");
+    if (!db.projects.get(id)) {
+      throw new HttpError(404, "PROJECT_NOT_FOUND", `no project with id ${id}`);
+    }
+    const policy = ProjectSandboxPolicySchema.parse(await parseJsonBody(c));
+    const updated = db.projects.setSandboxPolicy(id, policy);
+    if (!updated) {
+      throw new HttpError(404, "PROJECT_NOT_FOUND", `no project with id ${id}`);
+    }
+    c.get("logger").info(
+      { projectId: id, executionMode: policy.executionMode, image: policy.image ?? null },
+      "sandbox policy saved",
+    );
+    return c.json({ project: updated });
+  });
+
+  projects.delete("/:id", async (c) => {
     const db = requireDb(c);
     const id = c.req.param("id");
     if (!db.projects.get(c.req.param("id"))) {
       throw new HttpError(404, "PROJECT_NOT_FOUND", `no project with id ${c.req.param("id")}`);
     }
-    // Presets are owned metadata (nodes keep config copies), so they go with
-    // the project instead of blocking the delete via the FK.
+    // Presets and secrets are owned metadata, so they go with the project
+    // instead of blocking the delete via the FKs.
     db.agentPresets.deleteAllForProject(id);
+    db.projectSecrets.deleteAllForProject(id);
     if (!db.projects.delete(id)) {
       throw new HttpError(404, "PROJECT_NOT_FOUND", `no project with id ${c.req.param("id")}`);
+    }
+    // #105 (#148 QA): the project's named cache volumes (`openeuler-cache-<id>-*`)
+    // are never mounted again — remove them now. Best-effort: docker being
+    // down must not fail the delete (the periodic GC prunes leftovers).
+    const removed = await removeProjectCacheVolumes(id, {
+      db,
+      logger: c.get("logger"),
+      ...(options.cacheVolumeRunner === undefined ? {} : { runner: options.cacheVolumeRunner }),
+    });
+    if (removed > 0) {
+      c.get("logger").info({ projectId: id, removed }, "project cache volumes removed");
+      recordGcActivity(db, {
+        reason: "project-delete",
+        projectId: id,
+        cacheVolumesPruned: removed,
+      });
     }
     return c.body(null, 204);
   });

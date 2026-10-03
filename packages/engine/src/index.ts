@@ -30,10 +30,28 @@ export {
   type FlowEngineOptions,
   type FlowLogger,
   type RunControl,
+  type RunSandboxAcquirer,
+  type RunSandboxContext,
+  type RunSecrets,
+  type RunSecretsLoader,
   type StepDefinition,
 } from "./flow-engine.js";
 
 export { MAX_EDGE_ITERATIONS, executeGraphRun, type GraphEngineDeps } from "./graph-engine.js";
+
+export { detectPorts, mergeDetectedPorts, runPortList } from "./port-detect.js";
+
+export {
+  DEFAULT_SANDBOX_CPUS,
+  DEFAULT_SANDBOX_MEMORY_MB,
+  SANDBOX_WORKSPACE_PATH,
+  buildRunSandboxSpec,
+  buildSandboxSpec,
+  cacheVolumeName,
+  mergeSandboxConfig,
+  type MergedSandboxConfig,
+  type SandboxSpecExtras,
+} from "./sandbox-spec.js";
 
 export {
   compileExitCondition,

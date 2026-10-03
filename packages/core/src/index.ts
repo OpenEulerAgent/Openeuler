@@ -9,6 +9,28 @@ export { idSchema, timestampSchema } from "./common.js";
 export { ProjectSchema } from "./project.js";
 export type { Project } from "./project.js";
 
+export {
+  EXECUTION_MODES,
+  ProjectSandboxPolicySchema,
+  SANDBOX_IMAGE_REF_ISSUE,
+  SANDBOX_IMAGE_REF_PATTERN,
+  SANDBOX_POLICY_CACHE_PATHS_MAX,
+  SANDBOX_POLICY_CPUS_MAX,
+  SANDBOX_POLICY_CPUS_MIN,
+  SANDBOX_POLICY_MEMORY_MB_MAX,
+  SANDBOX_POLICY_MEMORY_MB_MIN,
+  SandboxNetworkModeSchema,
+  SandboxOverridesSchema,
+  sandboxOverridesActive,
+} from "./policy.js";
+export type {
+  ExecutionMode,
+  ProjectSandboxPolicy,
+  ProjectSandboxPolicyInput,
+  SandboxNetworkMode,
+  SandboxOverrides,
+} from "./policy.js";
+
 export { AgentPresetSchema } from "./preset.js";
 export type { AgentPreset } from "./preset.js";
 
@@ -68,14 +90,23 @@ export type {
 } from "./graph.js";
 
 export {
+  BreadcrumbEntrySchema,
+  MAX_RUN_PORTS,
+  RunPortsSchema,
   RunSchema,
   RunStatusSchema,
   StepRunSchema,
-  BreadcrumbEntrySchema,
   TERMINAL_RUN_STATUSES,
   TerminalRunStatusSchema,
 } from "./run.js";
-export type { Run, RunStatus, StepRun, BreadcrumbEntry, TerminalRunStatus } from "./run.js";
+export type {
+  BreadcrumbEntry,
+  Run,
+  RunPorts,
+  RunStatus,
+  StepRun,
+  TerminalRunStatus,
+} from "./run.js";
 
 export {
   AgentDoneEventSchema,
@@ -110,6 +141,8 @@ export {
   PersistedEventSchema,
   RunEventSchema,
   RunStatusEventSchema,
+  SandboxLogEventSchema,
+  SandboxLogTruncatedEventSchema,
   StepCompletedEventSchema,
   StepStartedEventSchema,
 } from "./run-event.js";
@@ -124,6 +157,8 @@ export type {
   PersistedEvent,
   RunEvent,
   RunStatusEvent,
+  SandboxLogEvent,
+  SandboxLogTruncatedEvent,
   StepCompletedEvent,
   StepStartedEvent,
 } from "./run-event.js";
@@ -136,3 +171,15 @@ export {
 export type { PromptTemplateVariable, PromptTemplateVars } from "./prompt.js";
 
 export { isValidRegex } from "./regex.js";
+
+export {
+  MIN_SECRET_REDACTION_LENGTH,
+  SECRET_NAME_MAX_LENGTH,
+  SECRET_NAME_REGEX,
+  SECRET_NAME_SCHEMA,
+  REDACTION_STRUCTURAL_KEYS,
+  redactJson,
+  redactSecrets,
+  secretRedactionMarker,
+} from "./secrets.js";
+export type { SecretForRedaction } from "./secrets.js";

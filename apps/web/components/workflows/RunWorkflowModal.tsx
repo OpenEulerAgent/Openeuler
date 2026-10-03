@@ -1,17 +1,20 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
 import type { Workflow } from "@openeuler/core";
 import { Button } from "@/components/ui/button";
 import { Dialog } from "@/components/ui/dialog";
 import { Field, Textarea } from "@/components/ui/input";
 import { ApiError } from "@/lib/api";
+import { effectiveModeHint, fetchSandboxStatus, type SandboxStatus } from "@/lib/sandbox-api";
 import { startWorkflowRun } from "@/lib/workflows-api";
 
 /**
  * "Run this workflow" modal: required task textarea → POST
- * /api/workflows/:id/runs (202) → navigate to `/runs/:id`.
+ * /api/workflows/:id/runs (202) → navigate to `/runs/:id`. The hint line
+ * under the task (#106) shows the project's effective execution mode given
+ * the daemon's docker availability, so surprises land BEFORE the launch.
  */
 export function RunWorkflowModal({
   workflow,
@@ -24,6 +27,22 @@ export function RunWorkflowModal({
   const [task, setTask] = useState("");
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [dockerStatus, setDockerStatus] = useState<SandboxStatus | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    fetchSandboxStatus(workflow.projectId).then(
+      (status) => {
+        if (!cancelled) setDockerStatus(status);
+      },
+      () => {
+        if (!cancelled) setDockerStatus(null);
+      },
+    );
+    return () => {
+      cancelled = true;
+    };
+  }, [workflow.projectId]);
 
   const trimmed = task.trim();
   const submit = async () => {
@@ -57,6 +76,14 @@ export function RunWorkflowModal({
             placeholder="e.g. Fix the failing tests in packages/core"
           />
         </Field>
+        {dockerStatus !== null && dockerStatus.projectMode !== undefined ? (
+          <p className="text-xs text-muted-fg" data-effective-mode-hint>
+            {effectiveModeHint({
+              executionMode: dockerStatus.projectMode,
+              available: dockerStatus.available,
+            })}
+          </p>
+        ) : null}
         {error ? (
           <p className="text-sm text-danger" role="alert">
             {error}

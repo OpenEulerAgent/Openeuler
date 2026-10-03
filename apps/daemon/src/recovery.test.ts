@@ -13,6 +13,7 @@ import { createExecutor } from "./executor.js";
 import type { Executor, ExecutorOptions } from "./executor.js";
 import { createLogger } from "./logger.js";
 import { sweepInterruptedRuns } from "./recovery.js";
+import { encryptSecretValue } from "./secrets-crypto.js";
 
 interface Harness {
   dir: string;
@@ -22,7 +23,11 @@ interface Harness {
   storeRoot: string;
   projectId: string;
   /** Seeds a run row in the given status plus an optional step run. */
-  seedRun(status: RunStatus, step?: { status: RunStatus; sessionId?: string }): string;
+  seedRun(
+    status: RunStatus,
+    step?: { status: RunStatus; sessionId?: string },
+    task?: string,
+  ): string;
 }
 
 const git = (cwd: string, ...args: string[]): void => {
@@ -70,7 +75,7 @@ const setup = (
     executor,
     storeRoot,
     projectId: project.id,
-    seedRun(status, step) {
+    seedRun(status, step, task = "seeded") {
       const runId = crypto.randomUUID();
       const now = new Date().toISOString();
       db.runs.create({
@@ -79,7 +84,7 @@ const setup = (
         status,
         branch: `agentloop/${runId}`,
         iteration: 0,
-        task: "seeded",
+        task,
         createdAt: now,
         updatedAt: now,
       });
@@ -236,5 +241,51 @@ describe("sweepInterruptedRuns (boot sweep)", () => {
     expect(existsSync(stale)).toBe(true);
     expect(result.orphanedWorktrees).not.toContain(join(h.storeRoot, interrupted));
     expect(existsSync(join(h.storeRoot, interrupted))).toBe(true);
+  });
+
+  it("redacts secret values from the sweep's activity payload (#93)", async () => {
+    const secretName = "DEPLOY_KEY";
+    const secretValue = "sk_live_sweep_778899";
+    const key = Buffer.from(crypto.getRandomValues(new Uint8Array(32)));
+    const h = setup({}, { secretsKey: key });
+    h.db.projectSecrets.set(h.projectId, secretName, encryptSecretValue(key, secretValue));
+    // A run interrupted by the crash still carrying a raw task (e.g. a row
+    // written before task redaction-at-rest existed).
+    const interrupted = h.seedRun(
+      "running",
+      { status: "running", sessionId: "s-1" },
+      `deploy with ${secretValue}`,
+    );
+
+    const result = await sweepInterruptedRuns({
+      db: h.db,
+      worktrees: h.worktrees,
+      executor: h.executor,
+      logger: createLogger("silent"),
+      secretsKey: key,
+    });
+
+    expect(result.interruptedRunIds).toEqual([interrupted]);
+    const entry = h.db.activity.list({ limit: 10 }).find((row) => row.runId === interrupted);
+    expect(entry).toBeDefined();
+    const payloadJson = JSON.stringify(entry?.payload ?? {});
+    expect(payloadJson).toContain(`***${secretName}***`);
+    expect(payloadJson).not.toContain(secretValue);
+  });
+
+  it("sweeps without a secrets key exactly as before (no redactor configured)", async () => {
+    const h = setup();
+    const interrupted = h.seedRun("queued", undefined, "plain seeded task");
+
+    const result = await sweepInterruptedRuns({
+      db: h.db,
+      worktrees: h.worktrees,
+      executor: h.executor,
+      logger: createLogger("silent"),
+    });
+
+    expect(result.interruptedRunIds).toEqual([interrupted]);
+    const entry = h.db.activity.list({ limit: 10 }).find((row) => row.runId === interrupted);
+    expect(JSON.stringify(entry?.payload ?? {})).toContain("plain seeded task");
   });
 });

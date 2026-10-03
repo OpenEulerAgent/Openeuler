@@ -280,4 +280,19 @@ describe("fold: idempotence / replay safety", () => {
     expect(state.lastSeq).toBe(5);
     expect(state.nodes).toEqual({});
   });
+
+  it("ignores sandbox.log events (seq-only) — no nodes, edges, or timeline rows (#104)", () => {
+    const base = buildRunGraphState(loopRunEvents());
+    const logs: RunStreamEvent[] = [
+      { type: "sandbox.log", seq: 900, sandboxId: "sb-1", stream: "stdout", line: "l1" },
+      { type: "sandbox.log", seq: 901, sandboxId: "sb-1", stream: "stderr", line: "l2" },
+      { type: "sandbox.log-truncated", seq: 902, sandboxId: "sb-1", dropped: 3, kept: 2000 },
+    ];
+    const state = foldRunGraphEvents(base, logs);
+    expect(state.nodes).toEqual(base.nodes);
+    expect(state.edges).toEqual(base.edges);
+    expect(state.timeline).toEqual(base.timeline);
+    expect(state.breadcrumb).toEqual(base.breadcrumb);
+    expect(state.lastSeq).toBe(902); // cursor still advances (dedupe stays sound)
+  });
 });

@@ -6,12 +6,13 @@ import { apiFetch, ApiError } from "./api";
 export interface HealthPayload {
   ok: boolean;
   version: string;
-  uptime: number;
+  /** Absent when the daemon runs with auth enabled (minimal `/health`, #92). */
+  uptime?: number;
 }
 
 export type HealthState =
   | { status: "checking" }
-  | { status: "healthy"; version: string; uptime: number }
+  | { status: "healthy"; version: string; uptime?: number }
   | { status: "degraded"; message: string };
 
 export const HEALTH_POLL_INTERVAL_MS = 5000;
@@ -21,7 +22,11 @@ export async function fetchHealth(): Promise<HealthState> {
   try {
     const payload = await apiFetch<HealthPayload>("/health");
     return payload.ok
-      ? { status: "healthy", version: payload.version, uptime: payload.uptime }
+      ? {
+          status: "healthy",
+          version: payload.version,
+          ...(payload.uptime === undefined ? {} : { uptime: payload.uptime }),
+        }
       : { status: "degraded", message: "Daemon reported an unhealthy state" };
   } catch (error) {
     const message = error instanceof ApiError ? error.message : "Unknown error";

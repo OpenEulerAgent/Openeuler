@@ -12,7 +12,21 @@ export type ActivityType =
   | "run.completed"
   | "run.failed"
   | "run.aborted"
-  | "run.interrupted";
+  | "run.interrupted"
+  | "ops.daemon-boot"
+  | "ops.recovery-sweep"
+  | "ops.gc"
+  | "ops.image-pull"
+  | "ops.image-build"
+  | "ops.sandbox-kept";
+
+/**
+ * ops.* rows (#94) are daemon-level system lines (boot, recovery sweep,
+ * GC): rendered as small gray text without badge or run link.
+ */
+export function isOpsActivityType(type: ActivityType): boolean {
+  return type.startsWith("ops.");
+}
 
 export interface ActivityItem {
   id: number;
