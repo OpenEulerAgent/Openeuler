@@ -2,7 +2,12 @@
 
 import { memo } from "react";
 import { Handle, Position, type Node, type NodeProps, type NodeTypes } from "@xyflow/react";
-import type { AgentNodeData, ExitNodeData, JoinNodeData } from "@/lib/graph/canvas-document";
+import type {
+  AgentNodeData,
+  ExitNodeData,
+  JoinNodeData,
+  SubworkflowNodeData,
+} from "@/lib/graph/canvas-document";
 import type { NodeVisualSlice } from "@/lib/run-graph/document";
 import { cn } from "@/lib/cn";
 
@@ -20,6 +25,10 @@ export type RunAgentFlowNode = Node<
 >;
 export type RunExitFlowNode = Node<ExitNodeData & { visual: NodeVisualSlice | null }, "run-exit">;
 export type RunJoinFlowNode = Node<JoinNodeData & { visual: NodeVisualSlice | null }, "run-join">;
+export type RunSubworkflowFlowNode = Node<
+  SubworkflowNodeData & { visual: NodeVisualSlice | null },
+  "run-subworkflow"
+>;
 
 /** Card frame per visual status (ring color + surface treatment). */
 const STATUS_CARD_CLASSES: Record<NodeVisualSlice["status"], string> = {
@@ -174,8 +183,57 @@ function JoinExecutionCard({ data }: NodeProps<RunJoinFlowNode>) {
   );
 }
 
+/**
+ * Sub-workflow execution card (#117): the spawned workflow's name/id with a
+ * "child run" marker — the drawer (click) carries the actual link into the
+ * child run's detail page.
+ */
+function SubworkflowExecutionCard({ data }: NodeProps<RunSubworkflowFlowNode>) {
+  const { visual } = data;
+  const status = visual?.status ?? "not-reached";
+  return (
+    <div
+      className={cn(
+        "relative flex w-56 cursor-pointer flex-col rounded-lg border bg-surface p-3 shadow-2 transition-colors",
+        statusCardClasses(status),
+      )}
+      data-run-node="subworkflow"
+      data-run-node-status={status}
+    >
+      <IterationBadge count={visual?.executionCount ?? 0} />
+      {data.isEntry ? (
+        <span className="absolute -top-2.5 left-3 rounded-full border border-accent/60 bg-accent px-2 py-0.5 text-[10px] font-semibold tracking-wide text-accent-fg uppercase">
+          Entry
+        </span>
+      ) : null}
+      <div className="flex items-center gap-2">
+        <StatusDot status={status} />
+        <p className="min-w-0 flex-1 truncate text-sm font-medium text-fg" title={data.name}>
+          {data.name.length > 0 ? data.name : "Untitled sub-workflow"}
+        </p>
+      </div>
+      <div className="mt-2 flex items-center gap-1.5">
+        <span
+          className="max-w-full truncate rounded-full bg-elevated px-2 py-0.5 font-mono text-[10px] text-muted-fg"
+          title={data.config.workflowId}
+        >
+          {data.config.workflowId.length > 0 ? data.config.workflowId : "—"}
+        </span>
+        <span className="shrink-0 rounded-full bg-elevated px-2 py-0.5 text-[10px] text-muted-fg">
+          {data.config.revision === "latest" ? "latest" : `rev ${data.config.revision}`}
+        </span>
+      </div>
+      {data.isEntry ? null : (
+        <Handle type="target" position={Position.Left} className="!bg-muted-fg" />
+      )}
+      <Handle type="source" position={Position.Right} className="!bg-accent" />
+    </div>
+  );
+}
+
 export const runGraphNodeTypes: NodeTypes = {
   "run-agent": memo(AgentExecutionCard) as unknown as NodeTypes["run-agent"],
   "run-exit": memo(ExitExecutionCard) as unknown as NodeTypes["run-exit"],
   "run-join": memo(JoinExecutionCard) as unknown as NodeTypes["run-join"],
+  "run-subworkflow": memo(SubworkflowExecutionCard) as unknown as NodeTypes["run-subworkflow"],
 };

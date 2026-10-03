@@ -230,14 +230,17 @@ export interface RunStatsBody {
  * computed field present only while the run sits in the global queue, and
  * `workflowRevision` `{ id, number }`, resolved for runs pinned to a graph
  * revision snapshot. `project`/`workflow` carry resolved names for table
- * rendering (#51). All are deliberately NOT part of the persisted core
- * Run schema.
+ * rendering (#51). `childRunIds` lists the sub-workflow child runs this
+ * run spawned (#117), in spawn order. All are deliberately NOT part of the
+ * persisted core Run schema.
  */
 export type RunApiBody = Run & {
   queuePosition?: number;
   workflowRevision?: { id: string; number: number };
   project?: { id: string; name: string };
   workflow?: { id: string; name: string };
+  /** Sub-workflow child runs spawned by this run (#117), spawn order. */
+  childRunIds?: string[];
 };
 
 /**
@@ -301,6 +304,12 @@ function decorateRuns(db: Db, rows: readonly Run[], positions?: Map<string, numb
       if (revision !== undefined) {
         body = { ...body, workflowRevision: { id: revision.id, number: revision.number } };
       }
+    }
+    // #117: sub-workflow children (spawn order) — present only when the run
+    // spawned any, so ordinary runs keep their shape.
+    const children = db.runs.listByParentRun(run.id);
+    if (children.length > 0) {
+      body = { ...body, childRunIds: children.map((child) => child.id) };
     }
     if (run.status === "queued" && positions !== undefined) {
       const queuePosition = positions.get(run.id);

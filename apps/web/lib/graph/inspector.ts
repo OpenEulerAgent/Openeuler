@@ -1,5 +1,6 @@
 import {
   AgentGraphNodeSchema,
+  SubworkflowGraphNodeSchema,
   extractOutputReferences,
   renderPromptTemplate,
   type PromptTemplateVars,
@@ -113,7 +114,9 @@ export type InspectorField =
   | "config.sandboxOverrides.image"
   | "config.sandboxOverrides.cpus"
   | "config.sandboxOverrides.memoryMb"
-  | "config.sandboxOverrides.network";
+  | "config.sandboxOverrides.network"
+  | "config.workflowId"
+  | "config.revision";
 
 export type InspectorFieldErrors = Partial<Record<InspectorField, string>>;
 
@@ -122,10 +125,32 @@ export type InspectorFieldErrors = Partial<Record<InspectorField, string>>;
  * (`AgentGraphNodeSchema` → `StepConfigSchema`) plus the graph-level rule
  * that `{{output:<nodeId>}}` must reference an upstream node — surfaced on
  * the prompt field so typing feedback is immediate, before any save attempt.
+ * Sub-workflow nodes (#117) validate through `SubworkflowGraphNodeSchema`
+ * (an unconfigured `workflowId` flags that field).
  */
 export function inspectorFieldErrors(doc: CanvasDocument, nodeId: string): InspectorFieldErrors {
   const node = doc.nodes.find((candidate) => candidate.id === nodeId);
-  if (node === undefined || node.data.kind !== "agent") return {};
+  if (node === undefined) return {};
+  if (node.data.kind === "subworkflow") {
+    const errors: InspectorFieldErrors = {};
+    const parsed = SubworkflowGraphNodeSchema.safeParse({
+      id: node.id,
+      type: "subworkflow",
+      name: node.data.name,
+      position: node.position,
+      config: node.data.config,
+    });
+    if (!parsed.success) {
+      for (const issue of parsed.error.issues) {
+        const field = issue.path.join(".");
+        if (field === "name" || field === "config.workflowId" || field === "config.revision") {
+          errors[field as InspectorField] ??= issue.message;
+        }
+      }
+    }
+    return errors;
+  }
+  if (node.data.kind !== "agent") return {};
 
   const errors: InspectorFieldErrors = {};
   const parsed = AgentGraphNodeSchema.safeParse({
@@ -180,6 +205,12 @@ export type InspectorAction =
    * editable config.
    */
   | { type: "patchJoinMode"; nodeId: string; mode: "all" | "any" }
+  /**
+   * Sub-workflow picker (#117): sets which workflow the node spawns and how
+   * its revision is pinned (`'latest'` or an exact number). Switching the
+   * workflow resets the revision to `'latest'`.
+   */
+  | { type: "patchSubworkflow"; nodeId: string; workflowId?: string; revision?: "latest" | number }
   | { type: "insertVariable"; nodeId: string; token: string; at: number }
   /**
    * Detach from the preset (#49): drops `presetId`, keeps the node's config
@@ -264,6 +295,27 @@ export function applyInspectorAction(doc: CanvasDocument, action: InspectorActio
           ? { ...candidate, data: { ...candidate.data, config: { mode: action.mode } } }
           : candidate,
       ),
+    };
+  }
+
+  if (action.type === "patchSubworkflow") {
+    if (node.data.kind !== "subworkflow") return doc;
+    return {
+      ...doc,
+      nodes: doc.nodes.map((candidate) => {
+        if (candidate.id !== action.nodeId || candidate.data.kind !== "subworkflow") {
+          return candidate;
+        }
+        const workflowId = action.workflowId ?? candidate.data.config.workflowId;
+        const revision =
+          action.workflowId !== undefined && action.workflowId !== candidate.data.config.workflowId
+            ? "latest"
+            : (action.revision ?? candidate.data.config.revision);
+        return {
+          ...candidate,
+          data: { ...candidate.data, config: { workflowId, revision } },
+        };
+      }),
     };
   }
 

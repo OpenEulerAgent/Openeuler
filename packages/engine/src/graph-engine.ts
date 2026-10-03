@@ -1,4 +1,8 @@
-import { DEFAULT_EDGE_MAX_ITERATIONS, renderPromptTemplate } from "@openeuler/core";
+import {
+  DEFAULT_EDGE_MAX_ITERATIONS,
+  isExecutableGraphNode,
+  renderPromptTemplate,
+} from "@openeuler/core";
 import type {
   AgentGraphNode,
   BreadcrumbEntry,
@@ -8,6 +12,7 @@ import type {
   Run,
   RunStatus,
   StepRun,
+  SubworkflowGraphNode,
   WorkflowGraph,
 } from "@openeuler/core";
 import type { Db, EventInput } from "@openeuler/db";
@@ -160,6 +165,15 @@ export const MAX_INNER_CONCURRENCY = 25;
 /** Defensive bound on total node executions per run (bug guard, not configurable). */
 const MAX_TOTAL_NODE_EXECUTIONS = 5_000;
 
+/**
+ * Maximum sub-workflow nesting depth (#117): a top-level run executes at
+ * depth 0; every sub-workflow node spawns its child run at depth + 1. A
+ * spawn that would exceed the cap fails the node with a clear error, so a
+ * self-referencing (or mutually referencing) workflow chain terminates
+ * instead of recursing forever.
+ */
+export const MAX_SUBWORKFLOW_DEPTH = 3;
+
 const describeError = (err: unknown): string => (err instanceof Error ? err.message : String(err));
 
 /** Whether an edge is unconditional — an always edge that is not inverted. */
@@ -215,12 +229,44 @@ export interface GraphEngineDeps {
    * runs only; the flow engine's implementation no-ops local runs).
    */
   recordDetectedPorts(runId: string, output: string): void;
+  /**
+   * #117: executes one sub-workflow node's CHILD RUN inline — creates the
+   * child run row (queued, `parentRunId` = the parent run, pinned to the
+   * resolved revision of `workflowId`), recursively executes it within the
+   * parent's execution context (own worktree/branch, own event log, own
+   * StepRuns) and resolves once the child is terminal. NEVER touches the
+   * scheduler: the child counts as part of its parent's global slot, so a
+   * `MAX_CONCURRENT_RUNS=1` daemon cannot deadlock against its own child.
+   * `control` is the CHILD's abort chain (parent abort propagates through
+   * it). Resolves `{ ok: false, error }` for unresolvable references
+   * (deleted workflow, missing revision) — the caller fails the node.
+   */
+  executeChildRun(params: {
+    parentRunId: string;
+    workflowId: string;
+    revision: "latest" | number;
+    /** The child's nesting depth (already validated ≤ the cap by the caller). */
+    depth: number;
+    /** The child's task (the parent run's task, verbatim). */
+    task: string;
+    /** Abort chain: parent abort / branch cancel must abort the child. */
+    control: RunControl;
+  }): Promise<
+    | { ok: true; runId: string; status: RunStatus; output: string; error: string | undefined }
+    | { ok: false; error: string }
+  >;
 }
 
 /** Options for {@link executeGraphRun} (#115). */
 export interface GraphRunOptions {
   /** Run-internal concurrency cap; defaults to {@link DEFAULT_INNER_CONCURRENCY}. */
   innerConcurrency?: number;
+  /**
+   * Sub-workflow nesting depth of THIS run (#117): 0 for top-level runs,
+   * `parentDepth + 1` for a child run. Drives the
+   * {@link MAX_SUBWORKFLOW_DEPTH} check on sub-workflow nodes.
+   */
+  depth?: number;
 }
 
 /** Terminal outcome of one node execution. */
@@ -265,13 +311,19 @@ interface ScheduledExec {
 type TaskVerdict =
   | { kind: "continue" }
   | { kind: "branch-done" }
+  /**
+   * A stale-round delivery (#115/#117): the execution finished naturally,
+   * but its join already triggered on this fan-out round — its result is
+   * discarded entirely (never delivered, never the run's final output).
+   */
+  | { kind: "suppressed" }
   | { kind: "fail-run"; error: string; output?: string }
   | { kind: "abort" };
 
 /** Live per-execution context: driver handle + branch-cancellation flag. */
 interface ExecContext {
   exec: ScheduledExec;
-  node: AgentGraphNode;
+  node: AgentGraphNode | SubworkflowGraphNode;
   handle: AgentHandle | undefined;
   /** Set when a fail-fast / any-trigger cancels this branch (#115). */
   cancelRequested: boolean;
@@ -346,6 +398,8 @@ interface GraphTopology {
   outgoing: Map<string, GraphEdge[]>;
   /** node id → incoming edges, in edges-array order (#115). */
   incoming: Map<string, GraphEdge[]>;
+  /** node id → nodes reachable from it via ≥ 1 edge (any condition). */
+  reach: Map<string, Set<string>>;
   /** join node id → node. */
   joins: Map<string, JoinGraphNode>;
   /** edge id → effective router order among its node's conditional siblings. */
@@ -512,6 +566,7 @@ function buildTopology(graph: WorkflowGraph): GraphTopology {
     edgesById,
     outgoing,
     incoming,
+    reach,
     joins,
     order,
     guarded,
@@ -567,7 +622,6 @@ function describeUnsatisfiedJoin(
   return `join node "${join.id}" (mode ${join.config.mode}) never triggered: ${parts.join("; ")}`;
 }
 
-
 /**
  * The comparison key for one join (#115): the lineage element of the join's
  * FEEDING fan-out (the shared unconditional parent of the join's direct
@@ -588,26 +642,54 @@ function joinRoundKey(topology: GraphTopology, joinId: string, rounds: readonly 
 }
 
 /**
- * Feeding fan-out of a join: the node whose unconditional outgoing edges
- * reach (a superset of) the join's direct incoming sources — i.e. the
- * fan-out that spawned the join's sibling branches. `undefined` when the
- * join is fed serially.
+ * The join's feeding fan-out: the fan-out node whose spawned branches are
+ * the join's incoming sources — i.e. the DEEPEST fan-out ancestor from
+ * which every direct incoming source of the join is reachable (through any
+ * edges: the sources may sit several hops downstream of the spawn, e.g.
+ * behind a nested fan-out + join + inner loop). The lineage token of THAT
+ * fan-out identifies the delivery's round; `undefined` when the join is
+ * fed serially (no common fan-out ancestor) — per-delivery keys then.
  */
 function feedingFanOutOf(topology: GraphTopology, joinId: string): string | undefined {
   const sources = new Set((topology.incoming.get(joinId) ?? []).map((edge) => edge.source));
-  for (const source of sources) {
-    const outs = topology.outgoing.get(source) ?? [];
-    const unconditional = outs.filter((edge) => isUnconditional(edge));
+  let best: { id: string; distance: number } | undefined;
+  for (const [candidate, edges] of topology.outgoing) {
+    const unconditional = edges.filter((edge) => isUnconditional(edge));
     if (unconditional.length < 2) continue;
-    const targets = new Set(unconditional.map((edge) => edge.target));
+    const reachable = topology.reach.get(candidate) ?? new Set<string>();
     let covers = true;
-    for (const sibling of sources) {
-      if (!targets.has(sibling)) {
+    for (const source of sources) {
+      if (!reachable.has(source)) {
         covers = false;
         break;
       }
     }
-    if (covers && targets.size >= sources.size) return source;
+    if (!covers) continue;
+    // Deeper (closer to the join) wins: the innermost fan-out's token
+    // distinguishes nested rounds; an outer ancestor's token would lump
+    // them together and suppress legitimate re-triggers.
+    const distance = hopDistance(topology, candidate, joinId);
+    if (distance === undefined) continue;
+    if (best === undefined || distance < best.distance) best = { id: candidate, distance };
+  }
+  return best?.id;
+}
+
+/** BFS hop distance from `from` to `to` over outgoing edges (undefined = unreachable). */
+function hopDistance(topology: GraphTopology, from: string, to: string): number | undefined {
+  if (from === to) return 0;
+  const seen = new Set<string>([from]);
+  const queue: Array<{ node: string; hops: number }> = [
+    ...(topology.outgoing.get(from) ?? []).map((edge) => ({ node: edge.target, hops: 1 })),
+  ];
+  while (queue.length > 0) {
+    const next = queue.shift() as { node: string; hops: number };
+    if (next.node === to) return next.hops;
+    if (seen.has(next.node)) continue;
+    seen.add(next.node);
+    for (const edge of topology.outgoing.get(next.node) ?? []) {
+      queue.push({ node: edge.target, hops: next.hops + 1 });
+    }
   }
   return undefined;
 }
@@ -885,7 +967,7 @@ function reconstructGraphResume(
       }
       // Scheduling follows the edge append synchronously; a target with no
       // row at the expected iteration was never scheduled (crash window).
-      if (target.type === "agent") {
+      if (isExecutableGraphNode(target)) {
         const iteration = (state.execCount.get(target.id) ?? 0) + 1;
         if (rowsByKey.get(`${target.id}#${iteration}`) === undefined) {
           state.execCount.set(target.id, iteration);
@@ -919,19 +1001,24 @@ function reconstructGraphResume(
  * Executes one node execution: StepRun lifecycle (reuse/restart aware),
  * `node.*` events, prompt rendering against the graph variable map, driver
  * invocation, streamed-event persistence, per-step diff, session recording.
- * Never throws — failures land in the returned outcome.
+ * Sub-workflow nodes (#117) dispatch to {@link runSubworkflowNode} instead
+ * of a driver. Never throws — failures land in the returned outcome.
  */
 async function runNode(
   deps: GraphEngineDeps,
   runId: string,
   worktreePath: string,
-  node: AgentGraphNode,
+  node: AgentGraphNode | SubworkflowGraphNode,
   exec: ScheduledExec,
   state: GraphRunState,
   control: RunControl,
   ctx: ExecContext,
   diffBase: { ref: string },
+  depth: number,
 ): Promise<NodeOutcome> {
+  if (node.type === "subworkflow") {
+    return runSubworkflowNode(deps, runId, node, exec, state, control, ctx, depth);
+  }
   const { iteration } = exec;
   const stepRun = deps.beginStepRun(runId, { stepId: node.id }, iteration);
   const currentRow = deps.db.runs.get(runId);
@@ -1086,6 +1173,124 @@ async function runNode(
   return { status, output: exit.output, error, sessionId: effectiveSessionId };
 }
 
+/**
+ * Executes one sub-workflow node execution (#117): StepRun lifecycle +
+ * `node.*` events like an agent node, but the work is a CHILD RUN of the
+ * referenced workflow — spawned INLINE through `deps.executeChildRun`
+ * (never the scheduler; the child counts as part of this run's global
+ * slot), awaited to its terminal state. The node's output is the child
+ * run's final output; `childRunId` rides the `node.completed` event (the
+ * run detail graph view links into the child). Child failure fails the
+ * node (v0.2 strict); an aborted child (parent abort or branch
+ * cancellation — the child shares this execution's abort chain) settles
+ * the node `aborted`. Never throws — failures land in the outcome.
+ */
+async function runSubworkflowNode(
+  deps: GraphEngineDeps,
+  runId: string,
+  node: SubworkflowGraphNode,
+  exec: ScheduledExec,
+  state: GraphRunState,
+  control: RunControl,
+  ctx: ExecContext,
+  depth: number,
+): Promise<NodeOutcome> {
+  const { iteration } = exec;
+  const stepRun = deps.beginStepRun(runId, { stepId: node.id }, iteration);
+  const startedAtMs = Date.now();
+  deps.appendEvent(runId, {
+    type: "node.started",
+    nodeId: node.id,
+    nodeName: node.name,
+    iteration,
+    ...(exec.viaEdgeId === undefined ? {} : { edgeId: exec.viaEdgeId }),
+    rounds: exec.rounds,
+  });
+  deps.log.info({ runId, nodeId: node.id, iteration }, "sub-workflow node started");
+
+  /** Settles the node execution (StepRun + node.completed + breadcrumb). */
+  const settle = (
+    status: RunStatus,
+    output: string,
+    error: string | undefined,
+    childRunId: string | undefined,
+  ): NodeOutcome => {
+    deps.db.stepRuns.update(stepRun.id, {
+      status,
+      output: output === "" ? "" : deps.redactText(runId, output),
+    });
+    deps.appendEvent(runId, {
+      type: "node.completed",
+      nodeId: node.id,
+      nodeName: node.name,
+      iteration,
+      status,
+      output: output === "" ? "" : deps.redactText(runId, output),
+      durationMs: Math.max(0, Date.now() - startedAtMs),
+      ...(error === undefined ? {} : { error: deps.redactText(runId, error) }),
+      ...(exec.viaEdgeId === undefined ? {} : { edgeId: exec.viaEdgeId }),
+      ...(childRunId === undefined ? {} : { childRunId }),
+    });
+    appendBreadcrumb(deps, runId, state, { kind: "node", nodeId: node.id, iteration });
+    deps.log.info(
+      { runId, nodeId: node.id, iteration, status, childRunId },
+      "sub-workflow node finished",
+    );
+    return { status, output, error, sessionId: undefined };
+  };
+
+  // Depth cap (#117): spawning one level deeper than allowed fails the
+  // node (and through fail-fast, the run) with a clear error instead of
+  // recursing forever on self-/mutually-referencing workflows.
+  if (depth + 1 > MAX_SUBWORKFLOW_DEPTH) {
+    return settle(
+      "failed",
+      "",
+      `sub-workflow nesting depth exceeds the maximum of ${MAX_SUBWORKFLOW_DEPTH}: node "${node.name}" (${node.id}) would spawn a child at depth ${depth + 1}`,
+      undefined,
+    );
+  }
+
+  // The child shares this execution's abort chain: a parent run abort (or a
+  // join/fail-fast branch cancellation, #115) aborts the child run through
+  // its own frontier.
+  const childControl: RunControl = {
+    isAbortRequested: () => control.isAbortRequested() || ctx.cancelRequested,
+    onHandle: control.onHandle,
+  };
+
+  let child: Awaited<ReturnType<GraphEngineDeps["executeChildRun"]>>;
+  try {
+    child = await deps.executeChildRun({
+      parentRunId: runId,
+      workflowId: node.config.workflowId,
+      revision: node.config.revision,
+      depth: depth + 1,
+      task: state.task,
+      control: childControl,
+    });
+  } catch (err) {
+    return settle("failed", "", `child run crashed: ${describeError(err)}`, undefined);
+  }
+  if (!child.ok) {
+    return settle("failed", "", child.error, undefined);
+  }
+
+  // Terminal child → node outcome. Success passes the child's final output
+  // through (addressable downstream as {{output:<nodeId>}}); failure keeps
+  // the child attribution; aborted settles aborted when the parent is going
+  // down with it, else reads as a node failure (v0.2 strict).
+  if (child.status === "success") {
+    return settle("success", child.output, undefined, child.runId);
+  }
+  if (child.status === "aborted" && (control.isAbortRequested() || ctx.cancelRequested)) {
+    return settle("aborted", "", undefined, child.runId);
+  }
+  const verb =
+    child.status === "aborted" ? "was aborted" : `failed: ${child.error ?? "unknown error"}`;
+  return settle("failed", "", `child run ${child.runId} ${verb}`, child.runId);
+}
+
 /** Appends a breadcrumb entry in memory + onto the run row (cheap, sync). */
 function appendBreadcrumb(
   deps: GraphEngineDeps,
@@ -1125,6 +1330,8 @@ export async function executeGraphRun(
     1,
     Math.min(options?.innerConcurrency ?? DEFAULT_INNER_CONCURRENCY, MAX_INNER_CONCURRENCY),
   );
+  /** Sub-workflow nesting depth of THIS run (#117); 0 for top-level runs. */
+  const depth = options?.depth ?? 0;
 
   // Compile every edge condition once per run (regex compile failures on
   // schema-bypassing data fail the run with a clear error up front).
@@ -1175,7 +1382,7 @@ export async function executeGraphRun(
    */
   const scheduleExec = (exec: ScheduledExec): void => {
     const node = topology.nodesById.get(exec.nodeId);
-    if (node === undefined || node.type !== "agent") return;
+    if (node === undefined || !isExecutableGraphNode(node)) return;
     state.execCount.set(
       exec.nodeId,
       Math.max(state.execCount.get(exec.nodeId) ?? 0, exec.iteration),
@@ -1380,7 +1587,7 @@ export async function executeGraphRun(
     deps.log.info({ runId, edgeId: out.id, target: out.target }, "edge taken");
     const target = topology.nodesById.get(out.target);
     if (target === undefined) return undefined;
-    if (target.type !== "agent") return []; // exit: the branch ends here
+    if (!isExecutableGraphNode(target)) return []; // exit: the branch ends here
     return [
       {
         nodeId: target.id,
@@ -1418,7 +1625,7 @@ export async function executeGraphRun(
         { runId, joinId: join.id, edgeId: edge.id, round: roundKey },
         "stale join delivery suppressed (round already triggered)",
       );
-      return { kind: "branch-done" };
+      return { kind: "suppressed" };
     }
     const pending = state.joinPending.get(join.id) ?? freshRound(join.id);
     pending.states.set(edge.id, "arrived");
@@ -1528,7 +1735,7 @@ export async function executeGraphRun(
       const branchLineage = [...sourceRounds, `${node.id}#${sourceIteration}`];
       for (const edge of unconditional) {
         const target = topology.nodesById.get(edge.target);
-        if (target === undefined || target.type !== "agent") {
+        if (target === undefined || !isExecutableGraphNode(target)) {
           return failRun(
             `fan-out edge "${edge.id}" targets ${target === undefined ? "unknown" : target.type} node "${edge.target}"`,
           );
@@ -1637,12 +1844,15 @@ export async function executeGraphRun(
     // Success: record the output/session and advance.
     state.outputs.set(node.id, outcome.output);
     state.sessions.set(node.id, outcome.sessionId);
-    state.runOutput = outcome.output;
     // #107: scan the node's final output for listening ports (sandboxed
     // runs only; persists detectedPorts on the run row as it goes).
     deps.recordDetectedPorts(runId, outcome.output);
 
-    return advance(node, outcome.output, iteration, ctx.exec.rounds);
+    const verdict = advance(node, outcome.output, iteration, ctx.exec.rounds);
+    // A superseded loser's output is never the run's final verdict text
+    // (#115): the winner (or the join's downstream path) already decided it.
+    if (verdict.kind !== "suppressed") state.runOutput = outcome.output;
+    return verdict;
   };
 
   /** Runs one scheduled execution to its verdict (never rejects). */
@@ -1659,6 +1869,7 @@ export async function executeGraphRun(
         control,
         ctx,
         diffBase,
+        depth,
       );
       return processCompletion(ctx, outcome);
     } catch (err) {
@@ -1678,9 +1889,9 @@ export async function executeGraphRun(
   // settled `aborted`, not re-run — their deliveries would be stale).
   if (resumed === undefined) {
     const entry = topology.nodesById.get(graph.entryNodeId);
-    if (entry === undefined || entry.type !== "agent") {
+    if (entry === undefined || !isExecutableGraphNode(entry)) {
       deps.finalizeRun(runId, "failed", {
-        error: `entry node "${graph.entryNodeId}" is not an agent node in the pinned graph revision`,
+        error: `entry node "${graph.entryNodeId}" is not an executable (agent/subworkflow) node in the pinned graph revision`,
       });
       return;
     }
@@ -1759,10 +1970,10 @@ export async function executeGraphRun(
         const exec = ready.shift();
         if (exec === undefined) break;
         const node = topology.nodesById.get(exec.nodeId);
-        if (node === undefined || node.type !== "agent") {
+        if (node === undefined || !isExecutableGraphNode(node)) {
           terminal = {
             kind: "fail-run",
-            error: `node "${exec.nodeId}" does not exist as an agent node in the pinned graph revision`,
+            error: `node "${exec.nodeId}" does not exist as an executable (agent/subworkflow) node in the pinned graph revision`,
           };
           break;
         }

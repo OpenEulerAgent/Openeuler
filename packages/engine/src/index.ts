@@ -42,6 +42,7 @@ export {
   DEFAULT_INNER_CONCURRENCY,
   MAX_EDGE_ITERATIONS,
   MAX_INNER_CONCURRENCY,
+  MAX_SUBWORKFLOW_DEPTH,
   executeGraphRun,
   type GraphEngineDeps,
   type GraphRunOptions,

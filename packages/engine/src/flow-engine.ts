@@ -25,9 +25,10 @@ import {
   evaluateExitCondition,
   type ExitEvaluator,
 } from "./conditions.js";
-import { executeGraphRun, type GraphEngineDeps } from "./graph-engine.js";
+import { executeGraphRun, MAX_SUBWORKFLOW_DEPTH, type GraphEngineDeps } from "./graph-engine.js";
 import { detectPorts, mergeDetectedPorts } from "./port-detect.js";
 import type { WorktreeManager } from "./worktree.js";
+import { branchForRun } from "./worktree.js";
 
 /** Default driver id for ad-hoc runs (override per run via `OPENEULER_DRIVER`). */
 export const DEFAULT_DRIVER_ID = "fake";
@@ -721,7 +722,122 @@ export function createFlowEngine(options: FlowEngineOptions): FlowEngine {
     }
   }
 
-  /** Shared machinery handed to the graph executor (#45, #115). */
+  /**
+   * #117: executes a sub-workflow node's child run INLINE, within the
+   * parent run's execution context. Creates the child row (queued,
+   * `parentRunId` set, pinned to the resolved revision of the referenced
+   * workflow) and recursively runs it through the SAME `execute` path as a
+   * top-level run — own worktree/branch, own event log, own StepRuns,
+   * secrets and (when configured) its own sandbox. The scheduler is never
+   * involved: the child counts as part of its parent's global
+   * `MAX_CONCURRENT_RUNS` slot, so a capped daemon can never deadlock
+   * against its own children. The child's abort chain is the caller's
+   * `control` (a parent abort aborts the child through its frontier).
+   */
+  async function executeChildRun(params: {
+    parentRunId: string;
+    workflowId: string;
+    revision: "latest" | number;
+    depth: number;
+    task: string;
+    control: RunControl;
+  }): Promise<
+    | { ok: true; runId: string; status: RunStatus; output: string; error: string | undefined }
+    | { ok: false; error: string }
+  > {
+    const parent = db.runs.get(params.parentRunId);
+    if (parent === undefined) {
+      return { ok: false, error: `parent run ${params.parentRunId} not found` };
+    }
+    if (params.depth < 0 || params.depth > MAX_SUBWORKFLOW_DEPTH) {
+      return {
+        ok: false,
+        error: `sub-workflow nesting depth exceeds the maximum of ${MAX_SUBWORKFLOW_DEPTH}`,
+      };
+    }
+    const workflow = db.workflows.get(params.workflowId);
+    if (workflow === undefined) {
+      return {
+        ok: false,
+        error: `sub-workflow references unknown workflow "${params.workflowId}" (it may have been deleted)`,
+      };
+    }
+    const revision =
+      params.revision === "latest"
+        ? db.workflowRevisions.latest(workflow.id)
+        : db.workflowRevisions.getByNumber(workflow.id, params.revision);
+    if (revision === undefined) {
+      return {
+        ok: false,
+        error:
+          params.revision === "latest"
+            ? `sub-workflow workflow "${workflow.name}" (${workflow.id}) has no graph revisions to run`
+            : `sub-workflow references revision ${params.revision} of workflow "${workflow.name}" (${workflow.id}), which does not exist`,
+      };
+    }
+
+    const childRunId = randomUUID();
+    const now = new Date().toISOString();
+    db.runs.create({
+      id: childRunId,
+      projectId: parent.projectId,
+      workflowId: workflow.id,
+      workflowRevisionId: revision.id,
+      parentRunId: parent.id,
+      status: "queued",
+      branch: branchForRun(childRunId),
+      iteration: 0,
+      // The parent task is redacted-at-rest (#93); the child copies it
+      // verbatim so its prompts render the same text.
+      ...(params.task === "" ? {} : { task: params.task }),
+      createdAt: now,
+      updatedAt: now,
+    });
+    log.info(
+      {
+        runId: childRunId,
+        parentRunId: parent.id,
+        workflowId: workflow.id,
+        workflowRevisionId: revision.id,
+        depth: params.depth,
+      },
+      "sub-workflow child run created (inline execution)",
+    );
+
+    try {
+      await execute(childRunId, params.control, undefined, params.depth);
+    } catch (err) {
+      // Belt and braces (mirrors the executeRun wrapper): the engine
+      // funnels failures into the row itself.
+      log.error({ err, runId: childRunId }, "child run crashed unexpectedly");
+      const row = db.runs.get(childRunId);
+      if (row !== undefined && !isTerminal(row.status)) {
+        db.runs.update(childRunId, {
+          status: "failed",
+          error: redactText(childRunId, describeError(err)),
+        });
+        settleStepRuns(childRunId, "failed");
+        emitRunStatus(childRunId, "failed", describeError(err));
+      }
+    } finally {
+      runSecrets.delete(childRunId);
+      runSandboxes.delete(childRunId);
+    }
+
+    const final = db.runs.get(childRunId);
+    if (final === undefined) {
+      return { ok: false, error: `child run ${childRunId} vanished during execution` };
+    }
+    return {
+      ok: true,
+      runId: childRunId,
+      status: final.status,
+      output: final.output ?? "",
+      error: final.error,
+    };
+  }
+
+  /** Shared machinery handed to the graph executor (#45, #115, #117). */
   const graphDeps: GraphEngineDeps = {
     db,
     worktrees,
@@ -740,12 +856,16 @@ export function createFlowEngine(options: FlowEngineOptions): FlowEngine {
     runSandbox: (runId) => runSandboxes.get(runId),
     /** #107: port detection over each completed node's final output. */
     recordDetectedPorts,
+    /** #117: inline child-run execution for sub-workflow nodes. */
+    executeChildRun,
   };
 
   async function execute(
     runId: string,
     control: RunControl,
     opts: ExecuteRunOptions | undefined,
+    /** Sub-workflow nesting depth (#117): 0 for top-level runs, parent+1 for children. */
+    depth = 0,
   ): Promise<void> {
     const run = db.runs.get(runId);
     if (!run) {
@@ -892,6 +1012,7 @@ export function createFlowEngine(options: FlowEngineOptions): FlowEngine {
         ...(options.graphInnerConcurrency === undefined
           ? {}
           : { innerConcurrency: options.graphInnerConcurrency }),
+        depth,
       });
       return;
     }

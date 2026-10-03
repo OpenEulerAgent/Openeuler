@@ -31,6 +31,7 @@ export const DEFAULT_LAYOUT_OPTIONS: Required<LayoutOptions> = {
 function nodeSize(node: CanvasNode): { width: number; height: number } {
   if (node.data.kind === "agent") return NODE_SIZES.agent;
   if (node.data.kind === "join") return NODE_SIZES.join;
+  if (node.data.kind === "subworkflow") return NODE_SIZES.subworkflow;
   return NODE_SIZES.exit;
 }
 

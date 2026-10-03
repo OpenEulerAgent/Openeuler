@@ -12,13 +12,15 @@ import type {
   CanvasNodeData,
   ExitNodeData,
   JoinNodeData,
+  SubworkflowNodeData,
 } from "@/lib/graph/canvas-document";
 
 /** React Flow node types as used by the canvas editor. */
 export type AgentFlowNode = Node<AgentNodeData, "agent">;
 export type ExitFlowNode = Node<ExitNodeData, "exit">;
 export type JoinFlowNode = Node<JoinNodeData, "join">;
-export type CanvasFlowNode = Node<CanvasNodeData, "agent" | "exit" | "join">;
+export type SubworkflowFlowNode = Node<SubworkflowNodeData, "subworkflow">;
+export type CanvasFlowNode = Node<CanvasNodeData, "agent" | "exit" | "join" | "subworkflow">;
 
 /**
  * Validation blocker counts per node id, provided by the editor so the cards
@@ -38,6 +40,13 @@ export const NodeHintCountsContext = createContext<ReadonlyMap<string, number>>(
  * fallback, #48) — amber badges, never blocking a save.
  */
 export const NodeWarningCountsContext = createContext<ReadonlyMap<string, number>>(new Map());
+
+/**
+ * Workflow id → display name (#117), provided by the editor so
+ * sub-workflow cards can show WHICH workflow they spawn without the
+ * (serialized) node data carrying a stale name copy.
+ */
+export const WorkflowNamesContext = createContext<ReadonlyMap<string, string>>(new Map());
 
 /** Session-chaining icon (chain link glyph) shown when continueSession is on. */
 function SessionIcon({ className }: { className?: string }) {
@@ -265,6 +274,85 @@ function JoinNodeCard({ id, data, selected }: NodeProps<JoinFlowNode>) {
 }
 
 /**
+ * Sub-workflow node card (#117): same deterministic box as an agent card,
+ * with a stacked-layers icon and the referenced workflow's name (resolved
+ * through {@link WorkflowNamesContext}; an unconfigured node shows a
+ * "pick a workflow" placeholder). Both handles: it chains like an agent.
+ */
+function SubworkflowNodeCard({ id, data, selected }: NodeProps<SubworkflowFlowNode>) {
+  const issueCounts = useContext(NodeIssueCountsContext);
+  const hintCounts = useContext(NodeHintCountsContext);
+  const workflowNames = useContext(WorkflowNamesContext);
+  const workflowName = workflowNames.get(data.config.workflowId);
+  const pinned = data.config.revision !== "latest";
+  return (
+    <div
+      className={cn(
+        "relative flex flex-col rounded-lg border bg-surface p-3 shadow-2 transition-colors",
+        CANVAS_NODE_SIZE_CLASSES.subworkflow.width,
+        CANVAS_NODE_SIZE_CLASSES.subworkflow.height,
+        selected ? "border-accent" : "border-border hover:border-muted-fg",
+      )}
+      data-canvas-node="subworkflow"
+    >
+      <IssueBadges blockers={issueCounts.get(id) ?? 0} hints={hintCounts.get(id) ?? 0} />
+      {data.isEntry ? (
+        <span className="absolute -top-2.5 left-3 rounded-full border border-accent/60 bg-accent px-2 py-0.5 text-[10px] font-semibold tracking-wide text-accent-fg uppercase">
+          Entry
+        </span>
+      ) : null}
+      <div className="flex items-center gap-2">
+        <SubworkflowIcon className="size-3.5 shrink-0 text-muted-fg" />
+        <p className="min-w-0 flex-1 truncate text-sm font-medium text-fg" title={data.name}>
+          {data.name.length > 0 ? data.name : "Untitled sub-workflow"}
+        </p>
+      </div>
+      <div className="mt-2 flex flex-nowrap items-center gap-1.5">
+        <Badge
+          variant="neutral"
+          className="min-w-0 truncate px-2 py-0 font-mono text-[10px]"
+          title={data.config.workflowId}
+        >
+          {workflowName ?? (data.config.workflowId.length > 0 ? data.config.workflowId : "—")}
+        </Badge>
+        <Badge
+          variant={pinned ? "warning" : "info"}
+          className="shrink-0 px-2 py-0 text-[10px] lowercase"
+          title={
+            pinned
+              ? `pinned to revision ${data.config.revision}`
+              : "resolves the latest revision at run time"
+          }
+        >
+          {pinned ? `rev ${data.config.revision}` : "latest"}
+        </Badge>
+      </div>
+      {data.isEntry ? null : (
+        <Handle type="target" position={Position.Left} className="!bg-muted-fg" />
+      )}
+      <Handle type="source" position={Position.Right} className="!bg-accent" />
+    </div>
+  );
+}
+
+/** Stacked-boxes glyph — one workflow running inside another. */
+export function SubworkflowIcon({ className }: { className?: string }) {
+  return (
+    <svg
+      aria-hidden
+      viewBox="0 0 16 16"
+      className={cn("size-4", className)}
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="1.5"
+    >
+      <rect x="1.5" y="4.5" width="9" height="8" rx="1.5" />
+      <path d="M5.5 2.5h7A2 2 0 0 1 14.5 4.5v6" strokeLinecap="round" />
+    </svg>
+  );
+}
+
+/**
  * Canvas nodes → React Flow nodes. The entry gets `deletable: false` so no
  * React Flow delete path can remove it (the editor's own delete planning
  * double-checks); the flag is runtime-only and never serialized.
@@ -279,7 +367,9 @@ const entryFlowNodeCache = new WeakMap<CanvasNode, CanvasFlowNode>();
 
 export function toFlowNodes(nodes: readonly CanvasNode[]): CanvasFlowNode[] {
   return nodes.map((node) => {
-    if (node.data.kind !== "agent" || !node.data.isEntry) return node as CanvasFlowNode;
+    const isEntry =
+      (node.data.kind === "agent" || node.data.kind === "subworkflow") && node.data.isEntry;
+    if (!isEntry) return node as CanvasFlowNode;
     const cached = entryFlowNodeCache.get(node);
     if (cached !== undefined) return cached;
     const stamped = { ...node, deletable: false } as CanvasFlowNode;
@@ -292,4 +382,5 @@ export const canvasNodeTypes: NodeTypes = {
   agent: memo(AgentNodeCard) as unknown as NodeTypes["agent"],
   exit: memo(ExitNodeCard) as unknown as NodeTypes["exit"],
   join: memo(JoinNodeCard) as unknown as NodeTypes["join"],
+  subworkflow: memo(SubworkflowNodeCard) as unknown as NodeTypes["subworkflow"],
 };

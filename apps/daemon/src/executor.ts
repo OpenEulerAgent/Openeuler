@@ -972,6 +972,13 @@ export function createExecutor(options: ExecutorOptions): Executor {
       // run leaves the active set, so "executor idle" implies "no sandbox of
       // the run is still being torn down".
       await disposeSandbox(runId);
+      // #117: sub-workflow child runs execute inline, so the executor never
+      // sees them in `active` — dispose their sandboxes (if any) here, with
+      // the parent. Children never host (they declare no ports), so this is
+      // a plain destroy-or-keep pass.
+      for (const child of db.runs.listByParentRun(runId)) {
+        await disposeSandbox(child.id);
+      }
       active.delete(runId);
     }
   }
@@ -1133,23 +1140,22 @@ export function createExecutor(options: ExecutorOptions): Executor {
     }
     // #102: sandboxes of runs that did not settle within the window would
     // otherwise leak containers — destroy them best-effort (debug-kept
-    // sandboxes are exempt by design).
-    for (const entry of entries) {
-      const sandbox = activeSandboxes.get(entry.runId);
-      if (sandbox === undefined) continue;
-      activeSandboxes.delete(entry.runId);
+    // sandboxes are exempt by design). #117: inline child runs never sit in
+    // `active`, so sweep the whole live map, not just the active entries.
+    for (const sandbox of [...activeSandboxes.values()]) {
+      activeSandboxes.delete(sandbox.runId);
       // #104: flush the log tail before the container goes away.
       await sandbox.tailer?.stop().catch(() => {});
       if (sandbox.keepForDebug) {
         recordSandboxKeptActivity(db, {
-          runId: entry.runId,
+          runId: sandbox.runId,
           container: sandbox.handle.id,
           image: sandbox.image,
         });
         continue;
       }
       await sandbox.handle.destroy().catch((err: unknown) => {
-        logger.warn({ err, runId: entry.runId }, "sandbox destroy during shutdown failed");
+        logger.warn({ err, runId: sandbox.runId }, "sandbox destroy during shutdown failed");
       });
     }
     logger.info("executor shutdown complete");

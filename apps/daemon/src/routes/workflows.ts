@@ -21,6 +21,7 @@ import { recordWorkflowCreatedActivity } from "../activity.js";
 import type { Executor } from "../executor.js";
 import { HttpError } from "../errors.js";
 import { redactorForProject } from "../secrets.js";
+import type { GraphValidationIssue, SubworkflowGraphNode } from "@openeuler/core";
 
 /**
  * Workflow CRUD + graph revisions.
@@ -165,14 +166,29 @@ function requireRevisionNumber(number: string): number {
 
 /**
  * Legacy steps mirror for a graph that the linear shape cannot represent
- * (routers, `{{output:}}` templates): the entry node as a single step. The
- * graph revision stays authoritative; this only keeps pre-graph consumers
- * (the steps-based builder UI) rendering something truthful about the start.
+ * (routers, `{{output:}}` templates, sub-workflow nodes): the entry node as
+ * a single step. The graph revision stays authoritative; this only keeps
+ * pre-graph consumers (the steps-based builder UI) rendering something
+ * truthful about the start.
  */
 function placeholderSteps(graph: WorkflowGraph): Step[] {
   const entry = graph.nodes.find((node) => node.id === graph.entryNodeId);
-  if (entry === undefined || entry.type !== "agent") {
-    throw new HttpError(422, "VALIDATION_ERROR", "graph entry node must be an agent node");
+  if (entry === undefined || entry.type === "exit" || entry.type === "join") {
+    throw new HttpError(422, "VALIDATION_ERROR", "graph entry node must be executable");
+  }
+  if (entry.type === "subworkflow") {
+    // A sub-workflow entry has no StepConfig of its own; mirror a harmless
+    // placeholder (the graph revision stays the source of truth).
+    return [
+      {
+        id: entry.id,
+        name: entry.name,
+        driver: "opencode",
+        mode: "auto",
+        promptTemplate: "{{task}}",
+        continueSession: false,
+      },
+    ];
   }
   return [
     {
@@ -181,6 +197,55 @@ function placeholderSteps(graph: WorkflowGraph): Step[] {
       ...entry.config,
     },
   ];
+}
+
+/**
+ * Save-time validation of sub-workflow node references (#117): every
+ * `subworkflow` node must point at an existing workflow, and a PINNED
+ * revision number must exist on it (`'latest'` always resolves — it is
+ * looked up again at execution time). Returns node-attributed issues in
+ * the same shape `validateWorkflowGraph` produces, so the API 422 details
+ * point at the offending nodes.
+ */
+export function subworkflowReferenceIssues(db: Db, graph: WorkflowGraph): GraphValidationIssue[] {
+  const issues: GraphValidationIssue[] = [];
+  for (const [index, node] of graph.nodes.entries()) {
+    if (node.type !== "subworkflow") continue;
+    const sub = node as SubworkflowGraphNode;
+    const referenced = db.workflows.get(sub.config.workflowId);
+    if (referenced === undefined) {
+      issues.push({
+        path: ["nodes", index, "config", "workflowId"],
+        message: `sub-workflow node "${sub.name}" (${sub.id}) references unknown workflow "${sub.config.workflowId}"`,
+      });
+      continue;
+    }
+    if (sub.config.revision === "latest") continue;
+    const revision = db.workflowRevisions.getByNumber(referenced.id, sub.config.revision);
+    if (revision === undefined) {
+      const latest = referenced.latestRevisionNumber;
+      issues.push({
+        path: ["nodes", index, "config", "revision"],
+        message: `sub-workflow node "${sub.name}" (${sub.id}) references revision ${sub.config.revision} of workflow "${referenced.name}" (${referenced.id}), which does not exist (latest: ${latest ?? "none"})`,
+      });
+    }
+  }
+  return issues;
+}
+
+/** Throws the 422 for {@link subworkflowReferenceIssues} findings, if any. */
+function requireResolvableSubworkflows(db: Db, graph: WorkflowGraph): void {
+  const issues = subworkflowReferenceIssues(db, graph);
+  if (issues.length === 0) return;
+  throw new HttpError(
+    422,
+    "VALIDATION_ERROR",
+    `graph has ${issues.length} unresolvable sub-workflow reference${issues.length === 1 ? "" : "s"}`,
+    issues.map((issue) => ({
+      path: `graph.${issue.path.join(".")}`,
+      message: issue.message,
+    })),
+  );
 }
 
 /** Mirrors a validated graph onto the legacy steps/loopBack columns when it round-trips. */
@@ -260,6 +325,8 @@ export function createWorkflowsRouter(): Hono<AppEnv> {
     let revision: WorkflowRevision;
     let workflow: Workflow;
     if (body.graph !== undefined) {
+      // #117: sub-workflow references must resolve at save time.
+      requireResolvableSubworkflows(db, body.graph);
       const linear = graphToLinear(body.graph);
       workflow = db.workflows.create({
         id: randomUUID(),
@@ -358,6 +425,9 @@ export function createWorkflowsRouter(): Hono<AppEnv> {
     const id = c.req.param("id");
     requireWorkflow(db, id);
     const body = PutGraphBodySchema.parse(await parseJsonBody(c));
+    // #117: sub-workflow references must resolve at save time (unknown
+    // workflow / missing pinned revision → 422 with node-attributed details).
+    requireResolvableSubworkflows(db, body.graph);
     // Concurrency guard (#76): the client pinned the revision it edited;
     // a newer revision elsewhere refuses the save (409) with the current
     // number so the editor can offer reload vs save-anyway.

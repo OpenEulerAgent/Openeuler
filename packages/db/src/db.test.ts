@@ -108,19 +108,21 @@ describe("createDatabase", () => {
     db.close();
 
     // Rewind the file to its pre-0008 shape: forget the last applied
-    // migrations (0008 hwm + 0009 run ports + 0010 hosting) and drop the
-    // columns they added. (Journal rows carry no usable id — order by
-    // created_at.)
+    // migrations (0008 hwm + 0009 run ports + 0010 hosting + 0011 sub-workflow
+    // parentRunId) and drop the columns they added. (Journal rows carry no
+    // usable id — order by created_at.)
     const raw = new Database(join(dir, "test.db"));
     try {
       raw.exec(
-        "delete from __drizzle_migrations where created_at >= (select distinct created_at from __drizzle_migrations order by created_at desc limit 1 offset 2)",
+        "delete from __drizzle_migrations where created_at >= (select distinct created_at from __drizzle_migrations order by created_at desc limit 1 offset 3)",
       );
       raw.exec("alter table runs drop column event_seq_hwm");
       raw.exec("alter table runs drop column ports");
       raw.exec("alter table runs drop column detected_ports");
       raw.exec("alter table runs drop column hosting");
       raw.exec("alter table runs drop column hosted_until");
+      raw.exec("drop index if exists runs_parent_run_id_idx");
+      raw.exec("alter table runs drop column parent_run_id");
     } finally {
       raw.close();
     }

@@ -391,3 +391,39 @@ describe("fold: parallel fan-out + join (#115)", () => {
     expect(state.nodes["c"]?.executions[0]?.status).toBe("failed");
   });
 });
+
+describe("fold sub-workflow child run ids (#117)", () => {
+  it("node.completed with childRunId threads it onto the execution row", () => {
+    const state = buildRunGraphState([
+      queued("sub"),
+      started("sub"),
+      completed("sub", 1, "success", { childRunId: "child-run-1" }),
+    ]);
+    expect(state.nodes["sub"]?.executions).toEqual([
+      {
+        iteration: 1,
+        status: "success",
+        childRunId: "child-run-1",
+        output: "out:sub:1",
+        durationMs: 100,
+      },
+    ]);
+  });
+
+  it("ordinary completions carry no childRunId, and re-folding the same events is idempotent", () => {
+    const events = [
+      queued("a"),
+      started("a"),
+      completed("a", 1),
+      queued("sub"),
+      started("sub"),
+      completed("sub", 1, "success", { childRunId: "child-run-1" }),
+      runStatus("success"),
+    ];
+    const state = buildRunGraphState(events);
+    expect(state.nodes["a"]?.executions[0]?.childRunId).toBeUndefined();
+    expect(state.nodes["sub"]?.executions[0]?.childRunId).toBe("child-run-1");
+    // SSE replay re-delivery (seq at or below the cursor) changes nothing.
+    expect(foldRunGraphEvents(state, events)).toBe(state);
+  });
+});

@@ -203,6 +203,39 @@ describe("toRunFlowNodes", () => {
     expect(find(after, "a").data).toBe(find(before, "a").data);
     expect(find(after, "b").data).not.toBe(find(before, "b").data);
   });
+
+  it("maps sub-workflow nodes to the run-subworkflow card type (#117)", () => {
+    const subDoc: CanvasDocument = toCanvasDocument({
+      entryNodeId: "a",
+      nodes: [
+        { id: "a", type: "agent", name: "Agent A", position: { x: 0, y: 0 }, config },
+        {
+          id: "sub",
+          type: "subworkflow",
+          name: "Spawn",
+          position: { x: 280, y: 0 },
+          config: { workflowId: "wf-child", revision: 2 },
+        },
+        { id: "exit", type: "exit", name: "Exit", position: { x: 560, y: 0 } },
+      ],
+      edges: [
+        { id: "e-a-sub", source: "a", target: "sub", condition: { type: "always" } },
+        { id: "e-sub-exit", source: "sub", target: "exit", condition: { type: "always" } },
+      ],
+    });
+    const nodes = toRunFlowNodes(subDoc, {});
+    const byId = new Map(nodes.map((node) => [node.id, node]));
+    expect(byId.get("a")).toMatchObject({ type: "run-agent" });
+    expect(byId.get("sub")).toMatchObject({
+      type: "run-subworkflow",
+      data: {
+        kind: "subworkflow",
+        config: { workflowId: "wf-child", revision: 2 },
+        visual: null,
+      },
+    });
+    expect(byId.get("exit")).toMatchObject({ type: "run-exit" });
+  });
 });
 
 describe("toRunFlowEdges", () => {

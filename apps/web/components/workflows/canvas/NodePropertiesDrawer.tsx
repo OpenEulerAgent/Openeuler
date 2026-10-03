@@ -12,6 +12,7 @@ import type {
   CanvasDocument,
   CanvasNode,
   JoinNodeData,
+  SubworkflowNodeData,
 } from "@/lib/graph/canvas-document";
 import {
   insertPromptVariable,
@@ -46,6 +47,7 @@ export function NodePropertiesDrawer({
   onPatchAgent,
   onPatchName,
   onPatchJoinMode,
+  onPatchSubworkflow,
   onCommitEdit,
   onDelete,
   onClose,
@@ -53,6 +55,7 @@ export function NodePropertiesDrawer({
   onDetachPreset,
   onUpdateFromPreset,
   onSaveAsPreset,
+  workflows,
 }: {
   node: CanvasNode;
   doc: CanvasDocument;
@@ -61,6 +64,11 @@ export function NodePropertiesDrawer({
   onPatchName: (name: string) => void;
   /** Join mode toggle (#116): `all` waits for every branch, `any` = first winner. */
   onPatchJoinMode?: (mode: "all" | "any") => void;
+  /**
+   * Sub-workflow picker (#117): which workflow the node spawns + how its
+   * revision is pinned.
+   */
+  onPatchSubworkflow?: (patch: { workflowId?: string; revision?: "latest" | number }) => void;
   /** Settles a pending debounced edit into one history entry (field blur). */
   onCommitEdit: () => void;
   onDelete: () => void;
@@ -71,6 +79,8 @@ export function NodePropertiesDrawer({
   onUpdateFromPreset?: () => void;
   /** Saves the node's current config as a new preset. */
   onSaveAsPreset?: (name: string, description: string) => Promise<void> | void;
+  /** The project's workflows, for the sub-workflow picker (#117). */
+  workflows?: readonly SubworkflowPickerWorkflow[] | undefined;
 }) {
   const fieldErrors = useMemo(() => inspectorFieldErrors(doc, node.id), [doc, node.id]);
   const nodeIssues = issuesForNode(issues, node.id).filter(
@@ -90,9 +100,16 @@ export function NodePropertiesDrawer({
                 ? "Agent step"
                 : node.data.kind === "join"
                   ? "Join node"
-                  : "Exit node"}
+                  : node.data.kind === "subworkflow"
+                    ? "Sub-workflow node"
+                    : "Exit node"}
             </h2>
             {node.data.kind === "agent" && node.data.isEntry ? (
+              <Badge variant="accent" className="mt-1">
+                entry · pinned
+              </Badge>
+            ) : null}
+            {node.data.kind === "subworkflow" && node.data.isEntry ? (
               <Badge variant="accent" className="mt-1">
                 entry · pinned
               </Badge>
@@ -149,6 +166,15 @@ export function NodePropertiesDrawer({
           <JoinInspector
             node={node as CanvasNode & { data: JoinNodeData }}
             onPatchJoinMode={onPatchJoinMode}
+          />
+        ) : null}
+
+        {node.data.kind === "subworkflow" ? (
+          <SubworkflowInspector
+            node={node as CanvasNode & { data: SubworkflowNodeData }}
+            workflows={workflows ?? []}
+            fieldErrors={fieldErrors}
+            onPatchSubworkflow={onPatchSubworkflow}
           />
         ) : null}
 
@@ -211,7 +237,7 @@ export function NodePropertiesDrawer({
         ) : null}
 
         <div className="mt-auto flex justify-end pt-2">
-          {node.data.kind === "agent" && node.data.isEntry ? (
+          {node.data.isEntry === true ? (
             <p className="text-xs text-muted-fg">The entry node cannot be deleted.</p>
           ) : (
             <Button variant="danger" onClick={onDelete}>
@@ -588,6 +614,111 @@ function JoinInspector({
           : "any: the first branch to complete wins and the flow continues immediately; the remaining branches are cancelled."}
       </p>
     </Field>
+  );
+}
+
+/** A workflow the sub-workflow picker (#117) lists. */
+export interface SubworkflowPickerWorkflow {
+  id: string;
+  name: string;
+  /** Latest revision number (the picker offers 1..N plus "latest"). */
+  latestRevision?: number | undefined;
+}
+
+/**
+ * Sub-workflow-only fields (#117): the whole config is a picker — WHICH
+ * workflow this node spawns and HOW its revision is pinned. `latest`
+ * re-resolves at every run (the child pins whatever is newest when it
+ * starts); a pinned number freezes the snapshot. Choosing a different
+ * workflow resets the revision to `latest`.
+ */
+function SubworkflowInspector({
+  node,
+  workflows,
+  fieldErrors,
+  onPatchSubworkflow,
+}: {
+  node: CanvasNode & { data: SubworkflowNodeData };
+  workflows: readonly SubworkflowPickerWorkflow[];
+  fieldErrors: InspectorFieldErrors;
+  onPatchSubworkflow?: (patch: { workflowId?: string; revision?: "latest" | number }) => void;
+}) {
+  const { workflowId, revision } = node.data.config;
+  const selected = workflows.find((candidate) => candidate.id === workflowId);
+  const latest = selected?.latestRevision ?? undefined;
+  return (
+    <>
+      <Field
+        label="Workflow"
+        htmlFor="node-subworkflow-workflow"
+        error={fieldErrors["config.workflowId"]}
+      >
+        <Select
+          id="node-subworkflow-workflow"
+          value={workflowId}
+          invalid={fieldErrors["config.workflowId"] !== undefined}
+          onChange={(event) => onPatchSubworkflow?.({ workflowId: event.target.value })}
+          data-subworkflow-workflow
+        >
+          <option value="">Pick a workflow…</option>
+          {workflows.map((candidate) => (
+            <option key={candidate.id} value={candidate.id}>
+              {candidate.name}
+              {candidate.latestRevision !== undefined ? ` (rev ${candidate.latestRevision})` : ""}
+            </option>
+          ))}
+        </Select>
+        {workflowId !== "" && selected === undefined ? (
+          <p className="text-xs text-warning" data-subworkflow-stale>
+            This workflow no longer exists — pick another before saving.
+          </p>
+        ) : null}
+        <p className="text-xs text-muted-fg">
+          Running this node spawns a child run of the workflow and waits for it — the child&apos;s
+          final output becomes this node&apos;s output.
+        </p>
+      </Field>
+
+      <Field
+        label="Revision"
+        htmlFor="node-subworkflow-revision"
+        error={fieldErrors["config.revision"]}
+      >
+        <Select
+          id="node-subworkflow-revision"
+          value={revision === "latest" ? "latest" : String(revision)}
+          invalid={fieldErrors["config.revision"] !== undefined}
+          onChange={(event) =>
+            onPatchSubworkflow?.({
+              revision: event.target.value === "latest" ? "latest" : Number(event.target.value),
+            })
+          }
+          data-subworkflow-revision
+        >
+          <option value="latest">latest — resolve at run time</option>
+          {latest !== undefined
+            ? Array.from({ length: latest }, (_, index) => index + 1)
+                .reverse()
+                .map((number) => (
+                  <option key={number} value={number}>
+                    pin revision {number}
+                  </option>
+                ))
+            : revision !== "latest"
+              ? [
+                  <option key={revision} value={revision}>
+                    pin revision {revision}
+                  </option>,
+                ]
+              : null}
+        </Select>
+        <p className="text-xs text-muted-fg" data-subworkflow-revision-copy>
+          {revision === "latest"
+            ? "latest: each run pins the workflow's newest revision when the child starts — edits never mutate a running run."
+            : `pinned: the child always runs revision ${revision}, exactly as saved.`}
+        </p>
+      </Field>
+    </>
   );
 }
 

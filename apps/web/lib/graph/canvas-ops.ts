@@ -60,7 +60,10 @@ export function checkConnect(doc: CanvasDocument, params: ConnectParams): Connec
     };
   }
 
-  if (targetNode.data.kind === "agent" && targetNode.data.isEntry) {
+  if (
+    (targetNode.data.kind === "agent" || targetNode.data.kind === "subworkflow") &&
+    targetNode.data.isEntry
+  ) {
     return {
       ok: false,
       reason: "entry-target",
@@ -130,10 +133,10 @@ export function planDelete(
   doc: CanvasDocument,
   selection: { nodeIds: readonly string[]; edgeIds: readonly string[] },
 ): DeleteCheck {
-  const nodes = selection.nodeIds.filter(
-    (id) =>
-      !doc.nodes.some((node) => node.id === id && node.data.kind === "agent" && node.data.isEntry),
-  );
+  const nodes = selection.nodeIds.filter((id) => {
+    const node = doc.nodes.find((candidate) => candidate.id === id);
+    return !(node !== undefined && node.data.isEntry === true);
+  });
   return { nodes, edges: [...selection.edgeIds] };
 }
 

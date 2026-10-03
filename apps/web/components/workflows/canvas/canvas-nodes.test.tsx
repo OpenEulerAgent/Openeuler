@@ -34,6 +34,7 @@ import { GraphCanvasEditor } from "./GraphCanvasEditor";
 import {
   NodeHintCountsContext,
   NodeIssueCountsContext,
+  WorkflowNamesContext,
   canvasNodeTypes,
   toFlowNodes,
 } from "./canvas-nodes";
@@ -63,6 +64,9 @@ const wrapperBox = (element: HTMLElement): { width: number; height: number } => 
   if (element.querySelector('[data-canvas-node="agent"]') !== null) return CANVAS_NODE_SIZES.agent;
   if (element.querySelector('[data-canvas-node="exit"]') !== null) return CANVAS_NODE_SIZES.exit;
   if (element.querySelector('[data-canvas-node="join"]') !== null) return CANVAS_NODE_SIZES.join;
+  if (element.querySelector('[data-canvas-node="subworkflow"]') !== null) {
+    return CANVAS_NODE_SIZES.subworkflow;
+  }
   return { width: 0, height: 0 };
 };
 
@@ -183,6 +187,17 @@ const joinNode: CanvasNode = {
   type: "join",
   position: { x: 640, y: 0 },
   data: { kind: "join", name: "Merge", config: { mode: "all" } },
+};
+
+const subworkflowNode: CanvasNode = {
+  id: "sub",
+  type: "subworkflow",
+  position: { x: 320, y: 160 },
+  data: {
+    kind: "subworkflow",
+    name: "Spawn",
+    config: { workflowId: "wf-child", revision: "latest" },
+  },
 };
 
 const doc: CanvasDocument = {
@@ -321,7 +336,7 @@ describe("canvas node cards under the real React Flow (#88)", () => {
   });
 
   it("geometry tokens, Tailwind classes and dagre NODE_SIZES agree (1 unit = 4px)", () => {
-    for (const kind of ["agent", "exit", "join"] as const) {
+    for (const kind of ["agent", "exit", "join", "subworkflow"] as const) {
       const widthUnit = Number(CANVAS_NODE_SIZE_CLASSES[kind].width.slice(2));
       const heightUnit = Number(CANVAS_NODE_SIZE_CLASSES[kind].height.slice(2));
       expect(widthUnit * 4).toBe(CANVAS_NODE_SIZES[kind].width);
@@ -418,7 +433,7 @@ describe("toFlowNodes (#88)", () => {
 
 describe("canvasNodeTypes identity (#88)", () => {
   it("is the module-scope registry with all card kinds", () => {
-    expect(Object.keys(canvasNodeTypes)).toEqual(["agent", "exit", "join"]);
+    expect(Object.keys(canvasNodeTypes)).toEqual(["agent", "exit", "join", "subworkflow"]);
   });
 
   it("keeps cards mounted across re-renders (stable component identity)", async () => {
@@ -594,5 +609,72 @@ describe("GraphCanvasEditor 3-node repro stand-in (#88)", () => {
     // Pane collapse insurance: the canvas pane keeps an explicit min-height.
     const pane = document.querySelector("[data-canvas-canvas]");
     expect(pane?.className).toContain("min-h-[480px]");
+  });
+});
+
+describe("sub-workflow node card (#117)", () => {
+  it("paints with the agent-size token, shows the workflow name from the names context, both handles", async () => {
+    await render(
+      createElement(
+        ReactFlowProvider,
+        null,
+        createElement(
+          WorkflowNamesContext.Provider,
+          { value: new Map([["wf-child", "Child flow"]]) },
+          createElement(ReactFlow, {
+            nodes: toFlowNodes([subworkflowNode]),
+            edges: [] as unknown as Edge[],
+            nodeTypes: canvasNodeTypes,
+            fitView: true,
+          }),
+        ),
+      ),
+    );
+    for (let i = 0; i < 12; i += 1) {
+      await act(async () => {});
+    }
+    const wrapper = nodeWrapper("sub");
+    expect(wrapper.style.visibility).toBe("visible");
+    const el = card("sub");
+    expect(el.getAttribute("data-canvas-node")).toBe("subworkflow");
+    expect(el.className).toContain(CANVAS_NODE_SIZE_CLASSES.subworkflow.width);
+    expect(el.className).toContain(CANVAS_NODE_SIZE_CLASSES.subworkflow.height);
+    expect(el.textContent).toContain("Spawn");
+    // The referenced workflow renders by NAME (resolved via context), with
+    // the latest/pin badge.
+    expect(el.textContent).toContain("Child flow");
+    expect(el.textContent).toContain("latest");
+    expect(handleCount("sub", "source")).toBe(1);
+    expect(handleCount("sub", "target")).toBe(1);
+  });
+
+  it("falls back to the raw workflow id when no name resolves; pinned revision shows rev N", async () => {
+    await render(
+      createElement(
+        ReactFlowProvider,
+        null,
+        createElement(ReactFlow, {
+          nodes: toFlowNodes([
+            {
+              ...subworkflowNode,
+              data: {
+                ...subworkflowNode.data,
+                kind: "subworkflow" as const,
+                config: { workflowId: "wf-unknown", revision: 2 },
+              },
+            },
+          ]),
+          edges: [] as unknown as Edge[],
+          nodeTypes: canvasNodeTypes,
+          fitView: true,
+        }),
+      ),
+    );
+    for (let i = 0; i < 12; i += 1) {
+      await act(async () => {});
+    }
+    const el = card("sub");
+    expect(el.textContent).toContain("wf-unknown");
+    expect(el.textContent).toContain("rev 2");
   });
 });

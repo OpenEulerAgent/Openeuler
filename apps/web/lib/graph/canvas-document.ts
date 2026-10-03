@@ -7,6 +7,8 @@ import type {
   GraphNodePosition,
   JoinGraphNode,
   StepConfig,
+  SubworkflowGraphNode,
+  SubworkflowRevision,
   WorkflowGraph,
   WorkflowGraphShape,
 } from "@openeuler/core";
@@ -55,11 +57,24 @@ export interface JoinNodeData extends Record<string, unknown> {
   config: { mode: "all" | "any" };
 }
 
-export type CanvasNodeData = AgentNodeData | ExitNodeData | JoinNodeData;
+/**
+ * Sub-workflow node payload (#117): spawns a child run of the referenced
+ * workflow (`revision` = `'latest'` or a pinned number). No prompt/driver
+ * of its own — the node's work IS the child run.
+ */
+export interface SubworkflowNodeData extends Record<string, unknown> {
+  kind: "subworkflow";
+  name: string;
+  config: { workflowId: string; revision: SubworkflowRevision };
+  /** Canvas-only: marks the node `entryNodeId` points at. */
+  isEntry?: boolean;
+}
+
+export type CanvasNodeData = AgentNodeData | ExitNodeData | JoinNodeData | SubworkflowNodeData;
 
 export type CanvasNode = {
   id: string;
-  type: "agent" | "exit" | "join";
+  type: "agent" | "exit" | "join" | "subworkflow";
   position: GraphNodePosition;
   data: CanvasNodeData;
   /** React Flow selection flag; runtime-only, never serialized. */
@@ -175,6 +190,23 @@ export function createJoinNode(
   };
 }
 
+/**
+ * A fresh sub-workflow node as the palette creates it (#117): no workflow
+ * picked yet (`workflowId: ""` is a live validation blocker until the
+ * inspector picker fills it), revision defaulting to `'latest'`.
+ */
+export function createSubworkflowNode(
+  position: GraphNodePosition = { x: 0, y: 0 },
+  name = "Sub-workflow",
+): CanvasNode {
+  return {
+    id: newCanvasNodeId(),
+    type: "subworkflow",
+    position,
+    data: { kind: "subworkflow", name, config: { workflowId: "", revision: "latest" } },
+  };
+}
+
 /** Structural slice of an {@link AgentPreset} the canvas needs to build a node. */
 export type PresetSource = {
   id: string;
@@ -255,6 +287,20 @@ export function toCanvasDocument(graph: WorkflowGraph): CanvasDocument {
         data: { kind: "join" as const, name: join.name, config: join.config },
       };
     }
+    if (node.type === "subworkflow") {
+      const sub = node as SubworkflowGraphNode;
+      return {
+        id: sub.id,
+        type: "subworkflow" as const,
+        position: sub.position,
+        data: {
+          kind: "subworkflow" as const,
+          name: sub.name,
+          config: { workflowId: sub.config.workflowId, revision: sub.config.revision },
+          ...(sub.id === graph.entryNodeId ? { isEntry: true } : {}),
+        },
+      };
+    }
     const exit = node as ExitGraphNode;
     return {
       id: exit.id,
@@ -302,6 +348,15 @@ export function fromCanvasDocument(doc: CanvasDocument): WorkflowGraph {
         config: node.data.config,
       };
     }
+    if (node.data.kind === "subworkflow") {
+      return {
+        id: node.id,
+        type: "subworkflow" as const,
+        name: node.data.name,
+        position: node.position,
+        config: { workflowId: node.data.config.workflowId, revision: node.data.config.revision },
+      };
+    }
     return {
       id: node.id,
       type: "exit" as const,
@@ -318,7 +373,9 @@ export function fromCanvasDocument(doc: CanvasDocument): WorkflowGraph {
     ...(edge.data.maxIterations === undefined ? {} : { maxIterations: edge.data.maxIterations }),
     ...(edge.data.invert === undefined ? {} : { invert: edge.data.invert }),
   }));
-  const entry = doc.nodes.find((node) => node.data.kind === "agent" && node.data.isEntry);
+  const entry = doc.nodes.find(
+    (node) => (node.data.kind === "agent" || node.data.kind === "subworkflow") && node.data.isEntry,
+  );
   return { entryNodeId: entry ? entry.id : (doc.nodes[0]?.id ?? ""), nodes, edges };
 }
 

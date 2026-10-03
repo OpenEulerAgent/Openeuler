@@ -85,7 +85,7 @@ describe("WorkflowGraphSchema", () => {
     expectIssue(
       { ...validChain(), entryNodeId: "exit" },
       ["entryNodeId"],
-      "must reference an agent node",
+      "must reference an agent or subworkflow node",
     );
   });
 
@@ -181,7 +181,7 @@ describe("WorkflowGraphSchema", () => {
         edges: [edge("e1", "a", "b"), edge("e2", "a", "exit"), edge("e3", "b", "exit")],
       },
       ["edges", 1],
-      "parallel branches must start at agent nodes",
+      "parallel branches must start at agent or subworkflow nodes",
     );
   });
 
@@ -771,6 +771,106 @@ describe("renderPromptTemplate ({{output:<nodeId>}})", () => {
   it("extractOutputReferences lists referenced node ids", () => {
     expect(extractOutputReferences("{{output:a}} {{task}} {{ output:b }}")).toEqual(["a", "b"]);
     expect(extractOutputReferences("{{task}}")).toEqual([]);
+  });
+});
+
+describe("sub-workflow nodes (#117)", () => {
+  const subworkflowNode = (
+    id: string,
+    workflowId: string,
+    revision: "latest" | number = "latest",
+  ) => ({
+    id,
+    type: "subworkflow" as const,
+    name: id,
+    position: { x: 0, y: 0 },
+    config: { workflowId, revision },
+  });
+
+  it("parses a subworkflow node with latest or pinned revision", () => {
+    const parsed = WorkflowGraphSchema.parse({
+      entryNodeId: "a",
+      nodes: [
+        agentNode("a"),
+        subworkflowNode("sub", "wf-1"),
+        subworkflowNode("pinned", "wf-2", 3),
+        exitNode(),
+      ],
+      edges: [edge("e1", "a", "sub"), edge("e2", "sub", "pinned"), edge("e3", "pinned", "exit")],
+    });
+    expect(parsed.nodes[1]).toEqual(subworkflowNode("sub", "wf-1"));
+    expect(parsed.nodes[2]).toEqual(subworkflowNode("pinned", "wf-2", 3));
+  });
+
+  it("rejects an empty workflowId and invalid revision numbers", () => {
+    expectIssue(
+      {
+        entryNodeId: "a",
+        nodes: [subworkflowNode("sub", ""), exitNode()],
+        edges: [edge("e1", "sub", "exit")],
+      },
+      ["nodes", 0, "config", "workflowId"],
+      "id must be a non-empty string",
+    );
+    expectIssue(
+      {
+        entryNodeId: "a",
+        nodes: [subworkflowNode("sub", "wf-1", 0), exitNode()],
+        edges: [edge("e1", "sub", "exit")],
+      },
+      ["nodes", 0, "config", "revision"],
+      "revision must be 'latest' or an integer >= 1",
+    );
+  });
+
+  it("allows a subworkflow node as the entry and as a fan-out branch target", () => {
+    const entry = WorkflowGraphSchema.parse({
+      entryNodeId: "sub",
+      nodes: [subworkflowNode("sub", "wf-1"), exitNode()],
+      edges: [edge("e1", "sub", "exit")],
+    });
+    expect(entry.entryNodeId).toBe("sub");
+
+    const fanOut = WorkflowGraphSchema.parse({
+      entryNodeId: "a",
+      nodes: [agentNode("a"), agentNode("b"), subworkflowNode("sub", "wf-1"), exitNode()],
+      edges: [
+        edge("e1", "a", "b"),
+        edge("e2", "a", "sub"),
+        edge("e3", "b", "exit"),
+        edge("e4", "sub", "exit"),
+      ],
+    });
+    expect(fanOut.nodes.map((node) => node.type)).toEqual([
+      "agent",
+      "agent",
+      "subworkflow",
+      "exit",
+    ]);
+  });
+
+  it("still rejects non-executable fan-out targets with clear messages", () => {
+    expectIssue(
+      {
+        entryNodeId: "a",
+        nodes: [agentNode("a"), exitNode("x1"), exitNode("x2")],
+        edges: [edge("e1", "a", "x1"), edge("e2", "a", "x2")],
+      },
+      ["edges", 1],
+      "parallel branches must start at agent or subworkflow nodes",
+    );
+  });
+
+  it("graphToLinear refuses subworkflow graphs (no legacy representation)", () => {
+    const result = graphToLinear(
+      WorkflowGraphSchema.parse({
+        entryNodeId: "a",
+        nodes: [agentNode("a"), subworkflowNode("sub", "wf-1"), exitNode()],
+        edges: [edge("e1", "a", "sub"), edge("e2", "sub", "exit")],
+      }),
+    );
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.reason).toContain("subworkflow");
   });
 });
 

@@ -270,6 +270,10 @@ export interface RunsApiRow {
   workflowRevision?: { id: string; number: number };
   project?: { id: string; name: string };
   workflow?: { id: string; name: string };
+  /** Parent run id when this run is a sub-workflow child (#117). */
+  parentRunId?: string;
+  /** Child runs this run spawned via sub-workflow nodes (#117). */
+  childRunIds?: string[];
 }
 
 /**
