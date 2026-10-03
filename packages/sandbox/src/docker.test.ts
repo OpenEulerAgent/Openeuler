@@ -699,6 +699,22 @@ describe("docker provider unit (fake CLI runner)", () => {
       code: "SANDBOX_EXEC_FAILED",
     });
   });
+
+  it("stop(id) runs docker stop with the default grace; missing containers resolve (#112)", async () => {
+    const runner = new RecordingRunner();
+    const provider = createDockerSandboxProvider({ runner: (a) => runner.run(a) });
+    runner.ok("openeuler-run-1-abc123\n");
+    await provider.stop?.("openeuler-run-1-abc123");
+    expect(findCall(runner, "stop")).toEqual(["stop", "-t", "10", "openeuler-run-1-abc123"]);
+
+    runner.fail(1, "Error response from daemon: No such container: ghost");
+    await expect(provider.stop?.("ghost")).resolves.toBeUndefined();
+
+    runner.fail(1, "driver failure while stopping");
+    await expect(provider.stop?.("stuck")).rejects.toMatchObject({
+      code: "SANDBOX_STOP_FAILED",
+    });
+  });
 });
 
 describe("docker logs demux (fake spawner)", () => {

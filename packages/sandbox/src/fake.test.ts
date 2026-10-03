@@ -486,6 +486,19 @@ describe("fake provider list/stats", () => {
     await expect(provider.destroy?.("never-existed")).resolves.toBeUndefined();
   });
 
+  it("stops by id (#112): kept + listed as stopped, unknown id is a no-op", async () => {
+    const provider = createFakeSandboxProvider();
+    const handle = await provider.create(spec());
+    await provider.stop?.(handle.id);
+    const summaries = await provider.list();
+    expect(summaries).toHaveLength(1);
+    expect(summaries[0]).toMatchObject({ id: handle.id, status: "stopped" });
+    expect(provider.stopCalls).toEqual([{ sandboxId: handle.id, timeoutMs: undefined }]);
+
+    // Already-gone ids resolve (idempotent), like destroy-by-id.
+    await expect(provider.stop?.("never-existed")).resolves.toBeUndefined();
+  });
+
   it("transitions to exited on its own after exitsAfterMs", async () => {
     const provider = createFakeSandboxProvider({ exitsAfterMs: 10 });
     const handle = await provider.create(spec());

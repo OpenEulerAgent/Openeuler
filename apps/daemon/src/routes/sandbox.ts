@@ -1,5 +1,7 @@
 import { randomUUID } from "node:crypto";
-import type { SandboxProvider } from "@openeuler/sandbox";
+import { cpus } from "node:os";
+import type { Db } from "@openeuler/db";
+import type { SandboxProvider, SandboxUsage, SandboxSummary } from "@openeuler/sandbox";
 import { SandboxError } from "@openeuler/sandbox";
 import type { SandboxImagesOptions } from "@openeuler/sandbox";
 import {
@@ -12,9 +14,9 @@ import {
   pullSandboxImage,
   removeSandboxImage,
 } from "@openeuler/sandbox";
+import { DEFAULT_SANDBOX_MEMORY_MB } from "@openeuler/engine";
 import { Hono } from "hono";
 import { z } from "zod";
-import type { Db } from "@openeuler/db";
 import { recordImageJobActivity } from "../activity.js";
 import type { AppEnv } from "../app.js";
 import { resolveExecutionMode } from "../executor.js";
@@ -48,6 +50,15 @@ import { createDockerStatusService, type DockerStatusOptions } from "../sandbox-
  *   ref.
  * - `GET /api/sandbox/jobs/:id` — in-memory job registry (running | done |
  *   failed, plus the failure message). Jobs live for the daemon process only.
+ * - `GET /api/sandbox/instances` — the sandboxes dashboard (#112): every
+ *   provider sandbox (`provider.list()`, newest first) joined with run rows
+ *   (project name, run status, hosted flag) where the `run` label resolves,
+ *   plus a live `usage` snapshot from `provider.stats()` when available (a
+ *   stats hiccup omits usage, never fails the listing).
+ * - `POST /api/sandbox/instances/:id/stop` — graceful container stop by
+ *   `list()` id: the sandbox is KEPT (listed `stopped`, inspectable).
+ * - `DELETE /api/sandbox/instances/:id` — typed destroy by id (#105's
+ *   `provider.destroy`), idempotent.
  *
  * Auth + rate limits apply automatically (mounted under `/api`).
  */
@@ -63,6 +74,40 @@ export interface SandboxJob {
   error?: string;
   createdAt: number;
   finishedAt?: number;
+}
+
+/** One `GET /api/sandbox/instances` row (#112). */
+export interface SandboxInstanceBody {
+  /** `list()` id (the docker container name). */
+  id: string;
+  /** Owning run id from the sandbox labels (`run`); null when unlabeled. */
+  runId: string | null;
+  image: string;
+  status: SandboxSummary["status"];
+  /** Epoch ms the sandbox was created. */
+  startedAt: number;
+  /**
+   * Live usage from `provider.stats()` when available. `cpuPercent` is the
+   * host-relative percentage (stats' fractional cores × host CPUs back into
+   * percent); `memLimitMb` is the project policy's memory cap (engine
+   * default when unset) — a soft reference for usage bars.
+   */
+  usage?: { cpuPercent?: number; memMb?: number; memLimitMb?: number };
+  /** Joined run row when the labeled run still exists (hosted runs too). */
+  run?: {
+    id: string;
+    status: string;
+    project?: { id: string; name: string };
+    /** True while the run's sandbox is hosted past success (#110). */
+    hosted?: boolean;
+  };
+}
+
+/** `GET /api/sandbox/instances` payload (#112). */
+export interface SandboxInstancesBody {
+  instances: SandboxInstanceBody[];
+  /** Epoch ms of the `list()` snapshot. */
+  checkedAt: number;
 }
 
 /** Options for {@link createSandboxRouter}. */
@@ -350,6 +395,173 @@ export function createSandboxRouter(options: SandboxRouterOptions = {}): Hono<Ap
       throw new HttpError(404, "JOB_NOT_FOUND", "no such image job (jobs are in-memory)");
     }
     return c.json(job);
+  });
+
+  // Sandboxes dashboard (#112): provider sandboxes joined with run rows.
+  // No provider → 503 like every sandbox route; a provider/daemon hiccup on
+  // list() surfaces typed; a stats() hiccup only drops the usage column.
+  router.get("/instances", async (c) => {
+    const sandboxProvider = provider();
+    const db = c.get("db");
+    let summaries: SandboxSummary[];
+    try {
+      summaries = await sandboxProvider.list();
+    } catch (err) {
+      if (err instanceof SandboxError) throw sandboxHttpError(err);
+      throw err;
+    }
+
+    const usageById = new Map<string, SandboxUsage>();
+    if (sandboxProvider.stats !== undefined) {
+      try {
+        for (const usage of await sandboxProvider.stats()) {
+          if (usage.id !== "") usageById.set(usage.id, usage);
+        }
+      } catch (err) {
+        c.get("logger").warn({ err }, "sandbox stats() failed — instances listed without usage");
+      }
+    }
+
+    // The docker provider reports fractional HOST cores; back into a percent
+    // with the daemon's own CPU count (same host in every real deployment).
+    const hostCpus = cpus().length || 1;
+    const instances: SandboxInstanceBody[] = summaries.map((summary) => {
+      const runId = summary.labels["run"] ?? null;
+      let run: SandboxInstanceBody["run"];
+      let memLimitMb: number | undefined;
+      if (runId !== null && db !== undefined) {
+        const row = db.runs.get(runId);
+        if (row !== undefined) {
+          const project = db.projects.get(row.projectId);
+          run = {
+            id: row.id,
+            status: row.status,
+            ...(project === undefined ? {} : { project: { id: project.id, name: project.name } }),
+            ...(row.hostedUntil === undefined || row.hostedUntil === null ? {} : { hosted: true }),
+          };
+          const policyMb = project?.sandboxPolicy?.memoryMb;
+          memLimitMb = policyMb ?? DEFAULT_SANDBOX_MEMORY_MB;
+        }
+      }
+      const usage = usageById.get(summary.id);
+      const cpuPercent =
+        usage?.cpus !== undefined && Number.isFinite(usage.cpus) && usage.cpus >= 0
+          ? Math.min(100, Math.round((usage.cpus / hostCpus) * 1000) / 10)
+          : undefined;
+      const memMb = usage?.memoryMb;
+      const hasUsage = cpuPercent !== undefined || memMb !== undefined || memLimitMb !== undefined;
+      return {
+        id: summary.id,
+        runId,
+        image: summary.image,
+        status: summary.status,
+        startedAt: summary.createdAt,
+        ...(hasUsage
+          ? {
+              usage: {
+                ...(cpuPercent === undefined ? {} : { cpuPercent }),
+                ...(memMb === undefined ? {} : { memMb }),
+                ...(memLimitMb === undefined ? {} : { memLimitMb }),
+              },
+            }
+          : {}),
+        ...(run === undefined ? {} : { run }),
+      };
+    });
+    // Newest first; ties (same-ms creations) break on id like the runs table.
+    instances.sort((a, b) =>
+      a.startedAt === b.startedAt ? (a.id < b.id ? -1 : 1) : b.startedAt - a.startedAt,
+    );
+    return c.json({ instances, checkedAt: Date.now() } satisfies SandboxInstancesBody);
+  });
+
+  /** Resolves 404 unless `id` is one of the provider's listed sandboxes. */
+  const requireKnownInstance = async (
+    sandboxProvider: SandboxProvider,
+    id: string,
+  ): Promise<SandboxSummary | undefined> => {
+    let listed: SandboxSummary[];
+    try {
+      listed = await sandboxProvider.list();
+    } catch (err) {
+      if (err instanceof SandboxError) throw sandboxHttpError(err);
+      throw err;
+    }
+    const summary = listed.find((candidate) => candidate.id === id);
+    if (summary === undefined) {
+      throw new HttpError(404, "SANDBOX_NOT_FOUND", `no sandbox with id ${id}`);
+    }
+    return summary;
+  };
+
+  /**
+   * Destroying a sandbox out-of-band (this dashboard path) must not leave a
+   * zombie hosted banner (#112 QA): if the destroyed sandbox belonged to a
+   * hosted run, clear its `hostedUntil` so the UI stops advertising a dead
+   * preview as extendable.
+   */
+  const clearHostingIfHeld = (db: Db | undefined, summary: SandboxSummary): void => {
+    const runId = summary.labels["run"];
+    if (db === undefined || runId === undefined) return;
+    const run = db.runs.get(runId);
+    if (run === undefined || run.hostedUntil === undefined) return;
+    try {
+      db.runs.update(runId, { hostedUntil: null });
+      db.activity.append({
+        type: "ops.hosting-expired",
+        runId,
+        payload: { runId, until: run.hostedUntil, reason: "sandbox-destroyed-externally" },
+      });
+      db.activity.append({
+        type: "ops.gc",
+        payload: { note: `hosting cleared: sandbox ${summary.id} destroyed externally` },
+      });
+    } catch {
+      // Bookkeeping must never fail the destroy response.
+    }
+  };
+
+  router.post("/instances/:id/stop", async (c) => {
+    const sandboxProvider = provider();
+    const id = c.req.param("id");
+    await requireKnownInstance(sandboxProvider, id);
+    if (sandboxProvider.stop === undefined) {
+      throw new HttpError(
+        501,
+        "SANDBOX_STOP_UNSUPPORTED",
+        `sandbox provider "${sandboxProvider.id}" cannot stop sandboxes by id`,
+      );
+    }
+    try {
+      await sandboxProvider.stop(id);
+    } catch (err) {
+      if (err instanceof SandboxError) throw sandboxHttpError(err);
+      throw err;
+    }
+    c.get("logger").info({ sandbox: id }, "sandbox stopped from the dashboard (kept)");
+    return c.json({ stopped: id });
+  });
+
+  router.delete("/instances/:id", async (c) => {
+    const sandboxProvider = provider();
+    const id = c.req.param("id");
+    const summary = await requireKnownInstance(sandboxProvider, id);
+    if (sandboxProvider.destroy === undefined) {
+      throw new HttpError(
+        501,
+        "SANDBOX_DESTROY_UNSUPPORTED",
+        `sandbox provider "${sandboxProvider.id}" cannot destroy sandboxes by id`,
+      );
+    }
+    try {
+      await sandboxProvider.destroy(id);
+    } catch (err) {
+      if (err instanceof SandboxError) throw sandboxHttpError(err);
+      throw err;
+    }
+    if (summary !== undefined) clearHostingIfHeld(c.get("db"), summary);
+    c.get("logger").info({ sandbox: id }, "sandbox destroyed from the dashboard");
+    return c.json({ deleted: id });
   });
 
   return router;

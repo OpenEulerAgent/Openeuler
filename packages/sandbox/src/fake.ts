@@ -469,6 +469,17 @@ export class FakeSandboxProvider implements SandboxProvider {
     await handle.destroy();
   }
 
+  /**
+   * Graceful stop by `list()` id (#112): idempotent — an unknown id resolves
+   * (already gone), a known one is stopped through its handle (recorded in
+   * `stopCalls`); the sandbox stays listed as `stopped`.
+   */
+  async stop(id: string): Promise<void> {
+    const handle = this.sandboxes.get(id);
+    if (handle === undefined) return;
+    await handle.stop();
+  }
+
   /** Clock used for `meta.createdAt` and measured exec durations. */
   now(): number {
     return this.options.now?.() ?? Date.now();
