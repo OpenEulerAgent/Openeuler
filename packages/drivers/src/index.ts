@@ -2,6 +2,9 @@ export const PACKAGE_NAME = "@openeuler/drivers";
 
 export type {
   AgentDriver,
+  AgentExecOptions,
+  AgentExecResult,
+  AgentExecSeam,
   AgentExit,
   AgentExitReason,
   AgentHandle,
@@ -32,6 +35,7 @@ export {
   OpenCodeDriver,
   OpenCodeAgentHandle,
   OpenCodeDriverError,
+  OpenCodeSandboxAgentHandle,
   parseOpencodeLine,
 } from "./opencode.js";
 export type {

@@ -2,6 +2,7 @@ import type { RunStatus } from "@openeuler/core";
 import type { Db } from "@openeuler/db";
 import type { WorktreeManager } from "@openeuler/engine";
 import { RunStatusSchema } from "@openeuler/core";
+import type { SandboxProvider } from "@openeuler/sandbox";
 import type { Executor } from "./executor.js";
 import { getVersion } from "./version.js";
 
@@ -23,6 +24,12 @@ export interface MetricsSources {
   db?: Db;
   executor?: Executor;
   worktrees?: WorktreeManager;
+  /**
+   * Sandbox provider backing the `openeuler_sandboxes_active` gauge (#102):
+   * when set, the scrape counts `provider.list()` (provider-managed
+   * sandboxes on this host).
+   */
+  sandbox?: { provider: SandboxProvider };
 }
 
 export interface MetricsSnapshot {
@@ -36,7 +43,7 @@ export interface MetricsSnapshot {
   eventLogRows: number;
   /** Runs with a live git worktree on disk. */
   worktreesActive: number;
-  /** Isolated sandboxes currently executing; placeholder 0 until M6. */
+  /** Provider-managed sandboxes alive at scrape time (#102). */
   sandboxesActive: number;
   uptimeSeconds: number;
   version: string;
@@ -53,8 +60,26 @@ function countRows(db: Db, table: "runs" | "events"): number {
   return row.n;
 }
 
+/**
+ * Async sources for one scrape: the sandbox gauge needs `provider.list()`
+ * (docker CLI round-trip). Failures degrade to 0 — a scrape must never 500
+ * because docker blinked.
+ */
+export async function countActiveSandboxes(
+  sources: MetricsSources = {},
+): Promise<number | undefined> {
+  if (sources.sandbox === undefined) return undefined;
+  try {
+    return (await sources.sandbox.provider.list()).length;
+  } catch {
+    return 0;
+  }
+}
+
 /** Collects every gauge from its cheap source; safe with no db/executor. */
-export function collectMetrics(sources: MetricsSources = {}): MetricsSnapshot {
+export function collectMetrics(
+  sources: MetricsSources & { sandboxesActive?: number } = {},
+): MetricsSnapshot {
   const runsByStatus = Object.fromEntries(RUN_STATUSES.map((s) => [s, 0])) as Record<
     RunStatus,
     number
@@ -75,7 +100,7 @@ export function collectMetrics(sources: MetricsSources = {}): MetricsSnapshot {
     queueDepth: runsByStatus["queued"] ?? 0,
     eventLogRows: sources.db === undefined ? 0 : countRows(sources.db, "events"),
     worktreesActive: sources.worktrees?.activeCount() ?? 0,
-    sandboxesActive: 0,
+    sandboxesActive: sources.sandboxesActive ?? 0,
     uptimeSeconds: process.uptime(),
     version: getVersion(),
   };
@@ -131,7 +156,7 @@ export function renderMetrics(snapshot: MetricsSnapshot): string {
     ]),
     ...family(
       "openeuler_sandboxes_active",
-      "Isolated sandboxes currently executing (placeholder until M6).",
+      "Provider-managed sandboxes alive at scrape time (#102).",
       [sample("openeuler_sandboxes_active", undefined, snapshot.sandboxesActive)],
     ),
   ];

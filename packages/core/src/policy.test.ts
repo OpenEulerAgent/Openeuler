@@ -22,8 +22,8 @@ const validStepConfig = {
 };
 
 describe("ProjectSandboxPolicySchema", () => {
-  it("defaults executionMode to auto and keeps everything else optional", () => {
-    expect(ProjectSandboxPolicySchema.parse({})).toEqual({ executionMode: "auto" });
+  it("defaults executionMode to local (sandboxing is opt-in, #102) and keeps everything else optional", () => {
+    expect(ProjectSandboxPolicySchema.parse({})).toEqual({ executionMode: "local" });
   });
 
   it("accepts a fully-specified policy", () => {

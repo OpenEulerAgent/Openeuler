@@ -18,7 +18,7 @@ import {
   evaluateExitCondition,
   type ExitEvaluator,
 } from "./conditions.js";
-import type { RunControl } from "./flow-engine.js";
+import type { RunControl, RunSandboxContext } from "./flow-engine.js";
 import type { WorktreeManager } from "./worktree.js";
 
 /**
@@ -129,6 +129,8 @@ export interface GraphEngineDeps {
   redactText(runId: string, text: string): string;
   /** The run's secret env (merged into driver starts); undefined = none. */
   runSecretsEnv(runId: string): Record<string, string> | undefined;
+  /** Per-run sandbox context (#102); undefined = local execution. */
+  runSandbox(runId: string): RunSandboxContext | undefined;
 }
 
 /** Terminal outcome of one node execution. */
@@ -468,8 +470,11 @@ async function runNode(
   const sessionId = cursor.restartSessionId ?? inherited;
   // Project secrets (#93): decrypted env merged into the driver process.
   const secretEnv = deps.runSecretsEnv(runId);
+  // Sandboxed runs (#102): driver cwd becomes the CONTAINER workspace and
+  // the command runs through the sandbox exec seam.
+  const sandbox = deps.runSandbox(runId);
   const handle = driver.start({
-    cwd: worktreePath,
+    cwd: sandbox?.workspacePath ?? worktreePath,
     prompt,
     mode: node.config.mode,
     ...(node.config.model === undefined ? {} : { model: node.config.model }),
@@ -478,6 +483,7 @@ async function runNode(
     ...(secretEnv === undefined || Object.keys(secretEnv).length === 0
       ? {}
       : { env: { ...secretEnv } }),
+    ...(sandbox === undefined ? {} : { exec: sandbox.exec }),
   });
   control.onHandle?.(handle);
 

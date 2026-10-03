@@ -5,7 +5,7 @@ import { describe, expect, it } from "vitest";
 import type { AgentEvent } from "@openeuler/core";
 import { createFakeDriver, type FakeDriver } from "./fake.js";
 import { DriverError } from "./error.js";
-import type { AgentStartOpts } from "./types.js";
+import type { AgentExecSeam, AgentStartOpts } from "./types.js";
 
 const startOpts: AgentStartOpts = {
   cwd: "/tmp/openeuler",
@@ -257,5 +257,56 @@ describe("fake driver onStart hook", () => {
     } finally {
       await rm(dir, { recursive: true, force: true });
     }
+  });
+});
+
+describe("fake driver sandbox exec seam (#102)", () => {
+  it("records the exec seam on calls and abort() stops in-flight commands", async () => {
+    let stopCalls = 0;
+    let cancel: ((error: Error) => void) | null = null;
+    const seam: AgentExecSeam = {
+      kind: "sandbox",
+      run: (cmd) =>
+        new Promise((_resolve, reject) => {
+          expect(cmd[0]).toBe("opencode");
+          cancel = reject;
+        }),
+      stop: () => {
+        stopCalls += 1;
+        cancel?.(new Error("sandbox exec cancelled"));
+      },
+    };
+    const driver = createFakeDriver({
+      delayMs: 60_000,
+      events: [{ type: "message-delta", seq: 1, delta: "x" }],
+    });
+    const handle = driver.start({ ...startOpts, cwd: "/workspace", exec: seam });
+    expect(driver.calls[0]?.exec).toBe(seam);
+    await handle.abort();
+    await expect(handle.exited).resolves.toMatchObject({ reason: "aborted" });
+    expect(stopCalls).toBe(1);
+  });
+
+  it("onStart can drive the seam (scripted results still replay afterwards)", async () => {
+    const ran: string[][] = [];
+    const seam: AgentExecSeam = {
+      kind: "sandbox",
+      run: async (cmd) => {
+        ran.push([...cmd]);
+        return { code: 0, stdout: "", stderr: "" };
+      },
+    };
+    const driver = createFakeDriver({
+      events: [{ type: "done", seq: 1, output: "ok" }],
+      output: "ok",
+      onStart: (opts) => {
+        void opts.exec?.run(["touch", "/workspace/hello.txt"]);
+      },
+    });
+    const handle = driver.start({ ...startOpts, cwd: "/workspace", exec: seam });
+    const events = await collect(handle);
+    await expect(handle.exited).resolves.toMatchObject({ reason: "exit", output: "ok" });
+    expect(events.map((event) => event.type)).toContain("done");
+    expect(ran).toContainEqual(["touch", "/workspace/hello.txt"]);
   });
 });

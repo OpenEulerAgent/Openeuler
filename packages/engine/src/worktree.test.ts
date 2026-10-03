@@ -461,3 +461,24 @@ describe("store root resolution", () => {
     expect(info.path).toBe(join(envStore, "run-1"));
   });
 });
+
+describe("WorktreeManager.mountSource (#102)", () => {
+  it("returns the worktree path for a run with a live worktree, null otherwise", async () => {
+    const repo = makeRepo();
+    const { manager, store } = makeManager();
+    expect(manager.mountSource("run-m1")).toBeNull(); // no worktree yet
+
+    const info = await manager.create("run-m1", makeProject(repo));
+    expect(manager.mountSource("run-m1")).toBe(join(store, "run-m1"));
+    expect(info.path).toBe(manager.mountSource("run-m1"));
+
+    await manager.remove("run-m1");
+    expect(manager.mountSource("run-m1")).toBeNull(); // removed again
+  });
+
+  it("rejects malformed run ids as null (never throws)", () => {
+    const { manager } = makeManager();
+    expect(manager.mountSource("../escape")).toBeNull();
+    expect(manager.mountSource("")).toBeNull();
+  });
+});

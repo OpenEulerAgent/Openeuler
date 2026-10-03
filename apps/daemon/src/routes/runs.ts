@@ -101,6 +101,11 @@ export interface RunDetailBody {
   /** Step runs grouped by 1-based loop pass, ordered by iteration. */
   iterations: Array<{ iteration: number; steps: StepRun[] }>;
   summary: { eventCount: number };
+  /**
+   * Live sandbox of the run, when it has one (#102): present only while the
+   * run executes sandboxed (the sandbox is destroyed at terminal).
+   */
+  sandbox?: { id: string; image: string; status: string };
 }
 
 /** Run list payload: runs plus computed queue metadata for queued rows. */
@@ -601,7 +606,7 @@ export function createRunsRouter(options: CreateRunsRouterOptions = {}): Hono<Ap
     });
   });
 
-  runs.get("/:id", (c) => {
+  runs.get("/:id", async (c) => {
     const db = requireDb(c);
     const run = requireRun(db, c.req.param("id"));
     const steps = db.stepRuns.listByRun(run.id);
@@ -619,11 +624,16 @@ export function createRunsRouter(options: CreateRunsRouterOptions = {}): Hono<Ap
       const bi = order.get(b.stepId) ?? Number.MAX_SAFE_INTEGER;
       return ai === bi ? a.stepId.localeCompare(b.stepId) : ai - bi;
     });
+    // #102: live sandbox snapshot while the run executes sandboxed; absent
+    // for local runs and after the sandbox's dispose.
+    const executor = c.get("executor");
+    const sandbox = executor === undefined ? undefined : await executor.sandboxInfo(run.id);
     const body: RunDetailBody = {
       run: decorateRun(db, run, queuePositionsByRunId(db)),
       steps: sorted,
       iterations: groupByIteration(sorted),
       summary: { eventCount: db.events.count(run.id) },
+      ...(sandbox === undefined ? {} : { sandbox }),
     };
     return c.json(body);
   });

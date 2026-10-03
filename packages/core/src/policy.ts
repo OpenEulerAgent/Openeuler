@@ -65,15 +65,22 @@ const cachePathSchema = z
   .string()
   .min(1, "cache paths must be non-empty")
   .startsWith("/", "cache paths must be absolute container paths starting with /")
-  .refine((value) => !value.includes(":"), "cache paths must not contain ':' — they become container-side mount targets");
+  .refine(
+    (value) => !value.includes(":"),
+    "cache paths must not contain ':' — they become container-side mount targets",
+  );
 
 /**
  * The whole-project sandbox policy. PATCHed atomically via
- * `PATCH /api/projects/:id/policy` (whole-policy replace); `executionMode`
- * defaults to `"auto"` when omitted.
+ * `PATCH /api/projects/:id/policy` (whole-policy replace).
+ *
+ * v0.2 (#102): `executionMode` defaults to `"local"` — sandboxed execution
+ * is strictly opt-in (`"sandbox"` always, `"auto"` only when docker is
+ * available). This keeps every project created before sandboxes landed on
+ * the exact local execution path it always had.
  */
 export const ProjectSandboxPolicySchema = z.strictObject({
-  executionMode: z.enum(EXECUTION_MODES).default("auto"),
+  executionMode: z.enum(EXECUTION_MODES).default("local"),
   image: imageRefSchema.optional(),
   cpus: cpusSchema.optional(),
   memoryMb: memoryMbSchema.optional(),

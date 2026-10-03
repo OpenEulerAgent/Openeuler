@@ -8,7 +8,7 @@ import { WorkflowGraphSchema, linearToGraph } from "@openeuler/core";
 import { createDatabase } from "@openeuler/db";
 import type { Db } from "@openeuler/db";
 import { createDriverRegistry, createFakeDriver } from "@openeuler/drivers";
-import type { AgentHandle, DriverRegistry, FakeDriver } from "@openeuler/drivers";
+import type { AgentExecSeam, AgentHandle, DriverRegistry, FakeDriver } from "@openeuler/drivers";
 import { createFlowEngine } from "./flow-engine.js";
 import type { FlowEngine } from "./flow-engine.js";
 import { WorktreeManager } from "./worktree.js";
@@ -1317,5 +1317,116 @@ describe("createFlowEngine (graph revision runs — dispatch to the graph engine
     expect(h.drivers.rev.calls).toHaveLength(0);
     expect(h.drivers.ship.calls[0]?.prompt).toBe("escalate IMPL-OUT");
     expect(h.db.runs.get(run.id)).toMatchObject({ status: "success", output: "SHIP-OUT" });
+  });
+});
+
+describe("createFlowEngine sandbox acquisition (#102)", () => {
+  const seam: AgentExecSeam = {
+    kind: "sandbox",
+    run: async () => ({ code: 0, stdout: "", stderr: "" }),
+  };
+
+  const oneStep = (h: Harness): Workflow =>
+    h.makeWorkflow([
+      {
+        id: "s1",
+        name: "implement",
+        driver: "impl",
+        mode: "auto",
+        promptTemplate: "Task: {{task}}",
+        continueSession: false,
+      },
+    ]);
+
+  it("routes driver starts through the sandbox context (container cwd + exec seam)", async () => {
+    const h = setup();
+    const acquired: Array<{ runId: string; worktreePath: string }> = [];
+    const engine = createFlowEngine({
+      db: h.db,
+      worktrees: h.worktrees,
+      drivers: h.registry,
+      acquireRunSandbox: async (run, worktreePath) => {
+        acquired.push({ runId: run.id, worktreePath });
+        return { workspacePath: "/workspace", exec: seam };
+      },
+    });
+    const workflow = oneStep(h);
+    const run = h.enqueueRun(workflow.id);
+
+    await engine.executeRun(run.id, noAbort);
+    await awaitStatus(h, run.id, "success");
+
+    // Acquired once, AFTER the worktree existed (mount source check).
+    expect(acquired).toHaveLength(1);
+    expect(acquired[0]?.runId).toBe(run.id);
+    expect(existsSync(acquired[0]?.worktreePath ?? "")).toBe(true);
+
+    // Driver saw container cwd + the seam, not the host worktree path.
+    const call = h.drivers.impl.calls[0];
+    expect(call?.cwd).toBe("/workspace");
+    expect(call?.exec).toBe(seam);
+  });
+
+  it("keeps runs local when the acquirer returns undefined", async () => {
+    const h = setup();
+    const engine = createFlowEngine({
+      db: h.db,
+      worktrees: h.worktrees,
+      drivers: h.registry,
+      acquireRunSandbox: async () => undefined,
+    });
+    const workflow = oneStep(h);
+    const run = h.enqueueRun(workflow.id);
+
+    await engine.executeRun(run.id, noAbort);
+    await awaitStatus(h, run.id, "success");
+
+    const call = h.drivers.impl.calls[0];
+    expect(call?.cwd).toBe(join(h.storeRoot, run.id)); // host worktree path
+    expect(call?.exec).toBeUndefined();
+  });
+
+  it("fails the run with the acquirer's typed error when sandbox creation fails", async () => {
+    const h = setup();
+    const engine = createFlowEngine({
+      db: h.db,
+      worktrees: h.worktrees,
+      drivers: h.registry,
+      acquireRunSandbox: async () => {
+        throw new Error("docker is not available (CLI missing from PATH or daemon unreachable)");
+      },
+    });
+    const workflow = oneStep(h);
+    const run = h.enqueueRun(workflow.id);
+
+    await engine.executeRun(run.id, noAbort);
+    await awaitStatus(h, run.id, "failed");
+
+    expect(h.db.runs.get(run.id)?.error).toContain("docker is not available");
+    // No step ever started: the sandbox is a precondition.
+    expect(h.drivers.impl.calls).toHaveLength(0);
+  });
+
+  it("graph-revision runs route through the sandbox context too", async () => {
+    const h = setup();
+    const engine = createFlowEngine({
+      db: h.db,
+      worktrees: h.worktrees,
+      drivers: h.registry,
+      acquireRunSandbox: async () => ({ workspacePath: "/workspace", exec: seam }),
+    });
+    const workflow = oneStep(h);
+    const revision = h.db.workflowRevisions.create(
+      workflow.id,
+      linearToGraph({ steps: workflow.steps, loopBack: workflow.loopBack }),
+    );
+    const run = h.enqueueRevisionRun(workflow.id, revision.id);
+
+    await engine.executeRun(run.id, noAbort);
+    await awaitStatus(h, run.id, "success");
+
+    const call = h.drivers.impl.calls[0];
+    expect(call?.cwd).toBe("/workspace");
+    expect(call?.exec).toBe(seam);
   });
 });

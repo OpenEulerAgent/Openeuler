@@ -12,7 +12,13 @@ import type {
   WorkflowGraph,
 } from "@openeuler/core";
 import type { Db, EventInput } from "@openeuler/db";
-import type { AgentDriver, AgentHandle, AgentMode, DriverRegistry } from "@openeuler/drivers";
+import type {
+  AgentDriver,
+  AgentExecSeam,
+  AgentHandle,
+  AgentMode,
+  DriverRegistry,
+} from "@openeuler/drivers";
 import {
   compileExitCondition,
   describeCondition,
@@ -92,6 +98,32 @@ export interface RunSecrets {
 /** Resolves a run's {@link RunSecrets}; undefined = no secrets configured. */
 export type RunSecretsLoader = (run: Run) => RunSecrets | undefined;
 
+/**
+ * Per-run sandbox execution context (#102). Resolved ONCE per execution
+ * after the run's worktree exists; every driver start for the run then
+ * executes inside the sandbox (`cwd` = `workspacePath`, commands through
+ * `exec`) instead of locally against the host worktree.
+ */
+export interface RunSandboxContext {
+  /** Container path the run's worktree is mounted at (driver `cwd`). */
+  workspacePath: string;
+  /** Exec seam drivers run their agent command through. */
+  exec: AgentExecSeam;
+}
+
+/**
+ * Acquires the run's sandbox (#102). Returns `undefined` when the run
+ * executes locally (no policy / mode resolved local); THROWS when sandboxed
+ * execution was wanted but the sandbox could not be created — the engine
+ * fails the run with the thrown (typed, actionable) error. The caller owns
+ * the sandbox's lifecycle: the engine only holds the returned context for
+ * the duration of the execution.
+ */
+export type RunSandboxAcquirer = (
+  run: Run,
+  worktreePath: string,
+) => Promise<RunSandboxContext | undefined>;
+
 export interface FlowEngineOptions {
   db: Db;
   worktrees: WorktreeManager;
@@ -113,6 +145,15 @@ export interface FlowEngineOptions {
    * a run never executes with secrets it cannot redact).
    */
   loadRunSecrets?: RunSecretsLoader;
+  /**
+   * Acquires the run's sandbox after its worktree exists (#102). Absent =
+   * every run executes locally (the pre-v0.2 behavior, byte-identical).
+   * When present: returning a {@link RunSandboxContext} routes all driver
+   * starts of the run through the sandbox; returning `undefined` keeps the
+   * run local; THROWING fails the run with the typed error (e.g. sandbox
+   * creation failed, no image configured).
+   */
+  acquireRunSandbox?: RunSandboxAcquirer;
 }
 
 export interface FlowEngine {
@@ -206,6 +247,13 @@ export function createFlowEngine(options: FlowEngineOptions): FlowEngine {
    * redact without threading a closure through the whole engine.
    */
   const runSecrets = new Map<string, RunSecrets>();
+
+  /**
+   * Per-run sandbox contexts (#102): set once the worktree exists and the
+   * acquirer returned a context, removed when the run settles. Presence
+   * switches every driver start of the run to sandboxed execution.
+   */
+  const runSandboxes = new Map<string, RunSandboxContext>();
 
   const secretsOf = (runId: string): ReadonlyArray<SecretForRedaction> =>
     runSecrets.get(runId)?.secrets ?? [];
@@ -534,8 +582,12 @@ export function createFlowEngine(options: FlowEngineOptions): FlowEngine {
     const sessionId = restartSessionId ?? (step.continueSession ? inheritedSessionId : undefined);
     // Project secrets (#93): decrypted env merged into the driver process.
     const secretEnv = runSecrets.get(runId)?.env;
+    // Sandboxed runs (#102): driver cwd becomes the CONTAINER workspace and
+    // the command runs through the sandbox exec seam; local runs keep the
+    // host worktree path and a local spawn.
+    const sandbox = runSandboxes.get(runId);
     const handle = driver.start({
-      cwd: worktreePath,
+      cwd: sandbox?.workspacePath ?? worktreePath,
       prompt,
       mode: step.mode,
       ...(step.model === undefined ? {} : { model: step.model }),
@@ -544,6 +596,7 @@ export function createFlowEngine(options: FlowEngineOptions): FlowEngine {
       ...(secretEnv === undefined || Object.keys(secretEnv).length === 0
         ? {}
         : { env: { ...secretEnv } }),
+      ...(sandbox === undefined ? {} : { exec: sandbox.exec }),
     });
     control.onHandle?.(handle);
 
@@ -627,6 +680,8 @@ export function createFlowEngine(options: FlowEngineOptions): FlowEngine {
     appendEvent,
     redactText,
     runSecretsEnv: (runId) => runSecrets.get(runId)?.env,
+    /** Per-run sandbox context (#102); undefined = local execution. */
+    runSandbox: (runId) => runSandboxes.get(runId),
   };
 
   async function execute(
@@ -746,6 +801,29 @@ export function createFlowEngine(options: FlowEngineOptions): FlowEngine {
         }
       }
       return;
+    }
+
+    // Sandbox acquisition (#102): ONE sandbox per run, created after the
+    // worktree exists (it is the bind-mount source) and before any step
+    // starts. `undefined` = local execution; a throw fails the run with the
+    // typed, actionable sandbox error. v0.2 deviation: the RUN sandbox is
+    // built from PROJECT policy only — per-node `sandboxOverrides` are
+    // validated/stored but do not fork per-node sandboxes (post-v0.2).
+    if (options.acquireRunSandbox !== undefined) {
+      let sandboxContext: RunSandboxContext | undefined;
+      try {
+        sandboxContext = await options.acquireRunSandbox(run, worktreePath);
+      } catch (err) {
+        finalizeRun(runId, "failed", { error: describeError(err) });
+        return;
+      }
+      if (sandboxContext !== undefined) {
+        runSandboxes.set(runId, sandboxContext);
+        log.info(
+          { runId, workspacePath: sandboxContext.workspacePath },
+          "run sandbox acquired (sandboxed execution)",
+        );
+      }
     }
 
     // Graph dispatch: the serial DAG executor owns everything from here
@@ -878,6 +956,7 @@ export function createFlowEngine(options: FlowEngineOptions): FlowEngine {
         }
       } finally {
         runSecrets.delete(runId);
+        runSandboxes.delete(runId);
       }
     },
   };

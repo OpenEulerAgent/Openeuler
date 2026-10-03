@@ -279,7 +279,8 @@ function SandboxPolicySection({ projectId }: { projectId: string }) {
   const { toast } = useToast();
   const [load, setLoad] = useState<PolicyLoad>("loading");
   const [images, setImages] = useState<SandboxImageEntry[] | null>(null);
-  const [mode, setMode] = useState<ProjectSandboxPolicy["executionMode"]>("auto");
+  // v0.2 default: "local" — sandboxed execution is opt-in (#102).
+  const [mode, setMode] = useState<ProjectSandboxPolicy["executionMode"]>("local");
   const [image, setImage] = useState("");
   const [cpus, setCpus] = useState(2);
   const [memoryMb, setMemoryMb] = useState(2048);
