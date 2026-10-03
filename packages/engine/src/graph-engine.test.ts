@@ -15,7 +15,14 @@ import { WorkflowGraphSchema } from "@openeuler/core";
 import { createDatabase } from "@openeuler/db";
 import type { Db } from "@openeuler/db";
 import { createDriverRegistry, createFakeDriver } from "@openeuler/drivers";
-import type { AgentHandle, DriverRegistry, FakeDriver } from "@openeuler/drivers";
+import type {
+  AgentDriver,
+  AgentExit,
+  AgentHandle,
+  AgentStartOpts,
+  DriverRegistry,
+  FakeDriver,
+} from "@openeuler/drivers";
 import { createFlowEngine } from "./flow-engine.js";
 import type { FlowEngine } from "./flow-engine.js";
 import { WorktreeManager } from "./worktree.js";
@@ -1798,6 +1805,21 @@ describe("graph engine (parallel fan-out + join, #115)", () => {
     expect(cDriver.calls[0]?.sessionId).toBe("s-c-partial");
     expect(dDriver.calls[0]?.prompt).toBe("D[" + JSON.stringify({ b: "B-OUT", c: "C-OUT" }) + "]");
 
+    // Branch attribution survives the resume even without pre-crash
+    // node.queued events: the graph shape recovers the fan-out branch
+    // edge for the restarted execution's node.* events.
+    expect(eventsOf(h, run.id, "node.started").find((event) => event.nodeId === "c")).toMatchObject(
+      { edgeId: "e-ac" },
+    );
+    expect(
+      eventsOf(h, run.id, "node.completed").find((event) => event.nodeId === "c"),
+    ).toMatchObject({ edgeId: "e-ac" });
+    // The restarted execution adopted its pre-crash row: with no pre-crash
+    // node.queued announcement either, none is emitted at all.
+    expect(eventsOf(h, run.id, "node.queued").filter((event) => event.nodeId === "c")).toHaveLength(
+      0,
+    );
+
     const joinCompleted = eventsOf(h, run.id, "node.completed").find(
       (event) => event.nodeId === "j",
     );
@@ -1933,20 +1955,457 @@ describe("graph engine (parallel fan-out + join, #115)", () => {
       "d[B-2+C-2]",
       "d[B-3+DONE]",
     ]);
-    expect(takenEdges(h, run.id)).toEqual([
-      "e-bj",
-      "e-cj",
+    // Branch arrival order WITHIN a round is scheduler-dependent (the two
+    // branches' diff captures race); the per-round set and the routing
+    // sequence between rounds are the contract.
+    const edges = takenEdges(h, run.id);
+    expect(edges.filter((id) => id !== "e-bj" && id !== "e-cj")).toEqual([
       "e-jd",
       "e-loop",
-      "e-bj",
-      "e-cj",
       "e-jd",
       "e-loop",
-      "e-bj",
-      "e-cj",
       "e-jd",
       "e-exit",
     ]);
+    expect(edges.filter((id) => id === "e-bj")).toHaveLength(3);
+    expect(edges.filter((id) => id === "e-cj")).toHaveLength(3);
     expect(h.db.runs.get(run.id)).toMatchObject({ status: "success", output: "DONE" });
+  });
+
+  it("resumes an any-join diamond with an UN-PERSISTED trigger: the interrupted loser settles aborted, downstream executes exactly once", async () => {
+    const h = setup();
+    const bDriver = createFakeDriver({
+      id: "d-b",
+      events: [{ type: "session", seq: 1, sessionId: "s-b" }],
+      output: "B-OUT",
+    });
+    const cDriver = createFakeDriver({
+      id: "d-c",
+      events: [{ type: "session", seq: 1, sessionId: "s-c" }],
+      output: "C-OUT",
+    });
+    const dDriver = createFakeDriver({ id: "d-d", output: "D-OUT" });
+    h.registry.registerDriver(bDriver);
+    h.registry.registerDriver(cDriver);
+    h.registry.registerDriver(dDriver);
+    const { revisionId } = h.pinGraph(diamondGraph({ joinMode: "any" }));
+    const run = h.enqueueRevisionRun(revisionId);
+
+    // Crash between b's delivery into the join and the join execution: the
+    // edge entry persisted, the join's own execution (and its sibling
+    // cancellation) did not; c was still in flight.
+    await h.worktrees.create(run.id, h.db.projects.get(h.projectId) as Project);
+    h.db.events.append(run.id, {
+      type: "node.queued",
+      nodeId: "c",
+      nodeName: "c",
+      iteration: 1,
+      edgeId: "e-ac",
+    });
+    h.db.stepRuns.create({
+      id: crypto.randomUUID(),
+      runId: run.id,
+      stepId: "a",
+      iteration: 1,
+      status: "success",
+      sessionId: "s-a",
+      output: "A-OUT",
+    });
+    h.db.stepRuns.create({
+      id: crypto.randomUUID(),
+      runId: run.id,
+      stepId: "b",
+      iteration: 1,
+      status: "success",
+      sessionId: "s-b",
+      output: "B-OUT",
+    });
+    h.db.stepRuns.create({
+      id: crypto.randomUUID(),
+      runId: run.id,
+      stepId: "c",
+      iteration: 1,
+      status: "interrupted",
+      sessionId: "s-c-partial",
+      output: "part",
+    });
+    h.db.runs.update(run.id, {
+      status: "interrupted",
+      breadcrumb: [
+        { kind: "node", nodeId: "a", iteration: 1 },
+        { kind: "node", nodeId: "b", iteration: 1 },
+        { kind: "edge", edgeId: "e-bj", iteration: 1 },
+      ],
+    });
+    h.db.runs.updateStatus(run.id, "queued");
+
+    await h.engine.executeRun(run.id, noAbort);
+    await awaitStatus(h, run.id, "success");
+
+    // The losing sibling never re-ran (round 1 already consumed by the
+    // pending trigger — its execution would be stale); the join fired
+    // exactly once and the downstream saw only the winner's map.
+    expect(cDriver.calls).toHaveLength(0);
+    expect(bDriver.calls).toHaveLength(0);
+    expect(h.drivers.impl.calls).toHaveLength(0);
+    expect(dDriver.calls).toHaveLength(1);
+    expect(dDriver.calls[0]?.prompt).toBe('D[{"b":"B-OUT"}]');
+
+    const joinCompleted = eventsOf(h, run.id, "node.completed").filter(
+      (event) => event.nodeId === "j",
+    );
+    expect(joinCompleted).toHaveLength(1);
+    expect(joinCompleted[0]).toMatchObject({ status: "success", output: '{"b":"B-OUT"}' });
+
+    const rows = h.db.stepRuns.listByRun(run.id);
+    expect(rows.filter((row) => row.stepId === "c").map((row) => [row.status, row.output])).toEqual(
+      [["aborted", ""]],
+    );
+    // Downstream exactly once.
+    expect(rows.filter((row) => row.stepId === "d")).toHaveLength(1);
+    expect(rows.find((row) => row.stepId === "d")).toMatchObject({ status: "success" });
+    // The loser's settlement mirrors an in-flight cancel: node.completed
+    // aborted with its branch attribution, no duplicate node.queued.
+    const cCompleted = eventsOf(h, run.id, "node.completed").filter(
+      (event) => event.nodeId === "c",
+    );
+    expect(cCompleted).toHaveLength(1);
+    expect(cCompleted[0]).toMatchObject({ status: "aborted", output: "", edgeId: "e-ac" });
+    expect(eventsOf(h, run.id, "node.queued").filter((event) => event.nodeId === "c")).toHaveLength(
+      1,
+    );
+    expect(h.db.runs.get(run.id)).toMatchObject({ status: "success", output: "D-OUT" });
+  });
+
+  it("resumes an any-join AFTER its trigger persisted: the loser settles aborted instead of re-triggering the join (single trigger per round)", async () => {
+    const h = setup();
+    const cDriver = createFakeDriver({
+      id: "d-c",
+      events: [{ type: "session", seq: 1, sessionId: "s-c" }],
+      output: "C-OUT",
+    });
+    const dDriver = createFakeDriver({ id: "d-d", output: "D-OUT" });
+    h.registry.registerDriver(cDriver);
+    h.registry.registerDriver(dDriver);
+    const { revisionId } = h.pinGraph(diamondGraph({ joinMode: "any" }));
+    const run = h.enqueueRevisionRun(revisionId);
+
+    // Crash after the any-join triggered on b's arrival (its execution
+    // persisted, d scheduled) but before the cancelled loser c or the
+    // downstream d settled.
+    await h.worktrees.create(run.id, h.db.projects.get(h.projectId) as Project);
+    for (const [stepId, output] of [
+      ["a", "A-OUT"],
+      ["b", "B-OUT"],
+    ] as const) {
+      h.db.stepRuns.create({
+        id: crypto.randomUUID(),
+        runId: run.id,
+        stepId,
+        iteration: 1,
+        status: "success",
+        sessionId: `s-${stepId}`,
+        output,
+      });
+    }
+    for (const stepId of ["c", "d"] as const) {
+      h.db.stepRuns.create({
+        id: crypto.randomUUID(),
+        runId: run.id,
+        stepId,
+        iteration: 1,
+        status: "interrupted",
+        sessionId: `s-${stepId}-partial`,
+        output: "part",
+      });
+    }
+    h.db.runs.update(run.id, {
+      status: "interrupted",
+      breadcrumb: [
+        { kind: "node", nodeId: "a", iteration: 1 },
+        { kind: "node", nodeId: "b", iteration: 1 },
+        { kind: "edge", edgeId: "e-bj", iteration: 1 },
+        { kind: "node", nodeId: "j", iteration: 1 },
+        { kind: "edge", edgeId: "e-jd", iteration: 1 },
+      ],
+    });
+    h.db.runs.updateStatus(run.id, "queued");
+
+    await h.engine.executeRun(run.id, noAbort);
+    await awaitStatus(h, run.id, "success");
+
+    // c's interrupted execution was a round-1 loser (the join already
+    // triggered on b's round-1 arrival): it settles aborted, its stale
+    // delivery never re-triggers the join, and the downstream d simply
+    // restarts — once.
+    expect(cDriver.calls).toHaveLength(0);
+    expect(dDriver.calls).toHaveLength(1);
+    expect(dDriver.calls[0]?.prompt).toBe('D[{"b":"B-OUT"}]');
+    expect(eventsOf(h, run.id, "node.completed").filter((event) => event.nodeId === "j")).toEqual(
+      [],
+    );
+    expect(takenEdges(h, run.id)).toEqual(["e-dexit"]);
+    const byNode = new Map(h.db.stepRuns.listByRun(run.id).map((row) => [row.stepId, row]));
+    expect(byNode.get("c")?.status).toBe("aborted");
+    expect(byNode.get("c")?.output).toBe("");
+    expect(byNode.get("d")?.status).toBe("success");
+    expect(h.db.runs.get(run.id)).toMatchObject({ status: "success", output: "D-OUT" });
+  });
+
+  it("a cancelled sibling whose driver ignores abort and exits naturally settles aborted and does not re-trigger the join", async () => {
+    const h = setup();
+    // The zombie: abort() is a no-op and the run keeps going, exiting 0 on
+    // its own AFTER the join already triggered on the fast sibling.
+    const zombieCalls: AgentStartOpts[] = [];
+    const zombie: AgentDriver = {
+      id: "d-zombie",
+      start(opts) {
+        zombieCalls.push(opts);
+        let resolveExit!: (exit: AgentExit) => void;
+        const exited = new Promise<AgentExit>((resolve) => {
+          resolveExit = resolve;
+        });
+        const events = (async function* () {
+          await new Promise((resolve) => setTimeout(resolve, 80));
+          yield { type: "session", seq: 1, sessionId: "s-zombie" } as const;
+        })();
+        setTimeout(() => resolveExit({ code: 0, reason: "exit", output: "ZOMBIE-OUT" }), 80);
+        return { events, exited, abort: async () => {} };
+      },
+    };
+    h.registry.registerDriver(zombie);
+    h.registry.registerDriver(
+      createFakeDriver({
+        id: "d-fast",
+        events: [{ type: "session", seq: 1, sessionId: "s-fast" }],
+        output: "FAST-OUT",
+        delayMs: 5,
+      }),
+    );
+    const dDriver = createFakeDriver({ id: "d-d", output: "D-OUT" });
+    h.registry.registerDriver(dDriver);
+    const { revisionId } = h.pinGraph(
+      diamondGraph({ bDriver: "d-zombie", cDriver: "d-fast", joinMode: "any" }),
+    );
+    const run = h.enqueueRevisionRun(revisionId);
+
+    await h.engine.executeRun(run.id, noAbort);
+    await awaitStatus(h, run.id, "success");
+
+    // c won the race; b was cancelled at trigger time but finished by
+    // itself — the superseded result settles aborted and never delivers,
+    // so the join triggers exactly once and d executes exactly once.
+    expect(zombieCalls).toHaveLength(1);
+    const byNode = new Map(h.db.stepRuns.listByRun(run.id).map((row) => [row.stepId, row]));
+    expect(byNode.get("b")?.status).toBe("aborted");
+    expect(byNode.get("c")?.status).toBe("success");
+    const joinCompleted = eventsOf(h, run.id, "node.completed").filter(
+      (event) => event.nodeId === "j",
+    );
+    expect(joinCompleted).toHaveLength(1);
+    expect(joinCompleted[0]).toMatchObject({ iteration: 1, output: '{"c":"FAST-OUT"}' });
+    expect(dDriver.calls).toHaveLength(1);
+    expect(h.db.stepRuns.listByRun(run.id).filter((row) => row.stepId === "d")).toHaveLength(1);
+    expect(h.db.runs.get(run.id)).toMatchObject({ status: "success", output: "D-OUT" });
+  });
+
+  it("a winning any-join settles cap-blocked never-started siblings aborted (never swept to success)", async () => {
+    const h = setup();
+    h.registry.registerDriver(
+      createFakeDriver({
+        id: "d-win",
+        events: [{ type: "session", seq: 1, sessionId: "s-win" }],
+        output: "WIN-OUT",
+        delayMs: 5,
+      }),
+    );
+    for (const id of ["d-slow1", "d-slow2"]) {
+      h.registry.registerDriver(
+        createFakeDriver({
+          id,
+          events: [{ type: "session", seq: 1, sessionId: `s-${id}` }],
+          output: `${id}-OUT`,
+          delayMs: 80,
+        }),
+      );
+    }
+    const neverCalls: AgentStartOpts[] = [];
+    h.registry.registerDriver({
+      id: "d-never",
+      start(opts) {
+        neverCalls.push(opts);
+        throw new Error("cap-blocked sibling must never start");
+      },
+    });
+    const xDriver = createFakeDriver({ id: "d-x", output: "X-OUT" });
+    h.registry.registerDriver(xDriver);
+    // Fan-out of FOUR behind the default inner concurrency cap of 3: the
+    // fourth branch stays QUEUED (never started) when the fast winner
+    // triggers the any-join.
+    const { revisionId } = h.pinGraph(
+      WorkflowGraphSchema.parse({
+        entryNodeId: "a",
+        nodes: [
+          agentNode("a", "impl"),
+          agentNode("b", "d-win", { y: -180 }),
+          agentNode("c", "d-slow1", { y: -60 }),
+          agentNode("e", "d-slow2", { y: 60 }),
+          agentNode("f", "d-never", { y: 180 }),
+          {
+            id: "j",
+            type: "join",
+            name: "merge",
+            position: { x: 560, y: 0 },
+            config: { mode: "any" },
+          },
+          agentNode("x", "d-x"),
+          exitNode(),
+        ],
+        edges: [
+          { id: "e-ab", source: "a", target: "b", condition: { type: "always" } },
+          { id: "e-ac", source: "a", target: "c", condition: { type: "always" } },
+          { id: "e-ae", source: "a", target: "e", condition: { type: "always" } },
+          { id: "e-af", source: "a", target: "f", condition: { type: "always" } },
+          { id: "e-bj", source: "b", target: "j", condition: { type: "always" } },
+          { id: "e-cj", source: "c", target: "j", condition: { type: "always" } },
+          { id: "e-ej", source: "e", target: "j", condition: { type: "always" } },
+          { id: "e-fj", source: "f", target: "j", condition: { type: "always" } },
+          { id: "e-jx", source: "j", target: "x", condition: { type: "always" } },
+          { id: "e-xexit", source: "x", target: "exit", condition: { type: "always" } },
+        ],
+      }),
+    );
+    const run = h.enqueueRevisionRun(revisionId);
+
+    await h.engine.executeRun(run.id, noAbort);
+    await awaitStatus(h, run.id, "success");
+
+    // The cap-blocked loser never started — its queued row settles
+    // `aborted` with empty output (NOT swept to the run's success), with
+    // a terminal node.completed mirroring the in-flight cancels; the
+    // in-flight losers settle aborted as before.
+    expect(neverCalls).toHaveLength(0);
+    const rows = h.db.stepRuns.listByRun(run.id);
+    expect(rows.filter((row) => row.stepId === "f").map((row) => [row.status, row.output])).toEqual(
+      [["aborted", ""]],
+    );
+    expect(rows.find((row) => row.stepId === "f")).toMatchObject({ status: "aborted" });
+    const fCompleted = eventsOf(h, run.id, "node.completed").filter(
+      (event) => event.nodeId === "f",
+    );
+    expect(fCompleted).toHaveLength(1);
+    expect(fCompleted[0]).toMatchObject({ status: "aborted", output: "", edgeId: "e-af" });
+    const byNode = new Map(rows.map((row) => [row.stepId, row]));
+    expect(byNode.get("c")?.status).toBe("aborted");
+    expect(byNode.get("e")?.status).toBe("aborted");
+    expect(byNode.get("b")?.status).toBe("success");
+    expect(byNode.get("x")?.status).toBe("success");
+    expect(xDriver.calls).toHaveLength(1);
+    const joinCompleted = eventsOf(h, run.id, "node.completed").filter(
+      (event) => event.nodeId === "j",
+    );
+    expect(joinCompleted).toHaveLength(1);
+    expect(h.db.runs.get(run.id)).toMatchObject({ status: "success", output: "X-OUT" });
+  });
+
+  it("resumes mid-diamond without re-emitting node.queued for adopted restarts, keeping branch edge attribution", async () => {
+    const h = setup();
+    const bDriver = createFakeDriver({
+      id: "d-b",
+      events: [{ type: "session", seq: 1, sessionId: "s-b" }],
+      output: "B-OUT",
+    });
+    const cDriver = createFakeDriver({
+      id: "d-c",
+      events: [{ type: "session", seq: 1, sessionId: "s-c" }],
+      output: "C-OUT",
+    });
+    const dDriver = createFakeDriver({ id: "d-d", output: "D-OUT" });
+    h.registry.registerDriver(bDriver);
+    h.registry.registerDriver(cDriver);
+    h.registry.registerDriver(dDriver);
+    const { revisionId } = h.pinGraph(diamondGraph({}));
+    const run = h.enqueueRevisionRun(revisionId);
+
+    // Crash mid-diamond (mode all): a + b completed, b's arrival persisted,
+    // c interrupted mid-flight — with the pre-crash node.queued events in
+    // the log (as a real crash would have).
+    await h.worktrees.create(run.id, h.db.projects.get(h.projectId) as Project);
+    h.db.events.append(run.id, {
+      type: "node.queued",
+      nodeId: "b",
+      nodeName: "b",
+      iteration: 1,
+      edgeId: "e-ab",
+    });
+    h.db.events.append(run.id, {
+      type: "node.queued",
+      nodeId: "c",
+      nodeName: "c",
+      iteration: 1,
+      edgeId: "e-ac",
+    });
+    h.db.stepRuns.create({
+      id: crypto.randomUUID(),
+      runId: run.id,
+      stepId: "a",
+      iteration: 1,
+      status: "success",
+      sessionId: "s-a",
+      output: "A-OUT",
+    });
+    h.db.stepRuns.create({
+      id: crypto.randomUUID(),
+      runId: run.id,
+      stepId: "b",
+      iteration: 1,
+      status: "success",
+      sessionId: "s-b",
+      output: "B-OUT",
+    });
+    h.db.stepRuns.create({
+      id: crypto.randomUUID(),
+      runId: run.id,
+      stepId: "c",
+      iteration: 1,
+      status: "interrupted",
+      sessionId: "s-c-partial",
+      output: "part",
+    });
+    h.db.runs.update(run.id, {
+      status: "interrupted",
+      breadcrumb: [
+        { kind: "node", nodeId: "a", iteration: 1 },
+        { kind: "node", nodeId: "b", iteration: 1 },
+        { kind: "edge", edgeId: "e-bj", iteration: 1 },
+      ],
+    });
+    h.db.runs.updateStatus(run.id, "queued");
+
+    await h.engine.executeRun(run.id, noAbort);
+    await awaitStatus(h, run.id, "success");
+
+    // Exactly one node.queued per (node, iteration) across BOTH lifetimes:
+    // the restart ADOPTS the pre-crash row instead of re-announcing it.
+    const queued = eventsOf(h, run.id, "node.queued");
+    expect(queued.filter((event) => event.nodeId === "c")).toHaveLength(1);
+    expect(queued.filter((event) => event.nodeId === "b")).toHaveLength(1);
+    expect(queued.filter((event) => event.nodeId === "d")).toHaveLength(1);
+
+    // Post-resume node.* events keep the branch attribution from the
+    // pre-crash node.queued events; the join-scheduled d (chain edge)
+    // stays unattributed.
+    expect(eventsOf(h, run.id, "node.started").find((event) => event.nodeId === "c")).toMatchObject(
+      { edgeId: "e-ac" },
+    );
+    expect(
+      eventsOf(h, run.id, "node.completed").find((event) => event.nodeId === "c"),
+    ).toMatchObject({ edgeId: "e-ac" });
+    expect(
+      eventsOf(h, run.id, "node.started").find((event) => event.nodeId === "d")?.edgeId,
+    ).toBeUndefined();
+    expect(cDriver.calls[0]?.sessionId).toBe("s-c-partial");
+    expect(dDriver.calls[0]?.prompt).toBe('D[{"b":"B-OUT","c":"C-OUT"}]');
+    expect(h.db.runs.get(run.id)).toMatchObject({ status: "success", output: "D-OUT" });
   });
 });

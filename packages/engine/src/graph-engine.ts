@@ -53,7 +53,12 @@ import type { WorktreeManager } from "./worktree.js";
  *   unconditional — it synchronizes, it never routes. `mode: "all"`
  *   (default) triggers when every incoming edge arrived; `mode: "any"`
  *   triggers on the first arrival and cancels the sibling branches still in
- *   flight (their results are no longer needed).
+ *   flight (their results are no longer needed). A join triggers AT MOST
+ *   ONCE per round (one fan-out iteration's branch executions): the
+ *   delivering edge's source execution number identifies the round, and a
+ *   delivery whose round already triggered is suppressed — so a cancelled
+ *   loser that exited naturally anyway (or re-ran after a resume) can never
+ *   re-trigger the join and double-execute the downstream subgraph.
  *
  * ## Failure policy (#115)
  *
@@ -65,7 +70,12 @@ import type { WorktreeManager } from "./worktree.js";
  * failures cancel all in-flight branches (their drivers are aborted; their
  * StepRuns settle `aborted`) before the run row turns `failed`. A `mode:
  * "any"` join triggering on one branch cancels its remaining siblings the
- * same way.
+ * same way. Cancelled branches settle `aborted` uniformly, whether the
+ * cancellation reached them mid-flight (driver aborted — or already exited
+ * naturally: the superseded result is discarded, never delivered) or while
+ * still queued behind the inner concurrency cap (their never-started
+ * StepRun rows settle `aborted` with empty output — never swept to the
+ * run-level status, which would read as false success on a winning run).
  *
  * ## Iteration semantics
  *
@@ -266,11 +276,22 @@ interface ExecContext {
  * Resolution of one incoming edge of a pending join since its last trigger
  * (fresh round = all `waiting`). `arrived` edges delivered their output;
  * `failed`/`missed` edges never will (source failed / routed elsewhere).
+ * `arrivals` records each delivery's source execution number — the ROUND
+ * identity behind the single-trigger-per-round guard.
  */
 type JoinEdgeState = "waiting" | "arrived" | "failed" | "missed";
 
 interface JoinPending {
   states: Map<string, JoinEdgeState>;
+  /** edge id → source node execution number at arrival (round identity). */
+  arrivals: Map<string, number>;
+}
+
+/** A fresh pending round: every incoming edge waiting, no arrivals. */
+function freshJoinPending(topology: GraphTopology, joinId: string): JoinPending {
+  const states = new Map<string, JoinEdgeState>();
+  for (const edge of topology.incoming.get(joinId) ?? []) states.set(edge.id, "waiting");
+  return { states, arrivals: new Map() };
 }
 
 /** Mutable per-run graph execution state. */
@@ -285,6 +306,14 @@ interface GraphRunState {
   takenCounts: Map<string, number>;
   /** Join id → per-incoming-edge satisfaction since its last trigger (#115). */
   joinPending: Map<string, JoinPending>;
+  /**
+   * Join id → source-execution rounds that already triggered (#115): a
+   * join triggers at most once per round, so a stale delivery (a cancelled
+   * loser that exited naturally, or re-ran after a resume) is suppressed
+   * instead of re-triggering the downstream subgraph. Reconstructable from
+   * the breadcrumb: each trigger consumes its arrived edges' iterations.
+   */
+  joinTriggeredRounds: Map<string, Set<number>>;
   /** Ordered breadcrumb, mirrored onto the run row on every append. */
   breadcrumb: BreadcrumbEntry[];
   /** Output of the last successfully completed agent node (final run output). */
@@ -321,6 +350,15 @@ interface GraphTopology {
    * are not tolerant (their failure starves the join of every branch).
    */
   failureScope: Map<string, { joinId: string; mode: "all" | "any"; tolerant: boolean }>;
+  /**
+   * join id → its direct branch siblings (#115): agent nodes spawned by a
+   * fan-out whose branches feed the join without crossing another join,
+   * and whose own join-free path leads into this join. For these nodes the
+   * per-node execution number identifies a round of the join, which is
+   * what the single-trigger-per-round guard and the resume-time loser
+   * settlement key on.
+   */
+  joinSiblings: Map<string, Set<string>>;
 }
 
 function buildTopology(graph: WorkflowGraph): GraphTopology {
@@ -425,7 +463,48 @@ function buildTopology(graph: WorkflowGraph): GraphTopology {
       failureScope.set(node.id, { joinId: found, mode: join.config.mode, tolerant });
     }
   }
-  return { nodesById, edgesById, outgoing, incoming, joins, order, guarded, failureScope };
+  // Direct branch siblings per join (#115): nodes a fan-out spawned on a
+  // branch that feeds the join without crossing another join (nested-join
+  // regions conservatively excluded — their execution numbers do not
+  // identify this join's rounds), and whose own join-free path delivers
+  // into this join.
+  const reachesAvoidingJoins = (from: string, to: string): boolean => {
+    const seen = new Set<string>();
+    const queue: string[] = (outgoing.get(from) ?? []).map((edge) => edge.target);
+    while (queue.length > 0) {
+      const next = queue.pop() as string;
+      if (next === to) return true;
+      if (seen.has(next) || joins.has(next)) continue;
+      seen.add(next);
+      for (const edge of outgoing.get(next) ?? []) queue.push(edge.target);
+    }
+    return false;
+  };
+  const joinSiblings = new Map<string, Set<string>>();
+  for (const joinId of joins.keys()) {
+    const siblings = new Set<string>();
+    for (const fanOut of fanOutNodes) {
+      if (!reachesAvoidingJoins(fanOut, joinId)) continue;
+      for (const node of graph.nodes) {
+        if (node.id === fanOut || node.id === joinId || joins.has(node.id)) continue;
+        if (reachesAvoidingJoins(fanOut, node.id) && reachesAvoidingJoins(node.id, joinId)) {
+          siblings.add(node.id);
+        }
+      }
+    }
+    joinSiblings.set(joinId, siblings);
+  }
+  return {
+    nodesById,
+    edgesById,
+    outgoing,
+    incoming,
+    joins,
+    order,
+    guarded,
+    failureScope,
+    joinSiblings,
+  };
 }
 
 /** Renders an edge's condition for the `matchedCondition` event field. */
@@ -514,6 +593,7 @@ function reconstructGraphResume(
     execCount: new Map(),
     takenCounts: new Map(),
     joinPending: new Map(),
+    joinTriggeredRounds: new Map(),
     breadcrumb: entries,
     runOutput: "",
     totalExecutions: 0,
@@ -529,11 +609,14 @@ function reconstructGraphResume(
   // entry into a join satisfies that edge; hitting the mode's threshold
   // means the join triggered (its node entry follows, resetting the round).
   let pendingJoinTrigger: string | undefined;
-  const freshRound = (joinId: string): JoinPending => {
-    const states = new Map<string, JoinEdgeState>();
-    for (const edge of topology.incoming.get(joinId) ?? []) states.set(edge.id, "waiting");
-    return { states };
-  };
+  /**
+   * Arrived-edge snapshot of the trigger detected on the last edge entry
+   * but whose join node entry has not been replayed yet — the source the
+   * join's output renders from (the round itself stays pending until the
+   * join's node entry — or the live re-fired trigger — consumes it).
+   */
+  let pendingTriggerArrived: Set<string> | undefined;
+  const freshRound = (joinId: string): JoinPending => freshJoinPending(topology, joinId);
   const arrivedSet = (pending: JoinPending | undefined): Set<string> =>
     new Set(
       [...(pending?.states ?? new Map()).entries()]
@@ -549,13 +632,6 @@ function reconstructGraphResume(
     return arrived >= (topology.incoming.get(joinId) ?? []).length;
   };
   for (const entry of entries) {
-    if (
-      pendingJoinTrigger !== undefined &&
-      entry.kind === "node" &&
-      entry.nodeId === pendingJoinTrigger
-    ) {
-      pendingJoinTrigger = undefined; // the trigger persisted
-    }
     if (entry.kind === "node") {
       state.execCount.set(
         entry.nodeId,
@@ -563,12 +639,17 @@ function reconstructGraphResume(
       );
       const node = topology.nodesById.get(entry.nodeId);
       if (node !== undefined && node.type === "join") {
-        const pending = state.joinPending.get(entry.nodeId);
-        state.outputs.set(
-          entry.nodeId,
-          renderJoinOutput(topology, state, entry.nodeId, arrivedSet(pending)),
-        );
+        const current = state.joinPending.get(entry.nodeId);
+        const arrived =
+          entry.nodeId === pendingJoinTrigger && pendingTriggerArrived !== undefined
+            ? pendingTriggerArrived
+            : arrivedSet(current);
+        state.outputs.set(entry.nodeId, renderJoinOutput(topology, state, entry.nodeId, arrived));
         state.joinPending.set(entry.nodeId, freshRound(entry.nodeId));
+        if (entry.nodeId === pendingJoinTrigger) {
+          pendingJoinTrigger = undefined; // the trigger persisted
+          pendingTriggerArrived = undefined;
+        }
         continue;
       }
       const row = rowsByKey.get(`${entry.nodeId}#${entry.iteration}`);
@@ -581,14 +662,24 @@ function reconstructGraphResume(
       state.takenCounts.set(entry.edgeId, (state.takenCounts.get(entry.edgeId) ?? 0) + 1);
       const edge = topology.edgesById.get(entry.edgeId);
       if (edge !== undefined && topology.joins.has(edge.target)) {
+        // Single trigger per round (#115): a delivery whose round already
+        // triggered is stale — replay skips it exactly like the runtime
+        // suppresses it, so a later resume never re-fires the trigger.
+        if (state.joinTriggeredRounds.get(edge.target)?.has(entry.iteration)) continue;
         const pending = state.joinPending.get(edge.target) ?? freshRound(edge.target);
         pending.states.set(entry.edgeId, "arrived");
+        pending.arrivals.set(entry.edgeId, entry.iteration);
         state.joinPending.set(edge.target, pending);
         if (joinTriggered(edge.target)) {
           // The trigger appends the join's node entry synchronously; if
-          // that entry never persisted, resume must fire it.
-          state.joinPending.set(edge.target, freshRound(edge.target));
+          // that entry never persisted, resume must fire it on the still-
+          // pending round. The consumed arrivals' rounds are recorded so
+          // suppressed siblings of the same round cannot re-trigger it.
+          const rounds = state.joinTriggeredRounds.get(edge.target) ?? new Set<number>();
+          for (const iteration of new Set(pending.arrivals.values())) rounds.add(iteration);
+          state.joinTriggeredRounds.set(edge.target, rounds);
           pendingJoinTrigger = edge.target;
+          pendingTriggerArrived = arrivedSet(pending);
         }
       }
     }
@@ -604,8 +695,64 @@ function reconstructGraphResume(
   // The routing context comes from the last persisted traversal INTO the
   // node (an agent node may carry conditional back-edges in addition to its
   // single unconditional incoming edge).
+  //
+  // Fan-out branch attribution survives the resume (#115): the pre-crash
+  // `node.queued` events carried the branch `edgeId`; failing that (an
+  // older, event-less log), the graph shape recovers it when the node is
+  // unambiguously a branch target — a single unconditional in-edge whose
+  // source fans out.
+  const queuedEdgeIds = new Map<string, string>();
+  for (const event of deps.db.events.getSince(run.id)) {
+    if (event.type === "node.queued" && event.edgeId !== undefined) {
+      queuedEdgeIds.set(`${event.nodeId}#${event.iteration}`, event.edgeId);
+    }
+  }
+  const branchEdgeInto = (nodeId: string): string | undefined => {
+    const unconditionalIn = (topology.incoming.get(nodeId) ?? []).filter(isUnconditional);
+    if (unconditionalIn.length !== 1) return undefined;
+    const [edge] = unconditionalIn;
+    if (edge === undefined) return undefined;
+    const sourceIsFanOut =
+      (topology.outgoing.get(edge.source) ?? []).filter(isUnconditional).length >= 2;
+    return sourceIsFanOut ? edge.id : undefined;
+  };
+  // Whether a non-terminal row's execution was superseded pre-crash: a
+  // direct branch sibling of a join whose round (the sibling's execution
+  // number) already triggered — an any-join loser the trigger-time
+  // cancellation never got to settle. Its delivery would be stale, so
+  // resume settles it `aborted` (mirroring the live cancellation) instead
+  // of re-running it.
+  const isSupersededLoser = (nodeId: string, iteration: number): boolean => {
+    for (const [joinId, siblings] of topology.joinSiblings) {
+      if (siblings.has(nodeId) && state.joinTriggeredRounds.get(joinId)?.has(iteration)) {
+        return true;
+      }
+    }
+    return false;
+  };
   for (const row of rows) {
     if (row.status !== "queued" && row.status !== "running" && row.status !== "interrupted") {
+      continue;
+    }
+    if (isSupersededLoser(row.stepId, row.iteration)) {
+      const viaEdgeId =
+        queuedEdgeIds.get(`${row.stepId}#${row.iteration}`) ?? branchEdgeInto(row.stepId);
+      deps.db.stepRuns.update(row.id, { status: "aborted", output: "" });
+      deps.appendEvent(run.id, {
+        type: "node.completed",
+        nodeId: row.stepId,
+        nodeName: topology.nodesById.get(row.stepId)?.name ?? row.stepId,
+        iteration: row.iteration,
+        status: "aborted",
+        output: "",
+        durationMs: 0,
+        ...(viaEdgeId === undefined ? {} : { edgeId: viaEdgeId }),
+      });
+      state.breadcrumb = [
+        ...state.breadcrumb,
+        { kind: "node" as const, nodeId: row.stepId, iteration: row.iteration },
+      ];
+      deps.db.runs.update(run.id, { breadcrumb: state.breadcrumb });
       continue;
     }
     const lastInto = [...entries]
@@ -625,7 +772,7 @@ function reconstructGraphResume(
       prevOutput: source === undefined ? "" : (state.outputs.get(source) ?? ""),
       prevSessionId: source === undefined ? undefined : state.sessions.get(source),
       restartSessionId: row.sessionId,
-      viaEdgeId: undefined,
+      viaEdgeId: queuedEdgeIds.get(`${row.stepId}#${row.iteration}`) ?? branchEdgeInto(row.stepId),
     });
   }
 
@@ -797,9 +944,15 @@ async function runNode(
 
   let status: RunStatus;
   let error: string | undefined;
-  if (exit.reason === "exit" && exit.code === 0) {
+  if (ctx.cancelRequested) {
+    // Branch cancellation (any-trigger / fail-fast) raced the exit — a
+    // driver that ignored its abort and finished naturally included: the
+    // superseded result is discarded, settling exactly like an aborted
+    // driver so it can never deliver into its join and re-trigger it.
+    status = "aborted";
+  } else if (exit.reason === "exit" && exit.code === 0) {
     status = "success";
-  } else if (exit.reason === "aborted" && (control.isAbortRequested() || ctx.cancelRequested)) {
+  } else if (exit.reason === "aborted" && control.isAbortRequested()) {
     status = "aborted";
   } else {
     status = "failed";
@@ -887,11 +1040,7 @@ export async function executeGraphRun(
     evaluators.set(edge.id, compiled);
   }
 
-  const freshRound = (joinId: string): JoinPending => {
-    const states = new Map<string, JoinEdgeState>();
-    for (const edge of topology.incoming.get(joinId) ?? []) states.set(edge.id, "waiting");
-    return { states };
-  };
+  const freshRound = (joinId: string): JoinPending => freshJoinPending(topology, joinId);
 
   const resumed = reconstructGraphResume(deps, run, topology);
   const state: GraphRunState = resumed?.state ?? {
@@ -900,6 +1049,7 @@ export async function executeGraphRun(
     execCount: new Map(),
     takenCounts: new Map(),
     joinPending: new Map(),
+    joinTriggeredRounds: new Map(),
     breadcrumb: [],
     runOutput: "",
     totalExecutions: 0,
@@ -916,7 +1066,13 @@ export async function executeGraphRun(
   let terminal:
     { kind: "fail-run"; error: string; output?: string } | { kind: "abort" } | undefined;
 
-  /** Schedules one execution: queued StepRun row + `node.queued` event. */
+  /**
+   * Schedules one execution: queued StepRun row + `node.queued` event.
+   * Restart adoption (#19/#115): when a persisted queued/running/
+   * interrupted row already exists for this (node, iteration) it announced
+   * itself pre-crash — the row is reused and the `node.queued` event is
+   * NOT re-emitted (no duplicates across restart points).
+   */
   const scheduleExec = (exec: ScheduledExec): void => {
     const node = topology.nodesById.get(exec.nodeId);
     if (node === undefined || node.type !== "agent") return;
@@ -924,18 +1080,72 @@ export async function executeGraphRun(
       exec.nodeId,
       Math.max(state.execCount.get(exec.nodeId) ?? 0, exec.iteration),
     );
-    deps.scheduleStepRun(runId, { stepId: node.id }, exec.iteration);
-    deps.appendEvent(runId, {
-      type: "node.queued",
-      nodeId: node.id,
-      nodeName: node.name,
-      iteration: exec.iteration,
-      ...(exec.viaEdgeId === undefined ? {} : { edgeId: exec.viaEdgeId }),
-    });
+    const adopted = deps.db.stepRuns
+      .listByRun(runId)
+      .find(
+        (row) =>
+          row.stepId === node.id &&
+          row.iteration === exec.iteration &&
+          (row.status === "queued" || row.status === "running" || row.status === "interrupted"),
+      );
+    if (adopted === undefined) {
+      deps.scheduleStepRun(runId, { stepId: node.id }, exec.iteration);
+      deps.appendEvent(runId, {
+        type: "node.queued",
+        nodeId: node.id,
+        nodeName: node.name,
+        iteration: exec.iteration,
+        ...(exec.viaEdgeId === undefined ? {} : { edgeId: exec.viaEdgeId }),
+      });
+    }
     ready.push(exec);
   };
 
-  /** Cancels in-flight executions (and drops still-queued ones) — #115. */
+  /**
+   * Settles a cancelled execution that never started (spliced from the
+   * ready queue by an any-trigger / fail-fast / drain, #115): its
+   * never-started StepRun row flips `aborted` with empty output —
+   * cancelled-not-started unifies with cancelled-in-flight, never swept to
+   * the run-level status afterwards (false success on a winning run) — and
+   * a terminal `node.completed {status:"aborted"}` event plus breadcrumb
+   * entry mirror the in-flight cancel settlement.
+   */
+  const settleCancelledExec = (exec: ScheduledExec): void => {
+    const node = topology.nodesById.get(exec.nodeId);
+    if (node === undefined) return;
+    const row = deps.db.stepRuns
+      .listByRun(runId)
+      .find(
+        (candidate) =>
+          candidate.stepId === node.id &&
+          candidate.iteration === exec.iteration &&
+          (candidate.status === "queued" ||
+            candidate.status === "running" ||
+            candidate.status === "interrupted"),
+      );
+    if (row !== undefined) deps.db.stepRuns.update(row.id, { status: "aborted", output: "" });
+    deps.appendEvent(runId, {
+      type: "node.completed",
+      nodeId: node.id,
+      nodeName: node.name,
+      iteration: exec.iteration,
+      status: "aborted",
+      output: "",
+      durationMs: 0,
+      ...(exec.viaEdgeId === undefined ? {} : { edgeId: exec.viaEdgeId }),
+    });
+    appendBreadcrumb(deps, runId, state, {
+      kind: "node",
+      nodeId: node.id,
+      iteration: exec.iteration,
+    });
+  };
+
+  /**
+   * Cancels in-flight executions (aborting their drivers — a loser that
+   * ignores the abort still settles `aborted` on its natural exit) and
+   * splices still-queued ones, settling their never-started rows (#115).
+   */
   const cancelExecutions = (scope: (nodeId: string) => boolean): void => {
     for (const ctx of contexts) {
       if (!scope(ctx.node.id)) continue;
@@ -944,7 +1154,9 @@ export async function executeGraphRun(
     }
     for (let i = ready.length - 1; i >= 0; i -= 1) {
       const exec = ready[i];
-      if (exec !== undefined && scope(exec.nodeId)) ready.splice(i, 1);
+      if (exec === undefined || !scope(exec.nodeId)) continue;
+      ready.splice(i, 1);
+      settleCancelledExec(exec);
     }
   };
 
@@ -1010,6 +1222,13 @@ export async function executeGraphRun(
     const arrived = new Set(
       [...pending.states.entries()].filter(([, s]) => s === "arrived").map(([id]) => id),
     );
+    // Single trigger per round (#115): the consumed arrivals' source
+    // execution numbers mark this round as triggered — any sibling delivery
+    // of the same round (a cancelled loser exiting naturally, or re-running
+    // after a resume) is suppressed from re-triggering.
+    const rounds = state.joinTriggeredRounds.get(joinId) ?? new Set<number>();
+    for (const iteration of new Set(pending.arrivals.values())) rounds.add(iteration);
+    state.joinTriggeredRounds.set(joinId, rounds);
     const output = renderJoinOutput(topology, state, joinId, arrived);
     const iteration = (state.execCount.get(joinId) ?? 0) + 1;
     state.execCount.set(joinId, iteration);
@@ -1068,14 +1287,30 @@ export async function executeGraphRun(
     ];
   };
 
-  /** Satisfies a join's incoming edge; triggers the join per its mode. */
-  const deliverToJoin = (edge: GraphEdge): TaskVerdict => {
+  /**
+   * Satisfies a join's incoming edge (delivered by the source's execution
+   * `sourceIteration` — the round identity); triggers the join per its
+   * mode, at most once per round.
+   */
+  const deliverToJoin = (edge: GraphEdge, sourceIteration: number): TaskVerdict => {
     const join = topology.joins.get(edge.target);
     if (join === undefined) {
       return failRun(`edge "${edge.id}" targets unknown join "${edge.target}"`);
     }
+    // Stale-round delivery (#115): this branch execution belongs to a
+    // fan-out round the join already triggered on — suppressed, never
+    // re-triggered (the downstream subgraph must execute exactly once per
+    // round even if the losing sibling exited naturally or re-ran).
+    if (state.joinTriggeredRounds.get(join.id)?.has(sourceIteration)) {
+      deps.log.info(
+        { runId, joinId: join.id, edgeId: edge.id, iteration: sourceIteration },
+        "stale join delivery suppressed (round already triggered)",
+      );
+      return { kind: "branch-done" };
+    }
     const pending = state.joinPending.get(join.id) ?? freshRound(join.id);
     pending.states.set(edge.id, "arrived");
+    pending.arrivals.set(edge.id, sourceIteration);
     state.joinPending.set(join.id, pending);
     const incoming = topology.incoming.get(join.id) ?? [];
     const arrivedCount = [...pending.states.values()].filter((s) => s === "arrived").length;
@@ -1125,7 +1360,7 @@ export async function executeGraphRun(
       return { kind: "branch-done" };
     }
     if (target.type === "join") {
-      return deliverToJoin(edge);
+      return deliverToJoin(edge, sourceIteration);
     }
     scheduleExec({
       nodeId: target.id,
@@ -1302,21 +1537,12 @@ export async function executeGraphRun(
 
   const diffBase = { ref: "HEAD" };
 
-  // A join trigger that never persisted (crash between the completing edge
-  // entry and the join execution) fires before anything else.
-  if (resumed !== undefined && resumed.pendingJoinTrigger !== undefined) {
-    const follow = triggerJoin(resumed.pendingJoinTrigger, () => {});
-    if (follow === undefined) {
-      deps.finalizeRun(runId, "failed", {
-        error: `join "${resumed.pendingJoinTrigger}" could not execute on resume`,
-      });
-      return;
-    }
-    for (const exec of follow) scheduleExec(exec);
-  }
-
   // Seed the ready queue: the entry node for fresh runs, the reconstructed
-  // restart set (+ re-derived routing) for resumed ones.
+  // restart set (+ re-derived routing) for resumed ones. This happens
+  // BEFORE firing an un-persisted join trigger so the trigger's sibling
+  // cancellation can splice the reconstructed losing branches (an any-join
+  // round that already triggered pre-crash needs its interrupted losers
+  // settled `aborted`, not re-run — their deliveries would be stale).
   if (resumed === undefined) {
     const entry = topology.nodesById.get(graph.entryNodeId);
     if (entry === undefined || entry.type !== "agent") {
@@ -1353,6 +1579,22 @@ export async function executeGraphRun(
         terminal = { kind: "abort" };
       }
     }
+  }
+
+  // A join trigger that never persisted (crash between the completing edge
+  // entry and the join execution) fires once the restart set is seeded,
+  // with the SAME sibling cancellation a live trigger applies.
+  if (resumed !== undefined && resumed.pendingJoinTrigger !== undefined) {
+    const follow = triggerJoin(resumed.pendingJoinTrigger, (scopeJoinId) => {
+      cancelExecutions((nodeId) => topology.failureScope.get(nodeId)?.joinId === scopeJoinId);
+    });
+    if (follow === undefined) {
+      deps.finalizeRun(runId, "failed", {
+        error: `join "${resumed.pendingJoinTrigger}" could not execute on resume`,
+      });
+      return;
+    }
+    for (const exec of follow) scheduleExec(exec);
   }
 
   /** Cancels everything still in flight and drains the verdicts. */
