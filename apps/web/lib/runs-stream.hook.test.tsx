@@ -338,6 +338,10 @@ describe("DashboardRunsTable stream wiring (current filters, in-place patches)",
       (button) => button.textContent === "Load more",
     ) as HTMLButtonElement | undefined;
 
+  /** The #114 compare CTA; absent until a row is ticked. */
+  const compareButton = (container: HTMLElement): HTMLButtonElement | null =>
+    container.querySelector('[data-testid="compare-runs-button"]');
+
   beforeEach(() => {
     vi.useFakeTimers();
     MockEventSource.instances = [];
@@ -377,6 +381,10 @@ describe("DashboardRunsTable stream wiring (current filters, in-place patches)",
     expect(runsFetches[0]).toContain("/api/runs?limit=50");
     expect(rowFor(view.container, r1)).not.toBeNull();
     expect(rowFor(view.container, r2)).not.toBeNull();
+    // #114: every row leads with a compare checkbox (the 0/1/2/3 selection
+    // flow itself is covered by DashboardRunsTable.compare.test.tsx).
+    expect(view.container.querySelectorAll("[data-compare-check]")).toHaveLength(2);
+    expect(compareButton(view.container)).toBeNull();
 
     // Filters A → B: pick project p1 in the filter dropdown (the URL becomes
     // ?projectId=p1 and the refetch must go out with that filter).

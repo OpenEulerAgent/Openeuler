@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import type { RunStatus } from "@openeuler/core";
 import type { RunStatusStreamEvent, RunsApiRow } from "./runs-stream";
 import {
+  compareSelectionComplete,
   decodeRunsFilters,
   encodeRunsFilters,
   filterRuns,
@@ -9,6 +10,7 @@ import {
   nextStopConfirmState,
   rowActionFor,
   runsTableReducer,
+  toggleCompareSelection,
 } from "./runs-table";
 
 const row = (overrides: Partial<RunsApiRow> = {}): RunsApiRow => ({
@@ -184,5 +186,32 @@ describe("rowActionFor", () => {
     expect(rowActionFor("failed")).toBe("retry");
     expect(rowActionFor("aborted")).toBe("retry");
     expect(rowActionFor("interrupted")).toBe("retry");
+  });
+});
+
+describe("compare selection (#114)", () => {
+  it("toggles ids in click order and removes on untick", () => {
+    let selected: string[] = [];
+    selected = toggleCompareSelection(selected, "run-1");
+    expect(selected).toEqual(["run-1"]);
+    selected = toggleCompareSelection(selected, "run-2");
+    expect(selected).toEqual(["run-1", "run-2"]);
+    // Unticking the first pick keeps the second — order stays click order.
+    selected = toggleCompareSelection(selected, "run-1");
+    expect(selected).toEqual(["run-2"]);
+    selected = toggleCompareSelection(selected, "run-3");
+    expect(selected).toEqual(["run-2", "run-3"]);
+  });
+
+  it("completes only at exactly two (a third pick is held, not swapped in)", () => {
+    let selected: string[] = [];
+    expect(compareSelectionComplete(selected)).toBe(false);
+    selected = toggleCompareSelection(selected, "run-1");
+    expect(compareSelectionComplete(selected)).toBe(false);
+    selected = toggleCompareSelection(selected, "run-2");
+    expect(compareSelectionComplete(selected)).toBe(true);
+    selected = toggleCompareSelection(selected, "run-3");
+    expect(selected).toEqual(["run-1", "run-2", "run-3"]);
+    expect(compareSelectionComplete(selected)).toBe(false);
   });
 });
