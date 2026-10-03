@@ -30,9 +30,11 @@ export const STREAM_ROUTE_PATTERNS: readonly RegExp[] = [
   /^\/api\/runs\/stream$/,
   // Per-run event stream (replay + tail).
   /^\/api\/runs\/[^/]+\/events$/,
-  // Live preview streams (v0.2; matched ahead of the route landing). The
-  // query-token fallback below stays GET-scoped (see acceptsQueryToken);
-  // widening these exemptions beyond GET must be justified by M7.
+  // Live preview streams (M7 / #108; matched ahead of the route landing).
+  // The query-token fallback below stays GET-scoped (see acceptsQueryToken):
+  // the iframe loads via GET — POST/PUT/… proxied writes must use the
+  // Authorization header (#108 widened the route-class exemptions to all
+  // preview methods because the proxy is method-passthrough).
   /^\/(api\/)?previews(\/|$)/,
   // Prometheus scrape endpoint (#94): GET-only, sits outside `/api`; many
   // scraper configs cannot set headers, so it takes `?token=` like SSE.

@@ -350,7 +350,10 @@ describe("startSandboxLogTailer", () => {
       redact: (text) => text,
       pollIntervalMs: 10,
     });
-    await sleep(80);
+    // Generous window + explicit timeout: the 2100-line burst drains
+    // across polls (2100 sqlite inserts) and under parallel-worker load the
+    // poll cadence slips well past vitest's 5s default per-test timeout.
+    await sleep(300);
     await tailer.stop();
 
     const events = logEvents(h.db);
@@ -361,7 +364,7 @@ describe("startSandboxLogTailer", () => {
       .getSince("run-1", 0)
       .find((event) => event.type === "sandbox.log-truncated");
     expect(marker).toMatchObject({ dropped: 100, kept: 2000 });
-  });
+  }, 30_000);
 
   it("advances the cursor to the newest line: a quiet stream cannot pin it (#149)", async () => {
     const h = setup();
