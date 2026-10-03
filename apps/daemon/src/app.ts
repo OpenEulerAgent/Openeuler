@@ -29,6 +29,8 @@ import type { EventStreamOptions, GlobalStreamOptions } from "./routes/runs.js";
 import { createRunsRouter } from "./routes/runs.js";
 import type { SystemRouterOptions } from "./routes/system.js";
 import { createSystemRouter } from "./routes/system.js";
+import { createWorktreesRouter } from "./routes/worktrees.js";
+import type { WorktreesRouterOptions } from "./routes/worktrees.js";
 import { createWorkflowsRouter } from "./routes/workflows.js";
 import { createActivityRouter } from "./routes/activity.js";
 import { createRateLimitMiddleware, resolveRateLimits, resolveTrustProxy } from "./rate-limit.js";
@@ -130,6 +132,12 @@ export interface CreateAppOptions {
    * project-delete cache-volume cleanup (tests script it).
    */
   projects?: ProjectsRouterOptions;
+  /**
+   * Worktree manager UI tuning (#111): injectable `du` binary, timeout and
+   * cache TTL for `GET /api/projects/:id/worktrees` (tests script the
+   * sizing).
+   */
+  worktreeRoutes?: WorktreesRouterOptions;
   /**
    * Preview proxy tuning (#108): injectable proxy service — tests shrink
    * the connect/overall timeouts. Routes mount at BOTH `/previews/…` (the
@@ -309,6 +317,8 @@ export function createApp(options: CreateAppOptions = {}): DaemonApp {
   app.route("/api/projects", createFilesRouter());
   app.route("/api/projects", createPresetsRouter());
   app.route("/api/projects", createSecretsRouter());
+  // Worktree manager UI (#111): per-project listing + prune.
+  app.route("/api/projects", createWorktreesRouter(options.worktreeRoutes));
   app.route("/api/drivers", createDriversRouter(options.drivers));
   // Sandbox image management (#100); `GET /api/sandbox/status` is #106.
   app.route("/api/sandbox", createSandboxRouter(options.sandbox));

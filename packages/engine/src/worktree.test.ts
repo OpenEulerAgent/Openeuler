@@ -335,6 +335,64 @@ describe("WorktreeManager.diffVsBase", () => {
   });
 });
 
+describe("WorktreeManager.list (#111)", () => {
+  it("enumerates metadata records (with exists flags) plus stale dirs without metadata", async () => {
+    const repo = makeRepo();
+    const { manager, store } = makeManager();
+    const info = await manager.create("run-1", makeProject(repo));
+    const stale = join(store, "stray-dir");
+    mkdirSync(stale);
+    writeFileSync(join(stale, "keep.txt"), "leftover\n", "utf8");
+
+    const entries = manager.list();
+
+    expect(entries).toEqual([
+      {
+        runId: "run-1",
+        path: info.path,
+        exists: true,
+        projectPath: repo,
+        branch: "agentloop/run-1",
+        createdAt: expect.any(String),
+      },
+      { runId: "stray-dir", path: stale, exists: true },
+    ]);
+    expect(Date.parse(entries[0]?.createdAt ?? "")).not.toBeNaN();
+  });
+
+  it("keeps metadata entries whose working copy was rm -rf'ed (exists: false)", async () => {
+    const repo = makeRepo();
+    const { manager } = makeManager();
+    const info = await manager.create("run-1", makeProject(repo));
+    rmSync(info.path, { recursive: true, force: true });
+
+    expect(manager.list()).toEqual([
+      expect.objectContaining({ runId: "run-1", path: info.path, exists: false }),
+    ]);
+  });
+
+  it("returns [] when the store does not exist and drops entries with remove()", async () => {
+    const missing = new WorktreeManager({ storeRoot: join(tempDir("nostore"), "missing") });
+    expect(missing.list()).toEqual([]);
+
+    const repo = makeRepo();
+    const { manager } = makeManager();
+    await manager.create("run-1", makeProject(repo));
+    expect(manager.list()).toHaveLength(1);
+    await manager.remove("run-1");
+    expect(manager.list()).toEqual([]);
+  });
+
+  it("skips the reserved meta directory and non-directory store entries", async () => {
+    const repo = makeRepo();
+    const { manager, store } = makeManager();
+    await manager.create("run-1", makeProject(repo));
+    writeFileSync(join(store, "notes.txt"), "not a worktree\n", "utf8");
+
+    expect(manager.list().map((entry) => entry.runId)).toEqual(["run-1"]);
+  });
+});
+
 describe("WorktreeManager.remove", () => {
   it("removes the worktree dir, the branch ref, and the metadata", async () => {
     const repo = makeRepo();

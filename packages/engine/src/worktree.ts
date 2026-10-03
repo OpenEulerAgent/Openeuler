@@ -71,6 +71,26 @@ export interface WorktreeRemoveResult {
   warnings: string[];
 }
 
+/**
+ * One store entry as enumerated by {@link WorktreeManager.list}: a run with
+ * metadata (even when its working copy is gone) or a stale directory with
+ * no metadata at all.
+ */
+export interface WorktreeStoreEntry {
+  /** Run id (the store directory name / metadata file key). */
+  runId: string;
+  /** `<storeRoot>/<runId>` (the metadata's `worktreePath` when present). */
+  path: string;
+  /** True when the store directory exists on disk. */
+  exists: boolean;
+  /** Repo the worktree was created from (`project.path`); present when metadata parses. */
+  projectPath?: string;
+  /** Branch checked out in the worktree; present when metadata parses. */
+  branch?: string;
+  /** ISO timestamp the metadata was written; present when metadata parses. */
+  createdAt?: string;
+}
+
 /** Per-run bookkeeping persisted at `<storeRoot>/meta/<runId>.json`. */
 interface WorktreeMetadata {
   runId: string;
@@ -353,6 +373,44 @@ export class WorktreeManager {
       if (meta !== null && existsSync(meta.worktreePath)) count += 1;
     }
     return count;
+  }
+
+  /**
+   * Enumerates every entry under the store: one per metadata record (even
+   * when the working copy no longer exists — the leftover the daemon's
+   * worktree manager UI surfaces as `orphan`, #111) plus stale directories
+   * with no matching metadata. Pure scan: no git invocations, nothing
+   * mutated; callers join this with run rows to derive statuses. Sorted by
+   * runId for stable listings.
+   */
+  list(): WorktreeStoreEntry[] {
+    const entries = new Map<string, WorktreeStoreEntry>();
+    const metaDir = join(this.#storeRoot, META_DIR);
+    if (existsSync(metaDir)) {
+      for (const file of readdirSync(metaDir)) {
+        if (!file.endsWith(".json")) continue;
+        const runId = file.slice(0, -".json".length);
+        const meta = this.#readMeta(runId);
+        if (meta === null) continue;
+        entries.set(runId, {
+          runId,
+          path: meta.worktreePath,
+          exists: existsSync(meta.worktreePath),
+          projectPath: meta.projectPath,
+          branch: meta.branch,
+          createdAt: meta.createdAt,
+        });
+      }
+    }
+    if (existsSync(this.#storeRoot)) {
+      for (const entry of readdirSync(this.#storeRoot, { withFileTypes: true })) {
+        if (!entry.isDirectory() || entry.name === META_DIR) continue;
+        if (entries.has(entry.name)) continue;
+        const path = join(this.#storeRoot, entry.name);
+        entries.set(entry.name, { runId: entry.name, path, exists: true });
+      }
+    }
+    return [...entries.values()].sort((a, b) => a.runId.localeCompare(b.runId));
   }
 
   /**
