@@ -11,11 +11,13 @@ import {
   PersistedEventSchema,
   ProjectSchema,
   RunEventSchema,
+  RunHostingOptionsSchema,
   RunSchema,
   RunStatusEventSchema,
   StepRunSchema,
   StepSchema,
   WorkflowSchema,
+  hostingKeepAliveMinutes,
   renderPromptTemplate,
 } from "./index.js";
 
@@ -129,6 +131,17 @@ describe("valid fixtures parse", () => {
   it("parses workflow runs and ad-hoc runs", () => {
     expect(RunSchema.parse(validRun)).toEqual(validRun);
     expect(RunSchema.parse(adHocRun)).toEqual(adHocRun);
+  });
+
+  it("parses a hosted run: hosting request + hostedUntil (#110)", () => {
+    const hosted = {
+      ...validRun,
+      status: "success",
+      ports: [3000],
+      hosting: { enabled: true, keepAliveMinutes: 90 },
+      hostedUntil: "2026-09-30T11:30:00.000Z",
+    };
+    expect(RunSchema.parse(hosted)).toEqual(hosted);
   });
 
   it("parses a step run", () => {
@@ -256,6 +269,38 @@ describe("invalid fixtures are rejected with clear messages", () => {
 
   it("rejects a bad run status", () => {
     expectRejected(RunSchema, { ...validRun, status: "cancelled" }, "queued", "interrupted");
+  });
+
+  it("rejects hosting options outside the 5..1440 minute window (#110)", () => {
+    expectRejected(
+      RunHostingOptionsSchema,
+      { enabled: true, keepAliveMinutes: 4 },
+      "keepAliveMinutes must be >= 5",
+    );
+    expectRejected(
+      RunHostingOptionsSchema,
+      { enabled: true, keepAliveMinutes: 1441 },
+      "keepAliveMinutes must be <= 1440",
+    );
+    expectRejected(
+      RunHostingOptionsSchema,
+      { enabled: true, keepAliveMinutes: 30.5 },
+      "keepAliveMinutes must be an integer",
+    );
+    expectRejected(RunHostingOptionsSchema, { keepAliveMinutes: 30 }, "expected boolean");
+    // Boundaries parse; a bare request defaults to 60 at usage sites.
+    expect(RunHostingOptionsSchema.parse({ enabled: true })).toEqual({ enabled: true });
+    expect(RunHostingOptionsSchema.parse({ enabled: true, keepAliveMinutes: 5 })).toEqual({
+      enabled: true,
+      keepAliveMinutes: 5,
+    });
+    expect(RunHostingOptionsSchema.parse({ enabled: true, keepAliveMinutes: 1440 })).toEqual({
+      enabled: true,
+      keepAliveMinutes: 1440,
+    });
+    expect(hostingKeepAliveMinutes(undefined)).toBe(60);
+    expect(hostingKeepAliveMinutes({ enabled: true })).toBe(60);
+    expect(hostingKeepAliveMinutes({ enabled: true, keepAliveMinutes: 15 })).toBe(15);
   });
 
   it("rejects malformed agent events", () => {

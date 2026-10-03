@@ -7,6 +7,7 @@ import { dirname } from "node:path";
 import { createApp } from "./app.js";
 import { recordDaemonBootActivity } from "./activity.js";
 import { createExecutor } from "./executor.js";
+import { reattachHostedRuns, startHostingSweeper } from "./hosting.js";
 import { createLogger } from "./logger.js";
 import { sweepInterruptedRuns } from "./recovery.js";
 import { startPeriodicSandboxGc } from "./sandbox-gc.js";
@@ -124,6 +125,15 @@ export async function main(): Promise<void> {
   // destroyed, orphan cache volumes pruned; one ops.gc event with the
   // counts), then keep sweeping every 10 minutes. The shared docker provider
   // is the same instance the executor and image routes use.
+  //
+  // #110: hosted runs first — a hosted run whose sandbox survived the
+  // restart gets a fresh TTL window (hosting continues); one whose sandbox
+  // died has hosting cleared. Then the hosting TTL sweeper (1min) owns
+  // hosted sandboxes' destruction from here on (the GC pass exempts them).
+  const hostingReattach = await reattachHostedRuns({ db, provider: sandboxProvider, logger });
+  if (hostingReattach.reattached + hostingReattach.cleared > 0) {
+    logger.info(hostingReattach, "hosted-run reattach sweep complete");
+  }
   const sandboxGc = startPeriodicSandboxGc({
     db,
     provider: sandboxProvider,
@@ -134,6 +144,12 @@ export async function main(): Promise<void> {
   if (bootGc.destroyed + bootGc.orphans + bootGc.cacheVolumesPruned > 0) {
     logger.info(bootGc, "sandbox GC boot sweep complete");
   }
+  const hostingSweeper = startHostingSweeper({
+    db,
+    provider: sandboxProvider,
+    logger,
+    stopHosted: async (runId) => (await executor.stopHosting(runId)).outcome === "stopped",
+  });
 
   const { app, onShutdown, handleShutdown, authRequired } = createApp({
     db,
@@ -146,9 +162,10 @@ export async function main(): Promise<void> {
     sandbox: { provider: sandboxProvider, status: { service: dockerStatus } },
   });
 
-  // LIFO: http-server → sandbox-gc → executor → db.
+  // LIFO: http-server → hosting-sweeper → sandbox-gc → executor → db.
   onShutdown(() => db.close(), "db");
   onShutdown(() => executor.shutdown(), "executor");
+  onShutdown(() => hostingSweeper.stop(), "hosting-sweeper");
   onShutdown(() => sandboxGc.stop(), "sandbox-gc");
 
   const port = resolvePort();

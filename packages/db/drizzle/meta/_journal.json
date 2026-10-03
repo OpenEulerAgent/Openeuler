@@ -71,6 +71,13 @@
       "when": 1791010716784,
       "tag": "0009_motionless_masque",
       "breakpoints": true
+    },
+    {
+      "idx": 10,
+      "version": "6",
+      "when": 1791023257075,
+      "tag": "0010_woozy_zombie",
+      "breakpoints": true
     }
   ]
 }

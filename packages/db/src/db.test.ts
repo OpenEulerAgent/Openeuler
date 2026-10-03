@@ -108,16 +108,19 @@ describe("createDatabase", () => {
     db.close();
 
     // Rewind the file to its pre-0008 shape: forget the last applied
-    // migrations (0008 hwm + 0009 run ports) and drop the columns they
-    // added. (Journal rows carry no usable id — order by created_at.)
+    // migrations (0008 hwm + 0009 run ports + 0010 hosting) and drop the
+    // columns they added. (Journal rows carry no usable id — order by
+    // created_at.)
     const raw = new Database(join(dir, "test.db"));
     try {
       raw.exec(
-        "delete from __drizzle_migrations where created_at >= (select distinct created_at from __drizzle_migrations order by created_at desc limit 1 offset 1)",
+        "delete from __drizzle_migrations where created_at >= (select distinct created_at from __drizzle_migrations order by created_at desc limit 1 offset 2)",
       );
       raw.exec("alter table runs drop column event_seq_hwm");
       raw.exec("alter table runs drop column ports");
       raw.exec("alter table runs drop column detected_ports");
+      raw.exec("alter table runs drop column hosting");
+      raw.exec("alter table runs drop column hosted_until");
     } finally {
       raw.close();
     }
@@ -311,6 +314,33 @@ describe("runs", () => {
     expect(db.runs.get(run.id)?.status).toBe("failed");
     expect(db.runs.get(run.id)?.updatedAt).not.toBe(run.updatedAt);
     expect(db.runs.updateStatus(uuid(), "running")).toBeUndefined();
+  });
+
+  it("round-trips hosting options and hostedUntil, clearing with null (#110)", () => {
+    const project = db.projects.create(makeProject());
+    const run = db.runs.create(
+      makeRun(project.id, {
+        status: "success",
+        ports: [3000],
+        hosting: { enabled: true, keepAliveMinutes: 30 },
+        hostedUntil: "2026-01-01T01:00:00.000Z",
+      }),
+    );
+    expect(db.runs.get(run.id)).toEqual(run);
+
+    // Extend: replace the timestamp.
+    db.runs.update(run.id, { hostedUntil: "2026-01-01T01:30:00.000Z" });
+    expect(db.runs.get(run.id)?.hostedUntil).toBe("2026-01-01T01:30:00.000Z");
+
+    // Hosting ends: null clears the column (absent on the domain row).
+    db.runs.update(run.id, { hostedUntil: null });
+    const cleared = db.runs.get(run.id);
+    expect(cleared?.hostedUntil).toBeUndefined();
+    expect(cleared?.hosting).toEqual({ enabled: true, keepAliveMinutes: 30 });
+
+    // The hosting request itself is clearable the same way.
+    db.runs.update(run.id, { hosting: null });
+    expect(db.runs.get(run.id)?.hosting).toBeUndefined();
   });
 
   it("filters lists by status on top of the project scope", () => {

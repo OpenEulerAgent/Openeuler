@@ -13,6 +13,8 @@ import type { Logger } from "./logger.js";
  * already scopes to its `openeuler.sandbox=1` label) with the run rows:
  *
  * - run active (in this executor, or row `queued`/`running`) → keep;
+ * - run HOSTED (`hostedUntil` set, #110) → keep — the hosting TTL sweeper
+ *   (`hosting.ts`) owns that sandbox's destruction, never this pass;
  * - run terminal → destroy once the terminal age crosses the grace
  *   (1h default; `policy.keepForDebug` sandboxes get 4h — the feed's
  *   `ops.sandbox-kept` entry extends the grace too);
@@ -405,6 +407,12 @@ export async function runSandboxGc(
       continue;
     }
     if ((TERMINAL_RUN_STATUSES as readonly string[]).includes(run.status)) {
+      // #110: hosted sandboxes are the hosting sweeper's to destroy —
+      // exempt from the terminal grace entirely while `hostedUntil` is set.
+      if (run.hostedUntil !== undefined) {
+        counts.kept += 1;
+        continue;
+      }
       const keepForDebug = isKeepForDebug(deps.db, run);
       const grace = keepForDebug ? debugGraceMs : graceMs;
       if (terminalAgeMs(run, summary, now()) < grace) {

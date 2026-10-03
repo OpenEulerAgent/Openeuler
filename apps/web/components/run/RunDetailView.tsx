@@ -8,6 +8,7 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/com
 import { Tabs, type TabItem } from "@/components/ui/tabs";
 import { SkeletonLines } from "@/components/ui/skeleton";
 import { apiFetch, ApiError } from "@/lib/api";
+import type { RunHostingView } from "@/lib/hosting";
 import type { PreviewPortView } from "@/lib/preview";
 import { connectRunEvents, type RunStreamEvent, type RunStreamState } from "@/lib/run-events";
 import {
@@ -29,6 +30,7 @@ import {
 } from "@/lib/run-detail-query";
 import { DiffsTab } from "./DiffsTab";
 import { EventFeed } from "./EventFeed";
+import { HostedRunBanner } from "./HostedRunBanner";
 import { InterruptedRunBanner } from "./InterruptedRunBanner";
 import { LocalFallbackBanner } from "./LocalFallbackBanner";
 import { OutputPanel } from "./OutputPanel";
@@ -46,6 +48,8 @@ interface RunDetail {
   sandbox?: { id: string; image: string; status: string };
   /** Previewable port views (#107/#109): declared + detected, host while the sandbox lives. */
   ports?: PreviewPortView[];
+  /** Hosting view (#110): expiry + live mappings while the run is hosted. */
+  hosting?: RunHostingView | null;
 }
 
 type LoadState =
@@ -295,6 +299,14 @@ export function RunDetailView({ runId }: { runId: string }) {
 
       <InterruptedRunBanner run={shownRun} steps={steps} onChanged={() => void refresh()} />
 
+      {/* #110: hosted banner — the sandbox outlives the successful run for
+          a TTL window; extend (+30m) or stop hosting inline. */}
+      <HostedRunBanner
+        runId={detail.run.id}
+        hosting={detail.hosting ?? null}
+        onChanged={() => void refresh()}
+      />
+
       <div className="flex flex-col gap-4" data-run-tabs>
         <Tabs
           tabs={tabs}
@@ -330,12 +342,14 @@ export function RunDetailView({ runId }: { runId: string }) {
         {activeTab === "timeline" ? <TimelineTab state={foldState} /> : null}
 
         {/* Preview (#109): mounted only while active — the iframe and its
-            HEAD poll are lazy by construction and torn down on switch. */}
+            HEAD poll are lazy by construction and torn down on switch.
+            Hosted runs (#110) keep live mappings past success. */}
         {activeTab === "preview" ? (
           <PreviewTab
             runId={detail.run.id}
             ports={detail.ports ?? []}
             terminal={effectiveStatus !== undefined && !live}
+            hosted={detail.hosting != null}
           />
         ) : null}
       </div>

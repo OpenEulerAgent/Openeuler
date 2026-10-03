@@ -410,4 +410,46 @@ describe("RunDetailView 2.0 (client flow)", () => {
     delete fetchRoutes["/api/runs/run-1"];
     fetchRoutes["/api/runs/run-1"] = runDetailResponse;
   });
+
+  it("renders the hosted banner for hosted runs; preview stays functional (#110)", async () => {
+    const until = new Date(Date.now() + 30 * 60_000).toISOString();
+    fetchRoutes["/api/runs/run-1"] = {
+      ...runDetailResponse,
+      ports: [{ container: 3000, host: 49153, declared: true }],
+      hosting: { until, ports: [{ container: 3000, host: 49153 }], extendable: true },
+    };
+    nav.search = "?tab=preview";
+    nav.notify = () =>
+      render(() =>
+        createElement(ThemeProvider, null, createElement(RunDetailView, { runId: "run-1" })),
+      );
+    nav.notify();
+    await settle();
+
+    // The hosted banner headlines the countdown and offers both actions.
+    const banner = document.querySelector("[data-hosted-banner]") as HTMLElement;
+    expect(banner.getAttribute("data-hosted-until")).toBe(until);
+    expect(banner.textContent).toContain("Hosted — preview live · expires in ");
+    expect(banner.textContent).toMatch(/2[89]m|30m/);
+    expect(document.querySelector("[data-hosted-extend]")).not.toBeNull();
+    expect(document.querySelector("[data-hosted-stop]")).not.toBeNull();
+
+    // The preview tab is fully functional: frame up through the proxy, and
+    // the terminal-run teardown note is replaced by the hosted banner.
+    const frame = document.querySelector("[data-preview-frame]") as HTMLIFrameElement;
+    expect(frame.getAttribute("src")).toBe("/previews/run-1/3000/");
+    expect(document.querySelector("[data-preview-terminal-note]")).toBeNull();
+
+    // Extend refreshes the detail through the daemon endpoint.
+    const extend = document.querySelector("[data-hosted-extend]") as HTMLButtonElement;
+    act(() => {
+      extend.click();
+    });
+    await settle();
+    expect(fetchCalls.some((href) => href.endsWith("/api/runs/run-1/hosting/extend"))).toBe(true);
+
+    delete fetchRoutes["/api/runs/run-1"];
+    fetchRoutes["/api/runs/run-1"] = runDetailResponse;
+    nav.search = "";
+  });
 });

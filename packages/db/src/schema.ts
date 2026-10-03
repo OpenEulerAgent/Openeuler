@@ -4,6 +4,7 @@ import type {
   BreadcrumbEntry,
   LoopBack,
   ProjectSandboxPolicy,
+  RunHostingOptions,
   Step,
   StepConfig,
   WorkflowGraph,
@@ -134,6 +135,16 @@ export const runs = sqliteTable(
      * until detection first fires (sandboxed runs only).
      */
     detectedPorts: text("detected_ports", { mode: "json" }).$type<number[]>(),
+    /**
+     * Hosting request for the run (#110) as JSON; NULL when hosting was
+     * not requested at creation.
+     */
+    hosting: text("hosting", { mode: "json" }).$type<RunHostingOptions>(),
+    /**
+     * While the run's sandbox is hosted past success (#110): the ISO
+     * expiry timestamp. NULL when not hosted.
+     */
+    hostedUntil: text("hosted_until"),
     /**
      * High-water mark of the event seqs assigned for this run (#149):
      * `events.append` sets seq = max(hwm, max(seq)) + 1 and raises hwm in

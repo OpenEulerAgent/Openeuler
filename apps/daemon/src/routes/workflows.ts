@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import type { GraphSummary, Run, Step, Workflow, WorkflowGraph } from "@openeuler/core";
 import {
   LoopBackSchema,
+  RunHostingOptionsSchema,
   RunPortsSchema,
   StepSchema,
   WorkflowGraphSchema,
@@ -109,6 +110,13 @@ const CreateWorkflowRunBodySchema = z.strictObject({
    * most 3, published by a sandboxed run's sandbox while it lives.
    */
   ports: RunPortsSchema.optional(),
+  /**
+   * Keep-alive hosting request (#110): on a SUCCESSFUL sandboxed run that
+   * declared ports, the sandbox stays up (previews live) for
+   * `keepAliveMinutes` (default 60, 5..1440). Aborted/failed runs never
+   * host; hosting applies to success only.
+   */
+  hosting: RunHostingOptionsSchema.optional(),
 });
 
 /** Revision number path param (`:number`). */
@@ -433,6 +441,9 @@ export function createWorkflowsRouter(): Hono<AppEnv> {
       // #107: declared container ports, persisted on the row; the run's
       // sandbox publishes them for its lifetime.
       ...(body.ports === undefined || body.ports.length === 0 ? {} : { ports: body.ports }),
+      // #110: hosting request, persisted on the row; the executor arms it
+      // when the run turns success sandboxed with declared ports.
+      ...(body.hosting === undefined ? {} : { hosting: body.hosting }),
       createdAt: now,
       updatedAt: now,
     };

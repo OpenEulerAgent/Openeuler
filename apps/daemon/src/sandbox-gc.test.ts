@@ -208,6 +208,25 @@ describe("runSandboxGc (#105)", () => {
     expect(counts).toEqual({ destroyed: 0, kept: 2, orphans: 0, cacheVolumesPruned: 0 });
   });
 
+  it("keeps a HOSTED sandbox regardless of grace (#110) — the hosting sweeper owns it", async () => {
+    const h = setup();
+    const hosted = h.addRun("success");
+    await h.addSandbox(hosted);
+    h.db.runs.update(hosted, { hostedUntil: new Date(Date.now() + 30 * 60_000).toISOString() });
+
+    // Far past every grace: still kept while hostedUntil is set.
+    const counts = await gc(h, { now: () => Date.now() + 10 * HOUR });
+    expect(counts).toEqual({ destroyed: 0, kept: 1, orphans: 0, cacheVolumesPruned: 0 });
+    expect(await h.provider.list({ run: hosted })).toHaveLength(1);
+
+    // Hosting ended (hostedUntil cleared): the normal terminal grace
+    // applies again — past it, the sandbox is collected.
+    h.db.runs.update(hosted, { hostedUntil: null });
+    const after = await gc(h, { now: () => Date.now() + 2 * HOUR });
+    expect(after.destroyed).toBe(1);
+    expect(await h.provider.list({ run: hosted })).toEqual([]);
+  });
+
   it("keeps a keepForDebug sandbox within the debug grace (policy OR kept-activity)", async () => {
     const h = setup({ executionMode: "sandbox", image: "busybox:1.36", keepForDebug: true });
     const policyRun = h.addRun("success");
