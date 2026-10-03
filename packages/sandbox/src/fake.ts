@@ -1,7 +1,10 @@
 import { SandboxError } from "./error.js";
+import type { SandboxExecStreamScript } from "./contract.js";
 import type {
+  SandboxExecChunk,
   SandboxExecOptions,
   SandboxExecResult,
+  SandboxExecStream,
   SandboxHandle,
   SandboxHandleMeta,
   SandboxHostPorts,
@@ -27,6 +30,12 @@ export interface FakeSandboxProviderOptions {
    * with the default echo result (code 0, stdout = the joined command).
    */
   execResults?: FakeExecScriptEntry[];
+  /**
+   * Scripted `execStream` outcomes served FIFO (#104). When the queue is
+   * empty, `execStream` streams the default echo result as a single stdout
+   * chunk and resolves `exited` with code 0.
+   */
+  execStreams?: SandboxExecStreamScript[];
   /** Simulated command duration in ms; also drives `SANDBOX_TIMEOUT` behavior. Default 0. */
   execDelayMs?: number;
   /** Log lines replayed (per sandbox) by `handle.logs()`. */
@@ -61,6 +70,13 @@ export interface FakeStopCall {
   timeoutMs: number | undefined;
 }
 
+/** Recorded `handle.execStream()` call. */
+export interface FakeExecStreamCall {
+  sandboxId: string;
+  cmd: string[];
+  opts: SandboxExecOptions | undefined;
+}
+
 interface TimestampedLog {
   entry: SandboxLogEntry;
   at: number;
@@ -74,6 +90,49 @@ function sleep(ms: number): Promise<void> {
 
 function matchesLabels(spec: SandboxSpec, labelSelector: Record<string, string>): boolean {
   return Object.entries(labelSelector).every(([key, value]) => spec.labels?.[key] === value);
+}
+
+/**
+ * Single-consumer async queue backing the fake's `execStream`: chunks are
+ * pushed from the scripted replay, the consumer iterates until `close()`.
+ */
+class StreamChunkQueue {
+  private readonly items: SandboxExecChunk[] = [];
+  private readonly waiters: ((chunk: SandboxExecChunk | null) => void)[] = [];
+  private closed = false;
+
+  push(chunk: SandboxExecChunk): void {
+    const waiter = this.waiters.shift();
+    if (waiter) {
+      waiter(chunk);
+      return;
+    }
+    this.items.push(chunk);
+  }
+
+  close(): void {
+    if (this.closed) return;
+    this.closed = true;
+    for (const waiter of this.waiters.splice(0)) waiter(null);
+  }
+
+  iterate(): AsyncIterable<SandboxExecChunk> {
+    const iterator: AsyncIterator<SandboxExecChunk> = {
+      // Arrow property: `this` stays bound to the queue instance.
+      next: async (): Promise<IteratorResult<SandboxExecChunk>> => {
+        const item = this.items.shift();
+        if (item !== undefined) return { value: item, done: false };
+        if (this.closed) return { value: undefined, done: true };
+        const chunk = await new Promise<SandboxExecChunk | null>((resolve) => {
+          this.waiters.push(resolve);
+        });
+        return chunk === null ? { value: undefined, done: true } : { value: chunk, done: false };
+      },
+    };
+    return {
+      [Symbol.asyncIterator]: (): AsyncIterator<SandboxExecChunk> => iterator,
+    };
+  }
 }
 
 class FakeSandboxHandle implements SandboxHandle {
@@ -156,6 +215,89 @@ class FakeSandboxHandle implements SandboxHandle {
     return { code: 0, stdout: `${cmd.join(" ")}\n`, stderr: "", durationMs: measured };
   }
 
+  execStream(cmd: string[], opts?: SandboxExecOptions): SandboxExecStream {
+    this.provider.recordExecStream(this.id, cmd, opts);
+    if (!Array.isArray(cmd) || cmd.length === 0 || cmd.some((part) => typeof part !== "string")) {
+      throw new SandboxError(
+        "SANDBOX_INVALID_SPEC",
+        "exec cmd must be a non-empty array of strings",
+      );
+    }
+    if (this.state !== "running") {
+      throw new SandboxError(
+        "SANDBOX_UNAVAILABLE",
+        `sandbox "${this.id}" is not running (state: ${this.state}); cannot exec ${cmd.join(" ")}`,
+      );
+    }
+    const startedAt = this.provider.now();
+    const scripted = this.provider.nextScriptedExecStream();
+    const chunks: SandboxExecChunk[] =
+      scripted === undefined
+        ? [{ stream: "stdout", chunk: `${cmd.join(" ")}\n` }]
+        : scripted.chunks.map((chunk) => ({ ...chunk }));
+    const interChunkDelayMs =
+      scripted?.interChunkDelayMs !== undefined
+        ? Math.max(0, scripted.interChunkDelayMs)
+        : this.provider.execDelayMs;
+    const code = scripted?.code ?? 0;
+    const timeoutMs = opts?.timeoutMs;
+
+    const queue = new StreamChunkQueue();
+    let rejectExit!: (error: SandboxError) => void;
+    const exited = new Promise<{ code: number; durationMs: number }>((resolve, reject) => {
+      rejectExit = reject;
+      void (async () => {
+        try {
+          // The delay applies BEFORE every chunk, and the timeout check
+          // happens before the sleep: a stream whose next chunk cannot
+          // arrive within timeoutMs rejects promptly (chunks already
+          // delivered stay delivered — the queue is closed, not unwound).
+          for (const chunk of chunks) {
+            if (interChunkDelayMs > 0) {
+              if (
+                timeoutMs !== undefined &&
+                this.provider.now() - startedAt + interChunkDelayMs > timeoutMs
+              ) {
+                queue.close();
+                reject(
+                  new SandboxError(
+                    "SANDBOX_TIMEOUT",
+                    `exec "${cmd.join(" ")}" in sandbox "${this.id}" timed out after ${timeoutMs}ms`,
+                  ),
+                );
+                return;
+              }
+              await sleep(interChunkDelayMs);
+            }
+            queue.push(chunk);
+          }
+          queue.close();
+          resolve({ code, durationMs: this.provider.now() - startedAt });
+        } catch (err) {
+          queue.close();
+          reject(
+            err instanceof SandboxError
+              ? err
+              : new SandboxError("SANDBOX_EXEC_FAILED", String(err)),
+          );
+        }
+      })();
+    });
+    return {
+      events: queue.iterate(),
+      exited,
+      cancel: () => {
+        queue.close();
+        rejectExit(
+          new SandboxError(
+            "SANDBOX_UNAVAILABLE",
+            `exec "${cmd.join(" ")}" in sandbox "${this.id}" was cancelled`,
+          ),
+        );
+      },
+    };
+  }
+
   logs(opts?: SandboxLogOptions): AsyncIterable<SandboxLogEntry> {
     const state = this.state;
     const delayMs = this.provider.logDelayMs;
@@ -170,9 +312,9 @@ class FakeSandboxHandle implements SandboxHandle {
     const entries = tail === undefined ? [...script] : tail <= 0 ? [] : script.slice(-tail);
     return {
       async *[Symbol.asyncIterator](): AsyncIterator<SandboxLogEntry> {
-        for (const { entry } of entries) {
+        for (const { entry, at } of entries) {
           if (delayMs > 0) await sleep(delayMs);
-          yield entry;
+          yield { ...entry, at };
         }
       },
     };
@@ -220,6 +362,8 @@ export class FakeSandboxProvider implements SandboxProvider {
   readonly createdSpecs: SandboxSpec[] = [];
   /** Every `handle.exec()` call, in call order. */
   readonly execCalls: FakeExecCall[] = [];
+  /** Every `handle.execStream()` call, in call order (#104). */
+  readonly execStreamCalls: FakeExecStreamCall[] = [];
   /** Every `handle.stop()` call, in call order. */
   readonly stopCalls: FakeStopCall[] = [];
   /** Every `handle.destroy()` call, in call order (idempotent calls included). */
@@ -230,6 +374,7 @@ export class FakeSandboxProvider implements SandboxProvider {
   > &
     FakeSandboxProviderOptions;
   private readonly execQueue: FakeExecScriptEntry[];
+  private readonly execStreamQueue: SandboxExecStreamScript[];
   private readonly sandboxes = new Map<string, FakeSandboxHandle>();
   private nextSandbox = 1;
   private nextHostPort = 32768;
@@ -242,6 +387,7 @@ export class FakeSandboxProvider implements SandboxProvider {
       logDelayMs: Math.max(0, options.logDelayMs ?? 0),
     };
     this.execQueue = [...(options.execResults ?? [])];
+    this.execStreamQueue = [...(options.execStreams ?? [])];
   }
 
   async create(spec: SandboxSpec): Promise<SandboxHandle> {
@@ -337,9 +483,23 @@ export class FakeSandboxProvider implements SandboxProvider {
     return this.execQueue.length > 0 ? this.execQueue.shift() : undefined;
   }
 
+  /** @internal Shift the next scripted execStream outcome (FIFO, may be undefined). */
+  nextScriptedExecStream(): SandboxExecStreamScript | undefined {
+    return this.execStreamQueue.length > 0 ? this.execStreamQueue.shift() : undefined;
+  }
+
   /** @internal Record an exec call for assertions. */
   recordExec(sandboxId: string, cmd: string[], opts: SandboxExecOptions | undefined): void {
     this.execCalls.push({
+      sandboxId,
+      cmd: [...cmd],
+      opts: opts === undefined ? undefined : { ...opts },
+    });
+  }
+
+  /** @internal Record an execStream call for assertions (#104). */
+  recordExecStream(sandboxId: string, cmd: string[], opts: SandboxExecOptions | undefined): void {
+    this.execStreamCalls.push({
       sandboxId,
       cmd: [...cmd],
       opts: opts === undefined ? undefined : { ...opts },

@@ -214,6 +214,13 @@ export interface EventRepo {
   getSince(runId: string, afterSeq?: number): PersistedEvent[];
   /** Number of events persisted for the run. */
   count(runId: string): number;
+  /**
+   * Deletes the `count` oldest events of exactly `type` for the run (by
+   * ascending seq) and returns how many rows were removed (#104: keeps the
+   * persisted `sandbox.log` ring bounded — the caller's in-memory counters
+   * stay authoritative because it is the sole writer of that type).
+   */
+  deleteOldestByType(runId: string, type: string, count: number): number;
   /** Latest persisted `run.status` event for the run, if any (terminal-close detection). */
   lastRunStatus(runId: string): RunStatusEvent | undefined;
 }
@@ -863,6 +870,30 @@ export function createEventRepo(db: Db): EventRepo {
         .where(eq(schema.events.runId, runId))
         .get();
       return row?.total ?? 0;
+    },
+    deleteOldestByType(runId, type, count) {
+      const limit = Math.max(0, Math.trunc(count));
+      if (limit === 0) return 0;
+      const oldest = db
+        .select({ seq: schema.events.seq })
+        .from(schema.events)
+        .where(and(eq(schema.events.runId, runId), eq(schema.events.type, type)))
+        .orderBy(schema.events.seq)
+        .limit(limit)
+        .all();
+      if (oldest.length === 0) return 0;
+      db.delete(schema.events)
+        .where(
+          and(
+            eq(schema.events.runId, runId),
+            inArray(
+              schema.events.seq,
+              oldest.map((row) => row.seq),
+            ),
+          ),
+        )
+        .run();
+      return oldest.length;
     },
     lastRunStatus(runId) {
       const row = db

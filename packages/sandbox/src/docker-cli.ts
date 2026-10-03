@@ -307,15 +307,21 @@ export async function dockerOk(
   );
 }
 
-/** A log source for `docker logs` demux: two piped streams plus a close event. */
+/**
+ * A log source for `docker logs` demux: two piped streams plus a close
+ * event. `kill` is present on real spawn() children (used by
+ * {@link SandboxHandle.execStream} timeouts/cancel); test fakes may omit it.
+ */
 export interface DockerLogsSource {
   stdout: Readable;
   stderr: Readable;
   on(event: "error", listener: (err: Error) => void): unknown;
   on(event: "close", listener: (code: number | null) => void): unknown;
+  /** Best-effort signal delivery to the CLI process; optional for fakes. */
+  kill?(signal?: NodeJS.Signals): void;
 }
 
-/** Spawns `docker <args>` with piped stdio for dual-stream log reading. */
+/** Spawns `docker <args>` with piped stdio for dual-stream reading. */
 export type DockerLogsSpawner = (args: readonly string[]) => DockerLogsSource;
 
 export const defaultDockerLogsSpawner: DockerLogsSpawner = (args) =>

@@ -174,6 +174,46 @@ describe("parseRunStreamEvent", () => {
     expect(events).toHaveLength(1);
   });
 
+  it("parses sandbox log events and registers them on the stream (#104)", () => {
+    const log = {
+      type: "sandbox.log",
+      seq: 11,
+      sandboxId: "openeuler-run-1-abc",
+      stream: "stdout" as const,
+      line: "make[1]: entering directory",
+    };
+    const marker = {
+      type: "sandbox.log-truncated",
+      seq: 12,
+      sandboxId: "openeuler-run-1-abc",
+      dropped: 100,
+      kept: 2000,
+    };
+    expect(parseRunStreamEvent(JSON.stringify(log))).toEqual(log);
+    expect(parseRunStreamEvent(JSON.stringify(marker))).toEqual(marker);
+
+    expect(RUN_EVENT_TYPES).toContain("sandbox.log");
+    expect(RUN_EVENT_TYPES).toContain("sandbox.log-truncated");
+    const events: RunStreamEvent[] = [];
+    const { source } = connect({ events });
+    source.simulateOpen();
+    source.simulateEvent({
+      type: "sandbox.log",
+      seq: 13,
+      sandboxId: "sb",
+      stream: "stderr",
+      line: "warn",
+    });
+    source.simulateEvent({
+      type: "sandbox.log-truncated",
+      seq: 14,
+      sandboxId: "sb",
+      dropped: 1,
+      kept: 2000,
+    });
+    expect(events).toHaveLength(2);
+  });
+
   it("returns null for malformed or unknown payloads", () => {
     expect(parseRunStreamEvent("not json")).toBeNull();
     expect(parseRunStreamEvent(JSON.stringify({ type: "mystery", seq: 1 }))).toBeNull();

@@ -9,6 +9,7 @@ import {
   defaultDockerLogsSpawner,
   type DockerCliResult,
   type DockerCliRunner,
+  type DockerLogsSource,
   type DockerLogsSpawner,
   docker,
   dockerOk,
@@ -19,8 +20,10 @@ import {
   stderrTail,
 } from "./docker-cli.js";
 import type {
+  SandboxExecChunk,
   SandboxExecOptions,
   SandboxExecResult,
+  SandboxExecStream,
   SandboxHandle,
   SandboxHandleMeta,
   SandboxHostPorts,
@@ -75,6 +78,12 @@ export interface DockerSandboxProviderOptions {
   runner?: DockerCliRunner;
   /** Injectable spawner used by `logs()` dual-stream demux; for tests. */
   logsSpawner?: DockerLogsSpawner;
+  /**
+   * Injectable spawner used by `execStream()` live output reading (#104);
+   * same shape as `logsSpawner` (any `docker` invocation with piped
+   * stdio). Defaults to the shared spawn-based spawner; for tests.
+   */
+  execSpawner?: DockerLogsSpawner;
   /** Timeout for `docker pull` when the image is missing. Default 300s. */
   pullTimeoutMs?: number;
   /** Default `exec` timeout when the caller passes no `timeoutMs`. Default 300s. */
@@ -105,6 +114,7 @@ interface ResolvedDockerOptions {
   id: string;
   runner: DockerCliRunner;
   logsSpawner: DockerLogsSpawner;
+  execSpawner: DockerLogsSpawner;
   pullTimeoutMs: number;
   execTimeoutMs: number;
   opTimeoutMs: number;
@@ -116,6 +126,52 @@ interface ResolvedDockerOptions {
 }
 
 const DEFAULT_IDLE_COMMAND = ["tail", "-f", "/dev/null"];
+
+/**
+ * Single-consumer async queue of exec chunks (#104): producers `push` from
+ * stream events, the consumer iterates until `close()` (which ends the
+ * iteration with a `null` sentinel). Chunks are buffered unboundedly — the
+ * consumer (a driver parser) drains promptly.
+ */
+class ChunkQueue {
+  private readonly items: SandboxExecChunk[] = [];
+  private readonly waiters: ((chunk: SandboxExecChunk | null) => void)[] = [];
+  private closed = false;
+
+  push(chunk: SandboxExecChunk): void {
+    const waiter = this.waiters.shift();
+    if (waiter) {
+      waiter(chunk);
+      return;
+    }
+    this.items.push(chunk);
+  }
+
+  close(): void {
+    if (this.closed) return;
+    this.closed = true;
+    for (const waiter of this.waiters.splice(0)) waiter(null);
+  }
+
+  /** Shared single iterator: repeated `[Symbol.asyncIterator]()` calls return it (a manual `next()` plus a `for await` continues one consumption). */
+  iterate(): AsyncIterable<SandboxExecChunk> {
+    const iterator: AsyncIterator<SandboxExecChunk> = {
+      // Arrow property: `this` stays bound to the queue instance.
+      next: async (): Promise<IteratorResult<SandboxExecChunk>> => {
+        const item = this.items.shift();
+        if (item !== undefined) return { value: item, done: false };
+        if (this.closed) return { value: undefined, done: true };
+        const chunk = await new Promise<SandboxExecChunk | null>((resolve) => {
+          this.waiters.push(resolve);
+        });
+        return chunk === null ? { value: undefined, done: true } : { value: chunk, done: false };
+      },
+    };
+    return {
+      [Symbol.asyncIterator]: (): AsyncIterator<SandboxExecChunk> => iterator,
+    };
+  }
+}
 
 /** `docker inspect` view of one container (only the fields we read). */
 interface DockerInspectView {
@@ -359,11 +415,18 @@ function parseDockerLabels(joined: string | undefined): Record<string, string> {
 }
 
 /** Strip the `--timestamps` prefix docker prepends to every log line. */
-const LOG_TIMESTAMP_PREFIX = /^\d{4}-\d{2}-\d{2}T[^\s]+ /;
+const LOG_TIMESTAMP_PREFIX = /^(\d{4}-\d{2}-\d{2}T[^\s]+) /;
 
-function stripLogTimestamp(line: string): string {
-  const stripped = line.replace(LOG_TIMESTAMP_PREFIX, "");
-  return stripped === line ? line : stripped;
+/**
+ * Split one `docker logs --timestamps` line into the log-entry fields: the
+ * stripped line plus the prefix's epoch ms (`at`, undefined when absent or
+ * unparsable — providers only promise `at` on a best-effort basis).
+ */
+function splitLogTimestampEntry(line: string): Pick<SandboxLogEntry, "line" | "at"> {
+  const match = LOG_TIMESTAMP_PREFIX.exec(line);
+  if (match === null) return { line };
+  const at = Date.parse(match[1] ?? "");
+  return Number.isNaN(at) ? { line } : { line: line.slice(match[0].length), at };
 }
 
 function mapPsStateToStatus(state: string | undefined): SandboxStatus {
@@ -421,25 +484,7 @@ class DockerSandboxHandle implements SandboxHandle {
   }
 
   async exec(cmd: string[], opts?: SandboxExecOptions): Promise<SandboxExecResult> {
-    if (!Array.isArray(cmd) || cmd.length === 0 || cmd.some((part) => typeof part !== "string")) {
-      throw new SandboxError(
-        "SANDBOX_INVALID_SPEC",
-        "exec cmd must be a non-empty array of strings",
-      );
-    }
-    validateEnvRecord(opts?.env ?? {}, "exec");
-    if (this.destroyed || this.stoppedByUs) {
-      throw new SandboxError(
-        "SANDBOX_UNAVAILABLE",
-        `sandbox "${this.id}" is not running (destroyed or stopped); cannot exec ${cmd.join(" ")}`,
-      );
-    }
-    const args = ["exec"];
-    if (opts?.cwd !== undefined) args.push("-w", opts.cwd);
-    for (const [key, value] of Object.entries(opts?.env ?? {})) {
-      args.push("-e", `${key}=${value}`);
-    }
-    args.push(this.id, ...cmd);
+    const args = this.buildExecArgs(cmd, opts);
     const startedAt = Date.now();
     const result = await docker(args, {
       runner: this.options.runner,
@@ -467,6 +512,179 @@ class DockerSandboxHandle implements SandboxHandle {
       stderr: result.stderr,
       durationMs: Date.now() - startedAt,
     };
+  }
+
+  /**
+   * Streaming exec (#104): spawns `docker exec` (no `--detach`) with piped
+   * stdio and forwards BOTH streams live as {@link SandboxExecChunk}s.
+   * `exited` mirrors `exec`'s error taxonomy (`SANDBOX_TIMEOUT` on timeout,
+   * `SANDBOX_UNAVAILABLE` when the sandbox/daemon is gone); a non-zero exit
+   * is a RESULT, resolved with its code. Note the CLI boundary: killing the
+   * CLI (timeout/cancel) stops streaming, but the command itself keeps
+   * running inside the sandbox until `stop()`/`destroy()` — callers that
+   * need the process gone must stop the sandbox.
+   */
+  execStream(cmd: string[], opts?: SandboxExecOptions): SandboxExecStream {
+    const args = this.buildExecArgs(cmd, opts);
+    const startedAt = Date.now();
+    const queue = new ChunkQueue();
+    let resolveExit!: (exit: { code: number; durationMs: number }) => void;
+    let rejectExit!: (error: SandboxError) => void;
+    const exited = new Promise<{ code: number; durationMs: number }>((resolve, reject) => {
+      resolveExit = resolve;
+      rejectExit = reject;
+    });
+    let child: DockerLogsSource;
+    try {
+      child = this.options.execSpawner(args);
+    } catch (err) {
+      queue.close();
+      rejectExit(
+        new SandboxError(
+          "SANDBOX_UNAVAILABLE",
+          `exec "${cmd.join(" ")}" in sandbox "${this.id}" failed to spawn: ${
+            err instanceof Error ? err.message : String(err)
+          }`,
+        ),
+      );
+      return { events: queue.iterate(), exited };
+    }
+
+    let settled = false;
+    let timedOut = false;
+    let rawStderr = "";
+    const stderrCap = this.options.logsCapBytes;
+    const timeoutMs = opts?.timeoutMs ?? this.options.execTimeoutMs;
+    const timer = setTimeout(() => {
+      timedOut = true;
+      killChild();
+    }, timeoutMs);
+    timer.unref?.();
+
+    const killChild = (): void => {
+      try {
+        child.kill?.("SIGKILL");
+      } catch {
+        // Already gone — the close handler settles.
+      }
+      child.stdout.destroy();
+      child.stderr.destroy();
+    };
+    const settle = (finish: () => void): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      queue.close();
+      finish();
+    };
+
+    child.stdout.setEncoding("utf8");
+    child.stdout.on("data", (chunk: string) => {
+      queue.push({ stream: "stdout", chunk });
+    });
+    child.stderr.setEncoding("utf8");
+    child.stderr.on("data", (chunk: string) => {
+      queue.push({ stream: "stderr", chunk });
+      if (rawStderr.length < stderrCap) rawStderr += chunk;
+    });
+    child.on("error", (err) =>
+      settle(() =>
+        rejectExit(
+          new SandboxError(
+            "SANDBOX_UNAVAILABLE",
+            `exec "${cmd.join(" ")}" in sandbox "${this.id}" failed: ${err.message}`,
+          ),
+        ),
+      ),
+    );
+    child.on("close", (code) => {
+      if (timedOut) {
+        settle(() =>
+          rejectExit(
+            new SandboxError(
+              "SANDBOX_TIMEOUT",
+              `exec "${cmd.join(" ")}" in sandbox "${this.id}" timed out after ${timeoutMs}ms`,
+            ),
+          ),
+        );
+        return;
+      }
+      if (code !== 0) {
+        const failureText = `${rawStderr}`;
+        if (isNotRunningText(failureText) || isContainerMissingText(failureText)) {
+          settle(() =>
+            rejectExit(
+              new SandboxError(
+                "SANDBOX_UNAVAILABLE",
+                `sandbox "${this.id}" is not running; cannot exec ${cmd.join(" ")}`,
+              ),
+            ),
+          );
+          return;
+        }
+        if (isDaemonDown({ stderr: rawStderr })) {
+          settle(() =>
+            rejectExit(
+              new SandboxError(
+                "SANDBOX_UNAVAILABLE",
+                `exec "${cmd.join(" ")}" failed (docker daemon unreachable): ${stderrTail(rawStderr)}`,
+              ),
+            ),
+          );
+          return;
+        }
+      }
+      const exitCode = code ?? 0;
+      settle(() => resolveExit({ code: exitCode, durationMs: Date.now() - startedAt }));
+    });
+
+    return {
+      events: queue.iterate(),
+      exited,
+      cancel: () => {
+        if (settled) return;
+        // Settle BEFORE killing: a synchronous `close` out of killChild()
+        // (e.g. test fakes) must not resolve the exit over the cancellation.
+        settle(() =>
+          rejectExit(
+            new SandboxError(
+              "SANDBOX_UNAVAILABLE",
+              `exec "${cmd.join(" ")}" in sandbox "${this.id}" was cancelled`,
+            ),
+          ),
+        );
+        killChild();
+      },
+    };
+  }
+
+  /** Shared exec precondition checks (throw synchronously, like `exec`). */
+  private assertExecable(cmd: string[], opts?: SandboxExecOptions): void {
+    if (!Array.isArray(cmd) || cmd.length === 0 || cmd.some((part) => typeof part !== "string")) {
+      throw new SandboxError(
+        "SANDBOX_INVALID_SPEC",
+        "exec cmd must be a non-empty array of strings",
+      );
+    }
+    validateEnvRecord(opts?.env ?? {}, "exec");
+    if (this.destroyed || this.stoppedByUs) {
+      throw new SandboxError(
+        "SANDBOX_UNAVAILABLE",
+        `sandbox "${this.id}" is not running (destroyed or stopped); cannot exec ${cmd.join(" ")}`,
+      );
+    }
+  }
+
+  /** Builds the `docker exec` argv shared by `exec` and `execStream`. */
+  private buildExecArgs(cmd: string[], opts?: SandboxExecOptions): string[] {
+    this.assertExecable(cmd, opts);
+    const args = ["exec"];
+    if (opts?.cwd !== undefined) args.push("-w", opts.cwd);
+    for (const [key, value] of Object.entries(opts?.env ?? {})) {
+      args.push("-e", `${key}=${value}`);
+    }
+    args.push(this.id, ...cmd);
+    return args;
   }
 
   logs(opts?: SandboxLogOptions): AsyncIterable<SandboxLogEntry> {
@@ -514,7 +732,7 @@ class DockerSandboxHandle implements SandboxHandle {
           child.stdout.destroy(); // unblock the CLI's pipe (expected EPIPE exit)
           return;
         }
-        entries.push({ stream: "stdout", line: stripLogTimestamp(line) });
+        entries.push({ stream: "stdout", ...splitLogTimestampEntry(line) });
       });
       const stderrInterface = createInterface({ input: child.stderr });
       stderrInterface.on("line", (line: string) => {
@@ -530,7 +748,7 @@ class DockerSandboxHandle implements SandboxHandle {
           child.stderr.destroy();
           return;
         }
-        entries.push({ stream: "stderr", line: stripLogTimestamp(line) });
+        entries.push({ stream: "stderr", ...splitLogTimestampEntry(line) });
         if (rawStderr.length < cap) rawStderr += `${line}\n`;
       });
       let settled = false;
@@ -681,6 +899,7 @@ export class DockerSandboxProvider implements SandboxProvider {
       id: this.id,
       runner: options.runner ?? defaultDockerCliRunner,
       logsSpawner: options.logsSpawner ?? defaultDockerLogsSpawner,
+      execSpawner: options.execSpawner ?? options.logsSpawner ?? defaultDockerLogsSpawner,
       pullTimeoutMs: options.pullTimeoutMs ?? 300_000,
       execTimeoutMs: options.execTimeoutMs ?? 300_000,
       opTimeoutMs: options.opTimeoutMs ?? 30_000,

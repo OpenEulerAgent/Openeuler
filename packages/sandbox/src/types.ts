@@ -91,10 +91,54 @@ export interface SandboxExecResult {
   durationMs: number;
 }
 
+/**
+ * One output chunk of a streaming {@link SandboxHandle.execStream} command.
+ * Chunks arrive as the command produces them (unsplittable writes may be
+ * split or coalesced by the transport); per-stream ORDER is guaranteed,
+ * cross-stream interleaving is arrival-order.
+ */
+export interface SandboxExecChunk {
+  stream: "stdout" | "stderr";
+  chunk: string;
+}
+
+/** Completion of a streaming {@link SandboxHandle.execStream} command. */
+export interface SandboxExecExit {
+  /** Process exit code. Non-zero is a *result*, not an error. */
+  code: number;
+  /** Wall-clock duration of the command in ms. */
+  durationMs: number;
+}
+
+/**
+ * Live view of one running {@link SandboxHandle.execStream} command (#104):
+ * `events` yields chunks as they arrive (ends when the command's streams
+ * close), `exited` settles exactly once with the exit code — or rejects with
+ * `SandboxError` (`SANDBOX_TIMEOUT`, `SANDBOX_UNAVAILABLE`, …) when the
+ * execution failed or was cancelled. `cancel()` best-effort stops the local
+ * CLI process (the command may keep running in the sandbox until
+ * `stop()`/`destroy()`); afterwards `events` ends and `exited` rejects with
+ * `SANDBOX_UNAVAILABLE`.
+ */
+export interface SandboxExecStream {
+  /** Output chunks in arrival order; single consumer. */
+  events: AsyncIterable<SandboxExecChunk>;
+  /** Resolves once with the exit; rejects on execution failure/cancel. */
+  exited: Promise<SandboxExecExit>;
+  /** Best-effort cancel; never throws. Optional (providers may lack it). */
+  cancel?(): void;
+}
+
 /** One log line streamed from a sandbox. */
 export interface SandboxLogEntry {
   stream: "stdout" | "stderr";
   line: string;
+  /**
+   * Epoch-ms emission timestamp when the provider can recover it (the docker
+   * provider parses the `--timestamps` prefix). Absent on providers without
+   * per-line timestamps; used by log tailers for incremental cursors.
+   */
+  at?: number;
 }
 
 /** Options for {@link SandboxHandle.logs}. */
@@ -133,6 +177,16 @@ export interface SandboxHandle {
    * stop/destroy rejects with `SANDBOX_UNAVAILABLE`.
    */
   exec(cmd: string[], opts?: SandboxExecOptions): Promise<SandboxExecResult>;
+  /**
+   * Streaming variant of {@link exec} (#104): runs the command WITHOUT
+   * detaching and returns its live output — `events` yields stdout/stderr
+   * chunks as the command emits them, `exited` settles with the exit code
+   * (or rejects with the same typed errors as `exec`). Prefer this over
+   * `exec` whenever output must be observed while the command runs (e.g. a
+   * driver streaming agent NDJSON live). After stop/destroy `exited` rejects
+   * with `SANDBOX_UNAVAILABLE` and `events` is empty.
+   */
+  execStream(cmd: string[], opts?: SandboxExecOptions): SandboxExecStream;
   /**
    * Stream log entries in emission order. May be called multiple times
    * (each call returns a fresh iterable). Empty once destroyed.

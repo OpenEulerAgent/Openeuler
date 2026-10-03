@@ -465,4 +465,50 @@ describe("events", () => {
     expect(db.events.lastRunStatus(runId)?.seq).toBe(2);
     expect(db.events.lastRunStatus(otherRunId)).toBeUndefined();
   });
+
+  it("deleteOldestByType removes the oldest N rows of one type, leaving others (#104)", () => {
+    const { runId, otherRunId } = seedRun();
+    for (let index = 1; index <= 5; index += 1) {
+      db.events.append(runId, {
+        type: "sandbox.log",
+        sandboxId: "sb-1",
+        stream: "stdout",
+        line: `l${index}`,
+      });
+    }
+    db.events.append(runId, { type: "started" });
+    db.events.append(runId, {
+      type: "sandbox.log",
+      sandboxId: "sb-1",
+      stream: "stderr",
+      line: "l6",
+    });
+    db.events.append(otherRunId, {
+      type: "sandbox.log",
+      sandboxId: "sb-2",
+      stream: "stdout",
+      line: "other",
+    });
+
+    expect(db.events.deleteOldestByType(runId, "sandbox.log", 2)).toBe(2);
+    const remaining = db.events
+      .getSince(runId, 0)
+      .filter((event) => event.type === "sandbox.log")
+      .map((event) => (event.type === "sandbox.log" ? event.line : ""));
+    expect(remaining).toEqual(["l3", "l4", "l5", "l6"]);
+    // Non-matching types and other runs stay untouched; seqs stay contiguous
+    // for what remains.
+    expect(db.events.getSince(runId, 0).some((event) => event.type === "started")).toBe(true);
+    expect(
+      db.events
+        .getSince(otherRunId, 0)
+        .some((event) => event.type === "sandbox.log" && event.line === "other"),
+    ).toBe(true);
+
+    // Over-asking removes what exists; count 0 and unknown types are no-ops.
+    expect(db.events.deleteOldestByType(runId, "sandbox.log", 100)).toBe(4);
+    expect(db.events.deleteOldestByType(runId, "sandbox.log", 3)).toBe(0);
+    expect(db.events.deleteOldestByType(runId, "nope", 3)).toBe(0);
+    expect(db.events.count(runId)).toBe(1); // only `started` remains
+  });
 });

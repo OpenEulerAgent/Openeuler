@@ -1,6 +1,11 @@
 import type { ProjectSandboxPolicy, RunStatus } from "@openeuler/core";
 import type { Db } from "@openeuler/db";
-import type { AgentExecSeam, AgentHandle, DriverRegistry } from "@openeuler/drivers";
+import type {
+  AgentExecOptions,
+  AgentExecSeam,
+  AgentHandle,
+  DriverRegistry,
+} from "@openeuler/drivers";
 import {
   createFlowEngine,
   buildRunSandboxSpec,
@@ -15,6 +20,7 @@ import { recordRunStatusActivity, recordSandboxKeptActivity } from "./activity.j
 import { DEFAULT_MAX_CONCURRENT_RUNS, resolveMaxConcurrentRuns } from "./concurrency.js";
 import type { Logger } from "./logger.js";
 import { createSecretsSupport, type SecretsSupport } from "./secrets.js";
+import { startSandboxLogTailer, type SandboxLogTailer } from "./sandbox-log-tailer.js";
 
 export { DEFAULT_DRIVER_ID };
 
@@ -153,6 +159,17 @@ export interface ExecutorOptions {
      * (30s cache).
      */
     isDockerAvailable?: () => Promise<boolean>;
+    /**
+     * Poll interval for the sandbox log tailer (#104) — container
+     * stdout/stderr lines are appended as `sandbox.log` events while the
+     * run's sandbox exists. Default 500ms.
+     */
+    logPollIntervalMs?: number;
+    /**
+     * Ring cap: max persisted `sandbox.log` events per run (drop-oldest,
+     * one `sandbox.log-truncated` marker). Default 2000.
+     */
+    logCap?: number;
   };
 }
 
@@ -182,6 +199,8 @@ interface ActiveSandbox {
   stopped: boolean;
   /** In-flight exec cancellations (wired to the driver's exec seam). */
   execControllers: Set<AbortController>;
+  /** Container log tailer (#104); stopped (final flush + marker) at dispose. */
+  tailer: SandboxLogTailer | null;
   /** Cancels in-flight execs and stops the container (abort path). */
   stop: () => Promise<void>;
 }
@@ -335,8 +354,23 @@ export function createExecutor(options: ExecutorOptions): Executor {
     }
   }
 
-  /** Builds the driver exec seam bound to one run's sandbox handle (#102). */
+  /** Builds the driver exec seam bound to one run's sandbox handle (#102/#104). */
   function execSeamFor(entry: ActiveSandbox): AgentExecSeam {
+    const mapOpts = (opts?: {
+      timeoutMs?: number;
+      env?: Record<string, string>;
+    }): Parameters<SandboxHandle["exec"]>[1] => ({
+      cwd: SANDBOX_WORKSPACE_PATH,
+      ...(opts?.timeoutMs === undefined ? {} : { timeoutMs: opts.timeoutMs }),
+      ...(opts?.env === undefined || Object.keys(opts.env).length === 0
+        ? {}
+        : { env: { ...opts.env } }),
+    });
+    const cancelMessage = (cmd: string[]): SandboxError =>
+      new SandboxError(
+        "SANDBOX_UNAVAILABLE",
+        `sandbox exec cancelled (sandbox stopped): ${cmd.join(" ")}`,
+      );
     return {
       kind: "sandbox",
       run: (cmd, opts) =>
@@ -351,29 +385,48 @@ export function createExecutor(options: ExecutorOptions): Executor {
             controller.signal.removeEventListener("abort", onAbort);
             finish();
           };
-          const onAbort = (): void =>
-            settle(() =>
-              reject(
-                new SandboxError(
-                  "SANDBOX_UNAVAILABLE",
-                  `sandbox exec cancelled (sandbox stopped): ${cmd.join(" ")}`,
-                ),
-              ),
-            );
+          const onAbort = (): void => settle(() => reject(cancelMessage(cmd)));
           controller.signal.addEventListener("abort", onAbort, { once: true });
-          entry.handle
-            .exec(cmd, {
-              cwd: SANDBOX_WORKSPACE_PATH,
-              ...(opts?.timeoutMs === undefined ? {} : { timeoutMs: opts.timeoutMs }),
-              ...(opts?.env === undefined || Object.keys(opts.env).length === 0
-                ? {}
-                : { env: { ...opts.env } }),
-            })
-            .then(
-              (result) => settle(() => resolve(result)),
-              (err) => settle(() => reject(err)),
-            );
+          entry.handle.exec(cmd, mapOpts(opts)).then(
+            (result) => settle(() => resolve(result)),
+            (err) => settle(() => reject(err)),
+          );
         }),
+      // #104: live-streaming variant — same abort wiring (the cancel both
+      // kills the CLI child and rejects `exited`, which settles the driver
+      // handle as aborted). Present whenever the provider handle implements
+      // `execStream`; drivers without streaming support fall back to `run`.
+      ...(typeof entry.handle.execStream === "function"
+        ? {
+            runStream: (cmd: string[], opts?: AgentExecOptions) => {
+              const controller = new AbortController();
+              entry.execControllers.add(controller);
+              const inner = entry.handle.execStream(cmd, mapOpts(opts));
+              let settled = false;
+              const settle = (finish: () => void): void => {
+                if (settled) return;
+                settled = true;
+                entry.execControllers.delete(controller);
+                controller.signal.removeEventListener("abort", onAbort);
+                finish();
+              };
+              let rejectExit!: (error: SandboxError) => void;
+              const onAbort = (): void => {
+                inner.cancel?.();
+                settle(() => rejectExit(cancelMessage(cmd)));
+              };
+              const exited = new Promise<{ code: number }>((resolve, reject) => {
+                rejectExit = reject;
+                controller.signal.addEventListener("abort", onAbort, { once: true });
+                inner.exited.then(
+                  (exit) => settle(() => resolve({ code: exit.code })),
+                  (err) => settle(() => reject(err)),
+                );
+              });
+              return { events: inner.events, exited };
+            },
+          }
+        : {}),
       stop: () => stopSandbox(entry),
     };
   }
@@ -419,6 +472,20 @@ export function createExecutor(options: ExecutorOptions): Executor {
             keepForDebug: policy.keepForDebug === true,
             stopped: false,
             execControllers: new Set(),
+            // #104: tail container stdout/stderr into the run event log
+            // (bounded ring, redacted) from create until dispose.
+            tailer: startSandboxLogTailer({
+              db,
+              handle,
+              runId: run.id,
+              sandboxId: handle.id,
+              redact: redactorFor(project.id),
+              ...(options.sandbox!.logPollIntervalMs === undefined
+                ? {}
+                : { pollIntervalMs: options.sandbox!.logPollIntervalMs }),
+              ...(options.sandbox!.logCap === undefined ? {} : { cap: options.sandbox!.logCap }),
+              onWarn: (message) => logger.warn({ runId: run.id, sandbox: handle.id }, message),
+            }),
             stop: async () => {
               await stopSandbox(entry);
             },
@@ -432,14 +499,19 @@ export function createExecutor(options: ExecutorOptions): Executor {
         };
 
   /**
-   * Disposes a run's sandbox when its execution ends (#102): destroy the
-   * container, or keep it (ops-activity recorded) when the policy says so.
-   * Best-effort — a failed destroy is logged, never thrown into the caller.
+   * Disposes a run's sandbox when its execution ends (#102): stop the log
+   * tailer first (#104 — final flush + truncation marker while the container
+   * still exists), then destroy the container, or keep it (ops-activity
+   * recorded) when the policy says so. Best-effort — a failed destroy is
+   * logged, never thrown into the caller.
    */
   async function disposeSandbox(runId: string): Promise<void> {
     const entry = activeSandboxes.get(runId);
     if (entry === undefined) return;
     activeSandboxes.delete(runId);
+    await entry.tailer?.stop().catch((err: unknown) => {
+      logger.warn({ err, runId }, "sandbox log tailer stop failed");
+    });
     if (entry.keepForDebug) {
       recordSandboxKeptActivity(db, {
         runId,
@@ -724,6 +796,8 @@ export function createExecutor(options: ExecutorOptions): Executor {
       const sandbox = activeSandboxes.get(entry.runId);
       if (sandbox === undefined) continue;
       activeSandboxes.delete(entry.runId);
+      // #104: flush the log tail before the container goes away.
+      await sandbox.tailer?.stop().catch(() => {});
       if (sandbox.keepForDebug) {
         recordSandboxKeptActivity(db, {
           runId: entry.runId,

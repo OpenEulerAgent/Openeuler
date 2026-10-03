@@ -19,17 +19,45 @@ export interface AgentExecResult {
   stderr: string;
 }
 
+/** One output chunk of a streaming {@link AgentExecSeam.runStream} command (#104). */
+export interface AgentExecChunk {
+  stream: "stdout" | "stderr";
+  chunk: string;
+}
+
+/**
+ * Live view of one streaming seam command (#104): `events` yields chunks as
+ * the command emits them (ends when its streams close), `exited` settles
+ * exactly once — resolving with the exit code, or rejecting when the
+ * execution failed (seam-cancelled, timeout, sandbox gone). Mirrors the
+ * `AgentHandle` events/exited shape.
+ */
+export interface AgentExecStream {
+  /** Output chunks in arrival order; single consumer. */
+  events: AsyncIterable<AgentExecChunk>;
+  /** Resolves once with the exit; rejects on execution failure/cancel. */
+  exited: Promise<{ code: number }>;
+}
+
 /**
  * Sandbox execution seam (#102): when present on {@link AgentStartOpts},
  * drivers run their agent command INSIDE the run's sandbox through `run`
  * instead of a local child-process spawn. `kind: "sandbox"` keeps the union
  * open for future seams (remote VMs, …). `stop` is the abort path: drivers
  * call it from `AgentHandle.abort()`; it must best-effort cancel every
- * in-flight `run()` (those promises then reject) and stop the sandbox.
+ * in-flight `run()`/`runStream()` (those promises then reject) and stop the
+ * sandbox. `runStream` (#104) is the live variant of `run`: drivers that can
+ * consume incremental output SHOULD prefer it and fall back to `run` when
+ * the seam does not provide it.
  */
 export interface AgentExecSeam {
   kind: "sandbox";
   run(cmd: string[], opts?: AgentExecOptions): Promise<AgentExecResult>;
+  /**
+   * Streaming variant of `run` (#104). Same command/option contract;
+   * output arrives as live chunks instead of one buffered result.
+   */
+  runStream?(cmd: string[], opts?: AgentExecOptions): AgentExecStream;
   /** Best-effort cancel of in-flight `run()` calls; never throws. */
   stop?(): void | Promise<void>;
 }

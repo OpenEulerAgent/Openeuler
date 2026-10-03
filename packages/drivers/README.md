@@ -44,6 +44,30 @@ interface AgentExit {
 `started`, `session` (`sessionId`), `message-delta`, `tool-call`,
 `tool-output`, `done`, `error` — every variant carries a monotonic `seq`.
 
+### Sandbox exec seam (#102 / #104)
+
+`opts.exec`, when present, moves the agent command INSIDE the run's sandbox:
+
+```ts
+interface AgentExecSeam {
+  kind: "sandbox";
+  run(cmd: string[], opts?: AgentExecOptions): Promise<AgentExecResult>;
+  runStream?(cmd: string[], opts?: AgentExecOptions): AgentExecStream; // #104, live
+  stop?(): void | Promise<void>; // abort path
+}
+
+interface AgentExecStream {
+  events: AsyncIterable<{ stream: "stdout" | "stderr"; chunk: string }>;
+  exited: Promise<{ code: number }>; // rejects on failure/cancel
+}
+```
+
+Drivers that can consume incremental output SHOULD prefer `runStream` (the
+opencode driver parses NDJSON as chunks arrive, so agent events — and the
+`session` id — stream live mid-node instead of batching at completion) and
+MUST fall back to `run` when the seam does not provide it. `cwd` is a
+CONTAINER path under the seam (e.g. `/workspace`); never host-resolve it.
+
 ## Lifecycle
 
 1. `start(opts)` spawns one run and returns its handle. `start` must be

@@ -144,6 +144,49 @@ export const EdgeTakenEventSchema = z.strictObject({
 
 export type EdgeTakenEvent = z.infer<typeof EdgeTakenEventSchema>;
 
+// -------------------------------------------------------------------------
+// Sandbox log events (#104). While a run's sandbox exists, its container
+// stdout/stderr lines are appended into the run's event log as first-class
+// history (`sandbox.log`), one event per line, bounded to the last
+// SANDBOX_LOG_CAP lines per run (drop-oldest; a single
+// `sandbox.log-truncated` marker records what fell out). The executor (which
+// owns the sandbox lifecycle) appends these; the web feed renders them as
+// mono gray lines under "All" only, and the graph fold ignores them.
+//
+
+/**
+ * Engine-emitted event: one sandbox log line, in emission order (per-stream
+ * order pinned; cross-stream interleaving is provider-dependent).
+ */
+export const SandboxLogEventSchema = z.strictObject({
+  type: z.literal("sandbox.log"),
+  seq: seqSchema,
+  /** Provider-scoped id of the sandbox the line came from. */
+  sandboxId: z.string().min(1, "sandboxId must be a non-empty string"),
+  stream: z.enum(["stdout", "stderr"]),
+  /** The raw line (secret-redacted before persistence). */
+  line: z.string(),
+});
+
+export type SandboxLogEvent = z.infer<typeof SandboxLogEventSchema>;
+
+/**
+ * Engine-emitted event: emitted at most ONCE per run (when the sandbox log
+ * tailer stops) when `sandbox.log` events were evicted to keep the run's log
+ * bounded — the ring keeps the LAST `kept` lines.
+ */
+export const SandboxLogTruncatedEventSchema = z.strictObject({
+  type: z.literal("sandbox.log-truncated"),
+  seq: seqSchema,
+  sandboxId: z.string().min(1, "sandboxId must be a non-empty string"),
+  /** Total lines evicted (dropped from the front of the ring) for the run. */
+  dropped: z.number().int().min(1, "dropped must be an integer >= 1"),
+  /** Lines the ring kept (the persisted `sandbox.log` event count). */
+  kept: z.number().int().min(0, "kept must be an integer >= 0"),
+});
+
+export type SandboxLogTruncatedEvent = z.infer<typeof SandboxLogTruncatedEventSchema>;
+
 /**
  * Engine-emitted event: a conditional cycle edge's condition matched but its
  * iteration guard blocked the traversal. `taken` counts the edge's matched
@@ -175,6 +218,8 @@ export const RunEventSchema = z.discriminatedUnion("type", [
   NodeCompletedEventSchema,
   EdgeTakenEventSchema,
   EdgeCapReachedEventSchema,
+  SandboxLogEventSchema,
+  SandboxLogTruncatedEventSchema,
 ]);
 
 export type RunEvent = z.infer<typeof RunEventSchema>;

@@ -34,6 +34,7 @@ interface SandboxHandle {
   id: string;
   status(): Promise<"running" | "exited" | "stopped">;
   exec(cmd: string[], opts?: SandboxExecOptions): Promise<SandboxExecResult>;
+  execStream(cmd: string[], opts?: SandboxExecOptions): SandboxExecStream; // live chunks + exited (#104)
   logs(opts?: SandboxLogOptions): AsyncIterable<SandboxLogEntry>;
   hostPorts(): Promise<Record<number, number>>; // container → host
   stop(timeoutMs?: number): Promise<void>;
@@ -75,12 +76,35 @@ interface SandboxHandle {
 - Infrastructure-level failures (command could not be spawned at all) reject
   with `SANDBOX_EXEC_FAILED`.
 
+## Streaming exec semantics (#104)
+
+`execStream(cmd, opts)` is the live variant of `exec`: it returns
+`{ events, exited, cancel? }` —
+
+- `events` is a single-consumer `AsyncIterable<{ stream: "stdout" | "stderr",
+chunk: string }>` yielding output AS the command produces it. Chunk
+  boundaries are transport-dependent (unsplittable writes may coalesce);
+  per-stream ORDER is guaranteed, cross-stream interleaving follows arrival
+  order.
+- `exited` resolves once with `{ code, durationMs }` — non-zero codes are
+  results — or rejects with the same typed errors as `exec`
+  (`SANDBOX_TIMEOUT`, `SANDBOX_UNAVAILABLE`, …) when the execution failed.
+- `cancel()` best-effort stops the LOCAL CLI process and rejects `exited`
+  with `SANDBOX_UNAVAILABLE`; the command itself may keep running inside the
+  sandbox until `stop()`/`destroy()` (there is no signal forwarding through
+  `docker exec`).
+- After stop/destroy, `execStream` throws `SANDBOX_UNAVAILABLE` synchronously
+  (mirroring `exec`).
+
 ## Log streaming semantics
 
 - `logs()` yields entries in emission order, preserving stdout/stderr
   interleaving.
 - `opts.tail` limits the stream to the last N entries (after `since`
   filtering); `opts.since` (epoch ms) drops older entries.
+- Entries carry an optional `at` (epoch ms emission timestamp) when the
+  provider can recover one — the docker provider parses its `--timestamps`
+  prefix. Incremental consumers (log tailers) use it as their cursor.
 - `follow` is reserved for future live tailing; only `false` (or omitted) is
   valid in v1.
 - Unlike agent event streams, `logs()` **may be called multiple times** — it
@@ -133,6 +157,10 @@ const provider = createFakeSandboxProvider({
     { code: 1, stdout: "boom" }, // order; Partial<SandboxExecResult> or
     new SandboxError("SANDBOX_EXEC_FAILED", "nope"), // a SandboxError to throw
   ], // empty queue → default echo result (code 0, stdout = joined cmd)
+  execStreams: [
+    // optional FIFO queue for execStream() (#104); chunks replay in order
+    { chunks: [{ stream: "stdout", chunk: "partial\n" }], code: 0, interChunkDelayMs: 0 },
+  ], // empty queue → single-stdout-chunk echo, exit code 0
   execDelayMs: 0, // simulated command duration; > timeoutMs → SANDBOX_TIMEOUT
   logLines: [{ stream: "stdout", line: "l1" }], // replayed by logs()
   logDelayMs: 0, // delay between log lines
@@ -331,8 +359,9 @@ pass host paths as the daemon sees them.
 `runSandboxContractTests(makeProvider)` (from the `@openeuler/sandbox/contract`
 subpath, which keeps vitest out of the runtime entrypoint) runs the
 provider-agnostic suite: lifecycle order, exec semantics (scripted queue,
-timeout, post-stop), log order + tail, stop idempotency, destroy-clears,
-ports mapping, list/label filtering, and error codes.
+timeout, post-stop), streaming exec semantics (#104: chunk order per stream,
+exit resolution, timeout, post-stop), log order + tail, stop idempotency,
+destroy-clears, ports mapping, list/label filtering, and error codes.
 
 ```ts
 // your-provider.contract.test.ts
@@ -341,6 +370,7 @@ import { runSandboxContractTests } from "@openeuler/sandbox/contract";
 runSandboxContractTests((script) =>
   createMyProvider({
     execResults: script.execResults, // map the script onto your backend
+    execStreams: script.execStreams,
     execDelayMs: script.execDelayMs,
     logLines: script.logLines,
     logDelayMs: script.logDelayMs,

@@ -2,9 +2,11 @@ export const PACKAGE_NAME = "@openeuler/drivers";
 
 export type {
   AgentDriver,
+  AgentExecChunk,
   AgentExecOptions,
   AgentExecResult,
   AgentExecSeam,
+  AgentExecStream,
   AgentExit,
   AgentExitReason,
   AgentHandle,

@@ -132,6 +132,8 @@ export {
   PersistedEventSchema,
   RunEventSchema,
   RunStatusEventSchema,
+  SandboxLogEventSchema,
+  SandboxLogTruncatedEventSchema,
   StepCompletedEventSchema,
   StepStartedEventSchema,
 } from "./run-event.js";
@@ -146,6 +148,8 @@ export type {
   PersistedEvent,
   RunEvent,
   RunStatusEvent,
+  SandboxLogEvent,
+  SandboxLogTruncatedEvent,
   StepCompletedEvent,
   StepStartedEvent,
 } from "./run-event.js";
