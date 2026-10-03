@@ -152,6 +152,10 @@ function projectWorktreeEntries(
     let status: WorktreeStatus;
     if (run !== undefined && !isTerminalRunStatus(run.status)) {
       status = "active";
+    } else if (run !== undefined && run.hostedUntil !== undefined && entry.exists) {
+      // Hosted runs (#110) keep a live sandbox bind-mounted at /workspace —
+      // pruning the worktree would empty the hosted preview. Treat as active.
+      status = "active";
     } else if (run !== undefined && entry.exists) {
       status = "inspectable";
     } else {
@@ -175,6 +179,8 @@ export function createWorktreesRouter(options: WorktreesRouterOptions = {}): Hon
   const duCacheTtlMs = options.duCacheTtlMs ?? WORKTREE_DU_CACHE_TTL_MS;
   /** Per-directory `du` results (#111); prune paths are harmless stale entries. */
   const duCache = new Map<string, { at: number; bytes: number | null }>();
+  /** In-flight `du` spawns, keyed by path — concurrent callers share one. */
+  const inFlightDu = new Map<string, Promise<number | null>>();
 
   const duBytes = async (path: string, refresh: boolean): Promise<number | null> => {
     if (!refresh) {
@@ -183,13 +189,25 @@ export function createWorktreesRouter(options: WorktreesRouterOptions = {}): Hon
     }
     let bytes: number | null = null;
     try {
-      const { stdout } = await execFileAsync(duBinary, ["-sB1", path], {
-        timeout: duTimeoutMs,
-        maxBuffer: 1024 * 1024,
-        windowsHide: true,
-      });
-      const value = Number.parseInt(stdout, 10);
-      bytes = Number.isFinite(value) && value >= 0 ? value : null;
+      // In-flight dedupe: concurrent callers share one `du` spawn per path.
+      let pending = inFlightDu.get(path);
+      if (pending === undefined) {
+        pending = execFileAsync(duBinary, ["-sB1", path], {
+          timeout: duTimeoutMs,
+          maxBuffer: 1024 * 1024,
+          windowsHide: true,
+        })
+          .then(({ stdout }) => {
+            const value = Number.parseInt(stdout, 10);
+            return Number.isFinite(value) && value >= 0 ? value : null;
+          })
+          .catch(() => null)
+          .finally(() => {
+            inFlightDu.delete(path);
+          });
+        inFlightDu.set(path, pending);
+      }
+      bytes = await pending;
     } catch {
       bytes = null;
     }
