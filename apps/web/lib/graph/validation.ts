@@ -206,9 +206,9 @@ function isMissingConditionIssue(issue: CanvasIssue): boolean {
 /**
  * Pure severity mapping for an issue: `'hint'` for structural WIP
  * (unreachable node, edge missing its condition pattern), `'blocker'` for
- * everything else (empty prompt, bad regex, dual-always, exit-node outgoing
- * edges, non-upstream `{{output:}}`, …). Purely tonal — both severities
- * block the save; see the editor's save gating.
+ * everything else (empty prompt, bad regex, fan-out/router mixing,
+ * exit-node outgoing edges, non-upstream `{{output:}}`, …). Purely tonal —
+ * both severities block the save; see the editor's save gating.
  */
 export function classifyIssue(issue: CanvasIssue): IssueSeverity {
   if (isUnreachableIssue(issue) || isMissingConditionIssue(issue)) return "hint";

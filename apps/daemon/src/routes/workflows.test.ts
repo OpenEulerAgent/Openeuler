@@ -629,6 +629,7 @@ describe("graph revisions (PUT /:id/graph, GET /:id/revisions)", () => {
       edgeCount: 2,
       hasLoop: false,
       hasRouter: false,
+      hasFanOut: false,
       revision: 1,
     });
 
@@ -869,6 +870,7 @@ describe("graph revisions (PUT /:id/graph, GET /:id/revisions)", () => {
       edgeCount: 3,
       hasLoop: true,
       hasRouter: true,
+      hasFanOut: false,
       revision: 2,
     });
 
@@ -888,7 +890,107 @@ describe("graph revisions (PUT /:id/graph, GET /:id/revisions)", () => {
       edgeCount: 2,
       hasLoop: false,
       hasRouter: false,
+      hasFanOut: false,
       revision: 3,
+    });
+  });
+
+  it("accepts a fan-out + join graph and summarizes the parallelism (#115)", async () => {
+    const h = setup();
+    const res = await postWorkflow(h, {
+      projectId: h.projectId,
+      name: "diamond",
+      graph: makeGraph({
+        entryNodeId: "n1",
+        nodes: [
+          {
+            id: "n1",
+            type: "agent",
+            name: "fan-out",
+            position: { x: 0, y: 0 },
+            config: {
+              driver: "first",
+              mode: "auto",
+              promptTemplate: "{{task}}",
+              continueSession: false,
+            },
+          },
+          {
+            id: "b",
+            type: "agent",
+            name: "build",
+            position: { x: 280, y: -120 },
+            config: {
+              driver: "second",
+              mode: "auto",
+              promptTemplate: "build {{prevOutput}}",
+              continueSession: false,
+            },
+          },
+          {
+            id: "c",
+            type: "agent",
+            name: "docs",
+            position: { x: 280, y: 120 },
+            config: {
+              driver: "first",
+              mode: "auto",
+              promptTemplate: "docs {{prevOutput}}",
+              continueSession: false,
+            },
+          },
+          {
+            id: "j",
+            type: "join",
+            name: "merge",
+            position: { x: 560, y: 0 },
+            config: { mode: "all" },
+          },
+          { id: "exit", type: "exit", name: "Exit", position: { x: 840, y: 0 } },
+        ],
+        edges: [
+          { id: "e-ab", source: "n1", target: "b" },
+          { id: "e-ac", source: "n1", target: "c" },
+          { id: "e-bj", source: "b", target: "j" },
+          { id: "e-cj", source: "c", target: "j" },
+          { id: "e-jx", source: "j", target: "exit" },
+        ],
+      }),
+    });
+    expect(res.status).toBe(201);
+    const body = (await res.json()) as {
+      workflow: Workflow & {
+        latestRevision?: { id: string; number: number };
+        graphSummary?: GraphSummary;
+        graph?: { nodes: unknown[] };
+      };
+      revision: { id: string; number: number };
+    };
+    // The join node persisted (config defaulted where omitted) and the
+    // summary flags the fan-out (parallel), not a router.
+    expect(body.workflow.graphSummary).toEqual({
+      nodeCount: 5,
+      edgeCount: 5,
+      hasLoop: false,
+      hasRouter: false,
+      hasFanOut: true,
+      revision: 1,
+    });
+    const join = (
+      body.workflow.graph?.nodes as Array<{ id: string; type: string }> | undefined
+    )?.find((node) => node.id === "j");
+    expect(join).toMatchObject({ id: "j", type: "join" });
+
+    // The revision snapshot round-trips through GET unchanged.
+    const revisionNumber = body.workflow.latestRevision?.number;
+    expect(revisionNumber).toBe(1);
+    const got = await h.request(`/api/workflows/${body.workflow.id}/revisions/1`);
+    expect(got.status).toBe(200);
+    const revisionBody = (await got.json()) as {
+      revision: { graph: { nodes: Array<{ id: string; type: string }> } };
+    };
+    expect(revisionBody.revision.graph.nodes.find((node) => node.id === "j")).toMatchObject({
+      type: "join",
     });
   });
 

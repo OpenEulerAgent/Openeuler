@@ -139,8 +139,8 @@ describe("WorkflowGraphSchema", () => {
     ).toBe(true);
   });
 
-  it("rejects multiple unconditional outgoing edges from one node", () => {
-    const graph = {
+  it("accepts fan-out (multiple always outgoing = parallel branches, #115) and rejects mixing", () => {
+    const fanOut = {
       entryNodeId: "a",
       nodes: [agentNode("a"), agentNode("b"), agentNode("c"), exitNode()],
       edges: [
@@ -150,7 +150,209 @@ describe("WorkflowGraphSchema", () => {
         edge("e4", "c", "exit"),
       ],
     };
-    expectIssue(graph, ["edges"], "unconditional (always) outgoing edges");
+    // Legal since #115: each always edge starts a parallel branch.
+    expect(WorkflowGraphSchema.safeParse(fanOut).success).toBe(true);
+
+    // Mixing fan-out with routing is ambiguous and rejected.
+    expectIssue(
+      {
+        ...fanOut,
+        edges: [
+          ...fanOut.edges,
+          edge("e5", "a", "exit", { condition: { type: "outputContains", pattern: "x" } }),
+        ],
+      },
+      ["edges"],
+      "mixes 2 unconditional (always) outgoing edges with conditional edges",
+    );
+
+    // Fan-out branches must be distinct agent nodes.
+    expectIssue(
+      {
+        ...fanOut,
+        edges: [edge("e1", "a", "b"), edge("e2", "a", "b"), edge("e3", "b", "exit")],
+      },
+      ["edges", 1],
+      "parallel branches must be distinct nodes",
+    );
+    expectIssue(
+      {
+        ...fanOut,
+        edges: [edge("e1", "a", "b"), edge("e2", "a", "exit"), edge("e3", "b", "exit")],
+      },
+      ["edges", 1],
+      "parallel branches must start at agent nodes",
+    );
+  });
+
+  it("validates join nodes (#115): ≥2 incoming, ≤1 unconditional outgoing, no agent fan-in", () => {
+    const joinNode = {
+      id: "j",
+      type: "join" as const,
+      name: "Join",
+      position: { x: 100, y: 0 },
+    };
+    const diamond = {
+      entryNodeId: "a",
+      nodes: [agentNode("a"), agentNode("b"), agentNode("c"), joinNode, agentNode("d"), exitNode()],
+      edges: [
+        edge("e-ab", "a", "b"),
+        edge("e-ac", "a", "c"),
+        edge("e-bj", "b", "j"),
+        edge("e-cj", "c", "j"),
+        edge("e-jd", "j", "d"),
+        edge("e-dexit", "d", "exit"),
+      ],
+    };
+    // Parses; the join config defaults to mode "all".
+    const parsed = WorkflowGraphSchema.parse(diamond);
+    expect(parsed.nodes.find((node) => node.id === "j")).toMatchObject({
+      type: "join",
+      config: { mode: "all" },
+    });
+    expect(
+      WorkflowGraphSchema.parse({
+        ...diamond,
+        nodes: diamond.nodes.map((node) =>
+          node.id === "j" ? { ...node, config: { mode: "any" as const } } : node,
+        ),
+      }).nodes.find((node) => node.id === "j"),
+    ).toMatchObject({ config: { mode: "any" } });
+
+    // A join with a single incoming merges nothing.
+    expectIssue(
+      {
+        entryNodeId: "a",
+        nodes: [agentNode("a"), agentNode("b"), joinNode, exitNode()],
+        edges: [edge("e-ab", "a", "b"), edge("e-bj", "b", "j"), edge("e-jx", "j", "exit")],
+      },
+      ["nodes", 2, "type"],
+      "a join merges at least two branches",
+    );
+    // A join is a synchronizer, not a router: one unconditional outgoing max.
+    expectIssue(
+      {
+        ...diamond,
+        edges: [
+          ...diamond.edges.filter((item) => item.id !== "e-jd"),
+          edge("e-jd", "j", "d"),
+          edge("e-jexit", "j", "exit"),
+        ],
+      },
+      ["nodes", 3, "type"],
+      "at most one is allowed",
+    );
+    expectIssue(
+      {
+        ...diamond,
+        edges: [
+          ...diamond.edges.filter((item) => item.id !== "e-jd"),
+          edge("e-jd", "j", "d", { condition: { type: "outputContains", pattern: "x" } }),
+        ],
+      },
+      ["nodes", 3, "type"],
+      "must not have conditional outgoing edges",
+    );
+    // Parallel always-convergence on an AGENT node is rejected (use a join):
+    // b and c share the fan-out ancestor a, so they can deliver concurrently.
+    expectIssue(
+      {
+        entryNodeId: "a",
+        nodes: [agentNode("a"), agentNode("b"), agentNode("c"), agentNode("d"), exitNode()],
+        edges: [
+          edge("e-ab", "a", "b"),
+          edge("e-ac", "a", "c"),
+          edge("e-bd", "b", "d"),
+          edge("e-cd", "c", "d"),
+          edge("e-dexit", "d", "exit"),
+        ],
+      },
+      ["nodes", 3, "type"],
+      "merge them at a join node instead",
+    );
+    // ...while SERIAL loop shapes keep parsing: a router node re-entered
+    // through an `always` back-edge carries two always-incoming edges that
+    // can never deliver concurrently (the shipped starter template).
+    expect(
+      WorkflowGraphSchema.safeParse({
+        entryNodeId: "implement",
+        nodes: [agentNode("implement"), agentNode("reviewer"), agentNode("fix"), exitNode()],
+        edges: [
+          edge("e-ir", "implement", "reviewer"),
+          edge("e-approve", "reviewer", "exit", {
+            condition: { type: "outputContains", pattern: "LGTM" },
+            order: 0,
+          }),
+          edge("e-rf", "reviewer", "fix", {
+            condition: { type: "outputNotContains", pattern: "LGTM" },
+            order: 1,
+            maxIterations: 3,
+          }),
+          edge("e-fr", "fix", "reviewer"),
+        ],
+      }).success,
+    ).toBe(true);
+    // ...and legacy conditional back-edges parse as before.
+    expect(
+      WorkflowGraphSchema.safeParse({
+        entryNodeId: "a",
+        nodes: [agentNode("a"), agentNode("b")],
+        edges: [
+          edge("e-ab", "a", "b"),
+          edge("e-back", "b", "a", { condition: { type: "outputContains", pattern: "RETRY" } }),
+        ],
+      }).success,
+    ).toBe(true);
+  });
+
+  it("rejects unconditional cycles through fan-out and join (guarded parallel loops parse)", () => {
+    // a fans out to b and j?? no: diamond a→(b,c)→j, with an always back
+    // edge j→a: an unconditional cycle — rejected.
+    expectIssue(
+      {
+        entryNodeId: "a",
+        nodes: [
+          agentNode("a"),
+          agentNode("b"),
+          agentNode("c"),
+          { id: "j", type: "join" as const, name: "J", position: { x: 0, y: 0 } },
+        ],
+        edges: [
+          edge("e-ab", "a", "b"),
+          edge("e-ac", "a", "c"),
+          edge("e-bj", "b", "j"),
+          edge("e-cj", "c", "j"),
+          edge("e-ja", "j", "a"),
+        ],
+      },
+      ["edges"],
+      "unconditional cycle rejected",
+    );
+    // The same cycle with a CONDITIONAL back edge parses (the guard makes
+    // the parallel loop finite) and picks up the default cycle cap. The
+    // conditional edge sits on an AGENT node — a join's single outgoing
+    // edge is always unconditional.
+    const guarded = WorkflowGraphSchema.parse({
+      entryNodeId: "a",
+      nodes: [
+        agentNode("a"),
+        agentNode("b"),
+        agentNode("c"),
+        { id: "j", type: "join" as const, name: "J", position: { x: 0, y: 0 } },
+        agentNode("d"),
+      ],
+      edges: [
+        edge("e-ab", "a", "b"),
+        edge("e-ac", "a", "c"),
+        edge("e-bj", "b", "j"),
+        edge("e-cj", "c", "j"),
+        edge("e-jd", "j", "d"),
+        edge("e-da", "d", "a", { condition: { type: "outputContains", pattern: "AGAIN" } }),
+      ],
+    });
+    expect(guarded.edges.find((item) => item.id === "e-da")?.maxIterations).toBe(
+      DEFAULT_EDGE_MAX_ITERATIONS,
+    );
   });
 
   it("accepts a conditional router (unique orders normalized by array index)", () => {
@@ -467,6 +669,7 @@ describe("summarizeGraph (list read model, #70)", () => {
       edgeCount: 3,
       hasLoop: false,
       hasRouter: false,
+      hasFanOut: false,
       revision: 1,
     });
   });
@@ -487,6 +690,7 @@ describe("summarizeGraph (list read model, #70)", () => {
       edgeCount: 4,
       hasLoop: true,
       hasRouter: true,
+      hasFanOut: false,
       revision: 7,
     });
   });
@@ -506,6 +710,7 @@ describe("summarizeGraph (list read model, #70)", () => {
       edgeCount: 3,
       hasLoop: true,
       hasRouter: true,
+      hasFanOut: false,
       revision: 2,
     });
   });
@@ -524,6 +729,7 @@ describe("summarizeGraph (list read model, #70)", () => {
       edgeCount: 2,
       hasLoop: true,
       hasRouter: true,
+      hasFanOut: false,
       revision: 1,
     });
   });

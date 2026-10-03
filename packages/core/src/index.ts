@@ -69,6 +69,8 @@ export {
   GraphEdgeSchema,
   GraphNodePositionSchema,
   GraphNodeSchema,
+  JoinGraphNodeSchema,
+  JoinNodeConfigSchema,
   WorkflowGraphSchema,
   WorkflowGraphShapeSchema,
   graphToLinear,
@@ -85,6 +87,8 @@ export type {
   GraphSummary,
   GraphToLinearResult,
   GraphValidationIssue,
+  JoinGraphNode,
+  JoinNodeConfig,
   WorkflowGraph,
   WorkflowGraphShape,
 } from "./graph.js";

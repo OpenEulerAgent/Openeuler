@@ -5,6 +5,7 @@ import type {
   GraphEdge,
   GraphNode,
   GraphNodePosition,
+  JoinGraphNode,
   StepConfig,
   WorkflowGraph,
   WorkflowGraphShape,
@@ -47,11 +48,18 @@ export interface ExitNodeData extends Record<string, unknown> {
   name: string;
 }
 
-export type CanvasNodeData = AgentNodeData | ExitNodeData;
+/** Join/merge synchronizer payload (#115): mode all (default) or any. */
+export interface JoinNodeData extends Record<string, unknown> {
+  kind: "join";
+  name: string;
+  config: { mode: "all" | "any" };
+}
+
+export type CanvasNodeData = AgentNodeData | ExitNodeData | JoinNodeData;
 
 export type CanvasNode = {
   id: string;
-  type: "agent" | "exit";
+  type: "agent" | "exit" | "join";
   position: GraphNodePosition;
   data: CanvasNodeData;
   /** React Flow selection flag; runtime-only, never serialized. */
@@ -181,9 +189,7 @@ export function createPresetAgentNode(options: CreatePresetAgentNodeOptions): Ca
     position: options.position ?? { x: 0, y: 0 },
     data: {
       kind: "agent",
-      name: options.takenNames
-        ? uniqueNodeName(preset.name, options.takenNames)
-        : preset.name,
+      name: options.takenNames ? uniqueNodeName(preset.name, options.takenNames) : preset.name,
       isEntry: false,
       config,
       presetId: preset.id,
@@ -222,6 +228,15 @@ export function toCanvasDocument(graph: WorkflowGraph): CanvasDocument {
         },
       };
     }
+    if (node.type === "join") {
+      const join = node as JoinGraphNode;
+      return {
+        id: join.id,
+        type: "join" as const,
+        position: join.position,
+        data: { kind: "join" as const, name: join.name, config: join.config },
+      };
+    }
     const exit = node as ExitGraphNode;
     return {
       id: exit.id,
@@ -258,6 +273,15 @@ export function fromCanvasDocument(doc: CanvasDocument): WorkflowGraph {
         position: node.position,
         config: node.data.config,
         ...(node.data.presetId === undefined ? {} : { presetId: node.data.presetId }),
+      };
+    }
+    if (node.data.kind === "join") {
+      return {
+        id: node.id,
+        type: "join" as const,
+        name: node.data.name,
+        position: node.position,
+        config: node.data.config,
       };
     }
     return {

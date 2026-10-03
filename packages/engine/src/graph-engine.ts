@@ -4,6 +4,7 @@ import type {
   BreadcrumbEntry,
   GraphEdge,
   GraphNode,
+  JoinGraphNode,
   Run,
   RunStatus,
   StepRun,
@@ -11,7 +12,7 @@ import type {
 } from "@openeuler/core";
 import type { Db, EventInput } from "@openeuler/db";
 import type { PersistedEvent } from "@openeuler/core";
-import type { AgentDriver, DriverRegistry } from "@openeuler/drivers";
+import type { AgentDriver, AgentHandle, DriverRegistry } from "@openeuler/drivers";
 import {
   compileExitCondition,
   describeCondition,
@@ -22,28 +23,60 @@ import type { RunControl, RunSandboxContext } from "./flow-engine.js";
 import type { WorktreeManager } from "./worktree.js";
 
 /**
- * Serial DAG graph execution engine (#45).
+ * Parallel DAG graph execution engine (#45 serial semantics, #115 parallel
+ * fan-out + join/merge).
  *
- * ## Execution semantics (v0.1 — SERIAL)
+ * ## Execution semantics (v0.2 — PARALLEL FRONTIER)
  *
- * Execution starts at `entryNodeId` and follows exactly ONE outgoing edge per
- * node completion: drawing multiple conditional edges from a node models
- * if/else-style paths, NOT concurrency (parallel fan-out with join/merge is
- * explicitly v0.2). On node completion the engine evaluates the node's
- * conditional outgoing edges in `order` (first match wins; `invert` negates
- * the match result) against the node's FINAL output. The first matching edge
- * is taken; when none matches, the node's single `always` fallback edge is
- * taken; with no outgoing edges at all — or an `exit` node reached — the run
- * ends `success`.
+ * The run maintains a READY SET of scheduled node executions and an IN-FLIGHT
+ * set of started ones (capped by the run's inner concurrency,
+ * {@link DEFAULT_INNER_CONCURRENCY}). An execution becomes ready exactly one
+ * way: an edge traversal delivers to it — a router/chain edge (first-match
+ * conditional or the single `always` fallback), or one of a fan-out's
+ * `always` edges.
+ *
+ * - **chain/router (serial)** — a node with conditionals + at most one
+ *   `always` fallback evaluates them in `order` on completion (first match
+ *   wins; `invert` negates) against the node's FINAL output; the taken edge
+ *   delivers to its target (`edge.taken` event). v0.1 semantics, unchanged.
+ * - **fan-out (parallel, #115)** — a node whose outgoing edges are ALL
+ *   `always` starts one parallel branch per edge: every branch target is
+ *   scheduled (up to the inner concurrency cap; the rest queue). Fan-out
+ *   emits no `edge.taken` — the branches are reported by the targets'
+ *   `node.queued` events carrying the branch `edgeId`.
+ * - **join/merge (#115)** — a `join` node is the fan-in counterpart: it
+ *   waits (per `config.mode`) for its incoming edges to be traversed and
+ *   then "executes" instantly (no driver, no StepRun row). Its output is the
+ *   JSON map `{<branchSourceNodeId>: <output>}` of the ARRIVED branches,
+ *   available downstream as `{{output:<joinId>}}` (branch outputs stay
+ *   addressable directly). A join has at most one outgoing edge and it is
+ *   unconditional — it synchronizes, it never routes. `mode: "all"`
+ *   (default) triggers when every incoming edge arrived; `mode: "any"`
+ *   triggers on the first arrival and cancels the sibling branches still in
+ *   flight (their results are no longer needed).
+ *
+ * ## Failure policy (#115)
+ *
+ * A failed node execution fails the run immediately (fail-fast) UNLESS the
+ * nearest join reachable from it (its failure scope) is `mode: "any"`: there
+ * the failure is tolerated while another incoming branch can still arrive;
+ * if the join ends up engaged but unsatisfiable (every incoming edge either
+ * failed or routed away), the run fails with join attribution. Fail-fast
+ * failures cancel all in-flight branches (their drivers are aborted; their
+ * StepRuns settle `aborted`) before the run row turns `failed`. A `mode:
+ * "any"` join triggering on one branch cancels its remaining siblings the
+ * same way.
  *
  * ## Iteration semantics
  *
  * Each node EXECUTION counts: a node re-entered by a conditional back-edge
- * runs as execution 1, 2, 3, … (per node, not global), and that number is
- * what the node's StepRun row, its `node.*` events and the `{{iterations}}`
- * template variable carry. `{{prevOutput}}` is the output of the node that
- * routed INTO the current execution (the taken edge's source); a node's own
- * `{{output:<nodeId>}}` reference resolves to that node's MOST RECENT
+ * runs as execution 1, 2, 3, … (per node, not global — join executions
+ * count the same way, one per trigger); that number is assigned at
+ * scheduling time and is what the node's StepRun row, its `node.*` events
+ * and the `{{iterations}}` template variable carry. `{{prevOutput}}` is the
+ * output of the node that routed INTO the current execution (the fan-out
+ * source for a branch start, the join's JSON map after a merge); a node's
+ * own `{{output:<nodeId>}}` reference resolves to that node's MOST RECENT
  * completed output from any earlier point of the run. `continueSession`
  * nodes reuse their sessionId across re-entries (their own previous
  * execution's session, like the #16 same-step rule; the routing source
@@ -59,30 +92,60 @@ import type { WorktreeManager } from "./worktree.js";
  * guarded edge's condition matches but the edge is already at its cap, the
  * engine emits `edge.cap-reached` and follows the source node's `always`
  * fallback edge; with no fallback the run fails with a clear reason.
- * Unconditional (`always`) edges are never guarded, and non-back-edge
- * conditional edges cannot cycle so they need no guard.
+ * Unconditional (`always`) edges are never guarded — fan-out branches do
+ * not consume edge caps — so every cycle (parallel or serial) needs at
+ * least one conditional edge somewhere on it; validation enforces exactly
+ * that. When a guarded edge's condition matches but the edge is already at
+ * its cap, the engine emits `edge.cap-reached` and follows the source
+ * node's `always` fallback edge; with no fallback the run fails with a
+ * clear reason.
+ *
+ * ## Scheduler interplay (#115)
+ *
+ * Parallel branches count against the run's INTERNAL semaphore
+ * ({@link DEFAULT_INNER_CONCURRENCY} concurrent driver executions per run)
+ * only — never against the daemon's `MAX_CONCURRENT_RUNS`, which caps
+ * concurrent RUNS: one run with three live branches still occupies exactly
+ * one global slot, so a busy fan-out run cannot starve other runs. A run
+ * abort cancels every in-flight branch (drivers aborted, StepRuns settled
+ * `aborted`).
  *
  * ## Events
  *
  * Graph runs emit `node.queued` / `node.started` / `node.completed` /
  * `edge.taken` / `edge.cap-reached` INSTEAD of the legacy `step.*` /
- * `loop.iteration` events (cleaner for the live graph view, #52), plus the
- * usual `run.status` transitions and the streamed driver events. Replaying
- * `node.completed` + `edge.taken` reconstructs the persisted run breadcrumb
- * exactly.
+ * `loop.*` events (cleaner for the live graph view, #52), plus the usual
+ * `run.status` transitions and the streamed driver events. `node.queued` is
+ * emitted at SCHEDULING time (a capped-out branch shows as queued while it
+ * waits for a slot); fan-out branch executions carry the branch `edgeId` on
+ * their `node.*` events. Replaying `node.completed` + `edge.taken`
+ * reconstructs the persisted run breadcrumb exactly.
  *
  * ## Breadcrumb
  *
  * The run row carries an ordered `breadcrumb` (JSON column): one
  * `{kind: "node", nodeId, iteration}` entry per completed node execution
- * and one `{kind: "edge", edgeId, iteration}` entry per taken edge
- * (`iteration` = the source node's execution number). It is appended
- * synchronously as execution proceeds and powers replay in #52; together
- * with the StepRun rows it also reconstructs the resume position (#19).
+ * (join triggers included) and one `{kind: "edge", edgeId, iteration}` entry
+ * per taken router/chain edge (`iteration` = the source node's execution
+ * number). Fan-out traversals append no edge entries (they are
+ * deterministic in the source completion). It is appended synchronously as
+ * execution proceeds and powers replay in #52; together with the StepRun
+ * rows it also reconstructs the resume position (#19).
  */
 
 /** Hard ceiling on how often one guarded edge may be taken, regardless of configuration. */
 export const MAX_EDGE_ITERATIONS = 25;
+
+/**
+ * Default number of node executions a run may have in flight at once (#115)
+ * — the run-internal parallelism cap for fan-out branches. Runs on a graph
+ * without fan-out never exceed one. Configurable per engine via
+ * `FlowEngineOptions.graphInnerConcurrency` (env/policy wiring is post-v0.2).
+ */
+export const DEFAULT_INNER_CONCURRENCY = 3;
+
+/** Hard ceiling on the inner concurrency cap (defensive bound). */
+export const MAX_INNER_CONCURRENCY = 25;
 
 /** Defensive bound on total node executions per run (bug guard, not configurable). */
 const MAX_TOTAL_NODE_EXECUTIONS = 5_000;
@@ -121,6 +184,12 @@ export interface GraphEngineDeps {
   /** Creates (or re-uses a queued/interrupted) StepRun row, flipped to running. */
   beginStepRun(runId: string, step: { stepId: string }, iteration: number): StepRun;
   /**
+   * Creates (or re-uses) a QUEUED StepRun row for a scheduled execution
+   * (#115): parallel branches are scheduled before they start (inner
+   * concurrency), so their pending state persists across a restart.
+   */
+  scheduleStepRun(runId: string, step: { stepId: string }, iteration: number): StepRun;
+  /**
    * Persists one event with the run's secret redaction applied to the
    * payload (#93). All graph-path event writes go through here.
    */
@@ -138,6 +207,12 @@ export interface GraphEngineDeps {
   recordDetectedPorts(runId: string, output: string): void;
 }
 
+/** Options for {@link executeGraphRun} (#115). */
+export interface GraphRunOptions {
+  /** Run-internal concurrency cap; defaults to {@link DEFAULT_INNER_CONCURRENCY}. */
+  innerConcurrency?: number;
+}
+
 /** Terminal outcome of one node execution. */
 interface NodeOutcome {
   status: RunStatus;
@@ -147,27 +222,56 @@ interface NodeOutcome {
   sessionId: string | undefined;
 }
 
-/** Where execution continues: run a node, or route out of a completed one. */
-type Cursor =
-  | {
-      kind: "execute";
-      nodeId: string;
-      /** This execution's 1-based number (per-node). */
-      iteration: number;
-      /** Output of the node that routed into this execution ("" at the entry). */
-      prevOutput: string;
-      /** Session of the routing source node, for `continueSession` chaining. */
-      prevSessionId: string | undefined;
-      /** SessionId recorded on an interrupted StepRun to restart into. */
-      restartSessionId: string | undefined;
-    }
-  | {
-      kind: "route";
-      nodeId: string;
-      output: string;
-      /** Execution number of the source node whose output routes. */
-      sourceIteration: number;
-    };
+/**
+ * One scheduled node execution (the unit of the ready queue). Delivering to
+ * a node is always via exactly one edge traversal; `viaEdgeId` records the
+ * fan-out branch edge when that is how it was readied.
+ */
+interface ScheduledExec {
+  nodeId: string;
+  /** This execution's 1-based number (per-node). */
+  iteration: number;
+  /** Output of the node that routed into this execution ("" at the entry). */
+  prevOutput: string;
+  /** Session of the routing source node, for `continueSession` chaining. */
+  prevSessionId: string | undefined;
+  /** SessionId recorded on an interrupted StepRun to restart into. */
+  restartSessionId: string | undefined;
+  /** The fan-out branch edge this execution runs on (#115), when known. */
+  viaEdgeId: string | undefined;
+}
+
+/** Verdict of one completed in-flight execution, acted on by the scheduler. */
+type TaskVerdict =
+  | { kind: "continue" }
+  | { kind: "branch-done" }
+  | { kind: "fail-run"; error: string; output?: string }
+  | { kind: "abort" };
+
+/** Live per-execution context: driver handle + branch-cancellation flag. */
+interface ExecContext {
+  exec: ScheduledExec;
+  node: AgentGraphNode;
+  handle: AgentHandle | undefined;
+  /** Set when a fail-fast / any-trigger cancels this branch (#115). */
+  cancelRequested: boolean;
+  /**
+   * The execution's full task promise (driver run + completion processing),
+   * never rejecting. Resolves to the verdict the scheduler acts on.
+   */
+  done: Promise<TaskVerdict>;
+}
+
+/**
+ * Resolution of one incoming edge of a pending join since its last trigger
+ * (fresh round = all `waiting`). `arrived` edges delivered their output;
+ * `failed`/`missed` edges never will (source failed / routed elsewhere).
+ */
+type JoinEdgeState = "waiting" | "arrived" | "failed" | "missed";
+
+interface JoinPending {
+  states: Map<string, JoinEdgeState>;
+}
 
 /** Mutable per-run graph execution state. */
 interface GraphRunState {
@@ -175,10 +279,12 @@ interface GraphRunState {
   outputs: Map<string, string>;
   /** Node id → its most recent effective session (routing-source chaining). */
   sessions: Map<string, string | undefined>;
-  /** Node id → highest started execution number (1-based, per-node). */
+  /** Node id → highest scheduled execution number (1-based, per-node). */
   execCount: Map<string, number>;
   /** Guarded edge id → times taken so far. */
   takenCounts: Map<string, number>;
+  /** Join id → per-incoming-edge satisfaction since its last trigger (#115). */
+  joinPending: Map<string, JoinPending>;
   /** Ordered breadcrumb, mirrored onto the run row on every append. */
   breadcrumb: BreadcrumbEntry[];
   /** Output of the last successfully completed agent node (final run output). */
@@ -189,27 +295,50 @@ interface GraphRunState {
   task: string;
 }
 
-/** Outgoing-edge lookup + guard classification, precomputed per run. */
+/** Outgoing-edge lookup + guard classification + join topology, per run. */
 interface GraphTopology {
   nodesById: Map<string, GraphNode>;
   /** edge id → edge. */
   edgesById: Map<string, GraphEdge>;
   /** node id → outgoing edges, in edges-array order. */
   outgoing: Map<string, GraphEdge[]>;
+  /** node id → incoming edges, in edges-array order (#115). */
+  incoming: Map<string, GraphEdge[]>;
+  /** join node id → node. */
+  joins: Map<string, JoinGraphNode>;
   /** edge id → effective router order among its node's conditional siblings. */
   order: Map<string, number>;
   /** Conditional back-edges (target reaches source) that carry a cycle guard. */
   guarded: Set<string>;
+  /**
+   * node id → the nearest join reachable from it (#115 failure scope): the
+   * join whose mode decides whether the node's failure fails the run
+   * (`all`/no join) or is tolerated (`any`) while a sibling can still
+   * arrive. Innermost join wins (min hop count). `tolerant` is true only
+   * when the node sits on a PARALLEL branch of that join — a fan-out
+   * ancestor reaches the join through a path AVOIDING this node, so another
+   * sibling can still arrive. Serial prefixes that merely precede the join
+   * are not tolerant (their failure starves the join of every branch).
+   */
+  failureScope: Map<string, { joinId: string; mode: "all" | "any"; tolerant: boolean }>;
 }
 
 function buildTopology(graph: WorkflowGraph): GraphTopology {
   const nodesById = new Map(graph.nodes.map((node) => [node.id, node]));
   const edgesById = new Map(graph.edges.map((edge) => [edge.id, edge]));
+  const joins = new Map<string, JoinGraphNode>();
+  for (const node of graph.nodes) {
+    if (node.type === "join") joins.set(node.id, node);
+  }
   const outgoing = new Map<string, GraphEdge[]>();
+  const incoming = new Map<string, GraphEdge[]>();
   for (const edge of graph.edges) {
-    const bucket = outgoing.get(edge.source);
-    if (bucket === undefined) outgoing.set(edge.source, [edge]);
-    else bucket.push(edge);
+    const out = outgoing.get(edge.source);
+    if (out === undefined) outgoing.set(edge.source, [edge]);
+    else out.push(edge);
+    const inc = incoming.get(edge.target);
+    if (inc === undefined) incoming.set(edge.target, [edge]);
+    else inc.push(edge);
   }
   // Transitive reachability (≥ 1 edge), node set is small.
   const reach = new Map<string, Set<string>>();
@@ -235,7 +364,68 @@ function buildTopology(graph: WorkflowGraph): GraphTopology {
   for (const edges of outgoing.values()) {
     for (const [index, edge] of edges.entries()) order.set(edge.id, edge.order ?? index);
   }
-  return { nodesById, edgesById, outgoing, order, guarded };
+  // Failure scopes (#115): BFS from every node over the outgoing subgraph,
+  // nearest join (min hops) wins. Join nodes themselves scope to the NEXT
+  // join downstream (an outer one), which is correct layering. `tolerant`
+  // requires a fan-out ancestor with an ALTERNATE path to the join that
+  // avoids this node (a sibling branch can still arrive).
+  const fanOutNodes = new Set(
+    [...outgoing.entries()]
+      .filter(([, edges]) => edges.filter((edge) => isUnconditional(edge)).length >= 2)
+      .map(([id]) => id),
+  );
+  const reaches = (from: string, to: string, avoid?: string): boolean => {
+    if (from === avoid) return false;
+    const seen = new Set<string>();
+    const queue = (outgoing.get(from) ?? []).map((edge) => edge.target);
+    while (queue.length > 0) {
+      const next = queue.pop() as string;
+      if (next === avoid || seen.has(next)) continue;
+      if (next === to) return true;
+      seen.add(next);
+      for (const edge of outgoing.get(next) ?? []) queue.push(edge.target);
+    }
+    return false;
+  };
+  const failureScope = new Map<
+    string,
+    { joinId: string; mode: "all" | "any"; tolerant: boolean }
+  >();
+  for (const node of graph.nodes) {
+    const dist = new Map<string, number>();
+    const queue: string[] = [];
+    for (const edge of outgoing.get(node.id) ?? []) {
+      if (joins.has(edge.target) && !dist.has(edge.target)) {
+        dist.set(edge.target, 1);
+        queue.push(edge.target);
+      }
+    }
+    let found: string | undefined;
+    while (queue.length > 0 && found === undefined) {
+      const current = queue.shift() as string;
+      if (joins.has(current)) {
+        found = current;
+        break;
+      }
+      for (const edge of outgoing.get(current) ?? []) {
+        if (!dist.has(edge.target)) {
+          dist.set(edge.target, (dist.get(current) ?? 0) + 1);
+          queue.push(edge.target);
+        }
+      }
+    }
+    if (found !== undefined) {
+      const join = joins.get(found) as JoinGraphNode;
+      // Parallel-branch membership: some fan-out ancestor of this node
+      // (not the node itself) reaches the join while avoiding this node.
+      const fanOutAncestors = [...fanOutNodes].filter(
+        (id) => id !== node.id && reaches(id, node.id),
+      );
+      const tolerant = fanOutAncestors.some((id) => reaches(id, found as string, node.id));
+      failureScope.set(node.id, { joinId: found, mode: join.config.mode, tolerant });
+    }
+  }
+  return { nodesById, edgesById, outgoing, incoming, joins, order, guarded, failureScope };
 }
 
 /** Renders an edge's condition for the `matchedCondition` event field. */
@@ -251,28 +441,54 @@ function effectiveMaxIterations(edge: GraphEdge): { max: number; clampedFrom: nu
   return { max, clampedFrom: configured > max ? configured : undefined };
 }
 
-/**
- * Reconstructs the graph execution state + resume cursor from the recorded
- * StepRun rows and the persisted breadcrumb:
- *
- * - a non-terminal StepRun (queued/running/interrupted) is the restart point:
- *   the node re-runs as its recorded execution number, restarting in its own
- *   recorded session;
- * - else the last breadcrumb entry decides: an `edge` entry means the next
- *   node is its target (the edge was already taken — it is NOT re-emitted);
- *   a `node` entry means routing out of it never persisted, so it is
- *   re-derived (deterministic: same output, same conditions);
- * - runs executed by the pre-#45 shim (rows but no breadcrumb) get a
- *   fallback breadcrumb replayed from the rows (iteration-major order,
- *   per-node renumbering) — correct for the chain+loop shapes the shim ran.
- *
- * Returns undefined for runs that never started a node (fresh execution).
- */
+/** The join's merged output: JSON map of the arrived branch sources' outputs. */
+function renderJoinOutput(
+  topology: GraphTopology,
+  state: GraphRunState,
+  joinId: string,
+  arrived: ReadonlySet<string>,
+): string {
+  const entries = (topology.incoming.get(joinId) ?? [])
+    .filter((edge) => arrived.has(edge.id))
+    .map((edge) => [edge.source, state.outputs.get(edge.source) ?? ""] as const);
+  return JSON.stringify(Object.fromEntries(entries));
+}
+
+/** Describes one pending (engaged but unsatisfied) join for an error message. */
+function describeUnsatisfiedJoin(
+  topology: GraphTopology,
+  join: JoinGraphNode,
+  pending: JoinPending,
+): string {
+  const parts = (topology.incoming.get(join.id) ?? []).map((edge) => {
+    const state = pending.states.get(edge.id) ?? "waiting";
+    const detail =
+      state === "arrived"
+        ? "arrived"
+        : state === "failed"
+          ? "source failed"
+          : state === "missed"
+            ? "source completed but routed elsewhere"
+            : "never reached";
+    return `edge "${edge.id}" from node "${edge.source}": ${detail}`;
+  });
+  return `join node "${join.id}" (mode ${join.config.mode}) never triggered: ${parts.join("; ")}`;
+}
+
+interface ResumeOutcome {
+  state: GraphRunState;
+  initial: ScheduledExec[];
+  /** Advance to re-run for a completed node whose routing never persisted. */
+  redrive: { nodeId: string; output: string; iteration: number } | undefined;
+  /** A join trigger whose execution never persisted. */
+  pendingJoinTrigger: string | undefined;
+}
+
 function reconstructGraphResume(
   deps: GraphEngineDeps,
   run: Run,
   topology: GraphTopology,
-): { state: GraphRunState; cursor: Cursor | undefined } | undefined {
+): ResumeOutcome | undefined {
   const rows = deps.db.stepRuns.listByRun(run.id);
   if (rows.length === 0) return undefined;
 
@@ -297,18 +513,64 @@ function reconstructGraphResume(
     sessions: new Map(),
     execCount: new Map(),
     takenCounts: new Map(),
+    joinPending: new Map(),
     breadcrumb: entries,
     runOutput: "",
     totalExecutions: 0,
     task: run.task ?? "",
   };
+  // Scheduled-but-unfinished executions carry their iteration on the row.
+  for (const row of rows) {
+    state.execCount.set(row.stepId, Math.max(state.execCount.get(row.stepId) ?? 0, row.iteration));
+  }
   const rowsByKey = new Map(rows.map((row) => [`${row.stepId}#${row.iteration}`, row]));
+
+  // Replay the breadcrumb. Join satisfaction mirrors the runtime: an edge
+  // entry into a join satisfies that edge; hitting the mode's threshold
+  // means the join triggered (its node entry follows, resetting the round).
+  let pendingJoinTrigger: string | undefined;
+  const freshRound = (joinId: string): JoinPending => {
+    const states = new Map<string, JoinEdgeState>();
+    for (const edge of topology.incoming.get(joinId) ?? []) states.set(edge.id, "waiting");
+    return { states };
+  };
+  const arrivedSet = (pending: JoinPending | undefined): Set<string> =>
+    new Set(
+      [...(pending?.states ?? new Map()).entries()]
+        .filter(([, edgeState]) => edgeState === "arrived")
+        .map(([id]) => id),
+    );
+  const joinTriggered = (joinId: string): boolean => {
+    const join = topology.joins.get(joinId);
+    if (join === undefined) return false;
+    const pending = state.joinPending.get(joinId) ?? freshRound(joinId);
+    const arrived = arrivedSet(pending).size;
+    if (join.config.mode === "any") return arrived >= 1;
+    return arrived >= (topology.incoming.get(joinId) ?? []).length;
+  };
   for (const entry of entries) {
+    if (
+      pendingJoinTrigger !== undefined &&
+      entry.kind === "node" &&
+      entry.nodeId === pendingJoinTrigger
+    ) {
+      pendingJoinTrigger = undefined; // the trigger persisted
+    }
     if (entry.kind === "node") {
       state.execCount.set(
         entry.nodeId,
         Math.max(state.execCount.get(entry.nodeId) ?? 0, entry.iteration),
       );
+      const node = topology.nodesById.get(entry.nodeId);
+      if (node !== undefined && node.type === "join") {
+        const pending = state.joinPending.get(entry.nodeId);
+        state.outputs.set(
+          entry.nodeId,
+          renderJoinOutput(topology, state, entry.nodeId, arrivedSet(pending)),
+        );
+        state.joinPending.set(entry.nodeId, freshRound(entry.nodeId));
+        continue;
+      }
       const row = rowsByKey.get(`${entry.nodeId}#${entry.iteration}`);
       if (row !== undefined && row.status === "success") {
         state.outputs.set(entry.nodeId, row.output);
@@ -317,78 +579,95 @@ function reconstructGraphResume(
       }
     } else {
       state.takenCounts.set(entry.edgeId, (state.takenCounts.get(entry.edgeId) ?? 0) + 1);
+      const edge = topology.edgesById.get(entry.edgeId);
+      if (edge !== undefined && topology.joins.has(edge.target)) {
+        const pending = state.joinPending.get(edge.target) ?? freshRound(edge.target);
+        pending.states.set(entry.edgeId, "arrived");
+        state.joinPending.set(edge.target, pending);
+        if (joinTriggered(edge.target)) {
+          // The trigger appends the join's node entry synchronously; if
+          // that entry never persisted, resume must fire it.
+          state.joinPending.set(edge.target, freshRound(edge.target));
+          pendingJoinTrigger = edge.target;
+        }
+      }
     }
   }
-
-  // Restart point: the latest non-terminal StepRun, if any.
-  const pending = rows
-    .filter(
-      (row) => row.status === "queued" || row.status === "running" || row.status === "interrupted",
-    )
-    .sort((a, b) => b.iteration - a.iteration)[0];
-  if (pending !== undefined) {
-    state.execCount.set(
-      pending.stepId,
-      Math.max(state.execCount.get(pending.stepId) ?? 0, pending.iteration),
-    );
-    // Routing context = the last traversal into this execution.
-    const lastEdgeEntry = [...entries].reverse().find((entry) => entry.kind === "edge");
-    const lastNodeEntry = [...entries].reverse().find((entry) => entry.kind === "node");
-    const lastEdge =
-      lastEdgeEntry !== undefined && lastEdgeEntry.kind === "edge"
-        ? topology.edgesById.get(lastEdgeEntry.edgeId)
-        : undefined;
-    const prevSource =
-      lastEdge !== undefined
-        ? lastEdge.source
-        : lastNodeEntry !== undefined && lastNodeEntry.kind === "node"
-          ? lastNodeEntry.nodeId
-          : undefined;
-    return {
-      state,
-      cursor: {
-        kind: "execute",
-        nodeId: pending.stepId,
-        iteration: pending.iteration,
-        prevOutput: prevSource === undefined ? "" : (state.outputs.get(prevSource) ?? ""),
-        prevSessionId: prevSource === undefined ? undefined : state.sessions.get(prevSource),
-        restartSessionId: pending.sessionId,
-      },
-    };
+  // Ensure every join has a pending round even if untouched so far.
+  for (const joinId of topology.joins.keys()) {
+    if (!state.joinPending.has(joinId)) state.joinPending.set(joinId, freshRound(joinId));
   }
 
-  const last = entries[entries.length - 1];
-  if (last === undefined) return undefined;
-  if (last.kind === "edge") {
-    const edge = topology.edgesById.get(last.edgeId);
-    const target = edge === undefined ? undefined : topology.nodesById.get(edge.target);
-    if (edge === undefined || target === undefined || target.type === "exit") {
-      // The traversal was persisted but the success finalize was not: finish.
-      deps.finalizeRun(run.id, "success", { output: state.runOutput });
-      return { state, cursor: undefined };
+  const outcome: ResumeOutcome = { state, initial: [], redrive: undefined, pendingJoinTrigger };
+
+  // Restart points: every non-terminal StepRun (in-flight or still queued).
+  // The routing context comes from the last persisted traversal INTO the
+  // node (an agent node may carry conditional back-edges in addition to its
+  // single unconditional incoming edge).
+  for (const row of rows) {
+    if (row.status !== "queued" && row.status !== "running" && row.status !== "interrupted") {
+      continue;
     }
-    return {
-      state,
-      cursor: {
-        kind: "execute",
-        nodeId: target.id,
-        iteration: (state.execCount.get(target.id) ?? 0) + 1,
-        prevOutput: state.outputs.get(edge.source) ?? "",
-        prevSessionId: state.sessions.get(edge.source),
-        restartSessionId: undefined,
-      } satisfies Cursor,
-    };
+    const lastInto = [...entries]
+      .reverse()
+      .find(
+        (item): item is Extract<typeof item, { kind: "edge" }> =>
+          item.kind === "edge" &&
+          (topology.edgesById.get(item.edgeId)?.target ?? undefined) === row.stepId,
+      );
+    const source =
+      lastInto !== undefined
+        ? topology.edgesById.get(lastInto.edgeId)?.source
+        : (topology.incoming.get(row.stepId) ?? [])[0]?.source;
+    outcome.initial.push({
+      nodeId: row.stepId,
+      iteration: row.iteration,
+      prevOutput: source === undefined ? "" : (state.outputs.get(source) ?? ""),
+      prevSessionId: source === undefined ? undefined : state.sessions.get(source),
+      restartSessionId: row.sessionId,
+      viaEdgeId: undefined,
+    });
   }
-  // Routing never persisted: re-derive it from the recorded output.
-  return {
-    state,
-    cursor: {
-      kind: "route",
+
+  if (outcome.initial.length === 0) {
+    const last = entries[entries.length - 1];
+    if (last === undefined) return undefined;
+    if (last.kind === "edge") {
+      const edge = topology.edgesById.get(last.edgeId);
+      const target = edge === undefined ? undefined : topology.nodesById.get(edge.target);
+      if (edge === undefined || target === undefined || target.type === "exit") {
+        // The traversal was persisted but the success finalize was not: finish.
+        deps.finalizeRun(run.id, "success", { output: state.runOutput });
+        return { ...outcome, pendingJoinTrigger: undefined };
+      }
+      // Scheduling follows the edge append synchronously; a target with no
+      // row at the expected iteration was never scheduled (crash window).
+      if (target.type === "agent") {
+        const iteration = (state.execCount.get(target.id) ?? 0) + 1;
+        if (rowsByKey.get(`${target.id}#${iteration}`) === undefined) {
+          state.execCount.set(target.id, iteration);
+          outcome.initial.push({
+            nodeId: target.id,
+            iteration,
+            prevOutput: state.outputs.get(edge.source) ?? "",
+            prevSessionId: state.sessions.get(edge.source),
+            restartSessionId: undefined,
+            viaEdgeId: undefined,
+          });
+        }
+      }
+      // Join targets: satisfaction replayed above (incl. pending triggers).
+      return outcome;
+    }
+    // Routing never persisted: re-drive the advance from the recorded output.
+    outcome.redrive = {
       nodeId: last.nodeId,
       output: state.outputs.get(last.nodeId) ?? "",
-      sourceIteration: last.iteration,
-    },
-  };
+      iteration: last.iteration,
+    };
+  }
+
+  return outcome;
 }
 
 /**
@@ -402,21 +681,20 @@ async function runNode(
   runId: string,
   worktreePath: string,
   node: AgentGraphNode,
-  cursor: Extract<Cursor, { kind: "execute" }>,
+  exec: ScheduledExec,
   state: GraphRunState,
   control: RunControl,
+  ctx: ExecContext,
   diffBase: { ref: string },
 ): Promise<NodeOutcome> {
-  const { iteration } = cursor;
-  deps.appendEvent(runId, {
-    type: "node.queued",
-    nodeId: node.id,
-    nodeName: node.name,
-    iteration,
-  });
+  const { iteration } = exec;
   const stepRun = deps.beginStepRun(runId, { stepId: node.id }, iteration);
   const currentRow = deps.db.runs.get(runId);
-  if (currentRow !== undefined && currentRow.iteration !== iteration - 1) {
+  if (
+    currentRow !== undefined &&
+    currentRow.iteration !== iteration - 1 &&
+    currentRow.iteration < iteration - 1
+  ) {
     deps.db.runs.update(runId, { iteration: iteration - 1 });
   }
   const startedAtMs = Date.now();
@@ -425,6 +703,7 @@ async function runNode(
     nodeId: node.id,
     nodeName: node.name,
     iteration,
+    ...(exec.viaEdgeId === undefined ? {} : { edgeId: exec.viaEdgeId }),
   });
   deps.log.info({ runId, nodeId: node.id, iteration }, "node started");
 
@@ -439,6 +718,7 @@ async function runNode(
       output: "",
       durationMs: Math.max(0, Date.now() - startedAtMs),
       error: deps.redactText(runId, error),
+      ...(exec.viaEdgeId === undefined ? {} : { edgeId: exec.viaEdgeId }),
     });
     appendBreadcrumb(deps, runId, state, { kind: "node", nodeId: node.id, iteration });
     return { status: "failed", output: "", error, sessionId: undefined };
@@ -451,7 +731,7 @@ async function runNode(
   try {
     prompt = renderPromptTemplate(node.config.promptTemplate, {
       task: state.task,
-      prevOutput: cursor.prevOutput,
+      prevOutput: exec.prevOutput,
       iterations: iteration,
       outputs: Object.fromEntries(state.outputs),
     });
@@ -469,10 +749,10 @@ async function runNode(
     inherited =
       iteration > 1
         ? (rows.find((row) => row.stepId === node.id && row.iteration === iteration - 1)
-            ?.sessionId ?? cursor.prevSessionId)
-        : cursor.prevSessionId;
+            ?.sessionId ?? exec.prevSessionId)
+        : exec.prevSessionId;
   }
-  const sessionId = cursor.restartSessionId ?? inherited;
+  const sessionId = exec.restartSessionId ?? inherited;
   // Project secrets (#93): decrypted env merged into the driver process.
   const secretEnv = deps.runSecretsEnv(runId);
   // Sandboxed runs (#102): driver cwd becomes the CONTAINER workspace and
@@ -490,6 +770,7 @@ async function runNode(
       : { env: { ...secretEnv } }),
     ...(sandbox === undefined ? {} : { exec: sandbox.exec }),
   });
+  ctx.handle = handle;
   control.onHandle?.(handle);
 
   let lastErrorMessage: string | undefined;
@@ -511,14 +792,14 @@ async function runNode(
   }
 
   const exit = await handle.exited;
-  control.onHandle?.(undefined);
+  ctx.handle = undefined;
   const diff = await deps.captureDiff(runId, worktreePath, diffBase);
 
   let status: RunStatus;
   let error: string | undefined;
   if (exit.reason === "exit" && exit.code === 0) {
     status = "success";
-  } else if (exit.reason === "aborted" && control.isAbortRequested()) {
+  } else if (exit.reason === "aborted" && (control.isAbortRequested() || ctx.cancelRequested)) {
     status = "aborted";
   } else {
     status = "failed";
@@ -530,7 +811,7 @@ async function runNode(
           : `agent exited with code ${exit.code ?? "unknown"}`;
   }
 
-  const effectiveSessionId = sessionFromEvents ?? cursor.restartSessionId ?? inherited;
+  const effectiveSessionId = sessionFromEvents ?? exec.restartSessionId ?? inherited;
   deps.db.stepRuns.update(stepRun.id, {
     status,
     output: deps.redactText(runId, exit.output),
@@ -545,6 +826,7 @@ async function runNode(
     output: exit.output === "" ? "" : deps.redactText(runId, exit.output),
     durationMs: Math.max(0, Date.now() - startedAtMs),
     ...(error === undefined ? {} : { error: deps.redactText(runId, error) }),
+    ...(exec.viaEdgeId === undefined ? {} : { edgeId: exec.viaEdgeId }),
   });
   appendBreadcrumb(deps, runId, state, { kind: "node", nodeId: node.id, iteration });
   deps.log.info({ runId, nodeId: node.id, iteration, status }, "node finished");
@@ -564,134 +846,18 @@ function appendBreadcrumb(
 }
 
 /**
- * Routes out of a completed node: evaluates the conditional siblings in
- * `order` (first match wins, `invert` negates), applies the cycle guard,
- * emits `edge.taken` / `edge.cap-reached`, appends the breadcrumb and
- * returns the next cursor — or undefined when the run settled here
- * (success, cap failure).
- */
-function routeFromNode(
-  deps: GraphEngineDeps,
-  runId: string,
-  topology: GraphTopology,
-  evaluators: Map<string, ExitEvaluator>,
-  state: GraphRunState,
-  source: AgentGraphNode,
-  output: string,
-  sourceIteration: number,
-): Cursor | undefined {
-  const siblings = topology.outgoing.get(source.id) ?? [];
-  const conditional = siblings
-    .filter((edge) => !isUnconditional(edge))
-    .sort((a, b) => (topology.order.get(a.id) ?? 0) - (topology.order.get(b.id) ?? 0));
-  const fallback = siblings.find(isUnconditional);
-
-  const winner = conditional.find((edge) => {
-    const match = evaluateExitCondition(evaluators.get(edge.id) as ExitEvaluator, output);
-    return edge.invert === true ? !match : match;
-  });
-
-  if (winner !== undefined && topology.guarded.has(winner.id)) {
-    const { max, clampedFrom } = effectiveMaxIterations(winner);
-    const taken = state.takenCounts.get(winner.id) ?? 0;
-    if (taken >= max) {
-      deps.appendEvent(runId, {
-        type: "edge.cap-reached",
-        edgeId: winner.id,
-        source: winner.source,
-        target: winner.target,
-        taken,
-        maxIterations: max,
-        detail:
-          `condition ${describeEdgeCondition(winner)} matched after ${taken} traversal(s) of edge "${winner.id}"` +
-          (clampedFrom === undefined
-            ? ` but maxIterations is ${max}`
-            : ` but maxIterations is ${max} (configured ${clampedFrom}, clamped to the hard cap ${MAX_EDGE_ITERATIONS})`),
-      });
-      if (fallback === undefined) {
-        deps.finalizeRun(runId, "failed", {
-          error:
-            `cycle guard reached on edge "${winner.id}" (${source.name} → ${winner.target}): the condition matched ${taken} time(s) ` +
-            `but maxIterations is ${max}` +
-            (clampedFrom === undefined
-              ? ""
-              : ` (configured ${clampedFrom}, clamped to the hard cap ${MAX_EDGE_ITERATIONS})`) +
-            ` and node "${source.id}" has no always fallback edge to take instead`,
-        });
-        return undefined;
-      }
-      deps.log.warn(
-        { runId, edgeId: winner.id, taken, max },
-        "edge cycle guard reached; taking always fallback",
-      );
-      return takeEdge(deps, runId, topology, state, fallback, output, sourceIteration, source);
-    }
-  }
-
-  const edge = winner ?? fallback;
-  if (edge === undefined) {
-    // No outgoing edges (or none left): terminal, the run succeeds here.
-    deps.finalizeRun(runId, "success", { output: state.runOutput });
-    return undefined;
-  }
-  return takeEdge(deps, runId, topology, state, edge, output, sourceIteration, source);
-}
-
-/** Emits `edge.taken`, records the traversal and builds the next cursor. */
-function takeEdge(
-  deps: GraphEngineDeps,
-  runId: string,
-  topology: GraphTopology,
-  state: GraphRunState,
-  edge: GraphEdge,
-  output: string,
-  sourceIteration: number,
-  source: AgentGraphNode,
-): Cursor | undefined {
-  deps.appendEvent(runId, {
-    type: "edge.taken",
-    edgeId: edge.id,
-    source: edge.source,
-    target: edge.target,
-    matchedCondition: describeEdgeCondition(edge),
-    iteration: sourceIteration,
-  });
-  if (topology.guarded.has(edge.id)) {
-    state.takenCounts.set(edge.id, (state.takenCounts.get(edge.id) ?? 0) + 1);
-  }
-  appendBreadcrumb(deps, runId, state, {
-    kind: "edge",
-    edgeId: edge.id,
-    iteration: sourceIteration,
-  });
-  deps.log.info({ runId, edgeId: edge.id, target: edge.target }, "edge taken");
-
-  const target = topology.nodesById.get(edge.target);
-  if (target === undefined) {
-    deps.finalizeRun(runId, "failed", {
-      error: `edge "${edge.id}" targets unknown node "${edge.target}"`,
-    });
-    return undefined;
-  }
-  if (target.type === "exit") {
-    deps.finalizeRun(runId, "success", { output: state.runOutput });
-    return undefined;
-  }
-  return {
-    kind: "execute",
-    nodeId: target.id,
-    iteration: (state.execCount.get(target.id) ?? 0) + 1,
-    prevOutput: output,
-    prevSessionId: state.sessions.get(source.id),
-    restartSessionId: undefined,
-  };
-}
-
-/**
- * Drives a graph-revision run to a terminal state. Called by the flow
- * engine's `executeRun` once the run row, worktree and abort guards are in
- * place; never throws (failures funnel into the run row through
- * `deps.finalizeRun`, and the flow engine's outer catch is the last resort).
+ * Drives a graph-revision run to a terminal state (#115 parallel frontier).
+ * Called by the flow engine's `executeRun` once the run row, worktree and
+ * abort guards are in place; never throws (failures funnel into the run row
+ * through `deps.finalizeRun`, and the flow engine's outer catch is the last
+ * resort).
+ *
+ * The loop keeps a ready queue of scheduled executions and at most
+ * `innerConcurrency` in flight, waiting on the first settlement each round.
+ * Terminal actions (fail-fast, abort) cancel + drain every in-flight branch
+ * BEFORE the run row turns terminal, so StepRun rows and `node.*` events
+ * settle in a deterministic order. An empty frontier finalizes the run:
+ * success, unless an engaged join never triggered (attribution in the error).
  */
 export async function executeGraphRun(
   deps: GraphEngineDeps,
@@ -699,9 +865,14 @@ export async function executeGraphRun(
   graph: WorkflowGraph,
   worktreePath: string,
   control: RunControl,
+  options?: GraphRunOptions,
 ): Promise<void> {
   const runId = run.id;
   const topology = buildTopology(graph);
+  const innerConcurrency = Math.max(
+    1,
+    Math.min(options?.innerConcurrency ?? DEFAULT_INNER_CONCURRENCY, MAX_INNER_CONCURRENCY),
+  );
 
   // Compile every edge condition once per run (regex compile failures on
   // schema-bypassing data fail the run with a clear error up front).
@@ -716,113 +887,573 @@ export async function executeGraphRun(
     evaluators.set(edge.id, compiled);
   }
 
+  const freshRound = (joinId: string): JoinPending => {
+    const states = new Map<string, JoinEdgeState>();
+    for (const edge of topology.incoming.get(joinId) ?? []) states.set(edge.id, "waiting");
+    return { states };
+  };
+
   const resumed = reconstructGraphResume(deps, run, topology);
   const state: GraphRunState = resumed?.state ?? {
     outputs: new Map(),
     sessions: new Map(),
     execCount: new Map(),
     takenCounts: new Map(),
+    joinPending: new Map(),
     breadcrumb: [],
     runOutput: "",
     totalExecutions: 0,
     task: run.task ?? "",
   };
-  let cursor: Cursor | undefined = resumed?.cursor ?? {
-    kind: "execute",
-    nodeId: graph.entryNodeId,
-    iteration: 1,
-    prevOutput: "",
-    prevSessionId: undefined,
-    restartSessionId: undefined,
-  };
-  if (cursor === undefined) return; // Resume settled the run (already finalized).
+  for (const joinId of topology.joins.keys()) {
+    if (!state.joinPending.has(joinId)) state.joinPending.set(joinId, freshRound(joinId));
+  }
 
-  const diffBase = { ref: "HEAD" };
+  const ready: ScheduledExec[] = [];
+  /** In-flight executions (their task promises never reject). */
+  const contexts = new Set<ExecContext>();
+  /** Terminal action once the in-flight branches drain; set = run is dying. */
+  let terminal:
+    { kind: "fail-run"; error: string; output?: string } | { kind: "abort" } | undefined;
 
-  while (cursor !== undefined) {
-    if (cursor.kind === "route") {
-      const node = topology.nodesById.get(cursor.nodeId);
-      if (node === undefined || node.type !== "agent") {
-        deps.finalizeRun(runId, "failed", {
-          error: `cannot route from node "${cursor.nodeId}": not a known agent node`,
-        });
-        return;
-      }
-      cursor = routeFromNode(
-        deps,
-        runId,
-        topology,
-        evaluators,
-        state,
-        node,
-        cursor.output,
-        cursor.sourceIteration,
-      );
-      continue;
-    }
-
-    if (control.isAbortRequested()) {
-      deps.abortRun(runId);
-      return;
-    }
-    if (state.totalExecutions >= MAX_TOTAL_NODE_EXECUTIONS) {
-      deps.finalizeRun(runId, "failed", {
-        error: `graph execution exceeded ${MAX_TOTAL_NODE_EXECUTIONS} node executions without terminating; aborting as a safety measure`,
-      });
-      return;
-    }
-
-    const node = topology.nodesById.get(cursor.nodeId);
-    if (node === undefined) {
-      deps.finalizeRun(runId, "failed", {
-        error: `node "${cursor.nodeId}" does not exist in the pinned graph revision`,
-      });
-      return;
-    }
-    if (node.type === "exit") {
-      // Exit nodes never execute; reaching one ends the run successfully.
-      deps.finalizeRun(runId, "success", { output: state.runOutput });
-      return;
-    }
-
-    state.execCount.set(node.id, Math.max(state.execCount.get(node.id) ?? 0, cursor.iteration));
-    state.totalExecutions += 1;
-    const outcome = await runNode(
-      deps,
-      runId,
-      worktreePath,
-      node,
-      cursor,
-      state,
-      control,
-      diffBase,
+  /** Schedules one execution: queued StepRun row + `node.queued` event. */
+  const scheduleExec = (exec: ScheduledExec): void => {
+    const node = topology.nodesById.get(exec.nodeId);
+    if (node === undefined || node.type !== "agent") return;
+    state.execCount.set(
+      exec.nodeId,
+      Math.max(state.execCount.get(exec.nodeId) ?? 0, exec.iteration),
     );
+    deps.scheduleStepRun(runId, { stepId: node.id }, exec.iteration);
+    deps.appendEvent(runId, {
+      type: "node.queued",
+      nodeId: node.id,
+      nodeName: node.name,
+      iteration: exec.iteration,
+      ...(exec.viaEdgeId === undefined ? {} : { edgeId: exec.viaEdgeId }),
+    });
+    ready.push(exec);
+  };
 
-    if (outcome.status !== "success") {
-      const error =
-        outcome.error === undefined
-          ? undefined
-          : outcome.status === "failed"
-            ? `node "${node.name}" (${node.id}) failed: ${outcome.error}`
-            : outcome.error;
-      deps.finalizeRun(runId, outcome.status, {
-        output: outcome.output,
-        ...(error === undefined ? {} : { error }),
-      });
-      return;
+  /** Cancels in-flight executions (and drops still-queued ones) — #115. */
+  const cancelExecutions = (scope: (nodeId: string) => boolean): void => {
+    for (const ctx of contexts) {
+      if (!scope(ctx.node.id)) continue;
+      ctx.cancelRequested = true;
+      if (ctx.handle !== undefined) void ctx.handle.abort().catch(() => {});
+    }
+    for (let i = ready.length - 1; i >= 0; i -= 1) {
+      const exec = ready[i];
+      if (exec !== undefined && scope(exec.nodeId)) ready.splice(i, 1);
+    }
+  };
+
+  /**
+   * Fail-fast: cancel every in-flight branch (their drivers abort, their
+   * StepRuns settle `aborted`), remember the terminal action — the run row
+   * only turns `failed` once the drain completed.
+   */
+  const failRun = (error: string, output?: string): TaskVerdict => {
+    if (terminal === undefined) {
+      terminal = { kind: "fail-run", error, ...(output === undefined ? {} : { output }) };
+    }
+    cancelExecutions(() => true);
+    return { kind: "fail-run", error, ...(output === undefined ? {} : { output }) };
+  };
+
+  /**
+   * Marks the pending join edges sourced at `nodeId` — it finished without
+   * delivering to them — and reports an engaged join that became
+   * unsatisfiable (mode `any` with every incoming edge failed).
+   */
+  const markJoinEdges = (
+    nodeId: string,
+    mark: "failed" | "missed",
+    exceptEdgeId?: string,
+  ): string | undefined => {
+    for (const [joinId, pending] of state.joinPending.entries()) {
+      const join = topology.joins.get(joinId);
+      if (join === undefined) continue;
+      for (const edge of topology.incoming.get(joinId) ?? []) {
+        if (edge.source !== nodeId || edge.id === exceptEdgeId) continue;
+        if ((pending.states.get(edge.id) ?? "waiting") === "waiting")
+          pending.states.set(edge.id, mark);
+      }
+      if (join.config.mode === "any") {
+        const states = new Set(pending.states.values());
+        if (
+          states.size > 0 &&
+          !states.has("waiting") &&
+          !states.has("arrived") &&
+          !states.has("missed")
+        ) {
+          return describeUnsatisfiedJoin(topology, join, pending);
+        }
+      }
+    }
+    return undefined;
+  };
+
+  /** Executes a triggered join instantly; returns its follow-up execs. */
+  const triggerJoin = (
+    joinId: string,
+    siblingsOf: (joinId: string) => void,
+  ): ScheduledExec[] | undefined => {
+    const join = topology.joins.get(joinId);
+    if (join === undefined) return undefined;
+    if (join.config.mode === "any") {
+      // Racing semantics: the losing siblings are no longer needed — cancel
+      // their in-flight/queued executions (#115).
+      siblingsOf(joinId);
+    }
+    const pending = state.joinPending.get(joinId) ?? freshRound(joinId);
+    const arrived = new Set(
+      [...pending.states.entries()].filter(([, s]) => s === "arrived").map(([id]) => id),
+    );
+    const output = renderJoinOutput(topology, state, joinId, arrived);
+    const iteration = (state.execCount.get(joinId) ?? 0) + 1;
+    state.execCount.set(joinId, iteration);
+    deps.appendEvent(runId, {
+      type: "node.queued",
+      nodeId: join.id,
+      nodeName: join.name,
+      iteration,
+    });
+    deps.appendEvent(runId, {
+      type: "node.started",
+      nodeId: join.id,
+      nodeName: join.name,
+      iteration,
+    });
+    deps.appendEvent(runId, {
+      type: "node.completed",
+      nodeId: join.id,
+      nodeName: join.name,
+      iteration,
+      status: "success",
+      output: deps.redactText(runId, output),
+      durationMs: 0,
+    });
+    appendBreadcrumb(deps, runId, state, { kind: "node", nodeId: join.id, iteration });
+    state.outputs.set(joinId, output);
+    state.joinPending.set(joinId, freshRound(joinId));
+    deps.log.info({ runId, joinId, iteration, mode: join.config.mode }, "join triggered");
+
+    // Route out of the join: its single unconditional edge (a join is a
+    // synchronizer, not a router — validation enforces the shape).
+    const out = (topology.outgoing.get(joinId) ?? []).find(isUnconditional);
+    if (out === undefined) return []; // terminal join: the branch ends here
+    deps.appendEvent(runId, {
+      type: "edge.taken",
+      edgeId: out.id,
+      source: out.source,
+      target: out.target,
+      matchedCondition: describeEdgeCondition(out),
+      iteration,
+    });
+    appendBreadcrumb(deps, runId, state, { kind: "edge", edgeId: out.id, iteration });
+    deps.log.info({ runId, edgeId: out.id, target: out.target }, "edge taken");
+    const target = topology.nodesById.get(out.target);
+    if (target === undefined) return undefined;
+    if (target.type !== "agent") return []; // exit: the branch ends here
+    return [
+      {
+        nodeId: target.id,
+        iteration: (state.execCount.get(target.id) ?? 0) + 1,
+        prevOutput: output,
+        prevSessionId: state.sessions.get(joinId),
+        restartSessionId: undefined,
+        viaEdgeId: undefined,
+      },
+    ];
+  };
+
+  /** Satisfies a join's incoming edge; triggers the join per its mode. */
+  const deliverToJoin = (edge: GraphEdge): TaskVerdict => {
+    const join = topology.joins.get(edge.target);
+    if (join === undefined) {
+      return failRun(`edge "${edge.id}" targets unknown join "${edge.target}"`);
+    }
+    const pending = state.joinPending.get(join.id) ?? freshRound(join.id);
+    pending.states.set(edge.id, "arrived");
+    state.joinPending.set(join.id, pending);
+    const incoming = topology.incoming.get(join.id) ?? [];
+    const arrivedCount = [...pending.states.values()].filter((s) => s === "arrived").length;
+    const triggered =
+      join.config.mode === "any" ? arrivedCount >= 1 : arrivedCount >= incoming.length;
+    if (!triggered) return { kind: "continue" }; // the join keeps waiting
+
+    const follow = triggerJoin(join.id, (scopeJoinId) => {
+      cancelExecutions((nodeId) => topology.failureScope.get(nodeId)?.joinId === scopeJoinId);
+    });
+    if (follow === undefined) return failRun(`join "${join.id}" could not execute`);
+    for (const exec of follow) scheduleExec(exec);
+    return { kind: "continue" };
+  };
+
+  /** Emits `edge.taken`, records the traversal and delivers to the target. */
+  const takeEdge = (edge: GraphEdge, output: string, sourceIteration: number): TaskVerdict => {
+    deps.appendEvent(runId, {
+      type: "edge.taken",
+      edgeId: edge.id,
+      source: edge.source,
+      target: edge.target,
+      matchedCondition: describeEdgeCondition(edge),
+      iteration: sourceIteration,
+    });
+    if (topology.guarded.has(edge.id)) {
+      state.takenCounts.set(edge.id, (state.takenCounts.get(edge.id) ?? 0) + 1);
+    }
+    appendBreadcrumb(deps, runId, state, {
+      kind: "edge",
+      edgeId: edge.id,
+      iteration: sourceIteration,
+    });
+    deps.log.info({ runId, edgeId: edge.id, target: edge.target }, "edge taken");
+
+    // The source routed HERE: its other pending join-edges can never arrive.
+    const unsatisfiable = markJoinEdges(edge.source, "missed", edge.id);
+    if (unsatisfiable !== undefined) return failRun(unsatisfiable);
+
+    const target = topology.nodesById.get(edge.target);
+    if (target === undefined) {
+      return failRun(`edge "${edge.id}" targets unknown node "${edge.target}"`);
+    }
+    if (target.type === "exit") {
+      // Reaching an exit ends this branch successfully; the run finalizes
+      // once every branch has settled.
+      return { kind: "branch-done" };
+    }
+    if (target.type === "join") {
+      return deliverToJoin(edge);
+    }
+    scheduleExec({
+      nodeId: target.id,
+      iteration: (state.execCount.get(target.id) ?? 0) + 1,
+      prevOutput: output,
+      prevSessionId: state.sessions.get(edge.source),
+      restartSessionId: undefined,
+      viaEdgeId: undefined,
+    });
+    return { kind: "continue" };
+  };
+
+  /**
+   * Advances out of a successfully completed node: a fan-out source starts
+   * one parallel branch per always edge; a router/chain node evaluates its
+   * conditional siblings in `order` (first match wins, `invert` negates),
+   * applies the cycle guard and takes the winner or the `always` fallback;
+   * with no outgoing edges at all the branch ends. Join nodes reach here
+   * only through resume re-derivation (their live advance happens inside
+   * `triggerJoin`): their single unconditional edge delivers like a chain.
+   */
+  const advance = (node: GraphNode, output: string, sourceIteration: number): TaskVerdict => {
+    const siblings = topology.outgoing.get(node.id) ?? [];
+    const unconditional = siblings.filter(isUnconditional);
+    const conditional = siblings
+      .filter((edge) => !isUnconditional(edge))
+      .sort((a, b) => (topology.order.get(a.id) ?? 0) - (topology.order.get(b.id) ?? 0));
+    const fallback = unconditional.find(isUnconditional);
+
+    // Fan-out (#115): every always edge starts a parallel branch. Fan-out
+    // edges are never guarded and emit no edge.taken — the branches are
+    // reported by the targets' node.queued events carrying the branch edgeId.
+    if (unconditional.length >= 2) {
+      for (const edge of unconditional) {
+        const target = topology.nodesById.get(edge.target);
+        if (target === undefined || target.type !== "agent") {
+          return failRun(
+            `fan-out edge "${edge.id}" targets ${target === undefined ? "unknown" : target.type} node "${edge.target}"`,
+          );
+        }
+        scheduleExec({
+          nodeId: target.id,
+          iteration: (state.execCount.get(target.id) ?? 0) + 1,
+          prevOutput: output,
+          prevSessionId: state.sessions.get(node.id),
+          restartSessionId: undefined,
+          viaEdgeId: edge.id,
+        });
+      }
+      deps.log.info(
+        { runId, nodeId: node.id, branches: unconditional.length },
+        "fan-out: parallel branches scheduled",
+      );
+      return { kind: "continue" };
     }
 
+    const winner = conditional.find((edge) => {
+      const match = evaluateExitCondition(evaluators.get(edge.id) as ExitEvaluator, output);
+      return edge.invert === true ? !match : match;
+    });
+
+    if (winner !== undefined && topology.guarded.has(winner.id)) {
+      const { max, clampedFrom } = effectiveMaxIterations(winner);
+      const taken = state.takenCounts.get(winner.id) ?? 0;
+      if (taken >= max) {
+        deps.appendEvent(runId, {
+          type: "edge.cap-reached",
+          edgeId: winner.id,
+          source: winner.source,
+          target: winner.target,
+          taken,
+          maxIterations: max,
+          detail:
+            `condition ${describeEdgeCondition(winner)} matched after ${taken} traversal(s) of edge "${winner.id}"` +
+            (clampedFrom === undefined
+              ? ` but maxIterations is ${max}`
+              : ` but maxIterations is ${max} (configured ${clampedFrom}, clamped to the hard cap ${MAX_EDGE_ITERATIONS})`),
+        });
+        if (fallback === undefined) {
+          return failRun(
+            `cycle guard reached on edge "${winner.id}" (${node.name} → ${winner.target}): the condition matched ${taken} time(s) ` +
+              `but maxIterations is ${max}` +
+              (clampedFrom === undefined
+                ? ""
+                : ` (configured ${clampedFrom}, clamped to the hard cap ${MAX_EDGE_ITERATIONS})`) +
+              ` and node "${node.id}" has no always fallback edge to take instead`,
+          );
+        }
+        deps.log.warn(
+          { runId, edgeId: winner.id, taken, max },
+          "edge cycle guard reached; taking always fallback",
+        );
+        return takeEdge(fallback, output, sourceIteration);
+      }
+    }
+
+    const edge = winner ?? fallback;
+    if (edge === undefined) {
+      // No outgoing edges (or none left): this branch ends here; the run
+      // finalizes once every branch has settled.
+      const unsatisfiable = markJoinEdges(node.id, "missed");
+      if (unsatisfiable !== undefined) return failRun(unsatisfiable);
+      return { kind: "branch-done" };
+    }
+    return takeEdge(edge, output, sourceIteration);
+  };
+
+  /** Processes one settled node execution into a scheduler verdict. */
+  const processCompletion = (ctx: ExecContext, outcome: NodeOutcome): TaskVerdict => {
+    const { node } = ctx;
+    const { iteration } = ctx.exec;
+
+    if (outcome.status === "aborted") {
+      // Branch cancellation (fail-fast / any-trigger): already accounted for.
+      if (ctx.cancelRequested) return { kind: "branch-done" };
+      return { kind: "abort" };
+    }
+
+    if (outcome.status === "failed") {
+      const attribution = `node "${node.name}" (${node.id}) failed: ${outcome.error ?? "unknown error"}`;
+      const scope = topology.failureScope.get(node.id);
+      const unsatisfiable = markJoinEdges(node.id, "failed");
+      // Fail-fast (#115 default): runs without joins, mode-`all` scopes,
+      // and serial prefixes of an `any` join (no sibling alternate path —
+      // `tolerant` is false) all die immediately, siblings cancelled.
+      if (scope === undefined || scope.mode === "all" || !scope.tolerant) {
+        return failRun(attribution, outcome.output);
+      }
+      if (unsatisfiable !== undefined) {
+        return failRun(`${attribution}; ${unsatisfiable}`);
+      }
+      // mode "any" on a parallel branch: tolerated while another incoming
+      // branch can still arrive.
+      deps.log.warn(
+        { runId, nodeId: node.id, joinId: scope.joinId, iteration },
+        "branch failure tolerated (join mode any)",
+      );
+      return { kind: "branch-done" };
+    }
+
+    // Success: record the output/session and advance.
     state.outputs.set(node.id, outcome.output);
     state.sessions.set(node.id, outcome.sessionId);
     state.runOutput = outcome.output;
     // #107: scan the node's final output for listening ports (sandboxed
     // runs only; persists detectedPorts on the run row as it goes).
     deps.recordDetectedPorts(runId, outcome.output);
-    cursor = {
-      kind: "route",
-      nodeId: node.id,
-      output: outcome.output,
-      sourceIteration: cursor.iteration,
-    };
+
+    return advance(node, outcome.output, iteration);
+  };
+
+  /** Runs one scheduled execution to its verdict (never rejects). */
+  const runTask = async (ctx: ExecContext): Promise<TaskVerdict> => {
+    state.totalExecutions += 1;
+    try {
+      const outcome = await runNode(
+        deps,
+        runId,
+        worktreePath,
+        ctx.node,
+        ctx.exec,
+        state,
+        control,
+        ctx,
+        diffBase,
+      );
+      return processCompletion(ctx, outcome);
+    } catch (err) {
+      // runNode never throws by contract; a crash here is an engine-level
+      // failure: fail the run with attribution.
+      return failRun(`node "${ctx.node.name}" (${ctx.node.id}) crashed: ${describeError(err)}`);
+    }
+  };
+
+  const diffBase = { ref: "HEAD" };
+
+  // A join trigger that never persisted (crash between the completing edge
+  // entry and the join execution) fires before anything else.
+  if (resumed !== undefined && resumed.pendingJoinTrigger !== undefined) {
+    const follow = triggerJoin(resumed.pendingJoinTrigger, () => {});
+    if (follow === undefined) {
+      deps.finalizeRun(runId, "failed", {
+        error: `join "${resumed.pendingJoinTrigger}" could not execute on resume`,
+      });
+      return;
+    }
+    for (const exec of follow) scheduleExec(exec);
+  }
+
+  // Seed the ready queue: the entry node for fresh runs, the reconstructed
+  // restart set (+ re-derived routing) for resumed ones.
+  if (resumed === undefined) {
+    const entry = topology.nodesById.get(graph.entryNodeId);
+    if (entry === undefined || entry.type !== "agent") {
+      deps.finalizeRun(runId, "failed", {
+        error: `entry node "${graph.entryNodeId}" is not an agent node in the pinned graph revision`,
+      });
+      return;
+    }
+    scheduleExec({
+      nodeId: entry.id,
+      iteration: 1,
+      prevOutput: "",
+      prevSessionId: undefined,
+      restartSessionId: undefined,
+      viaEdgeId: undefined,
+    });
+  } else {
+    for (const exec of resumed.initial) scheduleExec(exec);
+    // Routing that never persisted is re-driven through the REAL advance:
+    // deterministic (same output, same conditions) and it re-emits exactly
+    // the routing events that were lost.
+    if (resumed.redrive !== undefined) {
+      const node = topology.nodesById.get(resumed.redrive.nodeId);
+      if (node === undefined || node.type === "exit") {
+        deps.finalizeRun(runId, "failed", {
+          error: `cannot re-drive routing from node "${resumed.redrive.nodeId}": not a known executable node`,
+        });
+        return;
+      }
+      const verdict = advance(node, resumed.redrive.output, resumed.redrive.iteration);
+      if (verdict.kind === "fail-run" && terminal === undefined) {
+        terminal = verdict;
+      } else if (verdict.kind === "abort" && terminal === undefined) {
+        terminal = { kind: "abort" };
+      }
+    }
+  }
+
+  /** Cancels everything still in flight and drains the verdicts. */
+  const drain = async (): Promise<void> => {
+    cancelExecutions(() => true);
+    await Promise.allSettled([...contexts].map((ctx) => ctx.done));
+  };
+
+  try {
+    while (terminal === undefined) {
+      if (control.isAbortRequested()) {
+        terminal = { kind: "abort" };
+        break;
+      }
+
+      // Start as many ready executions as the inner concurrency cap allows.
+      while (ready.length > 0 && contexts.size < innerConcurrency) {
+        if (control.isAbortRequested() || terminal !== undefined) break;
+        const exec = ready.shift();
+        if (exec === undefined) break;
+        const node = topology.nodesById.get(exec.nodeId);
+        if (node === undefined || node.type !== "agent") {
+          terminal = {
+            kind: "fail-run",
+            error: `node "${exec.nodeId}" does not exist as an agent node in the pinned graph revision`,
+          };
+          break;
+        }
+        if (state.totalExecutions >= MAX_TOTAL_NODE_EXECUTIONS) {
+          terminal = {
+            kind: "fail-run",
+            error: `graph execution exceeded ${MAX_TOTAL_NODE_EXECUTIONS} node executions without terminating; aborting as a safety measure`,
+          };
+          break;
+        }
+        const ctx: ExecContext = {
+          exec,
+          node,
+          handle: undefined,
+          cancelRequested: false,
+          done: Promise.resolve({ kind: "continue" }),
+        };
+        const task = runTask(ctx);
+        ctx.done = task;
+        contexts.add(ctx);
+      }
+      if (terminal !== undefined) break;
+
+      if (contexts.size === 0) {
+        if (ready.length > 0) continue; // abort arrived mid-start: re-check
+        break; // frontier empty
+      }
+
+      // Wait for the first settlement, collect its verdict.
+      const settled = await Promise.race(
+        [...contexts].map((ctx) => ctx.done.then((verdict) => ({ ctx, verdict }))),
+      );
+      contexts.delete(settled.ctx);
+      if (settled.verdict.kind === "abort" && terminal === undefined) {
+        terminal = { kind: "abort" };
+      } else if (settled.verdict.kind === "fail-run" && terminal === undefined) {
+        terminal = settled.verdict;
+      }
+    }
+
+    if (terminal !== undefined) {
+      // Cancel + drain every in-flight branch BEFORE the run turns terminal
+      // (deterministic StepRun/event settlement).
+      await drain();
+      if (terminal.kind === "abort") {
+        deps.abortRun(runId);
+      } else {
+        deps.finalizeRun(runId, "failed", {
+          error: terminal.error,
+          ...(terminal.output === undefined || terminal.output.length === 0
+            ? {}
+            : { output: terminal.output }),
+        });
+      }
+      return;
+    }
+
+    // Frontier empty. An engaged join that never triggered fails the run
+    // with attribution (a join untouched by any delivery was fully bypassed
+    // by the taken paths and stays silent).
+    for (const [joinId, pending] of state.joinPending.entries()) {
+      const join = topology.joins.get(joinId);
+      if (join === undefined) continue;
+      const states = [...pending.states.values()];
+      const engaged = states.some((s) => s !== "waiting");
+      if (!engaged) continue;
+      const allArrived = states.every((s) => s === "arrived");
+      if (allArrived) continue; // cannot happen (trigger resets), defensive
+      deps.finalizeRun(runId, "failed", {
+        error: describeUnsatisfiedJoin(topology, join, pending),
+      });
+      return;
+    }
+
+    deps.finalizeRun(runId, "success", { output: state.runOutput });
+  } finally {
+    control.onHandle?.(undefined);
   }
 }

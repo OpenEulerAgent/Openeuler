@@ -52,7 +52,14 @@ describe("fetchWorkflows", () => {
   it("passes the daemon graph summary through untouched (#70)", async () => {
     const listed: WorkflowListed = {
       ...fixtureWorkflow(),
-      graphSummary: { nodeCount: 3, edgeCount: 2, hasLoop: true, hasRouter: false, revision: 4 },
+      graphSummary: {
+        nodeCount: 3,
+        edgeCount: 2,
+        hasLoop: true,
+        hasRouter: false,
+        hasFanOut: false,
+        revision: 4,
+      },
     };
     const fetcher = vi.fn().mockResolvedValue({ workflows: [listed] });
     const workflows = await fetchWorkflows("p-1", fetcher as unknown as WorkflowFetcher);
@@ -61,6 +68,7 @@ describe("fetchWorkflows", () => {
       edgeCount: 2,
       hasLoop: true,
       hasRouter: false,
+      hasFanOut: false,
       revision: 4,
     });
   });

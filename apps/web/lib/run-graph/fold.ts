@@ -36,6 +36,11 @@ export interface NodeExecutionInfo {
   output?: string;
   durationMs?: number;
   error?: string;
+  /**
+   * The fan-out branch edge this execution runs on (#115), when the engine
+   * reported one — the parallel-branch marker in the drawer/timeline.
+   */
+  edgeId?: string;
 }
 
 /** Folded state of one node. Referentially stable while the node is idle. */
@@ -196,9 +201,7 @@ function settleNodes(
       next[id] = {
         ...next[id],
         executions: next[id].executions.map((exec) =>
-          exec.status === "queued" || exec.status === "running"
-            ? { ...exec, status }
-            : exec,
+          exec.status === "queued" || exec.status === "running" ? { ...exec, status } : exec,
         ),
       };
       changed = true;
@@ -235,6 +238,11 @@ export function foldRunGraphEvent(
                 durationMs: event.durationMs,
                 ...(event.error === undefined ? {} : { error: event.error }),
               };
+      // #115: fan-out branch executions carry their branch edge id.
+      const withEdge =
+        "edgeId" in event && event.edgeId !== undefined
+          ? { ...execution, edgeId: event.edgeId }
+          : execution;
       const nodes = patchNode(state.nodes, nodeId, {
         status:
           event.type === "node.queued"
@@ -242,7 +250,7 @@ export function foldRunGraphEvent(
             : event.type === "node.started"
               ? "running"
               : event.status,
-        execution,
+        execution: withEdge,
       });
       let next: RunGraphFoldState = { ...state, lastSeq: event.seq };
       if (nodes !== state.nodes) next = { ...next, nodes };

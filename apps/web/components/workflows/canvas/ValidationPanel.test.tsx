@@ -53,7 +53,7 @@ describe("ValidationPanel severity grouping", () => {
     {
       nodeId: "b",
       message:
-        'node "b" has 2 unconditional (always) outgoing edges; at most one is allowed (as the router fallback)',
+        'node "b" mixes 2 unconditional (always) outgoing edges with conditional edges; outgoing edges must be either all-always (fan-out) or conditionals with at most one always fallback (router)',
     },
   ];
 

@@ -83,7 +83,12 @@ export type LoopIterationEvent = z.infer<typeof LoopIterationEventSchema>;
 // run.status) and power the live graph view / replay (#52).
 //
 
-/** Engine-emitted event: a graph node execution was scheduled next. */
+/**
+ * Engine-emitted event: a graph node execution was scheduled next. Emitted
+ * at SCHEDULING time (when the execution enters the run's ready queue), so
+ * a parallel branch (#115) shows up as queued while it waits for an inner
+ * concurrency slot.
+ */
 export const NodeQueuedEventSchema = z.strictObject({
   type: z.literal("node.queued"),
   seq: seqSchema,
@@ -91,6 +96,13 @@ export const NodeQueuedEventSchema = z.strictObject({
   nodeName: z.string().min(1, "nodeName must be a non-empty string"),
   /** 1-based execution number of THIS node (per-node, not global). */
   iteration: iterationSchema,
+  /**
+   * The branch edge (#115): for a fan-out branch execution, the always edge
+   * whose fan-out started this branch. Absent on serial/router-scheduled
+   * executions (their traversal is reported by `edge.taken`) and on join
+   * executions.
+   */
+  edgeId: idSchema.optional(),
 });
 
 export type NodeQueuedEvent = z.infer<typeof NodeQueuedEventSchema>;
@@ -102,6 +114,8 @@ export const NodeStartedEventSchema = z.strictObject({
   nodeId: idSchema,
   nodeName: z.string().min(1, "nodeName must be a non-empty string"),
   iteration: iterationSchema,
+  /** The branch edge this execution runs on (#115), when known. */
+  edgeId: idSchema.optional(),
 });
 
 export type NodeStartedEvent = z.infer<typeof NodeStartedEventSchema>;
@@ -109,7 +123,9 @@ export type NodeStartedEvent = z.infer<typeof NodeStartedEventSchema>;
 /**
  * Engine-emitted event: a graph node execution reached a terminal status.
  * `output` is the node's final output (what routing evaluated against);
- * `durationMs` covers the driver invocation.
+ * `durationMs` covers the driver invocation. Join nodes (#115) execute
+ * instantly (no driver): their `output` is the JSON map of the arrived
+ * branch outputs and `durationMs` is 0.
  */
 export const NodeCompletedEventSchema = z.strictObject({
   type: z.literal("node.completed"),
@@ -122,6 +138,8 @@ export const NodeCompletedEventSchema = z.strictObject({
   durationMs: z.number().int().min(0, "durationMs must be an integer >= 0"),
   /** Failure message on non-success statuses. */
   error: z.string().optional(),
+  /** The branch edge this execution runs on (#115), when known. */
+  edgeId: idSchema.optional(),
 });
 
 export type NodeCompletedEvent = z.infer<typeof NodeCompletedEventSchema>;
