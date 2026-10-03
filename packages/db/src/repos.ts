@@ -208,7 +208,13 @@ export interface StepRunRepo {
 }
 
 export interface EventRepo {
-  /** Assigns `seq = max(seq) + 1` for the run atomically; returns the stored event. */
+  /**
+   * Assigns `seq = max(runs.event_seq_hwm, max(seq)) + 1` for the run
+   * atomically and raises the high-water mark to the new seq (#149:
+   * monotonic even after `deleteOldestByType` evicts the max-seq rows, so
+   * SSE Last-Event-ID cursors never miss or rebind events). Returns the
+   * stored event.
+   */
   append(runId: string, event: EventInput): PersistedEvent;
   /** Events for the run with `seq > afterSeq`, in seq order. */
   getSince(runId: string, afterSeq?: number): PersistedEvent[];
@@ -218,7 +224,8 @@ export interface EventRepo {
    * Deletes the `count` oldest events of exactly `type` for the run (by
    * ascending seq) and returns how many rows were removed (#104: keeps the
    * persisted `sandbox.log` ring bounded — the caller's in-memory counters
-   * stay authoritative because it is the sole writer of that type).
+   * stay authoritative because it is the sole writer of that type; seq
+   * monotonicity survives deletion via `runs.event_seq_hwm`, #149).
    */
   deleteOldestByType(runId: string, type: string, count: number): number;
   /** Latest persisted `run.status` event for the run, if any (terminal-close detection). */
@@ -833,12 +840,19 @@ export function createEventRepo(db: Db): EventRepo {
       const body: Record<string, unknown> = { ...event };
       delete body["seq"];
       return db.transaction((tx) => {
-        const row = tx
+        // max(hwm, max(seq)) + 1: the high-water mark keeps seq monotonic
+        // even when the ring has evicted the rows that held the max seq.
+        const runRow = tx
+          .select({ hwm: schema.runs.eventSeqHwm })
+          .from(schema.runs)
+          .where(eq(schema.runs.id, runId))
+          .get();
+        const seqRow = tx
           .select({ maxSeq: sql<number | null>`max(${schema.events.seq})` })
           .from(schema.events)
           .where(eq(schema.events.runId, runId))
           .get();
-        const seq = (row?.maxSeq ?? 0) + 1;
+        const seq = Math.max(runRow?.hwm ?? 0, seqRow?.maxSeq ?? 0) + 1;
         const stored = PersistedEventSchema.parse({ ...body, seq });
         tx.insert(schema.events)
           .values({
@@ -849,6 +863,7 @@ export function createEventRepo(db: Db): EventRepo {
             createdAt: new Date().toISOString(),
           })
           .run();
+        tx.update(schema.runs).set({ eventSeqHwm: seq }).where(eq(schema.runs.id, runId)).run();
         return stored;
       });
     },

@@ -2,6 +2,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import Database from "better-sqlite3";
 import type { AgentEvent, PersistedEvent, Project, Run, StepRun, Workflow } from "@openeuler/core";
 import { createDatabase } from "./index.js";
 import type { Db } from "./index.js";
@@ -96,6 +97,50 @@ describe("createDatabase", () => {
       expect(reopened.projects.get(project.id)).toEqual(project);
     } finally {
       reopened.close();
+    }
+  });
+
+  it("0008 backfills runs.event_seq_hwm from existing events (#149)", () => {
+    const project = db.projects.create(makeProject());
+    const run = db.runs.create(makeRun(project.id));
+    db.events.append(run.id, { type: "started" });
+    db.events.append(run.id, { type: "done", output: "ok" });
+    db.close();
+
+    // Rewind the file to its pre-0008 shape: forget the last applied
+    // migration and drop the column it added.
+    const raw = new Database(join(dir, "test.db"));
+    try {
+      raw.exec(
+        "delete from __drizzle_migrations where created_at = (select max(created_at) from __drizzle_migrations)",
+      );
+      raw.exec("alter table runs drop column event_seq_hwm");
+    } finally {
+      raw.close();
+    }
+
+    // Re-opening re-applies 0008: ADD COLUMN + backfill hwm = max(seq)/run.
+    const upgraded = createDatabase({ path: join(dir, "test.db") });
+    const hwmOf = (id: string): number | undefined =>
+      (
+        upgraded.sqlite
+          .prepare<{ id: string }, { event_seq_hwm: number }>(
+            "select event_seq_hwm from runs where id = $id",
+          )
+          .get({ id }) ?? undefined
+      )?.event_seq_hwm;
+    try {
+      expect(hwmOf(run.id)).toBe(2);
+      // Runs with no events default to 0.
+      const emptyRun = upgraded.runs.create(makeRun(project.id));
+      expect(hwmOf(emptyRun.id)).toBe(0);
+      // Post-upgrade appends continue past the backfilled mark even after
+      // every event row is evicted.
+      expect(upgraded.events.deleteOldestByType(run.id, "started", 1)).toBe(1);
+      expect(upgraded.events.deleteOldestByType(run.id, "done", 1)).toBe(1);
+      expect(upgraded.events.append(run.id, { type: "done", output: "again" }).seq).toBe(3);
+    } finally {
+      upgraded.close();
     }
   });
 });
@@ -510,5 +555,43 @@ describe("events", () => {
     expect(db.events.deleteOldestByType(runId, "sandbox.log", 3)).toBe(0);
     expect(db.events.deleteOldestByType(runId, "nope", 3)).toBe(0);
     expect(db.events.count(runId)).toBe(1); // only `started` remains
+  });
+
+  it("never reuses seq after ring eviction removes the max-seq rows (#149)", () => {
+    const { runId } = seedRun();
+    const seqs = [1, 2, 3, 4, 5].map(
+      (index) =>
+        db.events.append(runId, {
+          type: "sandbox.log",
+          sandboxId: "sb-1",
+          stream: "stdout",
+          line: `l${index}`,
+        }).seq,
+    );
+    const maxSeq = Math.max(...seqs);
+
+    // Evict EVERY sandbox.log row — including the ones holding max(seq).
+    expect(db.events.deleteOldestByType(runId, "sandbox.log", seqs.length)).toBe(seqs.length);
+
+    // The next append must land BEYOND every previously assigned seq, so an
+    // SSE Last-Event-ID cursor at maxSeq neither misses nor rebinds events.
+    const next = db.events.append(runId, {
+      type: "sandbox.log",
+      sandboxId: "sb-1",
+      stream: "stdout",
+      line: "after-eviction",
+    });
+    expect(next.seq).toBeGreaterThan(maxSeq);
+    expect(db.events.getSince(runId, maxSeq)).toEqual([next]);
+
+    // Repeated evict/append cycles keep the seq strictly increasing.
+    db.events.deleteOldestByType(runId, "sandbox.log", 1);
+    const after = db.events.append(runId, {
+      type: "sandbox.log",
+      sandboxId: "sb-1",
+      stream: "stdout",
+      line: "after-eviction-2",
+    });
+    expect(after.seq).toBeGreaterThan(next.seq);
   });
 });

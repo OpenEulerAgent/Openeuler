@@ -37,6 +37,8 @@ function stubHandle(options: {
   ignoreSince?: boolean;
   /** When set, every logs() call rejects once with this error. */
   failNext?: () => boolean;
+  /** When provided, records the `since` value of every logs() call. */
+  sinceLog?: number[];
 }): SandboxHandle {
   return {
     id: "sb-stub",
@@ -62,6 +64,7 @@ function stubHandle(options: {
         };
       }
       const since = opts?.since;
+      if (options.sinceLog !== undefined && since !== undefined) options.sinceLog.push(since);
       const source = options.ignoreSince
         ? options.script
         : options.script.filter(
@@ -358,5 +361,74 @@ describe("startSandboxLogTailer", () => {
       .getSince("run-1", 0)
       .find((event) => event.type === "sandbox.log-truncated");
     expect(marker).toMatchObject({ dropped: 100, kept: 2000 });
+  });
+
+  it("advances the cursor to the newest line: a quiet stream cannot pin it (#149)", async () => {
+    const h = setup();
+    const base = now() + 8000;
+    // stdout-heavy stream plus a single EARLY stderr line: with a
+    // min-across-streams cursor the early stderr line would pin `since`
+    // and every later poll would re-fetch the whole stdout tail.
+    const script: SandboxLogEntry[] = [
+      ...Array.from({ length: 50 }, (_, index) => ({
+        stream: "stdout" as const,
+        line: `out-${index}`,
+        at: base + index,
+      })),
+      { stream: "stderr" as const, line: "early-err", at: base + 1 },
+    ];
+    const sinceLog: number[] = [];
+    const tailer = startSandboxLogTailer({
+      db: h.db,
+      handle: stubHandle({ script, sinceLog: sinceLog }),
+      runId: "run-1",
+      sandboxId: "sb-stub",
+      redact: (text) => text,
+      pollIntervalMs: 10,
+    });
+    await sleep(150);
+    await tailer.stop();
+
+    // Every line persisted exactly once — no duplicate appends.
+    const lines = logEvents(h.db).map((event) => event.line);
+    expect(lines).toHaveLength(51);
+    expect(lines.filter((line) => line === "out-42")).toHaveLength(1);
+
+    // After the first poll consumed the batch, subsequent polls fetched
+    // with an ADVANCING cursor: since reached the batch max (base + 49),
+    // not the early stderr line's timestamp (base + 1).
+    expect(sinceLog.length).toBeGreaterThan(1);
+    expect(Math.max(...sinceLog)).toBeGreaterThanOrEqual(base + 49);
+    // And no poll after the first re-fetched the early window: once the
+    // cursor advanced past base + 1, every later `since` is beyond it.
+    const later = sinceLog.slice(1);
+    expect(later.every((since) => since >= base + 49)).toBe(true);
+  });
+
+  it("drops provider truncation markers — they never reach run history (#149)", async () => {
+    const h = setup();
+    const script: SandboxLogEntry[] = [
+      { stream: "stdout", line: "real output", at: now() + 9000 },
+      // Byte-cap notices emitted by the docker provider mid-snapshot.
+      { stream: "stdout", line: "[openeuler] stdout log snapshot truncated at 8388608 bytes" },
+      { stream: "stderr", line: "[openeuler] stderr log snapshot truncated at 8388608 bytes" },
+      { stream: "stderr", line: "real error", at: now() + 9001 },
+    ];
+    const tailer = startSandboxLogTailer({
+      db: h.db,
+      handle: stubHandle({ script }),
+      runId: "run-1",
+      sandboxId: "sb-stub",
+      redact: (text) => text,
+      pollIntervalMs: 10,
+    });
+    await sleep(80);
+    await tailer.stop();
+
+    const lines = logEvents(h.db).map((event) => event.line);
+    expect(lines).toEqual(["real output", "real error"]);
+    // Markers carry no `at`, so every poll re-delivers them — they must
+    // stay filtered (never appended) across polls too.
+    expect(lines.some((line) => line.includes("truncated"))).toBe(false);
   });
 });

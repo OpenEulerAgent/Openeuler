@@ -124,6 +124,14 @@ export const runs = sqliteTable(
       .$type<BreadcrumbEntry[]>()
       .notNull()
       .default(sql`'[]'`),
+    /**
+     * High-water mark of the event seqs assigned for this run (#149):
+     * `events.append` sets seq = max(hwm, max(seq)) + 1 and raises hwm in
+     * the same transaction, so ring eviction (`deleteOldestByType`) can
+     * never make the next append reuse a seq — SSE Last-Event-ID cursors
+     * stay monotonic even after rows are deleted.
+     */
+    eventSeqHwm: integer("event_seq_hwm").notNull().default(0),
     createdAt: text("created_at").notNull(),
     updatedAt: text("updated_at").notNull(),
   },
@@ -177,8 +185,9 @@ export const projectSecrets = sqliteTable(
 
 /**
  * Append-only agent event log. `seq` is assigned per run by the repository
- * (max(seq)+1 inside a transaction); `payload` stores the event JSON without
- * its `seq` so the column stays the single source of truth.
+ * (max(runs.event_seq_hwm, max(seq)) + 1 inside a transaction, then hwm is
+ * raised); `payload` stores the event JSON without its `seq` so the column
+ * stays the single source of truth.
  */
 export const events = sqliteTable(
   "events",
