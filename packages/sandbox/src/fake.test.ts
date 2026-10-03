@@ -475,6 +475,17 @@ describe("fake provider list/stats", () => {
     expect(await provider.stats()).toEqual([]);
   });
 
+  it("destroys by id (GC path): known id removed + recorded, unknown id is a no-op (#105)", async () => {
+    const provider = createFakeSandboxProvider();
+    const handle = await provider.create(spec());
+    await provider.destroy?.(handle.id);
+    expect(await provider.list()).toEqual([]);
+    expect(provider.destroyCalls).toEqual([{ sandboxId: handle.id }]);
+
+    // Already-gone ids resolve (idempotent), like the docker provider.
+    await expect(provider.destroy?.("never-existed")).resolves.toBeUndefined();
+  });
+
   it("transitions to exited on its own after exitsAfterMs", async () => {
     const provider = createFakeSandboxProvider({ exitsAfterMs: 10 });
     const handle = await provider.create(spec());

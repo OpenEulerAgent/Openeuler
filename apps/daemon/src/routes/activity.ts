@@ -86,19 +86,27 @@ function opsMessage(type: OpsActivityType, payload: Record<string, unknown> | un
         numberish(payload?.["interrupted"]),
         "interrupted run",
       )}, ${plural(numberish(payload?.["orphanedWorktrees"]), "orphaned worktree")}`;
-    case "ops.gc":
-      return "Garbage collection ran";
+    case "ops.gc": {
+      const destroyed = numberish(payload?.["destroyed"]) + numberish(payload?.["orphans"]);
+      const volumes = numberish(payload?.["cacheVolumesPruned"]);
+      const warning = typeof payload?.["warning"] === "string" ? payload["warning"] : undefined;
+      const parts: string[] = [];
+      if (destroyed > 0) parts.push(`${plural(destroyed, "sandbox")} destroyed`);
+      if (volumes > 0) parts.push(`${plural(volumes, "cache volume")} pruned`);
+      if (parts.length === 0 && warning === undefined) return "Garbage collection ran";
+      if (parts.length === 0)
+        return `Garbage collection warning: ${warning ?? "check daemon logs"}`;
+      return `Garbage collection ran: ${parts.join(", ")}${
+        warning === undefined ? "" : ` — ${warning}`
+      }`;
+    }
     case "ops.image-pull": {
       const ref = typeof payload?.["ref"] === "string" ? (payload["ref"] as string) : "image";
-      return payload?.["done"] === false
-        ? `Image pull failed: ${ref}`
-        : `Image pulled: ${ref}`;
+      return payload?.["done"] === false ? `Image pull failed: ${ref}` : `Image pulled: ${ref}`;
     }
     case "ops.image-build": {
       const ref = typeof payload?.["ref"] === "string" ? (payload["ref"] as string) : "image";
-      return payload?.["done"] === false
-        ? `Image build failed: ${ref}`
-        : `Image built: ${ref}`;
+      return payload?.["done"] === false ? `Image build failed: ${ref}` : `Image built: ${ref}`;
     }
     case "ops.sandbox-kept": {
       const image = typeof payload?.["image"] === "string" ? (payload["image"] as string) : "";

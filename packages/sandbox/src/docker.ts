@@ -1041,6 +1041,24 @@ export class DockerSandboxProvider implements SandboxProvider {
   }
 
   /**
+   * Destroy by `list()` id (the GC path, #105): `docker rm -f` is idempotent
+   * — an already-missing container resolves, provider failures reject with a
+   * typed `SandboxError` (the GC logs and retries next pass).
+   */
+  async destroy(id: string): Promise<void> {
+    const result = await docker(["rm", "-f", id], {
+      runner: this.options.runner,
+      timeoutMs: this.options.opTimeoutMs,
+    });
+    if (result.code !== 0 && !isContainerMissingText(result.stderr)) {
+      throw new SandboxError(
+        "SANDBOX_EXEC_FAILED",
+        `failed to remove sandbox "${id}": ${stderrTail(result.stderr)}`,
+      );
+    }
+  }
+
+  /**
    * Best-effort `rm -f` used by `create()` cleanup paths: the name is ours
    * and freshly generated, so removing it can never hit a foreign container;
    * every failure is swallowed (the original error is what matters).

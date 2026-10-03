@@ -458,6 +458,17 @@ export class FakeSandboxProvider implements SandboxProvider {
     }));
   }
 
+  /**
+   * Destroy by `list()` id (the GC path, #105): idempotent like a handle
+   * `destroy()` — an unknown id resolves (already gone), a known one is
+   * destroyed through its handle (recorded in `destroyCalls`).
+   */
+  async destroy(id: string): Promise<void> {
+    const handle = this.sandboxes.get(id);
+    if (handle === undefined) return;
+    await handle.destroy();
+  }
+
   /** Clock used for `meta.createdAt` and measured exec durations. */
   now(): number {
     return this.options.now?.() ?? Date.now();

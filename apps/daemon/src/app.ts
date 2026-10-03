@@ -16,6 +16,7 @@ import { METRICS_CONTENT_TYPE, countActiveSandboxes, scrapeMetrics } from "./met
 import { createShutdownRegistry } from "./shutdown.js";
 import type { ShutdownHook, ShutdownRegistryOptions } from "./shutdown.js";
 import { createProjectsRouter } from "./routes/projects.js";
+import type { ProjectsRouterOptions } from "./routes/projects.js";
 import { createDriversRouter } from "./routes/drivers.js";
 import { createFilesRouter } from "./routes/files.js";
 import { createPresetsRouter } from "./routes/presets.js";
@@ -122,6 +123,11 @@ export interface CreateAppOptions {
    * operations. index.ts passes the boot-composed docker provider.
    */
   sandbox?: SandboxRouterOptions;
+  /**
+   * Projects router tuning (#105): injectable docker CLI runner for the
+   * project-delete cache-volume cleanup (tests script it).
+   */
+  projects?: ProjectsRouterOptions;
 }
 
 export interface DaemonApp {
@@ -287,7 +293,7 @@ export function createApp(options: CreateAppOptions = {}): DaemonApp {
     );
   });
 
-  app.route("/api/projects", createProjectsRouter());
+  app.route("/api/projects", createProjectsRouter(options.projects));
   app.route("/api/projects", createFilesRouter());
   app.route("/api/projects", createPresetsRouter());
   app.route("/api/projects", createSecretsRouter());

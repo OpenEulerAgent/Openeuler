@@ -171,8 +171,10 @@ export function recordRecoverySweepActivity(db: Db, payload: RecoverySweepActivi
 }
 
 /**
- * Records a garbage-collection pass (`ops.gc`, #94). Placeholder for M6's
- * sandbox GC — the helper ships now so emitters can land feature-by-feature.
+ * Records a garbage-collection pass (`ops.gc`, #94/#105): sandbox counts
+ * (`destroyed`/`kept`/`orphans`/`cacheVolumesPruned`), a disk-pressure
+ * `warning`, or a project-delete cache-volume cleanup (`reason`:
+ * "project-delete"). Same never-throw guard as the other writers.
  */
 export function recordGcActivity(db: Db, payload: Record<string, unknown> = {}): void {
   try {

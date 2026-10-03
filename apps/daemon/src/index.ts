@@ -9,6 +9,7 @@ import { recordDaemonBootActivity } from "./activity.js";
 import { createExecutor } from "./executor.js";
 import { createLogger } from "./logger.js";
 import { sweepInterruptedRuns } from "./recovery.js";
+import { startPeriodicSandboxGc } from "./sandbox-gc.js";
 import { loadOrCreateSecretKey } from "./secrets-crypto.js";
 import { getVersion } from "./version.js";
 
@@ -95,6 +96,22 @@ export async function main(): Promise<void> {
     );
   }
 
+  // Startup task #3, before serving (#105): sandbox GC boot sweep — reconcile
+  // provider sandboxes with the db (stale terminal + orphan containers
+  // destroyed, orphan cache volumes pruned; one ops.gc event with the
+  // counts), then keep sweeping every 10 minutes. The shared docker provider
+  // is the same instance the executor and image routes use.
+  const sandboxGc = startPeriodicSandboxGc({
+    db,
+    provider: sandboxProvider,
+    logger,
+    activeRunIds: () => executor.activeRunIds(),
+  });
+  const bootGc = await sandboxGc.bootSweep();
+  if (bootGc.destroyed + bootGc.orphans + bootGc.cacheVolumesPruned > 0) {
+    logger.info(bootGc, "sandbox GC boot sweep complete");
+  }
+
   const { app, onShutdown, handleShutdown, authRequired } = createApp({
     db,
     logger,
@@ -106,9 +123,10 @@ export async function main(): Promise<void> {
     sandbox: { provider: sandboxProvider },
   });
 
-  // LIFO: http-server → executor → db.
+  // LIFO: http-server → sandbox-gc → executor → db.
   onShutdown(() => db.close(), "db");
   onShutdown(() => executor.shutdown(), "executor");
+  onShutdown(() => sandboxGc.stop(), "sandbox-gc");
 
   const port = resolvePort();
   const server = serve({ fetch: app.fetch, port }, (info) => {

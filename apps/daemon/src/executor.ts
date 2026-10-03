@@ -17,7 +17,12 @@ import { SandboxError, dockerAvailable } from "@openeuler/sandbox";
 import type { SandboxHandle, SandboxProvider, SandboxStatus } from "@openeuler/sandbox";
 import pLimit from "p-limit";
 import { recordRunStatusActivity, recordSandboxKeptActivity } from "./activity.js";
-import { DEFAULT_MAX_CONCURRENT_RUNS, resolveMaxConcurrentRuns } from "./concurrency.js";
+import {
+  DEFAULT_MAX_CONCURRENT_RUNS,
+  DEFAULT_SANDBOX_CAP_RETRY_MS,
+  resolveMaxConcurrentRuns,
+  resolveMaxSandboxes,
+} from "./concurrency.js";
 import type { Logger } from "./logger.js";
 import { createSecretsSupport, type SecretsSupport } from "./secrets.js";
 import { startSandboxLogTailer, type SandboxLogTailer } from "./sandbox-log-tailer.js";
@@ -170,6 +175,18 @@ export interface ExecutorOptions {
      * one `sandbox.log-truncated` marker). Default 2000.
      */
     logCap?: number;
+    /**
+     * Upper bound on live provider sandboxes (#105). A sandbox-mode run
+     * dequeued while the provider is at the cap stays `queued` and is
+     * re-enqueued after `capRetryMs`. Defaults to `$MAX_SANDBOXES`
+     * (integer >= 2), then 8.
+     */
+    maxSandboxes?: number;
+    /**
+     * Delay before a sandbox-capped run is re-enqueued (#105). Default
+     * 30s; tests shrink it.
+     */
+    capRetryMs?: number;
   };
 }
 
@@ -268,6 +285,14 @@ export function createExecutor(options: ExecutorOptions): Executor {
     throw new Error(`maxConcurrentRuns must be an integer >= 1 (got ${maxConcurrentRuns})`);
   }
   const shutdownSettleMs = options.shutdownSettleMs ?? 2_000;
+  /**
+   * #105: global cap on live provider sandboxes — a sandbox-mode run
+   * dequeued at the cap stays `queued` (delay-requeued below), so sandboxes
+   * behave like a second, coarser resource queue behind MAX_CONCURRENT_RUNS.
+   */
+  const maxSandboxes =
+    options.sandbox?.maxSandboxes ?? resolveMaxSandboxes(process.env["MAX_SANDBOXES"]);
+  const capRetryMs = options.sandbox?.capRetryMs ?? DEFAULT_SANDBOX_CAP_RETRY_MS;
   /** Per-project secrets support (#93); undefined when no master key is configured. */
   const secrets: SecretsSupport | undefined =
     options.secretsKey === undefined ? undefined : createSecretsSupport(db, options.secretsKey);
@@ -549,6 +574,62 @@ export function createExecutor(options: ExecutorOptions): Executor {
   const limit = pLimit(maxConcurrentRuns);
   /** Per-project gates: projectId → the run holding the project's turn + waiters. */
   const projectGates = new Map<string, ProjectGate>();
+  /**
+   * Pending sandbox-cap retries (#105): runId → the delay-requeue timer.
+   * The runs are NOT in `active` (their row stays `queued`), so abort and
+   * shutdown clear these timers explicitly.
+   */
+  const sandboxCapRetries = new Map<string, ReturnType<typeof setTimeout>>();
+
+  /**
+   * #105: true when this project's runs execute in sandboxes AND the
+   * provider is at `maxSandboxes` live containers. Local runs never block;
+   * provider hiccups degrade to "not at cap" (the create attempt itself
+   * surfaces typed errors).
+   */
+  async function sandboxCapReached(projectId: string): Promise<boolean> {
+    if (options.sandbox === undefined) return false;
+    const project = db.projects.get(projectId);
+    const policy = project?.sandboxPolicy;
+    const isDockerAvailable = options.sandbox.isDockerAvailable ?? (() => dockerAvailable());
+    if (resolveExecutionMode(policy, await isDockerAvailable()) !== "sandbox") return false;
+    try {
+      return (await options.sandbox.provider.list()).length >= maxSandboxes;
+    } catch (err) {
+      logger.warn({ err, projectId }, "sandbox cap check failed (assuming below cap)");
+      return false;
+    }
+  }
+
+  /**
+   * Delay-requeues a sandbox-capped run (#105): after `capRetryMs` the run
+   * re-enters the scheduler (fresh policy/cap checks) unless it went
+   * terminal or was restarted meanwhile. The timer is unref'd and cleared
+   * by abort/shutdown.
+   */
+  function scheduleSandboxCapRetry(runId: string, opts: StartRunOptions | undefined): void {
+    if (sandboxCapRetries.has(runId)) return;
+    const timer = setTimeout(() => {
+      sandboxCapRetries.delete(runId);
+      const row = db.runs.get(runId);
+      if (row === undefined || isTerminal(row.status) || active.has(runId)) return;
+      startRun(runId, opts);
+    }, capRetryMs);
+    timer.unref?.();
+    sandboxCapRetries.set(runId, timer);
+    logger.info(
+      { runId, maxSandboxes, retryInMs: capRetryMs },
+      "sandbox cap reached — run stays queued, retry scheduled",
+    );
+  }
+
+  /** Clears a pending cap retry (abort path) so it cannot fire later. */
+  function clearSandboxCapRetry(runId: string): void {
+    const timer = sandboxCapRetries.get(runId);
+    if (timer === undefined) return;
+    clearTimeout(timer);
+    sandboxCapRetries.delete(runId);
+  }
 
   /** Resolves when it is this run's turn for the project; FIFO per project. */
   function acquireProjectGate(projectId: string, runId: string): Promise<void> {
@@ -651,8 +732,8 @@ export function createExecutor(options: ExecutorOptions): Executor {
 
   function startRun(runId: string, opts?: StartRunOptions): void {
     const existing = active.get(runId);
-    if (existing) {
-      logger.warn({ runId }, "startRun ignored: run is already executing");
+    if (existing || sandboxCapRetries.has(runId)) {
+      logger.warn({ runId }, "startRun ignored: run is already executing or queued");
       return;
     }
     const run = db.runs.get(runId);
@@ -691,6 +772,15 @@ export function createExecutor(options: ExecutorOptions): Executor {
           active.delete(runId);
           return;
         }
+        // #105: sandbox cap — a sandbox-mode run dequeued while the provider
+        // sits at MAX_SANDBOXES stays `queued` and re-enters the scheduler
+        // after capRetryMs (the row keeps its queued status; nothing runs).
+        if (await sandboxCapReached(run.projectId)) {
+          releaseProjectGate(run.projectId, runId);
+          active.delete(runId);
+          scheduleSandboxCapRetry(runId, opts);
+          return;
+        }
         try {
           await limit(() => execute(entry, opts));
         } finally {
@@ -715,6 +805,8 @@ export function createExecutor(options: ExecutorOptions): Executor {
     const entry = active.get(runId);
     if (!entry) {
       // Queued but never handed to the executor (or lost across a restart).
+      // #105: a pending sandbox-cap retry is cancelled with it.
+      clearSandboxCapRetry(runId);
       abortBeforeStart(runId, run.projectId);
       return { outcome: "aborted" };
     }
@@ -752,6 +844,10 @@ export function createExecutor(options: ExecutorOptions): Executor {
   }
 
   async function shutdown(): Promise<void> {
+    // #105: cancel pending sandbox-cap retries — their runs stay `queued`
+    // rows (the next boot's recovery sweep settles them, like any crash).
+    for (const timer of sandboxCapRetries.values()) clearTimeout(timer);
+    sandboxCapRetries.clear();
     const entries = [...active.values()];
     if (entries.length === 0) return;
     logger.info({ runs: entries.map((entry) => entry.runId) }, "executor shutdown: aborting runs");

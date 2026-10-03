@@ -683,6 +683,22 @@ describe("docker provider unit (fake CLI runner)", () => {
     await expect(provider.stats()).resolves.toEqual([]);
     expect(runner.calls.some((args) => args[0] === "stats")).toBe(false);
   });
+
+  it("destroy(id) runs docker rm -f; missing containers resolve, failures reject typed (#105)", async () => {
+    const runner = new RecordingRunner();
+    const provider = createDockerSandboxProvider({ runner: (a) => runner.run(a) });
+    runner.ok("openeuler-run-1-abc123\n");
+    await provider.destroy?.("openeuler-run-1-abc123");
+    expect(findCall(runner, "rm")).toEqual(["rm", "-f", "openeuler-run-1-abc123"]);
+
+    runner.fail(1, "Error response from daemon: No such container: ghost");
+    await expect(provider.destroy?.("ghost")).resolves.toBeUndefined();
+
+    runner.fail(1, "driver failure while removing");
+    await expect(provider.destroy?.("stuck")).rejects.toMatchObject({
+      code: "SANDBOX_EXEC_FAILED",
+    });
+  });
 });
 
 describe("docker logs demux (fake spawner)", () => {
