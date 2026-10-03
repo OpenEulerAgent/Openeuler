@@ -17,11 +17,19 @@ import { z } from "zod";
 import type { Db } from "@openeuler/db";
 import { recordImageJobActivity } from "../activity.js";
 import type { AppEnv } from "../app.js";
+import { resolveExecutionMode } from "../executor.js";
 import { HttpError } from "../errors.js";
+import { createDockerStatusService, type DockerStatusOptions } from "../sandbox-status.js";
 
 /**
- * Sandbox image management API (#100).
+ * Sandbox API (#100 images, #106 status).
  *
+ * - `GET /api/sandbox/status` — docker availability detection (#106):
+ *   `{available, version?, mode: "docker"|"unavailable", checkedAt}` from a
+ *   60s-cached `docker info` probe + `docker --version`. `?refresh=1`
+ *   bypasses the cache. `?projectId=<id>` adds `{projectMode, effective}` —
+ *   the project's policy executionMode and the same local/sandbox resolution
+ *   the executor applies to its runs (unknown projects answer 404).
  * - `GET /api/sandbox/images` — the image catalog: images under the
  *   `openeuler/` namespace (ours, built via this API) plus a curated list of
  *   common base images when present locally. Docker cannot label images, so
@@ -41,7 +49,6 @@ import { HttpError } from "../errors.js";
  * - `GET /api/sandbox/jobs/:id` — in-memory job registry (running | done |
  *   failed, plus the failure message). Jobs live for the daemon process only.
  *
- * `GET /api/sandbox/status` is a different issue (#106) and lives elsewhere.
  * Auth + rate limits apply automatically (mounted under `/api`).
  */
 
@@ -64,6 +71,11 @@ export interface SandboxRouterOptions {
   provider?: SandboxProvider;
   /** Injectable image-operation knobs (scripted runners for tests). */
   images?: SandboxImagesOptions;
+  /**
+   * Docker availability detection (#106): `GET /api/sandbox/status`. index.ts
+   * passes its boot-warmed service; tests inject the probe/version runner.
+   */
+  status?: DockerStatusOptions;
   /** Cap on finished jobs kept in the registry (oldest pruned). Default 200. */
   maxFinishedJobs?: number;
   /** Cap on concurrently-running pull/build jobs (each spawns a docker child). Default 4. */
@@ -109,6 +121,8 @@ export function createSandboxRouter(options: SandboxRouterOptions = {}): Hono<Ap
   const jobs = new Map<string, SandboxJob>();
   /** running-job ids by `${kind}:${normalizedRef}` for dedupe. */
   const runningByKey = new Map<string, string>();
+  /** Docker availability resolver (#106); shared boot-warmed instance in prod. */
+  const dockerStatus = options.status?.service ?? createDockerStatusService(options.status);
 
   const pruneFinished = (): void => {
     const finished = [...jobs.values()].filter((job) => job.status !== "running");
@@ -198,6 +212,32 @@ export function createSandboxRouter(options: SandboxRouterOptions = {}): Hono<Ap
     })();
     return job;
   };
+
+  // Docker availability (#106). Availability + CLI version resolve through the
+  // 60s-cached service; `?projectId=` layers the project's policy mode and the
+  // effective local/sandbox resolution on top — the SAME resolveExecutionMode
+  // the executor uses at run time, so the hint never disagrees with reality.
+  router.get("/status", async (c) => {
+    const status = await dockerStatus.status({
+      refresh: c.req.query("refresh") === "1",
+    });
+    const projectId = c.req.query("projectId")?.trim();
+    if (projectId === undefined || projectId === "") return c.json(status);
+    const db = c.get("db");
+    if (db === undefined) {
+      throw new HttpError(503, "DB_UNAVAILABLE", "database is not configured");
+    }
+    const project = db.projects.get(projectId);
+    if (project === undefined) {
+      throw new HttpError(404, "PROJECT_NOT_FOUND", `no project with id ${projectId}`);
+    }
+    return c.json({
+      ...status,
+      projectId: project.id,
+      projectMode: project.sandboxPolicy?.executionMode ?? "local",
+      effective: resolveExecutionMode(project.sandboxPolicy, status.available),
+    });
+  });
 
   router.get("/images", async (c) => {
     try {

@@ -155,12 +155,20 @@ const calls = (method: string, path: string): FetchCall[] =>
       ([url, init]) => String(url).replace(BASE, "") === path && (init?.method ?? "GET") === method,
     );
 
-/** Default mount routes: empty project policy, empty catalog, secrets list. */
+/** Default mount routes: empty project policy, empty catalog, secrets list, docker up (#106). */
 function mountRoutes(extra: RouteSpec = {}): RouteSpec {
   return {
     [`GET /api/projects/${PROJECT}`]: { project: {} },
     "GET /api/sandbox/images": { images: [] },
     [`GET /api/projects/${PROJECT}/secrets`]: { secrets: [] },
+    [`GET /api/sandbox/status?projectId=${PROJECT}`]: {
+      available: true,
+      version: "27.3.1",
+      mode: "docker",
+      checkedAt: 1,
+      projectMode: "local",
+      effective: "local",
+    },
     ...extra,
   };
 }
@@ -471,5 +479,67 @@ describe("ProjectSettingsDrawer sandbox policy pane (#101)", () => {
 
     expect(text()).toContain("Could not load the sandbox policy");
     expect(button("Retry")).toBeDefined();
+  });
+
+  it("renders the live effective-mode hint under the execution mode select (#106)", async () => {
+    installRoutes(
+      mountRoutes({
+        [`GET /api/projects/${PROJECT}`]: {
+          project: { sandboxPolicy: { executionMode: "auto" } },
+        },
+        [`GET /api/sandbox/status?projectId=${PROJECT}`]: {
+          available: false,
+          mode: "unavailable",
+          checkedAt: 2,
+          projectMode: "auto",
+          effective: "local",
+        },
+      }),
+    );
+    render();
+    await settle();
+
+    expect(calls("GET", `/api/sandbox/status?projectId=${PROJECT}`)).toHaveLength(1);
+    const hint = document.querySelector("[data-effective-mode-hint]");
+    expect(hint?.textContent).toBe("effective: local (Docker unavailable)");
+
+    // The hint follows the select live: switching to local while docker is
+    // down names the policy as the reason (no fallback claim).
+    setSelect("policy-execution-mode", "local");
+    await settle();
+    expect(document.querySelector("[data-effective-mode-hint]")?.textContent).toBe(
+      "effective: local (policy: local)",
+    );
+  });
+
+  it("shows the detected-sandbox hint when docker is up", async () => {
+    installRoutes(
+      mountRoutes({
+        [`GET /api/projects/${PROJECT}`]: {
+          project: { sandboxPolicy: { executionMode: "auto" } },
+        },
+      }),
+    );
+    render();
+    await settle();
+
+    expect(document.querySelector("[data-effective-mode-hint]")?.textContent).toBe(
+      "effective: sandbox (Docker detected)",
+    );
+  });
+
+  it("omits the hint when the docker status cannot be resolved", async () => {
+    installRoutes(
+      mountRoutes({
+        [`GET /api/sandbox/status?projectId=${PROJECT}`]: {
+          status: 503,
+          body: { error: { code: "SANDBOX_UNAVAILABLE", message: "no provider" } },
+        },
+      }),
+    );
+    render();
+    await settle();
+
+    expect(document.querySelector("[data-effective-mode-hint]")).toBeNull();
   });
 });

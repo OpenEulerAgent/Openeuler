@@ -2,11 +2,15 @@ import { describe, expect, it, vi } from "vitest";
 import { ApiError } from "./api";
 import {
   deleteSandboxImage,
+  effectiveModeHint,
   fetchSandboxImages,
   fetchSandboxJob,
+  fetchSandboxStatus,
   imageRefOf,
   isImageInUseError,
   isImageNotFoundError,
+  resolveEffectiveMode,
+  showLocalFallbackBanner,
   startSandboxImageBuild,
   startSandboxImagePull,
   waitForSandboxJob,
@@ -167,6 +171,94 @@ describe("imageRefOf (#100)", () => {
     expect(imageRefOf({ repository: "busybox", tag: "musl" })).toBe("busybox:musl");
     expect(imageRefOf(image({ repository: "openeuler/worker", tag: "latest" }))).toBe(
       "openeuler/worker:latest",
+    );
+  });
+});
+
+describe("fetchSandboxStatus (#106)", () => {
+  it("GETs the plain status endpoint without a projectId", async () => {
+    const fetcher = vi.fn(async () => ({
+      available: true,
+      version: "27.3.1",
+      mode: "docker",
+      checkedAt: 1,
+    }));
+    await expect(fetchSandboxStatus(undefined, asFetcher(fetcher))).resolves.toMatchObject({
+      available: true,
+      version: "27.3.1",
+    });
+    expect(fetcher).toHaveBeenCalledWith("/api/sandbox/status");
+  });
+
+  it("appends the percent-encoded projectId when given", async () => {
+    const fetcher = vi.fn(async () => ({
+      available: false,
+      mode: "unavailable",
+      checkedAt: 2,
+      projectMode: "auto",
+      effective: "local",
+    }));
+    await expect(fetchSandboxStatus("proj/1", asFetcher(fetcher))).resolves.toMatchObject({
+      projectMode: "auto",
+      effective: "local",
+    });
+    expect(fetcher).toHaveBeenCalledWith("/api/sandbox/status?projectId=proj%2F1");
+  });
+});
+
+describe("resolveEffectiveMode (#106)", () => {
+  it("mirrors the executor: sandbox stays, auto follows availability, else local", () => {
+    expect(resolveEffectiveMode("sandbox", false)).toBe("sandbox");
+    expect(resolveEffectiveMode("sandbox", true)).toBe("sandbox");
+    expect(resolveEffectiveMode("auto", true)).toBe("sandbox");
+    expect(resolveEffectiveMode("auto", false)).toBe("local");
+    expect(resolveEffectiveMode("local", true)).toBe("local");
+    expect(resolveEffectiveMode("local", false)).toBe("local");
+  });
+});
+
+describe("showLocalFallbackBanner (#106)", () => {
+  const base = { sandboxPresent: false, available: false };
+
+  it("shows for auto/sandbox policies without a sandbox while docker is down", () => {
+    expect(showLocalFallbackBanner({ ...base, projectMode: "auto" })).toBe(true);
+    expect(showLocalFallbackBanner({ ...base, projectMode: "sandbox" })).toBe(true);
+  });
+
+  it("hides when the run has a live sandbox, the policy is local, or docker is up", () => {
+    expect(showLocalFallbackBanner({ ...base, projectMode: "auto", sandboxPresent: true })).toBe(
+      false,
+    );
+    expect(showLocalFallbackBanner({ ...base, projectMode: "local" })).toBe(false);
+    expect(showLocalFallbackBanner({ ...base, projectMode: undefined })).toBe(false);
+    expect(
+      showLocalFallbackBanner({ sandboxPresent: false, projectMode: "auto", available: true }),
+    ).toBe(false);
+  });
+});
+
+describe("effectiveModeHint (#106)", () => {
+  it("renders the detected-sandbox and unavailable-fallback hints", () => {
+    expect(effectiveModeHint({ executionMode: "auto", available: true })).toBe(
+      "effective: sandbox (Docker detected)",
+    );
+    expect(effectiveModeHint({ executionMode: "auto", available: false })).toBe(
+      "effective: local (Docker unavailable)",
+    );
+  });
+
+  it("is honest about the remaining corners", () => {
+    expect(effectiveModeHint({ executionMode: "sandbox", available: true })).toBe(
+      "effective: sandbox (Docker detected)",
+    );
+    expect(effectiveModeHint({ executionMode: "sandbox", available: false })).toBe(
+      "effective: sandbox (Docker unavailable — sandbox runs will fail)",
+    );
+    expect(effectiveModeHint({ executionMode: "local", available: true })).toBe(
+      "effective: local (policy: local)",
+    );
+    expect(effectiveModeHint({ executionMode: "local", available: false })).toBe(
+      "effective: local (policy: local)",
     );
   });
 });
