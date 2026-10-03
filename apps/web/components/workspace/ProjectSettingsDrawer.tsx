@@ -3,12 +3,14 @@
 import { useCallback, useEffect, useState } from "react";
 import type { ProjectSandboxPolicy, SandboxNetworkMode } from "@openeuler/core";
 import { Badge } from "@/components/ui/badge";
-import { Button } from "@/components/ui/button";
+import { Button, ButtonLink } from "@/components/ui/button";
 import { Drawer } from "@/components/ui/drawer";
 import { EmptyState } from "@/components/ui/empty-state";
 import { Field, Input, Select } from "@/components/ui/input";
 import { useToast } from "@/components/ui/toast";
 import { ApiError } from "@/lib/api";
+import { formatBytes, usagePercent } from "@/lib/settings";
+import { formatRelativeAge } from "@/lib/time";
 import { fetchProjectPolicy, patchProjectPolicy, policyIssue } from "@/lib/policy-api";
 import {
   effectiveModeHint,
@@ -25,12 +27,20 @@ import {
   secretNameIssue,
   type ProjectSecretName,
 } from "@/lib/secrets-api";
+import {
+  fetchProjectWorktrees,
+  pruneProjectWorktrees,
+  WORKTREE_STATUS_LABEL,
+  type WorktreeEntry,
+  type WorktreePruneResult,
+  type WorktreeStatus,
+} from "@/lib/worktrees-api";
 
 /**
- * Project settings drawer (#93 secrets, #101 sandbox policy). v0.2 ships
- * two panes: per-project env vars (values write-only, stored encrypted on
- * the daemon) and the sandbox policy (execution mode, image, resources,
- * network exposure) every sandboxed run of the project executes under.
+ * Project settings drawer (#93 secrets, #101 sandbox policy, #111 worktrees).
+ * Panes: per-project env vars (values write-only, stored encrypted on the
+ * daemon), the sandbox policy every sandboxed run of the project executes
+ * under, and the worktree manager (per-run isolation footprint on disk).
  */
 
 const formatCreated = (iso: string): string => {
@@ -256,6 +266,7 @@ export function ProjectSettingsDrawer({
       </section>
 
       <SandboxPolicySection projectId={projectId} />
+      <WorktreesSection projectId={projectId} />
     </Drawer>
   );
 }
@@ -593,6 +604,293 @@ function SandboxPolicySection({ projectId }: { projectId: string }) {
             </Button>
           </div>
         </form>
+      )}
+    </section>
+  );
+}
+
+/** Status → badge variant for the worktree rows (#111). */
+const WORKTREE_STATUS_VARIANT: Record<WorktreeStatus, "info" | "neutral" | "warning"> = {
+  active: "info",
+  inspectable: "neutral",
+  orphan: "warning",
+};
+
+type WorktreesLoad = "loading" | "failed" | "ready";
+
+/**
+ * The Worktrees pane (#111): every per-run worktree the daemon attributes to
+ * this project — branch, status badge, `du`-sized usage bar (shared scale),
+ * relative last activity — plus totals, inspect/copy actions and the prune
+ * flows (selected entry or all orphans, both behind a confirm click).
+ */
+function WorktreesSection({ projectId }: { projectId: string }) {
+  const { toast } = useToast();
+  const [load, setLoad] = useState<WorktreesLoad>("loading");
+  const [entries, setEntries] = useState<WorktreeEntry[] | null>(null);
+  const [totalBytes, setTotalBytes] = useState<number | null>(null);
+  /** Run id awaiting its confirm click (null = no per-row confirm open). */
+  const [confirmingRun, setConfirmingRun] = useState<string | null>(null);
+  const [confirmingAll, setConfirmingAll] = useState(false);
+  /** runId | "all" while a prune is in flight. */
+  const [busy, setBusy] = useState<string | null>(null);
+
+  const refresh = useCallback(() => {
+    setLoad("loading");
+    fetchProjectWorktrees(projectId)
+      .then((payload) => {
+        setEntries(payload.worktrees);
+        setTotalBytes(payload.totalBytes);
+        setLoad("ready");
+      })
+      .catch(() => {
+        setEntries(null);
+        setLoad("failed");
+      });
+  }, [projectId]);
+
+  useEffect(() => {
+    refresh();
+  }, [refresh]);
+
+  const copyPath = async (entry: WorktreeEntry) => {
+    try {
+      await navigator.clipboard.writeText(entry.path);
+      toast({ title: "Worktree path copied", description: entry.path, variant: "info" });
+    } catch {
+      toast({
+        title: "Copy failed",
+        description: "The clipboard is unavailable in this context.",
+        variant: "danger",
+      });
+    }
+  };
+
+  const pruneToast = (result: WorktreePruneResult): void => {
+    const warnings = result.removed.flatMap((row) => row.warnings ?? []);
+    toast({
+      variant: warnings.length > 0 ? "danger" : "success",
+      title:
+        result.removed.length === 1
+          ? `Pruned ${result.removed[0]?.runId}`
+          : `Pruned ${result.removed.length} worktrees`,
+      description:
+        warnings.length > 0
+          ? `${warnings.length} cleanup warning(s) — branch or metadata leftovers may remain.`
+          : result.kept > 0
+            ? `${result.kept} kept (active or still inspectable).`
+            : undefined,
+    });
+  };
+
+  const pruneOne = async (runId: string) => {
+    setBusy(runId);
+    try {
+      pruneToast(await pruneProjectWorktrees(projectId, { runId }));
+      refresh();
+    } catch (cause) {
+      const message = cause instanceof ApiError ? cause.message : "Failed to prune the worktree";
+      toast({ variant: "danger", title: "Could not prune worktree", description: message });
+    } finally {
+      setBusy(null);
+      setConfirmingRun(null);
+    }
+  };
+
+  const pruneOrphans = async () => {
+    setBusy("all");
+    try {
+      pruneToast(await pruneProjectWorktrees(projectId, { orphans: true }));
+      refresh();
+    } catch (cause) {
+      const message =
+        cause instanceof ApiError ? cause.message : "Failed to prune orphaned worktrees";
+      toast({ variant: "danger", title: "Could not prune worktrees", description: message });
+    } finally {
+      setBusy(null);
+      setConfirmingAll(false);
+    }
+  };
+
+  const orphans = entries?.filter((entry) => entry.status === "orphan") ?? [];
+  const scale = Math.max(...(entries ?? []).map((entry) => entry.diskUsageBytes ?? 0), 1);
+
+  return (
+    <section className="mt-6 border-t border-border pt-5" aria-label="Worktrees">
+      <div className="flex items-center justify-between gap-2">
+        <h3 className="text-sm font-semibold uppercase tracking-wide text-muted-fg">Worktrees</h3>
+        {entries !== null && entries.length > 0 ? (
+          <Badge variant="neutral">{entries.length}</Badge>
+        ) : null}
+      </div>
+
+      {load === "loading" ? (
+        <p className="mt-3 text-sm text-muted-fg" role="status">
+          Loading worktrees…
+        </p>
+      ) : load === "failed" ? (
+        <div className="mt-3 flex flex-col items-start gap-2 text-sm">
+          <p className="text-danger">Could not load worktrees.</p>
+          <Button variant="secondary" onClick={refresh}>
+            Retry
+          </Button>
+        </div>
+      ) : entries !== null && entries.length === 0 ? (
+        <EmptyState
+          className="py-6"
+          title="No worktrees yet"
+          description="Every run of this project gets its own worktree under the daemon's store; they appear here."
+        />
+      ) : (
+        entries !== null && (
+          <>
+            {/* Totals card (#111): shared-scale footprint of the project's runs. */}
+            <div
+              className="mt-3 rounded-md border border-border bg-elevated px-3 py-2 text-xs text-muted-fg"
+              data-worktrees-total
+            >
+              <span className="font-medium text-fg">{formatBytes(totalBytes)}</span> on disk across{" "}
+              {entries.length} {entries.length === 1 ? "worktree" : "worktrees"}
+              {orphans.length > 0 ? ` · ${orphans.length} orphaned` : ""}
+            </div>
+
+            <ul
+              className="mt-3 flex flex-col divide-y divide-border rounded-md border border-border"
+              data-worktrees-table
+            >
+              {entries.map((entry) => {
+                const percent = usagePercent(entry.diskUsageBytes, scale);
+                return (
+                  <li
+                    key={entry.runId}
+                    className="flex flex-col gap-2 px-3 py-2"
+                    data-worktree-row={entry.runId}
+                    data-worktree-status={entry.status}
+                  >
+                    <div className="flex items-center justify-between gap-2">
+                      <p
+                        className="min-w-0 truncate font-mono text-sm font-medium text-fg"
+                        title={entry.branch}
+                      >
+                        {entry.branch}
+                      </p>
+                      <Badge variant={WORKTREE_STATUS_VARIANT[entry.status]}>
+                        {WORKTREE_STATUS_LABEL[entry.status]}
+                      </Badge>
+                    </div>
+
+                    {/* Usage bar vs the project's largest worktree (#111). */}
+                    <div className="flex flex-col gap-1">
+                      <div className="flex items-baseline justify-between gap-3 text-xs text-muted-fg">
+                        <span className="truncate font-mono" title={entry.path}>
+                          {entry.path}
+                        </span>
+                        <span className="shrink-0">
+                          {formatBytes(entry.diskUsageBytes)} ·{" "}
+                          {formatRelativeAge(entry.lastActivity ?? "")}
+                        </span>
+                      </div>
+                      <div
+                        className="h-1.5 w-full overflow-hidden rounded-full bg-elevated"
+                        role="progressbar"
+                        aria-label={`${entry.branch} disk usage`}
+                        aria-valuemin={0}
+                        aria-valuemax={100}
+                        aria-valuenow={percent}
+                        data-worktree-usage
+                      >
+                        <div
+                          className="h-full rounded-full bg-accent"
+                          style={{ width: `${percent}%` }}
+                        />
+                      </div>
+                    </div>
+
+                    <div className="flex flex-wrap items-center gap-2">
+                      {entry.runStatus !== undefined ? (
+                        <ButtonLink href={`/runs/${entry.runId}`} variant="ghost" size="sm">
+                          Inspect
+                        </ButtonLink>
+                      ) : null}
+                      <Button variant="ghost" size="sm" onClick={() => void copyPath(entry)}>
+                        Copy path
+                      </Button>
+                      {entry.status === "active" ? null : confirmingRun === entry.runId ? (
+                        <>
+                          <Button
+                            variant="danger"
+                            size="sm"
+                            loading={busy === entry.runId}
+                            onClick={() => void pruneOne(entry.runId)}
+                            aria-label={`Confirm prune ${entry.runId}`}
+                          >
+                            Prune
+                          </Button>
+                          <Button
+                            variant="secondary"
+                            size="sm"
+                            onClick={() => setConfirmingRun(null)}
+                            disabled={busy === entry.runId}
+                          >
+                            Cancel
+                          </Button>
+                        </>
+                      ) : (
+                        <Button
+                          variant="ghost"
+                          size="sm"
+                          onClick={() => setConfirmingRun(entry.runId)}
+                          aria-label={`Prune ${entry.runId}`}
+                        >
+                          Prune
+                        </Button>
+                      )}
+                    </div>
+                  </li>
+                );
+              })}
+            </ul>
+
+            <div className="mt-3 flex items-center justify-between gap-3">
+              <p className="text-xs text-muted-fg">
+                Orphans have no live run (deleted runs or crash leftovers); inspectable worktrees
+                belong to finished runs.
+              </p>
+              {confirmingAll ? (
+                <div className="flex shrink-0 items-center gap-2">
+                  <Button
+                    variant="danger"
+                    size="sm"
+                    loading={busy === "all"}
+                    disabled={orphans.length === 0}
+                    onClick={() => void pruneOrphans()}
+                    aria-label="Confirm prune all orphaned worktrees"
+                  >
+                    Prune {orphans.length} {orphans.length === 1 ? "orphan" : "orphans"}
+                  </Button>
+                  <Button
+                    variant="secondary"
+                    size="sm"
+                    disabled={busy === "all"}
+                    onClick={() => setConfirmingAll(false)}
+                  >
+                    Cancel
+                  </Button>
+                </div>
+              ) : (
+                <Button
+                  variant="secondary"
+                  size="sm"
+                  className="shrink-0"
+                  disabled={orphans.length === 0 || busy !== null}
+                  onClick={() => setConfirmingAll(true)}
+                >
+                  Prune all orphans
+                </Button>
+              )}
+            </div>
+          </>
+        )
       )}
     </section>
   );

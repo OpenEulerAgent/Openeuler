@@ -1,10 +1,13 @@
 // @vitest-environment jsdom
 //
-// Project settings drawer (#93 secrets, #101 sandbox policy). Secrets pane:
-// the list renders names + created dates only — a value column must never
-// exist; add calls PUT, delete needs a confirm click. Sandbox pane: loads
-// the saved policy + image catalog, PATCHes the whole policy, shows inline
-// validation errors and the "limited does not filter egress" honesty note.
+// Project settings drawer (#93 secrets, #101 sandbox policy, #111 worktrees).
+// Secrets pane: the list renders names + created dates only — a value column
+// must never exist; add calls PUT, delete needs a confirm click. Sandbox
+// pane: loads the saved policy + image catalog, PATCHes the whole policy,
+// shows inline validation errors and the "limited does not filter egress"
+// honesty note. Worktrees pane: rows with status badges + usage bars, totals
+// card, copy path, and prune flows (selected entry / all orphans) behind
+// confirm clicks.
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { act, createElement, type ReactNode } from "react";
@@ -155,17 +158,17 @@ const calls = (method: string, path: string): FetchCall[] =>
       ([url, init]) => String(url).replace(BASE, "") === path && (init?.method ?? "GET") === method,
     );
 
-/** Default mount routes: empty project policy, empty catalog, secrets list, docker up (#106). */
+/** Default mount routes: empty project policy, empty catalog, secrets list, docker up (#106), worktrees (#111). */
 function mountRoutes(extra: RouteSpec = {}): RouteSpec {
   return {
     [`GET /api/projects/${PROJECT}`]: { project: {} },
     "GET /api/sandbox/images": { images: [] },
     [`GET /api/projects/${PROJECT}/secrets`]: { secrets: [] },
+    [`GET /api/projects/${PROJECT}/worktrees`]: { worktrees: [], totalBytes: 0 },
     [`GET /api/sandbox/status?projectId=${PROJECT}`]: {
       available: true,
       version: "27.3.1",
       mode: "docker",
-      checkedAt: 1,
       projectMode: "local",
       effective: "local",
     },
@@ -541,5 +544,259 @@ describe("ProjectSettingsDrawer sandbox policy pane (#101)", () => {
     await settle();
 
     expect(document.querySelector("[data-effective-mode-hint]")).toBeNull();
+  });
+});
+
+describe("ProjectSettingsDrawer worktrees pane (#111)", () => {
+  const KB = 1024;
+  const hoursAgo = (hours: number): string =>
+    new Date(Date.now() - hours * 3_600_000).toISOString();
+
+  const rows = {
+    worktrees: [
+      {
+        runId: "run-live",
+        branch: "agentloop/run-live",
+        path: "/store/run-live",
+        diskUsageBytes: 900 * KB,
+        lastActivity: hoursAgo(1),
+        status: "active",
+        runStatus: "running",
+      },
+      {
+        runId: "run-done",
+        branch: "agentloop/run-done",
+        path: "/store/run-done",
+        diskUsageBytes: 300 * KB,
+        lastActivity: hoursAgo(3),
+        status: "inspectable",
+        runStatus: "success",
+      },
+      {
+        runId: "run-orphan",
+        branch: "agentloop/run-orphan",
+        path: "/store/run-orphan",
+        diskUsageBytes: 100 * KB,
+        lastActivity: hoursAgo(26),
+        status: "orphan",
+      },
+    ],
+    totalBytes: 1300 * KB,
+  };
+
+  const row = (runId: string): HTMLElement =>
+    document.querySelector(`[data-worktree-row="${runId}"]`) as HTMLElement;
+
+  const usageValue = (runId: string): string | null =>
+    row(runId)?.querySelector("[data-worktree-usage]")?.getAttribute("aria-valuenow") ?? null;
+
+  it("renders rows with mono branches, status badges, usage bars, relative activity and totals", async () => {
+    installRoutes(
+      mountRoutes({
+        [`GET /api/projects/${PROJECT}/worktrees`]: rows,
+      }),
+    );
+    render();
+    await settle();
+
+    expect(row("run-live")).not.toBeNull();
+    expect(row("run-done").getAttribute("data-worktree-status")).toBe("inspectable");
+    expect(row("run-orphan").getAttribute("data-worktree-status")).toBe("orphan");
+    for (const branch of rows.worktrees.map((entry) => entry.branch)) {
+      expect(text()).toContain(branch);
+    }
+    expect(text()).toContain("Active");
+    expect(text()).toContain("Inspectable");
+    expect(text()).toContain("Orphan");
+
+    // Bars share one scale: the largest worktree is full width.
+    expect(usageValue("run-live")).toBe("100");
+    expect(usageValue("run-done")).toBe("33");
+    expect(usageValue("run-orphan")).toBe("11");
+
+    expect(text()).toContain("1.3 MB");
+    expect(text()).toContain("3 worktrees");
+    expect(text()).toContain("1 orphaned");
+    expect(text()).toContain("3h ago");
+    expect(text()).toContain("1d ago");
+
+    // Inspect links exist only for rows with a run behind them.
+    expect(document.querySelector('a[href="/runs/run-live"]')).not.toBeNull();
+    expect(document.querySelector('a[href="/runs/run-done"]')).not.toBeNull();
+    expect(document.querySelector('a[href="/runs/run-orphan"]')).toBeNull();
+  });
+
+  it("never offers prune on an active worktree", async () => {
+    installRoutes(
+      mountRoutes({
+        [`GET /api/projects/${PROJECT}/worktrees`]: {
+          worktrees: [rows.worktrees[0]],
+          totalBytes: 900 * KB,
+        },
+      }),
+    );
+    render();
+    await settle();
+
+    expect(button("Prune run-live")).toBeUndefined();
+    // Bulk action renders but is disabled with zero orphans.
+    expect(button("Prune all orphans")?.disabled).toBe(true);
+  });
+
+  it("shows the empty state when the project has no worktrees", async () => {
+    installRoutes(mountRoutes());
+    render();
+    await settle();
+    expect(text()).toContain("No worktrees yet");
+  });
+
+  it("copy path writes the worktree path to the clipboard", async () => {
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    vi.stubGlobal("navigator", { clipboard: { writeText } });
+    installRoutes(
+      mountRoutes({
+        [`GET /api/projects/${PROJECT}/worktrees`]: rows,
+      }),
+    );
+    render();
+    await settle();
+
+    act(() => button("Copy path")?.click());
+    await settle();
+
+    expect(writeText).toHaveBeenCalledWith("/store/run-live");
+    expect(text()).toContain("Worktree path copied");
+  });
+
+  it("prunes a selected orphan only after the confirm click, then refreshes", async () => {
+    installRoutes(
+      mountRoutes({
+        [`GET /api/projects/${PROJECT}/worktrees`]: [
+          rows,
+          { worktrees: [rows.worktrees[0], rows.worktrees[1]], totalBytes: 1200 * KB },
+        ],
+        [`POST /api/projects/${PROJECT}/worktrees/prune`]: {
+          removed: [{ runId: "run-orphan", path: "/store/run-orphan" }],
+          kept: 2,
+        },
+      }),
+    );
+    render();
+    await settle();
+
+    act(() => button("Prune run-orphan")?.click());
+    await settle();
+    expect(calls("POST", `/api/projects/${PROJECT}/worktrees/prune`)).toHaveLength(0);
+
+    act(() => button("Confirm prune run-orphan")?.click());
+    await settle();
+
+    const post = calls("POST", `/api/projects/${PROJECT}/worktrees/prune`);
+    expect(post[0]?.[1]?.body).toBe(JSON.stringify({ runId: "run-orphan" }));
+    expect(text()).toContain("Pruned run-orphan");
+    // Refreshed listing: the orphan row is gone.
+    expect(row("run-orphan")).toBeNull();
+    expect(row("run-live")).not.toBeNull();
+  });
+
+  it("prunes all orphans via the bulk action confirm", async () => {
+    installRoutes(
+      mountRoutes({
+        [`GET /api/projects/${PROJECT}/worktrees`]: [
+          rows,
+          { worktrees: rows.worktrees.slice(0, 2), totalBytes: 1200 * KB },
+        ],
+        [`POST /api/projects/${PROJECT}/worktrees/prune`]: {
+          removed: [{ runId: "run-orphan", path: "/store/run-orphan" }],
+          kept: 2,
+        },
+      }),
+    );
+    render();
+    await settle();
+
+    act(() => button("Prune all orphans")?.click());
+    await settle();
+    expect(calls("POST", `/api/projects/${PROJECT}/worktrees/prune`)).toHaveLength(0);
+
+    act(() => button("Confirm prune all orphaned worktrees")?.click());
+    await settle();
+
+    const post = calls("POST", `/api/projects/${PROJECT}/worktrees/prune`);
+    expect(post[0]?.[1]?.body).toBe(JSON.stringify({ orphans: true }));
+    expect(text()).toContain("Pruned run-orphan");
+    expect(row("run-orphan")).toBeNull();
+  });
+
+  it("surfaces a daemon 409 WORKTREE_ACTIVE as a danger toast", async () => {
+    installRoutes(
+      mountRoutes({
+        [`GET /api/projects/${PROJECT}/worktrees`]: rows,
+        [`POST /api/projects/${PROJECT}/worktrees/prune`]: {
+          status: 409,
+          body: {
+            error: {
+              code: "WORKTREE_ACTIVE",
+              message: "run run-done is still running; its worktree cannot be pruned yet",
+            },
+          },
+        },
+      }),
+    );
+    render();
+    await settle();
+
+    // The daemon is the guard of record: a row the UI believed prunable can
+    // still answer 409 (e.g. the run restarted underneath the listing).
+    act(() => button("Prune run-done")?.click());
+    await settle();
+    act(() => button("Confirm prune run-done")?.click());
+    await settle();
+
+    expect(text()).toContain("Could not prune worktree");
+    expect(text()).toContain("cannot be pruned yet");
+  });
+
+  it("surfaces prune cleanup warnings in the toast", async () => {
+    installRoutes(
+      mountRoutes({
+        [`GET /api/projects/${PROJECT}/worktrees`]: rows,
+        [`POST /api/projects/${PROJECT}/worktrees/prune`]: {
+          removed: [
+            {
+              runId: "run-orphan",
+              path: "/store/run-orphan",
+              warnings: ["failed to delete branch agentloop/run-orphan"],
+            },
+          ],
+          kept: 2,
+        },
+      }),
+    );
+    render();
+    await settle();
+
+    act(() => button("Prune run-orphan")?.click());
+    await settle();
+    act(() => button("Confirm prune run-orphan")?.click());
+    await settle();
+
+    expect(text()).toContain("cleanup warning");
+  });
+
+  it("shows a retry affordance when the listing fails to load", async () => {
+    installRoutes(
+      mountRoutes({
+        [`GET /api/projects/${PROJECT}/worktrees`]: {
+          status: 500,
+          body: { error: { code: "INTERNAL_ERROR", message: "boom" } },
+        },
+      }),
+    );
+    render();
+    await settle();
+
+    expect(text()).toContain("Could not load worktrees");
+    expect(button("Retry")).toBeDefined();
   });
 });
