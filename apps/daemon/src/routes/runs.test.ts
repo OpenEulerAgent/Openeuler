@@ -32,7 +32,12 @@ interface RunBody {
 
 interface RunDetailBody {
   run: Run & { queuePosition?: number };
-  steps: StepRun[];
+  steps: Array<StepRun & { name?: string; durationMs?: number }>;
+  /** Step runs grouped by 1-based loop pass (same enrichment as `steps`). */
+  iterations: Array<{
+    iteration: number;
+    steps: Array<StepRun & { name?: string; durationMs?: number }>;
+  }>;
   summary: { eventCount: number };
 }
 
@@ -920,5 +925,99 @@ describe("GET /api/runs/:id sandbox info (#102)", () => {
 
     db.close();
     rmSync(sandboxDir, { recursive: true, force: true });
+  });
+});
+
+describe("GET /api/runs/:id step enrichment (#113)", () => {
+  it("decorates steps with node name + durationMs (graph) and step name (linear)", async () => {
+    const h = setup();
+    const runId = crypto.randomUUID();
+    const now = new Date().toISOString();
+    h.db.runs.create({
+      id: runId,
+      projectId: h.projectId,
+      status: "success",
+      branch: `agentloop/${runId}`,
+      iteration: 0,
+      createdAt: now,
+      updatedAt: now,
+    });
+    h.db.stepRuns.create({
+      id: crypto.randomUUID(),
+      runId,
+      stepId: "node-a",
+      iteration: 1,
+      status: "success",
+      output: "a done",
+    });
+    h.db.stepRuns.create({
+      id: crypto.randomUUID(),
+      runId,
+      stepId: "node-b",
+      iteration: 2,
+      status: "failed",
+      output: "",
+    });
+    // Graph events carry name + durationMs; the linear step.completed below
+    // contributes a name only (no duration on that event type).
+    h.db.events.append(runId, {
+      type: "node.completed",
+      nodeId: "node-a",
+      nodeName: "Worker A",
+      iteration: 1,
+      status: "success",
+      output: "a done",
+      durationMs: 1_500,
+    });
+    h.db.events.append(runId, {
+      type: "step.completed",
+      stepId: "node-b",
+      stepName: "Legacy step",
+      iteration: 2,
+      status: "failed",
+    });
+
+    const body = await getRun(h, runId);
+    expect(body.steps).toHaveLength(2);
+    expect(body.steps[0]).toMatchObject({
+      stepId: "node-a",
+      name: "Worker A",
+      durationMs: 1_500,
+    });
+    expect(body.steps[1]).toMatchObject({
+      stepId: "node-b",
+      name: "Legacy step",
+    });
+    expect(body.steps[1]?.durationMs).toBeUndefined();
+    // The grouped view carries the same enrichment.
+    expect(body.iterations[0]?.steps[0]).toMatchObject({ name: "Worker A" });
+  });
+
+  it("leaves steps untouched when the event log has no matching completions", async () => {
+    const h = setup();
+    const runId = crypto.randomUUID();
+    const now = new Date().toISOString();
+    h.db.runs.create({
+      id: runId,
+      projectId: h.projectId,
+      status: "success",
+      branch: `agentloop/${runId}`,
+      iteration: 0,
+      createdAt: now,
+      updatedAt: now,
+    });
+    h.db.stepRuns.create({
+      id: crypto.randomUUID(),
+      runId,
+      stepId: "adhoc",
+      iteration: 1,
+      status: "success",
+      output: "done",
+    });
+
+    const body = await getRun(h, runId);
+    expect(body.steps).toHaveLength(1);
+    expect(body.steps[0]?.name).toBeUndefined();
+    expect(body.steps[0]?.durationMs).toBeUndefined();
   });
 });

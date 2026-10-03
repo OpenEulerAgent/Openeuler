@@ -128,6 +128,17 @@ export function CommandPalette({ open, onClose }: { open: boolean; onClose: () =
         },
       },
       {
+        id: "page-lanes",
+        group: "Pages",
+        label: "Lanes",
+        hint: "/lanes",
+        keywords: "parallel matrix workmux swimlanes filmstrip",
+        run: (context) => {
+          context.router.push("/lanes");
+          context.close();
+        },
+      },
+      {
         id: "page-settings",
         group: "Pages",
         label: "Settings",
