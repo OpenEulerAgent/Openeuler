@@ -7,7 +7,12 @@ import { Button } from "@/components/ui/button";
 import { Dialog } from "@/components/ui/dialog";
 import { Drawer } from "@/components/ui/drawer";
 import { Field, Input, Select, Textarea } from "@/components/ui/input";
-import type { AgentNodeData, CanvasDocument, CanvasNode } from "@/lib/graph/canvas-document";
+import type {
+  AgentNodeData,
+  CanvasDocument,
+  CanvasNode,
+  JoinNodeData,
+} from "@/lib/graph/canvas-document";
 import {
   insertPromptVariable,
   inspectorFieldErrors,
@@ -40,6 +45,7 @@ export function NodePropertiesDrawer({
   issues,
   onPatchAgent,
   onPatchName,
+  onPatchJoinMode,
   onCommitEdit,
   onDelete,
   onClose,
@@ -53,6 +59,8 @@ export function NodePropertiesDrawer({
   issues: readonly CanvasIssue[];
   onPatchAgent: (patch: Partial<StepConfig>) => void;
   onPatchName: (name: string) => void;
+  /** Join mode toggle (#116): `all` waits for every branch, `any` = first winner. */
+  onPatchJoinMode?: (mode: "all" | "any") => void;
   /** Settles a pending debounced edit into one history entry (field blur). */
   onCommitEdit: () => void;
   onDelete: () => void;
@@ -78,7 +86,11 @@ export function NodePropertiesDrawer({
         <div className="flex items-start justify-between gap-2">
           <div>
             <h2 className="text-title font-semibold text-fg">
-              {node.data.kind === "agent" ? "Agent step" : "Exit node"}
+              {node.data.kind === "agent"
+                ? "Agent step"
+                : node.data.kind === "join"
+                  ? "Join node"
+                  : "Exit node"}
             </h2>
             {node.data.kind === "agent" && node.data.isEntry ? (
               <Badge variant="accent" className="mt-1">
@@ -114,7 +126,13 @@ export function NodePropertiesDrawer({
             value={node.data.name}
             invalid={fieldErrors["name"] !== undefined}
             onChange={(event) => onPatchName(event.target.value)}
-            placeholder={node.data.kind === "agent" ? "e.g. implement" : "Exit"}
+            placeholder={
+              node.data.kind === "agent"
+                ? "e.g. implement"
+                : node.data.kind === "join"
+                  ? "Join"
+                  : "Exit"
+            }
           />
         </Field>
 
@@ -124,6 +142,13 @@ export function NodePropertiesDrawer({
             doc={doc}
             fieldErrors={fieldErrors}
             onPatchAgent={onPatchAgent}
+          />
+        ) : null}
+
+        {node.data.kind === "join" ? (
+          <JoinInspector
+            node={node as CanvasNode & { data: JoinNodeData }}
+            onPatchJoinMode={onPatchJoinMode}
           />
         ) : null}
 
@@ -518,6 +543,51 @@ function AgentInspector({
         onPatchAgent={onPatchAgent}
       />
     </>
+  );
+}
+
+/**
+ * Join-only fields (#116): the mode toggle is the whole config — a join has
+ * no prompt, driver or model of its own. `all` synchronizes every branch,
+ * `any` races them; the copy under each option says exactly what run time
+ * does so the toggle never needs a manual.
+ */
+function JoinInspector({
+  node,
+  onPatchJoinMode,
+}: {
+  node: CanvasNode & { data: JoinNodeData };
+  onPatchJoinMode?: (mode: "all" | "any") => void;
+}) {
+  const { mode } = node.data.config;
+  return (
+    <Field label="Mode" htmlFor="node-join-mode">
+      <div
+        id="node-join-mode"
+        role="group"
+        aria-label="Join mode"
+        className="grid grid-cols-2 gap-1 rounded-md border border-border bg-surface p-1"
+        data-join-mode={mode}
+      >
+        <ModeOption
+          active={mode === "all"}
+          title="all"
+          hint="wait for every branch"
+          onClick={() => onPatchJoinMode?.("all")}
+        />
+        <ModeOption
+          active={mode === "any"}
+          title="any"
+          hint="first winner — losers cancelled"
+          onClick={() => onPatchJoinMode?.("any")}
+        />
+      </div>
+      <p className="text-xs text-muted-fg" data-join-mode-copy>
+        {mode === "all"
+          ? "all: every incoming branch must complete before the flow continues — the merged outputs of all branches become this join's output."
+          : "any: the first branch to complete wins and the flow continues immediately; the remaining branches are cancelled."}
+      </p>
+    </Field>
   );
 }
 

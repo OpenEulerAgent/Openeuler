@@ -30,6 +30,13 @@ export const EDGE_MAX_ITERATIONS_DEFAULT = DEFAULT_EDGE_MAX_ITERATIONS;
 export const MISSING_FALLBACK_MESSAGE =
   "router has no fallback: if no condition matches the run ends here — add an always edge";
 
+/**
+ * Advisory notice for a fan-out node (#116): multiple unconditional outgoing
+ * edges are legal parallelism (#115), not an error — the copy says what the
+ * shape does and where the branches should converge.
+ */
+export const FAN_OUT_NOTICE = "fan-out: branches run in parallel — converge them at a join node";
+
 /** Advisory finding for a node (never blocks saving, unlike CanvasIssue). */
 export interface CanvasWarning {
   nodeId: string;
@@ -371,6 +378,30 @@ export function routerFallbackWarnings(doc: CanvasDocument): CanvasWarning[] {
     }
   }
   return warnings;
+}
+
+// ---------------------------------------------------------------------------
+// Fan-out notices (#116)
+//
+
+/**
+ * Advisory notices for fan-out nodes (#116): a node with 2+ unconditional
+ * outgoing edges fans out — legal parallelism since #115, surfaced as
+ * "fan-out: branches run in parallel" instead of the old rejection. The
+ * always+conditional MIX is still a hard blocker (core names fan-out vs
+ * router in its message); pure fan-out only earns this notice.
+ */
+export function fanOutNotices(doc: CanvasDocument): CanvasWarning[] {
+  const notices: CanvasWarning[] = [];
+  for (const node of doc.nodes) {
+    const unconditional = doc.edges.filter(
+      (edge) => edge.source === node.id && isUnconditionalEdge(edge.data),
+    );
+    if (unconditional.length >= 2) {
+      notices.push({ nodeId: node.id, message: FAN_OUT_NOTICE });
+    }
+  }
+  return notices;
 }
 
 // ---------------------------------------------------------------------------

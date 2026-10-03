@@ -5,7 +5,7 @@ import { NODE_SIZES, applyLayout, layoutCanvasDocument } from "./layout";
 
 function docFrom(raw: {
   entryNodeId: string;
-  nodes: Array<{ id: string; type?: "agent" | "exit"; name?: string }>;
+  nodes: Array<{ id: string; type?: "agent" | "exit" | "join"; name?: string }>;
   edges: Array<{ source: string; target: string; condition?: "always" | "conditional" }>;
 }): CanvasDocument {
   const graph = WorkflowGraphSchema.parse({
@@ -17,14 +17,16 @@ function docFrom(raw: {
       position: { x: 0, y: 0 },
       ...(node.type === "exit"
         ? {}
-        : {
-            config: {
-              driver: "opencode",
-              mode: "auto",
-              promptTemplate: `p${index}: {{task}}`,
-              continueSession: false,
-            },
-          }),
+        : node.type === "join"
+          ? { config: { mode: "all" as const } }
+          : {
+              config: {
+                driver: "opencode",
+                mode: "auto",
+                promptTemplate: `p${index}: {{task}}`,
+                continueSession: false,
+              },
+            }),
     })),
     edges: raw.edges.map((edge) => ({
       id: `e-${edge.source}-${edge.target}`,
@@ -44,7 +46,12 @@ function boxes(doc: CanvasDocument, positions: Map<string, { x: number; y: numbe
   return doc.nodes.map((node) => {
     const position = positions.get(node.id);
     if (position === undefined) throw new Error(`missing position for ${node.id}`);
-    const size = node.data.kind === "agent" ? NODE_SIZES.agent : NODE_SIZES.exit;
+    const size =
+      node.data.kind === "agent"
+        ? NODE_SIZES.agent
+        : node.data.kind === "join"
+          ? NODE_SIZES.join
+          : NODE_SIZES.exit;
     return { id: node.id, ...position, ...size };
   });
 }
@@ -120,6 +127,45 @@ describe("layoutCanvasDocument", () => {
     });
     assertNoOverlaps(router, layoutCanvasDocument(router));
     assertNoOverlaps(fixLoop, layoutCanvasDocument(fixLoop));
+  });
+
+  it("diamonds (fan-out → join) lay out without overlaps and rank strictly (#116)", () => {
+    // entry → (left, right) → join → exit: the canonical parallel shape.
+    // All four fan-out edges are unconditional (legal parallelism, #115).
+    const diamond = docFrom({
+      entryNodeId: "entry",
+      nodes: [
+        { id: "entry" },
+        { id: "left" },
+        { id: "right" },
+        { id: "j", type: "join" },
+        { id: "x", type: "exit" },
+      ],
+      edges: [
+        { source: "entry", target: "left" },
+        { source: "entry", target: "right" },
+        { source: "left", target: "j" },
+        { source: "right", target: "j" },
+        { source: "j", target: "x" },
+      ],
+    });
+    const positions = layoutCanvasDocument(diamond);
+    assertNoOverlaps(diamond, positions);
+
+    // Rank order: entry < branches < join < exit — the join sits AFTER both
+    // of its branches (dagre sees the join's own 140×64 token box, #116).
+    const rank = (id: string): number => positions.get(id)?.x ?? -1;
+    expect(rank("entry")).toBeLessThan(rank("left"));
+    expect(rank("entry")).toBeLessThan(rank("right"));
+    expect(rank("left")).toBeLessThan(rank("j"));
+    expect(rank("right")).toBeLessThan(rank("j"));
+    expect(rank("j")).toBeLessThan(rank("x"));
+
+    // The two branches never share a lane: separated by at least the node
+    // heights plus the vertical gap (nodesep 40 in the default options).
+    const leftY = positions.get("left")?.y ?? 0;
+    const rightY = positions.get("right")?.y ?? 0;
+    expect(Math.abs(leftY - rightY)).toBeGreaterThanOrEqual(NODE_SIZES.agent.height + 40);
   });
 
   it("stacks isolated (unwired) nodes below the graph instead of on top", () => {

@@ -29,7 +29,9 @@ export const DEFAULT_LAYOUT_OPTIONS: Required<LayoutOptions> = {
 };
 
 function nodeSize(node: CanvasNode): { width: number; height: number } {
-  return node.data.kind === "agent" ? NODE_SIZES.agent : NODE_SIZES.exit;
+  if (node.data.kind === "agent") return NODE_SIZES.agent;
+  if (node.data.kind === "join") return NODE_SIZES.join;
+  return NODE_SIZES.exit;
 }
 
 /**

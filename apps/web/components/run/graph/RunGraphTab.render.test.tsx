@@ -238,6 +238,138 @@ describe("RunGraphTab (jsdom)", () => {
     );
     expect(document.body.textContent).toContain("Graph unavailable");
   });
+
+  it("renders the diamond: join card + two branches running concurrently (#116)", () => {
+    // a fans out to b and c; both converge at join j before the exit.
+    const diamond: WorkflowGraph = {
+      entryNodeId: "a",
+      nodes: [
+        {
+          id: "a",
+          type: "agent",
+          name: "Split",
+          position: { x: 0, y: 0 },
+          config: {
+            driver: "fake",
+            mode: "auto",
+            promptTemplate: "{{task}}",
+            continueSession: false,
+          },
+        },
+        {
+          id: "b",
+          type: "agent",
+          name: "Left",
+          position: { x: 300, y: -140 },
+          config: {
+            driver: "fake",
+            mode: "auto",
+            promptTemplate: "{{task}}",
+            continueSession: false,
+          },
+        },
+        {
+          id: "c",
+          type: "agent",
+          name: "Right",
+          position: { x: 300, y: 140 },
+          config: {
+            driver: "fake",
+            mode: "auto",
+            promptTemplate: "{{task}}",
+            continueSession: false,
+          },
+        },
+        {
+          id: "j",
+          type: "join",
+          name: "Merge",
+          position: { x: 600, y: 0 },
+          config: { mode: "all" },
+        },
+        { id: "exit", type: "exit", name: "Exit", position: { x: 900, y: 0 } },
+      ],
+      edges: [
+        { id: "e-a-b", source: "a", target: "b", condition: { type: "always" } },
+        { id: "e-a-c", source: "a", target: "c", condition: { type: "always" } },
+        { id: "e-b-j", source: "b", target: "j", condition: { type: "always" } },
+        { id: "e-c-j", source: "c", target: "j", condition: { type: "always" } },
+        { id: "e-j-exit", source: "j", target: "exit", condition: { type: "always" } },
+      ],
+    };
+    // Mid-run: a finished; b and c are BOTH running (fan-out), the join and
+    // exit have not been reached yet.
+    const mid = buildRunGraphState([
+      { type: "run.status", seq: 0, status: "running" },
+      { type: "node.queued", seq: 1, nodeId: "a", nodeName: "Split", iteration: 1 },
+      { type: "node.started", seq: 2, nodeId: "a", nodeName: "Split", iteration: 1 },
+      {
+        type: "node.completed",
+        seq: 3,
+        nodeId: "a",
+        nodeName: "Split",
+        iteration: 1,
+        status: "success",
+        output: "split-out",
+        durationMs: 900,
+      },
+      { type: "node.queued", seq: 4, nodeId: "b", nodeName: "Left", iteration: 1, edgeId: "e-a-b" },
+      {
+        type: "node.queued",
+        seq: 5,
+        nodeId: "c",
+        nodeName: "Right",
+        iteration: 1,
+        edgeId: "e-a-c",
+      },
+      {
+        type: "node.started",
+        seq: 6,
+        nodeId: "b",
+        nodeName: "Left",
+        iteration: 1,
+        edgeId: "e-a-b",
+      },
+      {
+        type: "node.started",
+        seq: 7,
+        nodeId: "c",
+        nodeName: "Right",
+        iteration: 1,
+        edgeId: "e-a-c",
+      },
+    ]);
+    render(
+      createElement(RunGraphTab, {
+        graph: { kind: "revision", doc: toCanvasDocument(diamond), revisionNumber: 1 },
+        state: mid,
+        live: true,
+        steps: [],
+        onOpenDiff: () => {},
+      }),
+    );
+
+    const cards = [...document.querySelectorAll("[data-run-node]")];
+    expect(cards.map((card) => card.getAttribute("data-run-node"))).toEqual([
+      "agent",
+      "agent",
+      "agent",
+      "join",
+      "exit",
+    ]);
+    // Both branches live at once; the join waits (not-reached), and its
+    // card shows the synchronizer identity.
+    expect(cards.map((card) => card.getAttribute("data-run-node-status"))).toEqual([
+      "success",
+      "running",
+      "running",
+      "not-reached",
+      "not-reached",
+    ]);
+    const joinCard = cards[3] as HTMLElement;
+    expect(joinCard.textContent).toContain("Merge");
+    expect(joinCard.textContent).toContain("join · all");
+  });
 });
 
 describe("NodeRunDrawer", () => {

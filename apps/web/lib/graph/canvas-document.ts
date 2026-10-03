@@ -157,6 +157,24 @@ export function createExitNode(
   };
 }
 
+/**
+ * A fresh join node as the palette creates it (#116): mode `all` by default —
+ * the synchronizer waits for every branch. The inspector's mode toggle
+ * switches it to `any` (first winner, losers cancelled).
+ */
+export function createJoinNode(
+  position: GraphNodePosition = { x: 0, y: 0 },
+  name = "Join",
+  mode: "all" | "any" = "all",
+): CanvasNode {
+  return {
+    id: newCanvasNodeId(),
+    type: "join",
+    position,
+    data: { kind: "join", name, config: { mode } },
+  };
+}
+
 /** Structural slice of an {@link AgentPreset} the canvas needs to build a node. */
 export type PresetSource = {
   id: string;

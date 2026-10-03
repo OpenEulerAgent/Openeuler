@@ -120,6 +120,101 @@ const setSelect = (id: string, value: string): void => {
   fireValue(el as HTMLSelectElement, value, "change");
 };
 
+describe("NodePropertiesDrawer join inspector (#116)", () => {
+  const joinNode = (mode: "all" | "any" = "all"): CanvasNode => ({
+    id: "j",
+    type: "join",
+    position: { x: 0, y: 0 },
+    data: { kind: "join", name: "Merge", config: { mode } },
+  });
+
+  /** Renders the drawer for a join doc; mode toggles run the REAL reducer. */
+  const renderJoinDrawer = (node: CanvasNode): void => {
+    doc = { nodes: [node], edges: [] };
+    container = document.createElement("div");
+    document.body.appendChild(container);
+    root = createRoot(container);
+    const renderAt = (): void => {
+      const inspected = doc.nodes[0] as CanvasNode;
+      act(() =>
+        root?.render(
+          createElement(NodePropertiesDrawer, {
+            node: inspected,
+            doc,
+            issues: [],
+            onPatchAgent: () => {},
+            onPatchName: (name) => {
+              doc = applyInspectorAction(doc, { type: "patchName", nodeId: "j", name });
+              renderAt();
+            },
+            onPatchJoinMode: (mode) => {
+              doc = applyInspectorAction(doc, { type: "patchJoinMode", nodeId: "j", mode });
+              renderAt();
+            },
+            onCommitEdit: () => {},
+            onDelete: () => {},
+            onClose: () => {},
+          }),
+        ),
+      );
+    };
+    renderAt();
+  };
+
+  const joinMode = (): string => (doc.nodes[0]?.data as { config: { mode: string } }).config.mode;
+
+  it("renders the mode toggle with all active and the wait-for-every-branch copy", () => {
+    renderJoinDrawer(joinNode("all"));
+    expect(document.querySelector("h2")?.textContent).toBe("Join node");
+    const group = document.querySelector("[data-join-mode]");
+    expect(group).not.toBeNull();
+    expect(group?.getAttribute("data-join-mode")).toBe("all");
+    const copy = document.querySelector("[data-join-mode-copy]")?.textContent ?? "";
+    expect(copy).toContain("every incoming branch must complete");
+    // Agent-only affordances never render for a join.
+    expect(document.getElementById("node-prompt")).toBeNull();
+    expect(document.getElementById("node-driver")).toBeNull();
+    expect(document.querySelector("[data-sandbox-overrides-toggle]")).toBeNull();
+    expect(document.querySelector("[data-save-as-preset]")).toBeNull();
+  });
+
+  it("toggling any patches through the reducer, flips the copy, and back", () => {
+    renderJoinDrawer(joinNode("all"));
+    const anyOption = [...document.querySelectorAll("[data-join-mode] button")].find((button) =>
+      button.textContent?.includes("any"),
+    ) as HTMLButtonElement | undefined;
+    expect(anyOption).toBeDefined();
+    act(() => anyOption?.click());
+    expect(joinMode()).toBe("any");
+    expect(document.querySelector("[data-join-mode]")?.getAttribute("data-join-mode")).toBe("any");
+    const copy = document.querySelector("[data-join-mode-copy]")?.textContent ?? "";
+    expect(copy).toContain("first branch to complete wins");
+    expect(copy).toContain("cancelled");
+
+    const allOption = [...document.querySelectorAll("[data-join-mode] button")].find((button) =>
+      button.textContent?.includes("all"),
+    ) as HTMLButtonElement | undefined;
+    act(() => allOption?.click());
+    expect(joinMode()).toBe("all");
+  });
+
+  it("renaming a join patches its name like any other node", () => {
+    renderJoinDrawer(joinNode("all"));
+    setInput("node-name", "Converge");
+    expect((doc.nodes[0]?.data as { name: string }).name).toBe("Converge");
+  });
+
+  it("patchJoinMode is a no-op on non-join nodes (unknown/guarded)", () => {
+    const agentDoc: CanvasDocument = { nodes: [agentNode()], edges: [] };
+    const next = applyInspectorAction(agentDoc, {
+      type: "patchJoinMode",
+      nodeId: "a",
+      mode: "any",
+    });
+    expect(next).toBe(agentDoc);
+  });
+});
+
 describe("NodePropertiesDrawer sandbox overrides (#101)", () => {
   it("is collapsed by default and shows the override count when set", () => {
     renderDrawer(agentNode({ cpus: 4, network: "none" }));

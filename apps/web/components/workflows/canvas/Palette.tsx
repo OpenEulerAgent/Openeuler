@@ -19,7 +19,7 @@ import { Skeleton } from "@/components/ui/skeleton";
 export const CANVAS_NODE_MIME = "application/openeuler-canvas-node";
 export const CANVAS_PRESET_MIME = "application/openeuler-canvas-preset";
 
-export type PaletteNodeKind = "agent" | "exit";
+export type PaletteNodeKind = "agent" | "exit" | "join";
 
 export interface PaletteSection {
   id: string;
@@ -62,6 +62,24 @@ export function ExitIcon({ className }: { className?: string }) {
     >
       <circle cx="8" cy="8" r="6" />
       <rect x="5.5" y="5.5" width="5" height="5" rx="0.5" fill="currentColor" stroke="none" />
+    </svg>
+  );
+}
+
+/** Two branches converging into one — the fan-in counterpart of fan-out. */
+export function JoinIcon({ className }: { className?: string }) {
+  return (
+    <svg
+      aria-hidden
+      viewBox="0 0 16 16"
+      className={cn("size-4", className)}
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="1.5"
+    >
+      <path d="M2 4.5h4l4 3.5h4" strokeLinecap="round" />
+      <path d="M2 11.5h4l4-3.5" strokeLinecap="round" />
+      <path d="M12.5 6.5 14 8l-1.5 1.5" strokeLinecap="round" strokeLinejoin="round" />
     </svg>
   );
 }

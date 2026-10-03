@@ -14,7 +14,7 @@ import { createRoot, type Root } from "react-dom/client";
 import { ToastProvider } from "@/components/ui/toast";
 import type { AgentPreset, WorkflowGraph } from "@openeuler/core";
 import { GraphCanvasEditor } from "./GraphCanvasEditor";
-import { CANVAS_PRESET_MIME } from "./Palette";
+import { CANVAS_NODE_MIME, CANVAS_PRESET_MIME } from "./Palette";
 import type { WorkflowWithGraph } from "@/lib/workflows-api";
 
 (globalThis as Record<string, unknown>)["IS_REACT_ACT_ENVIRONMENT"] = true;
@@ -225,6 +225,23 @@ const dropPreset = (presetId: string): void => {
   });
 };
 
+/** Drop-event carrying a palette node kind (agent / exit / join). */
+const dropNode = (kind: string): void => {
+  const pane = document.querySelector<HTMLElement>("[data-canvas-canvas]");
+  if (pane === null) throw new Error("canvas pane not found");
+  const event = new Event("drop", { bubbles: true, cancelable: true });
+  Object.defineProperty(event, "dataTransfer", {
+    value: {
+      getData: (mime: string) => (mime === CANVAS_NODE_MIME ? kind : ""),
+    },
+  });
+  Object.defineProperty(event, "clientX", { value: 620 });
+  Object.defineProperty(event, "clientY", { value: 420 });
+  act(() => {
+    pane.dispatchEvent(event);
+  });
+};
+
 afterEach(() => {
   act(() => {
     root?.unmount();
@@ -365,5 +382,57 @@ describe("GraphCanvasEditor canvas interaction (#72)", () => {
     // And the preset node actually landed.
     expect(nodeIds()).toHaveLength(2);
     expect(text()).toContain("Senior Reviewer");
+  });
+
+  it("palette Join: click and drop create join nodes (mode all); the drawer toggles mode (#116)", async () => {
+    renderEditor(() => ({ presets: [] }));
+    stubCanvasRect();
+    await act(async () => {});
+
+    // The palette carries the Join item in the Steps section.
+    const joinItem = document.querySelector('[aria-label="Add Join"]');
+    expect(joinItem).not.toBeNull();
+    expect(joinItem?.textContent).toContain("Merge parallel branches");
+
+    // Click-to-add: a join node lands with its default mode-all config.
+    click(joinItem);
+    expect(nodeIds()).toHaveLength(2);
+    expect(text()).toContain("join · all");
+
+    // The drawer opened on the fresh join (it portals to document.body,
+    // outside the render container): join title + mode toggle, and none
+    // of the agent-only fields.
+    const drawerText = document.body.textContent ?? "";
+    expect(drawerText).toContain("Join node");
+    expect(document.querySelector("[data-join-mode]")?.getAttribute("data-join-mode")).toBe("all");
+    expect(document.getElementById("node-prompt")).toBeNull();
+    expect(document.getElementById("node-driver")).toBeNull();
+
+    // Toggling any patches the doc through the debounced inspector path.
+    const anyOption = [...document.querySelectorAll("[data-join-mode] button")].find(
+      (button): button is HTMLButtonElement =>
+        button instanceof HTMLButtonElement && button.textContent?.includes("any") === true,
+    );
+    expect(anyOption).toBeDefined();
+    act(() => anyOption?.click());
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 600));
+    });
+    expect(text()).toContain("join · any");
+    expect(document.body.textContent ?? "").toContain("first branch to complete wins");
+  });
+
+  it("drag-and-drop of the Join palette item lands a join at the drop point (#116)", async () => {
+    renderEditor(() => ({ presets: [] }));
+    stubCanvasRect();
+    await act(async () => {});
+
+    const before = nodeIds();
+    dropNode("join");
+    expect(nodeIds()).toHaveLength(before.length + 1);
+    expect(text()).toContain("join · all");
+    // The drop point (620, 420) was converted through screenToFlowPosition.
+    const calls = flowMock.screenToFlowPosition.mock.calls as Array<[{ x: number; y: number }]>;
+    expect(calls.at(-1)?.[0]).toEqual({ x: 620, y: 420 });
   });
 });

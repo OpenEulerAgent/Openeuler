@@ -174,6 +174,12 @@ export function inspectorFieldErrors(doc: CanvasDocument, nodeId: string): Inspe
 export type InspectorAction =
   | { type: "patchName"; nodeId: string; name: string }
   | { type: "patchConfig"; nodeId: string; patch: Partial<StepConfig> }
+  /**
+   * Join mode toggle (#116): `all` waits for every branch, `any` fires on
+   * the first winner and cancels the losers. Join nodes carry no other
+   * editable config.
+   */
+  | { type: "patchJoinMode"; nodeId: string; mode: "all" | "any" }
   | { type: "insertVariable"; nodeId: string; token: string; at: number }
   /**
    * Detach from the preset (#49): drops `presetId`, keeps the node's config
@@ -244,6 +250,18 @@ export function applyInspectorAction(doc: CanvasDocument, action: InspectorActio
                 presetId: action.preset.id,
               },
             }
+          : candidate,
+      ),
+    };
+  }
+
+  if (action.type === "patchJoinMode") {
+    if (node.data.kind !== "join") return doc;
+    return {
+      ...doc,
+      nodes: doc.nodes.map((candidate) =>
+        candidate.id === action.nodeId && candidate.data.kind === "join"
+          ? { ...candidate, data: { ...candidate.data, config: { mode: action.mode } } }
           : candidate,
       ),
     };

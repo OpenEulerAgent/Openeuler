@@ -15,6 +15,7 @@ import { canvasDocsEquivalent } from "./canvas-document";
 import {
   EDGE_MAX_ITERATIONS_DEFAULT,
   EDGE_MAX_ITERATIONS_HARD_CAP,
+  FAN_OUT_NOTICE,
   MISSING_FALLBACK_MESSAGE,
   SET_CONDITION_LABEL,
   applyEdgeInspectorAction,
@@ -25,6 +26,7 @@ import {
   edgeChipLabel,
   edgeFieldErrors,
   edgeInspectorReducer,
+  fanOutNotices,
   moveRouterEdge,
   needsConditionConfig,
   routerFallbackWarnings,
@@ -567,6 +569,71 @@ describe("routerFallbackWarnings (missing fallback)", () => {
     expect(routerFallbackWarnings(doc)).toEqual([
       { nodeId: "a", message: MISSING_FALLBACK_MESSAGE },
     ]);
+  });
+});
+
+describe("fanOutNotices (#116): always-multi is parallelism, not an error", () => {
+  it("notices a pure fan-out node (2+ unconditional outgoing edges) with the parallel copy", () => {
+    const doc: CanvasDocument = {
+      nodes: [
+        node("a", { isEntry: true }),
+        node("b", { position: { x: 300, y: -140 } }),
+        node("c", { position: { x: 300, y: 140 } }),
+      ],
+      edges: [edge("a", "b"), edge("a", "c")],
+    };
+    expect(fanOutNotices(doc)).toEqual([{ nodeId: "a", message: FAN_OUT_NOTICE }]);
+    expect(FAN_OUT_NOTICE).toContain("fan-out: branches run in parallel");
+  });
+
+  it("stays quiet for chains, routers and dead ends", () => {
+    const chain: CanvasDocument = {
+      nodes: [node("a", { isEntry: true }), node("b", { position: { x: 300, y: 0 } }), exit("x")],
+      edges: [edge("a", "b"), edge("b", "x")],
+    };
+    expect(fanOutNotices(chain)).toEqual([]);
+
+    const router: CanvasDocument = {
+      nodes: [node("a", { isEntry: true }), node("b"), exit("x")],
+      edges: [
+        edge("a", "b", { condition: condition({ type: "outputContains", pattern: "LGTM" }) }),
+        edge("a", "x"),
+      ],
+    };
+    expect(fanOutNotices(router)).toEqual([]);
+
+    const deadEnd: CanvasDocument = { nodes: [node("a", { isEntry: true })], edges: [] };
+    expect(fanOutNotices(deadEnd)).toEqual([]);
+  });
+
+  it("complements the hard rule: mixing always+conditional is still a blocker that names fan-out vs router", () => {
+    const mixed: CanvasDocument = {
+      nodes: [node("a", { isEntry: true }), node("b"), node("c"), exit("x")],
+      edges: [
+        edge("a", "b"),
+        edge("a", "c"),
+        edge("a", "x", { condition: condition({ type: "outputContains", pattern: "LGTM" }) }),
+      ],
+    };
+    // The notice fires (2+ unconditional outgoing edges), but validation is
+    // what rejects the MIX — its message explains both legal shapes.
+    expect(fanOutNotices(mixed)).toEqual([{ nodeId: "a", message: FAN_OUT_NOTICE }]);
+    const messages = validateCanvasDocument(mixed)
+      .map((issue) => issue.message)
+      .join("\n");
+    expect(messages).toContain("all-always (fan-out)");
+    expect(messages).toContain("always fallback (router)");
+    // The pure diamond, by contrast, validates clean — the notice is the
+    // only fan-out feedback it ever produces.
+    const diamond: CanvasDocument = {
+      nodes: [
+        node("a", { isEntry: true }),
+        node("b", { position: { x: 300, y: -140 } }),
+        node("c", { position: { x: 300, y: 140 } }),
+      ],
+      edges: [edge("a", "b"), edge("a", "c")],
+    };
+    expect(validateCanvasDocument(diamond)).toEqual([]);
   });
 
   it("treats an inverted always edge as conditional (no fallback)", () => {

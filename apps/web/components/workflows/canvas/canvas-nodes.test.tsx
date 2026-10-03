@@ -62,6 +62,7 @@ const wrapperBox = (element: HTMLElement): { width: number; height: number } => 
   }
   if (element.querySelector('[data-canvas-node="agent"]') !== null) return CANVAS_NODE_SIZES.agent;
   if (element.querySelector('[data-canvas-node="exit"]') !== null) return CANVAS_NODE_SIZES.exit;
+  if (element.querySelector('[data-canvas-node="join"]') !== null) return CANVAS_NODE_SIZES.join;
   return { width: 0, height: 0 };
 };
 
@@ -177,8 +178,15 @@ const exitNode: CanvasNode = {
   data: { kind: "exit", name: "Done" },
 };
 
+const joinNode: CanvasNode = {
+  id: "merge",
+  type: "join",
+  position: { x: 640, y: 0 },
+  data: { kind: "join", name: "Merge", config: { mode: "all" } },
+};
+
 const doc: CanvasDocument = {
-  nodes: [entry, worker, exitNode],
+  nodes: [entry, worker, joinNode, exitNode],
   edges: [
     {
       id: "e-planner-worker",
@@ -187,8 +195,14 @@ const doc: CanvasDocument = {
       data: { condition: { type: "always" } },
     },
     {
-      id: "e-worker-exit",
+      id: "e-worker-merge",
       source: "worker",
+      target: "merge",
+      data: { condition: { type: "always" } },
+    },
+    {
+      id: "e-merge-exit",
+      source: "merge",
       target: "exit",
       data: { condition: { type: "always" } },
     },
@@ -279,6 +293,12 @@ describe("canvas node cards under the real React Flow (#88)", () => {
     expect(card("worker").className).toContain(CANVAS_NODE_SIZE_CLASSES.agent.height);
     expect(card("exit").className).toContain(CANVAS_NODE_SIZE_CLASSES.exit.width);
     expect(card("exit").className).toContain(CANVAS_NODE_SIZE_CLASSES.exit.height);
+    // Join card (#116): its OWN geometry token (not borrowed from exit) —
+    // same 140×64 box today, but the pair can diverge without touching
+    // either card.
+    expect(card("merge").className).toContain(CANVAS_NODE_SIZE_CLASSES.join.width);
+    expect(card("merge").className).toContain(CANVAS_NODE_SIZE_CLASSES.join.height);
+    expect(CANVAS_NODE_SIZE_CLASSES.join).not.toBe(CANVAS_NODE_SIZE_CLASSES.exit);
 
     // Content: name, driver, model, mode, session pill, terminal marker.
     const planner = card("planner").textContent ?? "";
@@ -295,10 +315,13 @@ describe("canvas node cards under the real React Flow (#88)", () => {
     const exitText = card("exit").textContent ?? "";
     expect(exitText).toContain("Done");
     expect(exitText).toContain("terminal");
+    const joinText = card("merge").textContent ?? "";
+    expect(joinText).toContain("Merge");
+    expect(joinText).toContain("join · all");
   });
 
   it("geometry tokens, Tailwind classes and dagre NODE_SIZES agree (1 unit = 4px)", () => {
-    for (const kind of ["agent", "exit"] as const) {
+    for (const kind of ["agent", "exit", "join"] as const) {
       const widthUnit = Number(CANVAS_NODE_SIZE_CLASSES[kind].width.slice(2));
       const heightUnit = Number(CANVAS_NODE_SIZE_CLASSES[kind].height.slice(2));
       expect(widthUnit * 4).toBe(CANVAS_NODE_SIZES[kind].width);
@@ -308,7 +331,7 @@ describe("canvas node cards under the real React Flow (#88)", () => {
     expect(NODE_SIZES).toBe(CANVAS_NODE_SIZES);
   });
 
-  it("handles: entry has source only, other agents both, exit target only", async () => {
+  it("handles: entry has source only, other agents both, exit target only, join both", async () => {
     await renderFlow(doc.nodes, doc.edges);
     expect(handleCount("planner", "source")).toBe(1);
     expect(handleCount("planner", "target")).toBe(0);
@@ -316,6 +339,8 @@ describe("canvas node cards under the real React Flow (#88)", () => {
     expect(handleCount("worker", "target")).toBe(1);
     expect(handleCount("exit", "source")).toBe(0);
     expect(handleCount("exit", "target")).toBe(1);
+    expect(handleCount("merge", "source")).toBe(1);
+    expect(handleCount("merge", "target")).toBe(1);
   });
 
   it("badge contexts drive issue/hint/warning chips on the cards", async () => {
@@ -373,9 +398,10 @@ describe("toFlowNodes (#88)", () => {
       ...worker,
       data: { ...worker.data, name: "Renamed" },
     };
-    const next = toFlowNodes([entry, renamedWorker, exitNode]);
+    const next = toFlowNodes([entry, renamedWorker, joinNode, exitNode]);
     expect(next[1]).not.toBe(flow[1]);
     expect(next[2]).toBe(flow[2]);
+    expect(next[3]).toBe(flow[3]);
     expect(next[0]).toBe(flow[0]);
     expect(next[1]?.data.name).toBe("Renamed");
 
@@ -384,7 +410,7 @@ describe("toFlowNodes (#88)", () => {
       ...entry,
       data: { ...entry.data, name: "Renamed entry" },
     };
-    const restamped = toFlowNodes([renamedEntry, worker, exitNode]);
+    const restamped = toFlowNodes([renamedEntry, worker, joinNode, exitNode]);
     expect(restamped[0]).not.toBe(flow[0]);
     expect(restamped[0]?.deletable).toBe(false);
   });
@@ -423,7 +449,7 @@ describe("canvasNodeTypes identity (#88)", () => {
     // The same DOM node survives: a rebuilt nodeTypes registry would have
     // unmounted and remounted every card.
     expect(card("worker")).toBe(workerCard);
-    expect(document.querySelectorAll(".react-flow__node")).toHaveLength(4);
+    expect(document.querySelectorAll(".react-flow__node")).toHaveLength(5);
     expect(card("reviewer").textContent).toContain("Reviewer");
   });
 });
