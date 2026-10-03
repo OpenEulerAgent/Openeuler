@@ -17,7 +17,8 @@ export type ActivityType =
   | "ops.recovery-sweep"
   | "ops.gc"
   | "ops.image-pull"
-  | "ops.image-build";
+  | "ops.image-build"
+  | "ops.sandbox-kept";
 
 /**
  * ops.* rows (#94) are daemon-level system lines (boot, recovery sweep,

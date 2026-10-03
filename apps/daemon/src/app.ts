@@ -12,7 +12,7 @@ import { HttpError } from "./errors.js";
 import { healthPayload, minimalHealthPayload } from "./health.js";
 import { createLogger } from "./logger.js";
 import type { Logger } from "./logger.js";
-import { METRICS_CONTENT_TYPE, scrapeMetrics } from "./metrics.js";
+import { METRICS_CONTENT_TYPE, countActiveSandboxes, scrapeMetrics } from "./metrics.js";
 import { createShutdownRegistry } from "./shutdown.js";
 import type { ShutdownHook, ShutdownRegistryOptions } from "./shutdown.js";
 import { createProjectsRouter } from "./routes/projects.js";
@@ -267,12 +267,25 @@ export function createApp(options: CreateAppOptions = {}): DaemonApp {
   );
 
   // Prometheus scrape endpoint (#94): gauges refreshed on scrape from cheap
-  // sqlite counts + in-memory executor/worktree state (see metrics.ts).
-  app.get("/metrics", (c) =>
-    c.newResponse(scrapeMetrics({ db, executor, worktrees }), 200, {
-      "Content-Type": METRICS_CONTENT_TYPE,
-    }),
-  );
+  // sqlite counts + in-memory executor/worktree state (see metrics.ts). The
+  // sandbox gauge (#102) needs one async provider.list() round-trip.
+  app.get("/metrics", async (c) => {
+    const sandboxesActive = await countActiveSandboxes({
+      ...(options.sandbox?.provider === undefined
+        ? {}
+        : { sandbox: { provider: options.sandbox.provider } }),
+    });
+    return c.newResponse(
+      scrapeMetrics({
+        db,
+        executor,
+        worktrees,
+        ...(sandboxesActive === undefined ? {} : { sandboxesActive }),
+      }),
+      200,
+      { "Content-Type": METRICS_CONTENT_TYPE },
+    );
+  });
 
   app.route("/api/projects", createProjectsRouter());
   app.route("/api/projects", createFilesRouter());

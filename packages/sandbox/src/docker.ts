@@ -202,6 +202,35 @@ function validateSpec(spec: SandboxSpec): void {
         `mount containerPath "${mount.containerPath}" must not contain ":" (docker -v separator)`,
       );
     }
+    if (
+      mount?.consistency !== undefined &&
+      !["consistent", "cached", "delegated"].includes(mount.consistency)
+    ) {
+      throw new SandboxError(
+        "SANDBOX_INVALID_SPEC",
+        `mount consistency "${mount.consistency}" must be one of consistent|cached|delegated`,
+      );
+    }
+  }
+  for (const volume of spec.volumes ?? []) {
+    if (!/^[a-zA-Z0-9][a-zA-Z0-9_.-]*$/.test(volume?.name ?? "")) {
+      throw new SandboxError(
+        "SANDBOX_INVALID_SPEC",
+        `volume name "${volume?.name}" is not a valid docker volume name ([a-zA-Z0-9][a-zA-Z0-9_.-]*)`,
+      );
+    }
+    if (!isAbsolute(volume?.containerPath ?? "")) {
+      throw new SandboxError(
+        "SANDBOX_INVALID_SPEC",
+        `volume containerPath "${volume?.containerPath}" must be absolute`,
+      );
+    }
+    if (volume?.containerPath.includes(":")) {
+      throw new SandboxError(
+        "SANDBOX_INVALID_SPEC",
+        `volume containerPath "${volume.containerPath}" must not contain ":" (docker -v separator)`,
+      );
+    }
   }
   validateEnvRecord(spec.env ?? {}, "spec");
   for (const port of spec.ports ?? []) {
@@ -267,7 +296,16 @@ function buildRunArgs(
   const workingDir = spec.workingDir ?? (spec.mounts.length > 0 ? "/workspace" : undefined);
   if (workingDir !== undefined) args.push("-w", workingDir);
   for (const mount of spec.mounts) {
-    args.push("-v", `${mount.hostPath}:${mount.containerPath}${mount.readonly ? ":ro" : ""}`);
+    const consistency = mount.consistency === undefined ? "" : `:${mount.consistency}`;
+    args.push(
+      "-v",
+      `${mount.hostPath}:${mount.containerPath}${mount.readonly ? ":ro" : ""}${consistency}`,
+    );
+  }
+  for (const volume of spec.volumes ?? []) {
+    // Named volume: docker creates it on first use; contents persist across
+    // sandboxes (the run-to-run cache mounts, #102).
+    args.push("-v", `${volume.name}:${volume.containerPath}`);
   }
   for (const [key, value] of Object.entries(spec.env)) {
     args.push("-e", `${key}=${value}`);

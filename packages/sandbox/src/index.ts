@@ -16,6 +16,7 @@ export type {
   SandboxStatus,
   SandboxSummary,
   SandboxUsage,
+  SandboxVolume,
 } from "./types.js";
 
 export { SandboxError } from "./error.js";

@@ -4,7 +4,13 @@ import type { ChildProcess } from "node:child_process";
 import { existsSync } from "node:fs";
 import { resolve } from "node:path";
 import { DriverError } from "./error.js";
-import type { AgentDriver, AgentExit, AgentHandle, AgentStartOpts } from "./types.js";
+import type {
+  AgentDriver,
+  AgentExit,
+  AgentHandle,
+  AgentExecSeam,
+  AgentStartOpts,
+} from "./types.js";
 
 /** Error codes for {@link OpenCodeDriverError}. */
 export type OpenCodeDriverErrorCode = "OPENCODE_NOT_FOUND" | "OPENCODE_SPAWN_FAILED";
@@ -214,6 +220,12 @@ export interface OpenCodeDriverOptions {
   killGraceMs?: number;
   /** Bytes of stderr retained for diagnostics; defaults to `4096`. */
   stderrTailBytes?: number;
+  /**
+   * Timeout for one in-sandbox agent command (`exec` seam, #102) when the
+   * seam passes no `timeoutMs`. Defaults to 30 minutes — the local path has
+   * no spawn timeout, so the sandbox bound is deliberately generous.
+   */
+  sandboxExecTimeoutMs?: number;
   /** Diagnostic sink for malformed NDJSON lines; defaults to a no-op. */
   log?: (message: string) => void;
 }
@@ -224,12 +236,16 @@ interface RecordLike {
   eventBufferCap: number;
   killGraceMs: number;
   stderrTailBytes: number;
+  sandboxExecTimeoutMs: number;
   log: (message: string) => void;
 }
 
 const DEFAULT_EVENT_BUFFER_CAP = 1000;
 const DEFAULT_KILL_GRACE_MS = 5000;
 const DEFAULT_STDERR_TAIL_BYTES = 4096;
+const DEFAULT_SANDBOX_EXEC_TIMEOUT_MS = 30 * 60 * 1000;
+
+const delay = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 
 class BoundedEventQueue {
   private readonly items: AgentEvent[] = [];
@@ -565,6 +581,210 @@ export class OpenCodeAgentHandle implements AgentHandle {
 }
 
 /**
+ * Handle for one in-sandbox `opencode run` invocation (#102): the argv is
+ * the same as the local path (`buildOpencodeArgs`, with `cwd` a container
+ * path like `/workspace`), but the command runs through the run's exec
+ * seam instead of a local spawn. Stdout NDJSON is parsed with the exact
+ * same line parser; abort goes through `seam.stop()` (which must cancel
+ * the in-flight `run()` — the rejection settles this handle as aborted).
+ */
+export class OpenCodeSandboxAgentHandle implements AgentHandle {
+  readonly events: AsyncIterable<AgentEvent>;
+  readonly exited: Promise<AgentExit>;
+
+  private readonly config: RecordLike;
+  private readonly seam: AgentExecSeam;
+  private readonly argv: string[];
+  private readonly env: Record<string, string> | undefined;
+  private readonly queue: BoundedEventQueue;
+  private readonly state: OpencodeParserState = createOpencodeParserState();
+  private readonly stderrRing: StderrRing;
+  private readonly stream: AsyncGenerator<AgentEvent, void>;
+  private resolveExited!: (exit: AgentExit) => void;
+  private finished = false;
+  private iterated = false;
+  private abortRequested = false;
+  private abortPromise: Promise<void> | null = null;
+
+  constructor(config: RecordLike, opts: AgentStartOpts, seam: AgentExecSeam, args: string[]) {
+    this.config = config;
+    this.seam = seam;
+    this.argv = [config.binary, ...args];
+    this.env = opts.env;
+    this.stderrRing = new StderrRing(config.stderrTailBytes);
+    this.queue = new BoundedEventQueue(config.eventBufferCap);
+    this.exited = new Promise<AgentExit>((resolve) => {
+      this.resolveExited = resolve;
+    });
+    this.queue.push({ type: "started", seq: 0 });
+    this.stream = this.streamEvents();
+    this.events = { [Symbol.asyncIterator]: () => this[Symbol.asyncIterator]() };
+    void this.invoke();
+  }
+
+  /** argv the seam is asked to run (`opencode run …`), for diagnostics/tests. */
+  get command(): string[] {
+    return [...this.argv];
+  }
+
+  /**
+   * Abort the in-sandbox run: ask the seam to cancel in-flight work, then
+   * wait (bounded by the kill grace) for the run to settle. No-op when the
+   * run already finished; safe to call repeatedly.
+   */
+  abort(): Promise<void> {
+    if (this.finished) return Promise.resolve();
+    if (this.abortPromise) return this.abortPromise;
+    this.abortRequested = true;
+    this.abortPromise = this.terminate();
+    return this.abortPromise;
+  }
+
+  [Symbol.asyncIterator](): AsyncIterator<AgentEvent> {
+    if (this.iterated) {
+      throw new DriverError(
+        "DRIVER_EVENTS_ALREADY_CONSUMED",
+        `opencode driver "${this.config.id}" handle events were already iterated; an AgentHandle supports a single consumer`,
+      );
+    }
+    this.iterated = true;
+    return this.stream[Symbol.asyncIterator]();
+  }
+
+  private async terminate(): Promise<void> {
+    try {
+      await this.seam.stop?.();
+    } catch {
+      // Best-effort: a failed stop must not mask the abort itself. A seam
+      // without stop leaves the run to settle via its own timeout.
+    }
+    // Bounded wait: seam.stop() cancels the in-flight exec (its promise
+    // rejects → finish), but a misbehaving seam must not hang abort().
+    await Promise.race([this.exited, delay(this.config.killGraceMs)]);
+  }
+
+  private async invoke(): Promise<void> {
+    let result: Awaited<ReturnType<AgentExecSeam["run"]>> | null;
+    let failure: unknown = null;
+    try {
+      result = await this.seam.run(this.argv, {
+        timeoutMs: this.config.sandboxExecTimeoutMs,
+        ...(this.env === undefined || Object.keys(this.env).length === 0
+          ? {}
+          : { env: { ...this.env } }),
+      });
+    } catch (err) {
+      result = null;
+      failure = err;
+    }
+    if (this.finished) return;
+    if (result !== null) this.stderrRing.append(Buffer.from(result.stderr, "utf8"));
+    this.finish(result, failure);
+  }
+
+  private feedStdout(stdout: string): void {
+    const lines = stdout.split("\n");
+    if (lines.length > 0 && lines[lines.length - 1] === "") lines.pop();
+    for (const line of lines) {
+      const { events, skipped } = parseOpencodeLine(line, this.state);
+      if (skipped === "malformed") {
+        this.config.log(
+          `opencode driver "${this.config.id}": skipping malformed NDJSON line: ${line.slice(0, 200)}`,
+        );
+      }
+      for (const event of events) this.queue.push(event);
+    }
+  }
+
+  private async *streamEvents(): AsyncGenerator<AgentEvent, void> {
+    for (;;) {
+      const event = await this.queue.next();
+      if (event === null) return;
+      yield event;
+    }
+  }
+
+  private finish(
+    result: { code: number; stdout: string; stderr: string } | null,
+    failure: unknown,
+  ): void {
+    if (this.finished) return;
+    this.finished = true;
+
+    // Abort wins even if the command meanwhile produced a result: the run's
+    // verdict is "aborted", with whatever output streamed so far.
+    if (this.abortRequested) {
+      this.queue.close();
+      this.resolveExited({ code: null, reason: "aborted", output: this.state.outputSoFar });
+      return;
+    }
+
+    if (failure !== null) {
+      // Seam failures (sandbox stopped under us, exec timeout, …) are typed
+      // errors — except the abort race handled above.
+      const message = failure instanceof Error ? failure.message : String(failure);
+      this.queue.push({ type: "error", seq: this.state.seq++, message });
+      this.queue.close();
+      this.resolveExited({ code: null, reason: "error", output: message });
+      return;
+    }
+
+    this.feedStdout(result?.stdout ?? "");
+
+    const exitCode = result?.code ?? null;
+    // Only a NON-ZERO exit may be classified as a missing binary — a
+    // successful run whose stderr incidentally contains "not found" (grep
+    // output, warnings) must not fail the step.
+    if (
+      exitCode !== null &&
+      exitCode !== 0 &&
+      (exitCode === 127 || /(?:not found|ENOENT|no such file)/i.test(result?.stderr ?? ""))
+    ) {
+      const error = new OpenCodeDriverError(
+        "OPENCODE_NOT_FOUND",
+        `opencode CLI not found inside the sandbox image (tried "${this.config.binary}", exit ${exitCode ?? "?"}). Install opencode in the sandbox image (e.g. add it to the image built via POST /api/sandbox/images/build) and retry.`,
+      );
+      this.queue.push({
+        type: "error",
+        seq: this.state.seq++,
+        message: error.message,
+        code: error.code,
+      });
+      this.queue.close();
+      this.resolveExited({ code: exitCode, reason: "error", output: error.message });
+      return;
+    }
+
+    if (exitCode === 0 && !this.state.sawError) {
+      this.queue.push({ type: "done", seq: this.state.seq++, output: this.state.outputSoFar });
+      this.queue.close();
+      this.resolveExited({ code: 0, reason: "exit", output: this.state.outputSoFar });
+      return;
+    }
+
+    const stderrTail = this.stderrRing.toString().trim();
+    const exitDescription =
+      exitCode !== null
+        ? `opencode exited with code ${exitCode} inside the sandbox`
+        : "opencode sandbox run failed";
+    if (!this.state.sawError) {
+      const message = stderrTail ? `${exitDescription}: ${stderrTail}` : exitDescription;
+      this.queue.push({
+        type: "error",
+        seq: this.state.seq++,
+        message,
+        code: "OPENCODE_NONZERO_EXIT",
+      });
+    }
+    const output = stderrTail
+      ? `${this.state.outputSoFar}${this.state.outputSoFar ? "\n" : ""}[stderr]\n${stderrTail}`
+      : this.state.outputSoFar;
+    this.queue.close();
+    this.resolveExited({ code: exitCode, reason: "error", output });
+  }
+}
+
+/**
  * Process-backed driver that spawns `opencode run` per start, streams its
  * `--format json` NDJSON as `AgentEvent`s, and supports session continuation
  * and group-abort.
@@ -582,12 +802,22 @@ export class OpenCodeDriver implements AgentDriver {
       eventBufferCap: Math.max(1, options.eventBufferCap ?? DEFAULT_EVENT_BUFFER_CAP),
       killGraceMs: options.killGraceMs ?? DEFAULT_KILL_GRACE_MS,
       stderrTailBytes: options.stderrTailBytes ?? DEFAULT_STDERR_TAIL_BYTES,
+      sandboxExecTimeoutMs: options.sandboxExecTimeoutMs ?? DEFAULT_SANDBOX_EXEC_TIMEOUT_MS,
       log: options.log ?? (() => {}),
     };
   }
 
-  start(opts: AgentStartOpts): OpenCodeAgentHandle {
+  /** Local execution (no `exec` seam): a live child-process handle. */
+  start(opts: AgentStartOpts & { exec?: undefined }): OpenCodeAgentHandle;
+  /** Sandboxed execution (#102, `exec` seam present): an in-sandbox handle. */
+  start(opts: AgentStartOpts): AgentHandle;
+  start(opts: AgentStartOpts): AgentHandle {
     const args = buildOpencodeArgs(opts);
+    if (opts.exec !== undefined) {
+      // Sandbox execution (#102): the command runs inside the run's sandbox
+      // through the seam; `cwd` is already a container path.
+      return new OpenCodeSandboxAgentHandle(this.options, opts, opts.exec, args);
+    }
     return new OpenCodeAgentHandle(this.options, opts, args);
   }
 }

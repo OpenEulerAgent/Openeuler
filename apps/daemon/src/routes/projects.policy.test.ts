@@ -90,13 +90,13 @@ describe("PATCH /api/projects/:id/policy", () => {
     expect(project.sandboxPolicy).toEqual(policy);
   });
 
-  it("defaults executionMode to auto when omitted", async () => {
+  it("defaults executionMode to local when omitted (#102 zero-regression default)", async () => {
     const app = build();
     const id = await register(app);
     const res = await patchPolicy(app, id, { cpus: 2 });
     expect(res.status).toBe(200);
     const body = (await res.json()) as { project: { sandboxPolicy: { executionMode: string } } };
-    expect(body.project.sandboxPolicy.executionMode).toBe("auto");
+    expect(body.project.sandboxPolicy.executionMode).toBe("local");
   });
 
   it("replaces the whole policy (dropped fields disappear)", async () => {

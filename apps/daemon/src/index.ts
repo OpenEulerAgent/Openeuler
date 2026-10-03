@@ -46,14 +46,23 @@ export async function main(): Promise<void> {
   drivers.registerDriver(createOpenCodeDriver());
 
   const worktrees = new WorktreeManager();
-  const executor = createExecutor({ db, worktrees, drivers, logger, secretsKey: secretKey.key });
 
-  // Sandbox composition at boot (#100): the docker provider backs the image
-  // management API (in-use checks) and future sandbox routes. Registered on
-  // the module-level default registry as a convenience for callers that
-  // resolve providers by id (`getSandboxProvider("docker")`).
+  // Sandbox composition at boot (#100 + #102): ONE docker provider instance
+  // backs the image management API, the run executor's sandboxed execution
+  // and the /metrics sandbox gauge. Registered on the module-level default
+  // registry as a convenience for callers that resolve providers by id
+  // (`getSandboxProvider("docker")`).
   const sandboxProvider = createDockerSandboxProvider();
   registerSandboxProvider(sandboxProvider);
+
+  const executor = createExecutor({
+    db,
+    worktrees,
+    drivers,
+    logger,
+    secretsKey: secretKey.key,
+    sandbox: { provider: sandboxProvider },
+  });
 
   // Startup task #1: snapshot legacy `steps` workflows as graph revision 1
   // (idempotent — workflows that already have revisions are untouched), so

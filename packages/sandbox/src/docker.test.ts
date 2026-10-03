@@ -147,6 +147,53 @@ describe("docker provider unit (fake CLI runner)", () => {
     expect(sandbox.meta.createdAt).toBeGreaterThan(0);
   });
 
+  it("appends mount consistency and mounts named volumes after bind mounts (#102)", async () => {
+    const runner = new RecordingRunner();
+    scriptCreate(runner);
+    const provider = createDockerSandboxProvider({ runner: (a) => runner.run(a) });
+    await provider.create(
+      baseSpec({
+        mounts: [{ hostPath: "/host/wt", containerPath: "/workspace", consistency: "cached" }],
+        volumes: [
+          {
+            name: "openeuler-cache-p1-workspace-node_modules",
+            containerPath: "/workspace/node_modules",
+          },
+        ],
+      }),
+    );
+    const runArgs = findCall(runner, "run");
+    const volumeIndex = runArgs.indexOf("-v");
+    expect(volumeIndex).toBeGreaterThan(0);
+    expect(runArgs).toContain("/host/wt:/workspace:cached");
+    expect(runArgs).toContain("openeuler-cache-p1-workspace-node_modules:/workspace/node_modules");
+    // Bind mount comes before the cache volume in the arg vector.
+    expect(runArgs.indexOf("/host/wt:/workspace:cached")).toBeLessThan(
+      runArgs.indexOf("openeuler-cache-p1-workspace-node_modules:/workspace/node_modules"),
+    );
+  });
+
+  it("rejects invalid volume names/paths and unknown consistency values (#102)", async () => {
+    const runner = new RecordingRunner();
+    const provider = createDockerSandboxProvider({ runner: (a) => runner.run(a) });
+    await expect(
+      provider.create(baseSpec({ volumes: [{ name: "-bad", containerPath: "/c" }] })),
+    ).rejects.toMatchObject({ code: "SANDBOX_INVALID_SPEC" });
+    await expect(
+      provider.create(baseSpec({ volumes: [{ name: "ok", containerPath: "rel" }] })),
+    ).rejects.toMatchObject({ code: "SANDBOX_INVALID_SPEC" });
+    await expect(
+      provider.create(baseSpec({ volumes: [{ name: "ok", containerPath: "/a:b" }] })),
+    ).rejects.toMatchObject({ code: "SANDBOX_INVALID_SPEC" });
+    await expect(
+      provider.create(
+        baseSpec({
+          mounts: [{ hostPath: "/h", containerPath: "/c", consistency: "zfs" as never }],
+        }),
+      ),
+    ).rejects.toMatchObject({ code: "SANDBOX_INVALID_SPEC" });
+  });
+
   it("omits -w without mounts and uses spec workingDir when given", async () => {
     const runner = new RecordingRunner();
     scriptCreate(runner);

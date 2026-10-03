@@ -322,6 +322,22 @@ export class WorktreeManager {
   }
 
   /**
+   * Host path a run's sandbox bind-mounts at `/workspace` (#102): the run's
+   * worktree when one exists, else `null` (nothing to mount). Pure lookup —
+   * the executor builds the run's `SandboxSpec` around it.
+   */
+  mountSource(runId: string): string | null {
+    try {
+      validateRunId(runId);
+    } catch {
+      return null;
+    }
+    const meta = this.#readMeta(runId);
+    if (meta === null || !existsSync(meta.worktreePath)) return null;
+    return meta.worktreePath;
+  }
+
+  /**
    * Number of runs with a live worktree on disk: metadata records whose
    * working copy still exists. A cheap filesystem scan (no git
    * invocations), scraped by the daemon's `openeuler_worktrees_active`

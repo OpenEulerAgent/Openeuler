@@ -10,6 +10,7 @@ import { createDatabase } from "@openeuler/db";
 import type { FakeDriverOptions } from "@openeuler/drivers";
 import { createDriverRegistry, createFakeDriver } from "@openeuler/drivers";
 import { WorktreeManager } from "@openeuler/engine";
+import { createFakeSandboxProvider } from "@openeuler/sandbox";
 import { createApp } from "../app.js";
 import { createExecutor } from "../executor.js";
 import type { Executor } from "../executor.js";
@@ -839,5 +840,85 @@ describe("concurrent scheduling over the API", () => {
   it("GET /api/runs/stats returns zeroed counts on an idle daemon", async () => {
     const h = setup({ events: script });
     expect(await getStats(h)).toEqual({ queued: 0, running: 0 });
+  });
+});
+
+describe("GET /api/runs/:id sandbox info (#102)", () => {
+  const sandboxDir = join(tmpdir(), `openeuler-runs-sb-${process.pid}-${Date.now()}`);
+
+  it("carries {id, image, status} while the run executes sandboxed, absent otherwise", async () => {
+    const db = createDatabase({ path: join(sandboxDir, "test.db") });
+    const repoPath = join(sandboxDir, "repo");
+    execFileSync("git", ["init", "-b", "main", repoPath], { stdio: "pipe" });
+    writeFileSync(join(repoPath, "README.md"), "# demo\n");
+    git(repoPath, "add", "-A");
+    git(repoPath, "-c", "user.email=t@openeuler.dev", "-c", "user.name=T", "commit", "-m", "init");
+    const project = db.projects.create({
+      id: crypto.randomUUID(),
+      path: repoPath,
+      name: "repo",
+      defaultBranch: "main",
+      createdAt: new Date().toISOString(),
+    });
+    db.projects.setSandboxPolicy(project.id, {
+      executionMode: "sandbox",
+      image: "busybox:1.36",
+    });
+
+    const drivers = createDriverRegistry();
+    const driver = createFakeDriver({
+      events: [{ type: "message-delta", seq: 1, delta: "working" }],
+      output: "done",
+      delayMs: 120,
+    });
+    drivers.registerDriver(driver);
+    const provider = createFakeSandboxProvider();
+    const executor = createExecutor({
+      db,
+      worktrees: new WorktreeManager({ storeRoot: join(sandboxDir, "store") }),
+      drivers,
+      logger: createLogger("silent"),
+      sandbox: { provider, isDockerAvailable: async () => true },
+    });
+    const { app } = createApp({ db, logger: createLogger("silent"), executor });
+
+    const createRes = await app.request("/api/runs", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ projectId: project.id, prompt: "do it" }),
+    });
+    expect([201, 202]).toContain(createRes.status);
+    const { run } = (await createRes.json()) as { run: Run };
+
+    // Poll the detail until the sandbox appears mid-run.
+    type DetailWithSandbox = RunDetailBody & {
+      sandbox?: { id: string; image: string; status: string };
+    };
+    let detail: DetailWithSandbox | null = null;
+    const deadline = Date.now() + 5_000;
+    while (Date.now() < deadline) {
+      const res = await app.request(`/api/runs/${run.id}`);
+      detail = (await res.json()) as DetailWithSandbox;
+      if (detail?.sandbox !== undefined) break;
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    expect(detail?.sandbox).toMatchObject({ image: "busybox:1.36", status: "running" });
+    expect(detail?.sandbox?.id).toBeTruthy();
+
+    // Terminal: the sandbox is gone and so is the field.
+    const terminalDeadline = Date.now() + 5_000;
+    for (;;) {
+      const row = db.runs.get(run.id);
+      if (row && (row.status === "success" || row.status === "failed")) break;
+      if (Date.now() > terminalDeadline) throw new Error("run never finished");
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    const finalRes = await app.request(`/api/runs/${run.id}`);
+    const finalBody = (await finalRes.json()) as typeof detail;
+    expect(finalBody?.sandbox).toBeUndefined();
+    expect(provider.destroyCalls).toHaveLength(1);
+
+    db.close();
+    rmSync(sandboxDir, { recursive: true, force: true });
   });
 });

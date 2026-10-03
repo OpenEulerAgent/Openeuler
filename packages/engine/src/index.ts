@@ -30,6 +30,8 @@ export {
   type FlowEngineOptions,
   type FlowLogger,
   type RunControl,
+  type RunSandboxAcquirer,
+  type RunSandboxContext,
   type RunSecrets,
   type RunSecretsLoader,
   type StepDefinition,
@@ -40,9 +42,13 @@ export { MAX_EDGE_ITERATIONS, executeGraphRun, type GraphEngineDeps } from "./gr
 export {
   DEFAULT_SANDBOX_CPUS,
   DEFAULT_SANDBOX_MEMORY_MB,
+  SANDBOX_WORKSPACE_PATH,
+  buildRunSandboxSpec,
   buildSandboxSpec,
+  cacheVolumeName,
   mergeSandboxConfig,
   type MergedSandboxConfig,
+  type SandboxSpecExtras,
 } from "./sandbox-spec.js";
 
 export {

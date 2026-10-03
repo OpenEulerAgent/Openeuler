@@ -12,12 +12,14 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterAll, describe, expect, it } from "vitest";
 import type { AgentEvent } from "@openeuler/core";
+import type { AgentExecOptions, AgentExecSeam } from "./types.js";
 import { DriverError } from "./error.js";
 import {
   buildOpencodeArgs,
   checkOpenCodeInstalled,
   createOpencodeParserState,
   createOpenCodeDriver,
+  OpenCodeAgentHandle,
   OpenCodeDriverError,
   parseOpencodeLine,
 } from "./opencode.js";
@@ -493,7 +495,7 @@ describe("OpenCodeDriver with stub binary", () => {
   it("reports a missing binary as a typed error via exited, without throwing from start()", async () => {
     const driver = createOpenCodeDriver();
     const cwd = newRunDir();
-    let handle: ReturnType<typeof driver.start>;
+    let handle: OpenCodeAgentHandle;
     expect(() => {
       handle = driver.start({ cwd, prompt: "hi", mode: "auto", env: { PATH: emptyBin } });
     }).not.toThrow();
@@ -572,5 +574,197 @@ describe("checkOpenCodeInstalled", () => {
 
   it("resolves when the preflight command succeeds", async () => {
     await expect(checkOpenCodeInstalled({ binary: stubPath, env: {} })).resolves.toBeUndefined();
+  });
+});
+
+describe("OpenCodeDriver with sandbox exec seam (#102)", () => {
+  /** Scripted seam: records calls, settles on demand, tracks stop(). */
+  function scriptedSeam(): {
+    seam: AgentExecSeam;
+    calls: Array<{ cmd: string[]; opts?: AgentExecOptions }>;
+    stopCalls: number;
+    settle(result: { code: number; stdout: string; stderr: string }): void;
+    reject(error: unknown): void;
+  } {
+    const calls: Array<{ cmd: string[]; opts?: AgentExecOptions }> = [];
+    let stopCalls = 0;
+    let settleFn: ((result: { code: number; stdout: string; stderr: string }) => void) | null =
+      null;
+    let rejectFn: ((error: unknown) => void) | null = null;
+    const seam: AgentExecSeam = {
+      kind: "sandbox",
+      run: (cmd, opts) =>
+        new Promise((resolve, reject) => {
+          calls.push({ cmd: [...cmd], opts });
+          settleFn = resolve;
+          rejectFn = reject;
+        }),
+      stop: () => {
+        stopCalls += 1;
+        rejectFn?.(new Error("sandbox exec cancelled (sandbox stopped)"));
+      },
+    };
+    return {
+      seam,
+      calls,
+      get stopCalls() {
+        return stopCalls;
+      },
+      settle(result) {
+        settleFn?.(result);
+      },
+      reject(error) {
+        rejectFn?.(error);
+      },
+    };
+  }
+
+  const ndjson = [
+    JSON.stringify({
+      type: "text",
+      sessionID: "ses_sb",
+      timestamp: 1000,
+      part: { text: "hello " },
+    }),
+    JSON.stringify({ type: "text", timestamp: 1001, part: { text: "world" } }),
+  ].join("\n");
+
+  it("runs the exact local argv inside the sandbox, with env and a generous timeout", async () => {
+    const script = scriptedSeam();
+    const driver = createOpenCodeDriver({ sandboxExecTimeoutMs: 123_000 });
+    const handle = driver.start({
+      cwd: "/workspace",
+      prompt: "fix the bug",
+      mode: "auto",
+      model: "glm-4.6",
+      sessionId: "ses_prev",
+      env: { SECRET_TOKEN: "s3cret" },
+      exec: script.seam,
+    });
+    script.settle({ code: 0, stdout: `${ndjson}\n`, stderr: "" });
+
+    const events = await collectEvents(handle);
+    const exit = await handle.exited;
+    expect(script.calls).toHaveLength(1);
+    const call = script.calls[0];
+    if (!call) throw new Error("no seam call recorded");
+    expect(call.cmd).toEqual([
+      "opencode",
+      "run",
+      "fix the bug",
+      "--format",
+      "json",
+      "--dir",
+      "/workspace",
+      "--auto",
+      "-m",
+      "glm-4.6",
+      "--session",
+      "ses_prev",
+    ]);
+    expect(call.opts).toMatchObject({ timeoutMs: 123_000, env: { SECRET_TOKEN: "s3cret" } });
+    expect(events.map((event) => event.type)).toEqual([
+      "started",
+      "session",
+      "message-delta",
+      "message-delta",
+      "done",
+    ]);
+    expect(exit).toMatchObject({ code: 0, reason: "exit", output: "hello world" });
+  });
+
+  it("maps exit 127 (and not-found stderr) to a typed OPENCODE_NOT_FOUND with an image hint", async () => {
+    const script = scriptedSeam();
+    const driver = createOpenCodeDriver();
+    const handle = driver.start({
+      cwd: "/workspace",
+      prompt: "x",
+      mode: "auto",
+      exec: script.seam,
+    });
+    script.settle({
+      code: 127,
+      stdout: "",
+      stderr: "sh: opencode: not found\n",
+    });
+    const events = await collectEvents(handle);
+    const exit = await handle.exited;
+    expect(events.map((event) => event.type)).toEqual(["started", "error"]);
+    const error = events[1];
+    if (error?.type !== "error") throw new Error("expected error event");
+    expect(error.code).toBe("OPENCODE_NOT_FOUND");
+    expect(error.message).toContain("Install opencode in the sandbox image");
+    expect(exit).toMatchObject({ code: 127, reason: "error" });
+    expect(exit.output).toContain("not found");
+  });
+
+  it("surfaces non-zero exits (non-127) with the stderr tail like the local path", async () => {
+    const script = scriptedSeam();
+    const driver = createOpenCodeDriver();
+    const handle = driver.start({
+      cwd: "/workspace",
+      prompt: "x",
+      mode: "auto",
+      exec: script.seam,
+    });
+    script.settle({ code: 2, stdout: "", stderr: "boom: bad flag\n" });
+    const events = await collectEvents(handle);
+    const exit = await handle.exited;
+    const error = events[1];
+    if (error?.type !== "error") throw new Error("expected error event");
+    expect(error.code).toBe("OPENCODE_NONZERO_EXIT");
+    expect(error.message).toContain("exited with code 2 inside the sandbox");
+    expect(error.message).toContain("boom: bad flag");
+    expect(exit).toMatchObject({ code: 2, reason: "error" });
+  });
+
+  it("abort() stops the in-sandbox command and settles the run as aborted", async () => {
+    const script = scriptedSeam();
+    const driver = createOpenCodeDriver({ killGraceMs: 500 });
+    const handle = driver.start({
+      cwd: "/workspace",
+      prompt: "x",
+      mode: "auto",
+      exec: script.seam,
+    });
+    await handle.abort();
+    const exit = await handle.exited;
+    expect(script.stopCalls).toBe(1);
+    expect(exit).toMatchObject({ code: null, reason: "aborted" });
+    // A late seam result must not resurrect the aborted run.
+    script.settle({ code: 0, stdout: `${ndjson}\n`, stderr: "" });
+    expect(await handle.exited).toMatchObject({ reason: "aborted" });
+  });
+
+  it("maps seam rejections (sandbox stopped under us) to typed run errors", async () => {
+    const script = scriptedSeam();
+    const driver = createOpenCodeDriver();
+    const handle = driver.start({
+      cwd: "/workspace",
+      prompt: "x",
+      mode: "auto",
+      exec: script.seam,
+    });
+    script.reject(new Error("sandbox exec cancelled (sandbox stopped)"));
+    const events = await collectEvents(handle);
+    const exit = await handle.exited;
+    const error = events[1];
+    if (error?.type !== "error") throw new Error("expected error event");
+    expect(error.message).toContain("sandbox exec cancelled");
+    expect(exit).toMatchObject({ code: null, reason: "error" });
+  });
+
+  it("supports a single events consumer (same contract as the local handle)", async () => {
+    const script = scriptedSeam();
+    const driver = createOpenCodeDriver();
+    const handle = driver.start({
+      cwd: "/workspace",
+      prompt: "x",
+      mode: "auto",
+      exec: script.seam,
+    });
+    script.settle({ code: 0, stdout: "", stderr: "" });
+    void handle.events[Symbol.asyncIterator]();
+    expect(() => handle.events[Symbol.asyncIterator]()).toThrow(DriverError);
   });
 });

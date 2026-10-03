@@ -31,7 +31,8 @@ export type OpsActivityType =
   | "ops.recovery-sweep"
   | "ops.gc"
   | "ops.image-pull"
-  | "ops.image-build";
+  | "ops.image-build"
+  | "ops.sandbox-kept";
 
 /** True for `ops.*` rows: rendered as small gray system lines in the web feed. */
 export function isOpsActivityType(type: ActivityType): type is OpsActivityType {
@@ -178,6 +179,29 @@ export function recordGcActivity(db: Db, payload: Record<string, unknown> = {}):
     db.activity.append({ type: "ops.gc", payload });
   } catch {
     // Feed appends must never break the GC pass itself.
+  }
+}
+
+/** Payload of {@link recordSandboxKeptActivity} (#102). */
+export interface SandboxKeptActivityPayload {
+  /** Run whose sandbox was kept. */
+  runId: string;
+  /** Container id/name to remove manually when debugging is done. */
+  container: string;
+  /** Image the sandbox runs. */
+  image: string;
+}
+
+/**
+ * Records that a run's sandbox was kept for debugging (`ops.sandbox-kept`,
+ * #102 `policy.keepForDebug`) — the feed is the reminder to remove the
+ * container manually. Same never-throw guard as the other writers.
+ */
+export function recordSandboxKeptActivity(db: Db, payload: SandboxKeptActivityPayload): void {
+  try {
+    db.activity.append({ type: "ops.sandbox-kept", runId: payload.runId, payload: { ...payload } });
+  } catch {
+    // Feed appends must never break the run's terminal transition.
   }
 }
 

@@ -6,6 +6,24 @@ export interface SandboxMount {
   containerPath: string;
   /** Mount read-only when true. */
   readonly?: boolean;
+  /**
+   * Bind consistency hint appended to the `-v` spec (`:cached` etc.). A
+   * documented no-op on native Linux daemons; meaningful on Docker Desktop.
+   */
+  consistency?: "consistent" | "cached" | "delegated";
+}
+
+/**
+ * Named volume mounted into a sandbox (#102). Unlike {@link SandboxMount}
+ * this is a docker-managed named volume (docker auto-creates it on first
+ * use), so its contents persist across sandboxes — the run-to-run cache
+ * mounts (`policy.cachePaths`).
+ */
+export interface SandboxVolume {
+  /** Docker volume name (`[a-zA-Z0-9][a-zA-Z0-9_.-]*`). */
+  name: string;
+  /** Absolute path inside the sandbox the volume is mounted at. */
+  containerPath: string;
 }
 
 /** CPU/memory constraints for a sandbox. */
@@ -34,6 +52,8 @@ export interface SandboxSpec {
   image: string;
   /** Directory bind-mounts. May be empty. */
   mounts: SandboxMount[];
+  /** Named volumes (persist across sandboxes; e.g. dependency caches). May be empty. */
+  volumes?: SandboxVolume[];
   /** Environment variables set inside the sandbox. */
   env: Record<string, string>;
   /** Container ports to publish; mapped to ephemeral host ports. */

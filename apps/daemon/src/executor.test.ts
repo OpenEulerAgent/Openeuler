@@ -9,7 +9,8 @@ import { createDatabase } from "@openeuler/db";
 import type { FakeDriverOptions } from "@openeuler/drivers";
 import { createDriverRegistry, createFakeDriver } from "@openeuler/drivers";
 import { WorktreeManager } from "@openeuler/engine";
-import { createExecutor } from "./executor.js";
+import { createFakeSandboxProvider } from "@openeuler/sandbox";
+import { createExecutor, resolveExecutionMode } from "./executor.js";
 import type { Executor, ExecutorOptions } from "./executor.js";
 import { createLogger } from "./logger.js";
 
@@ -617,5 +618,206 @@ describe("createExecutor concurrency scheduling", () => {
     expect(statusOf(h, queued.runId)).toBe("aborted");
     expect(h.executor.activeRunIds()).toEqual([]);
     expect(h.driver.calls.map((call) => call.prompt)).toEqual(["long"]);
+  });
+});
+
+describe("createExecutor sandboxed execution (#102)", () => {
+  const sandboxPolicy = {
+    executionMode: "sandbox" as const,
+    image: "busybox:1.36",
+  };
+
+  it("resolveExecutionMode: local default, sandbox explicit, auto follows availability", () => {
+    expect(resolveExecutionMode(undefined, true)).toBe("local");
+    expect(resolveExecutionMode(undefined, false)).toBe("local");
+    expect(resolveExecutionMode({ executionMode: "local" }, true)).toBe("local");
+    expect(resolveExecutionMode({ executionMode: "sandbox" }, false)).toBe("sandbox");
+    expect(resolveExecutionMode({ executionMode: "auto" }, true)).toBe("sandbox");
+    expect(resolveExecutionMode({ executionMode: "auto" }, false)).toBe("local");
+  });
+
+  it("executes sandboxed runs in ONE sandbox with worktree mount + run label, destroyed at terminal", async () => {
+    const provider = createFakeSandboxProvider();
+    const h = setup(
+      {
+        events: [{ type: "done", seq: 1, output: "sandboxed" }],
+        output: "sandboxed",
+        onStart: (opts) => {
+          if (opts.exec) void opts.exec.run(["touch", "/workspace/hello.txt"]);
+        },
+      },
+      {
+        sandbox: { provider, isDockerAvailable: async () => true },
+      },
+    );
+    h.db.projects.setSandboxPolicy(h.projectId, {
+      ...sandboxPolicy,
+      cachePaths: ["/workspace/node_modules"],
+    });
+    const { runId } = h.enqueue();
+
+    h.executor.startRun(runId);
+    await waitForStatus(h, runId, "success");
+    await waitForIdle(h);
+
+    // ONE sandbox for the whole run, spec built from PROJECT policy only.
+    expect(provider.createdSpecs).toHaveLength(1);
+    const spec = provider.createdSpecs[0];
+    expect(spec?.runId).toBe(runId);
+    expect(spec?.image).toBe("busybox:1.36");
+    expect(spec?.mounts).toEqual([
+      {
+        hostPath: join(h.worktrees.storeRoot, runId),
+        containerPath: "/workspace",
+        consistency: "cached",
+      },
+    ]);
+    expect(spec?.volumes).toEqual([
+      {
+        name: `openeuler-cache-${h.projectId}-workspace-node_modules`,
+        containerPath: "/workspace/node_modules",
+      },
+    ]);
+    expect(spec?.labels).toEqual({ run: runId });
+    expect(spec?.workingDir).toBe("/workspace");
+    expect(spec?.env).toMatchObject({ OPENEULER_RUN_ID: runId });
+
+    // The driver started in the container workspace and its seam ran there.
+    expect(h.driver.calls[0]?.cwd).toBe("/workspace");
+    expect(h.driver.calls[0]?.exec?.kind).toBe("sandbox");
+    expect(provider.execCalls.map((call) => call.cmd)).toContainEqual([
+      "touch",
+      "/workspace/hello.txt",
+    ]);
+
+    // Terminal → sandbox destroyed; no leaks.
+    expect(provider.destroyCalls).toHaveLength(1);
+    expect(await provider.list()).toEqual([]);
+    expect(await h.executor.sandboxInfo(runId)).toBeUndefined();
+  });
+
+  it("auto mode falls back to local when docker is unavailable", async () => {
+    const provider = createFakeSandboxProvider();
+    const h = setup({}, { sandbox: { provider, isDockerAvailable: async () => false } });
+    h.db.projects.setSandboxPolicy(h.projectId, { executionMode: "auto", image: "busybox:1.36" });
+    const { runId } = h.enqueue();
+
+    h.executor.startRun(runId);
+    await waitForStatus(h, runId, "success");
+    await waitForIdle(h);
+
+    expect(provider.createdSpecs).toHaveLength(0);
+    expect(h.driver.calls[0]?.cwd).toBe(join(h.worktrees.storeRoot, runId));
+    expect(h.driver.calls[0]?.exec).toBeUndefined();
+  });
+
+  it("projects without a policy keep executing locally (zero regression)", async () => {
+    const provider = createFakeSandboxProvider();
+    const h = setup({}, { sandbox: { provider, isDockerAvailable: async () => true } });
+    const { runId } = h.enqueue();
+
+    h.executor.startRun(runId);
+    await waitForStatus(h, runId, "success");
+    await waitForIdle(h);
+
+    expect(provider.createdSpecs).toHaveLength(0);
+    expect(h.driver.calls[0]?.exec).toBeUndefined();
+  });
+
+  it("fails the run typed+actionable when sandbox creation fails", async () => {
+    const provider = createFakeSandboxProvider({ failOnCreate: true });
+    const h = setup({}, { sandbox: { provider, isDockerAvailable: async () => true } });
+    h.db.projects.setSandboxPolicy(h.projectId, sandboxPolicy);
+    const { runId } = h.enqueue();
+
+    h.executor.startRun(runId);
+    await waitForStatus(h, runId, "failed");
+
+    const run = h.db.runs.get(runId);
+    expect(run?.error).toContain("configured to fail create()");
+    expect(await h.executor.sandboxInfo(runId)).toBeUndefined();
+  });
+
+  it("fails the run typed when sandbox mode has no image configured", async () => {
+    const provider = createFakeSandboxProvider();
+    const h = setup({}, { sandbox: { provider, isDockerAvailable: async () => true } });
+    h.db.projects.setSandboxPolicy(h.projectId, { executionMode: "sandbox" });
+    const { runId } = h.enqueue();
+
+    h.executor.startRun(runId);
+    await waitForStatus(h, runId, "failed");
+    expect(h.db.runs.get(runId)?.error).toContain("sandbox execution needs an image");
+  });
+
+  it("keepsForDebug keeps the container and records an ops activity", async () => {
+    const provider = createFakeSandboxProvider();
+    const h = setup({}, { sandbox: { provider, isDockerAvailable: async () => true } });
+    h.db.projects.setSandboxPolicy(h.projectId, { ...sandboxPolicy, keepForDebug: true });
+    const { runId } = h.enqueue();
+
+    h.executor.startRun(runId);
+    await waitForStatus(h, runId, "success");
+    await waitForIdle(h);
+
+    expect(provider.destroyCalls).toHaveLength(0);
+    expect(await provider.list({ run: runId })).toHaveLength(1);
+    const kept = h.db.activity
+      .list({ limit: 50 })
+      .find((row) => row.type === "ops.sandbox-kept" && row.runId === runId);
+    expect(kept).toBeDefined();
+    expect(kept?.payload).toMatchObject({ runId, image: "busybox:1.36" });
+  });
+
+  it("abort stops the sandbox and the run still disposes it (unless kept)", async () => {
+    const provider = createFakeSandboxProvider({ execDelayMs: 60_000 });
+    const h = setup(
+      { events: [{ type: "message-delta", seq: 1, delta: "working" }], delayMs: 60_000 },
+      { sandbox: { provider, isDockerAvailable: async () => true } },
+    );
+    h.db.projects.setSandboxPolicy(h.projectId, sandboxPolicy);
+    const { runId } = h.enqueue();
+
+    h.executor.startRun(runId);
+    await waitForStatus(h, runId, "running");
+    // Wait until the sandbox exists and the driver is mid-run.
+    const deadline = Date.now() + 5_000;
+    while (provider.createdSpecs.length === 0 || h.executor.activeRunIds().length === 0) {
+      if (Date.now() > deadline) throw new Error("sandbox never created");
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+
+    const abortResult = await h.executor.abortRun(runId);
+    expect(abortResult).toEqual({ outcome: "aborted" });
+    await waitForIdle(h);
+
+    expect(h.db.runs.get(runId)?.status).toBe("aborted");
+    expect(provider.stopCalls.length).toBeGreaterThanOrEqual(1);
+    expect(provider.destroyCalls).toHaveLength(1);
+    expect(await provider.list()).toEqual([]);
+  });
+
+  it("sandboxInfo reports the live sandbox while the run executes", async () => {
+    const provider = createFakeSandboxProvider({ execDelayMs: 300 });
+    const h = setup(
+      { events: [{ type: "message-delta", seq: 1, delta: "x" }], delayMs: 50 },
+      { sandbox: { provider, isDockerAvailable: async () => true } },
+    );
+    h.db.projects.setSandboxPolicy(h.projectId, sandboxPolicy);
+    const { runId } = h.enqueue();
+
+    h.executor.startRun(runId);
+    const deadline = Date.now() + 5_000;
+    let info: Awaited<ReturnType<Executor["sandboxInfo"]>> = undefined;
+    while (Date.now() < deadline) {
+      info = await h.executor.sandboxInfo(runId);
+      if (info !== undefined) break;
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+    expect(info).toMatchObject({ image: "busybox:1.36", status: "running" });
+    expect(info?.id).toBeTruthy();
+
+    await waitForStatus(h, runId, "success");
+    await waitForIdle(h);
+    expect(await h.executor.sandboxInfo(runId)).toBeUndefined();
   });
 });

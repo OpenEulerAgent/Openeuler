@@ -8,6 +8,8 @@ import type { Db } from "@openeuler/db";
 import { createDatabase } from "@openeuler/db";
 import { createDriverRegistry, createFakeDriver } from "@openeuler/drivers";
 import { WorktreeManager } from "@openeuler/engine";
+import { createFakeSandboxProvider } from "@openeuler/sandbox";
+import type { SandboxProvider, SandboxSpec } from "@openeuler/sandbox";
 import { createApp } from "./app.js";
 import { recordDaemonBootActivity } from "./activity.js";
 import { createExecutor } from "./executor.js";
@@ -15,6 +17,7 @@ import { createLogger } from "./logger.js";
 import {
   METRICS_CONTENT_TYPE,
   collectMetrics,
+  countActiveSandboxes,
   escapeLabelValue,
   renderMetrics,
 } from "./metrics.js";
@@ -443,4 +446,46 @@ afterEach(() => {
     item.db.close();
     rmSync(item.dir, { recursive: true, force: true });
   }
+});
+
+describe("sandbox gauge (#102)", () => {
+  it("collectMetrics honors the async sandbox count and defaults to 0 without a provider", async () => {
+    expect(collectMetrics({}).sandboxesActive).toBe(0);
+    expect(collectMetrics({ sandboxesActive: 3 }).sandboxesActive).toBe(3);
+    expect(await countActiveSandboxes({})).toBeUndefined();
+  });
+
+  it("countActiveSandboxes counts provider.list() and degrades to 0 on provider failure", async () => {
+    const provider = createFakeSandboxProvider();
+    // Two live sandboxes on the provider.
+    const spec: SandboxSpec = { runId: "r1", image: "img", mounts: [], env: {} };
+    await provider.create(spec);
+    await provider.create({ ...spec, runId: "r2" });
+    expect(await countActiveSandboxes({ sandbox: { provider } })).toBe(2);
+
+    const broken: SandboxProvider = {
+      id: "broken",
+      create: () => Promise.reject(new Error("no")),
+      list: () => Promise.reject(new Error("docker daemon unreachable")),
+    };
+    expect(await countActiveSandboxes({ sandbox: { provider: broken } })).toBe(0);
+  });
+
+  it("GET /metrics renders the live sandbox count (#102)", async () => {
+    const provider = createFakeSandboxProvider();
+    await provider.create({ runId: "r1", image: "img", mounts: [], env: {} });
+    const dir = mkdtempSync(join(tmpdir(), "openeuler-metrics-"));
+    const db = createDatabase({ path: join(dir, "test.db") });
+    created.push({ db, dir });
+    const { app } = createApp({
+      db,
+      logger: createLogger("silent"),
+      sandbox: { provider },
+    });
+    const res = await app.request("/metrics");
+    expect(res.status).toBe(200);
+    const parsed = parseExposition(await res.text());
+    const sample = parsed.samples.find((entry) => entry.name === "openeuler_sandboxes_active");
+    expect(sample?.value).toBe(1);
+  });
 });

@@ -100,6 +100,10 @@ function opsMessage(type: OpsActivityType, payload: Record<string, unknown> | un
         ? `Image build failed: ${ref}`
         : `Image built: ${ref}`;
     }
+    case "ops.sandbox-kept": {
+      const image = typeof payload?.["image"] === "string" ? (payload["image"] as string) : "";
+      return `Sandbox kept for debugging${image === "" ? "" : ` (${image})`}`;
+    }
   }
 }
 
