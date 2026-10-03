@@ -180,14 +180,16 @@ export function parsePreviewPath(pathname: string): ParsedPreviewPath | "malform
 
 /**
  * Removes the proxy's own query params (`token`, `port`) from a raw search
- * string before forwarding; everything else round-trips **byte-identical**
- * (no URLSearchParams round-trip — it would rewrite `%20` to `+`). Returns
- * "" or "?…" (with the leading `?` when non-empty).
+ * string before forwarding. Names are compared AFTER percent-decoding — a
+ * `?%74oken=` form decodes to `token` and must be stripped too, or the
+ * daemon token would reach the sandbox app's logs. Everything else
+ * round-trips byte-identical per pair (no full URLSearchParams round-trip —
+ * it would rewrite `%20` to `+`). Returns "" or "?…" (with the leading `?`
+ * when non-empty).
  */
 export function forwardableSearch(search: string): string {
   if (search === "") return "";
   const raw = search.startsWith("?") ? search.slice(1) : search;
-  if (!/(^|[?&])(token|port)=/i.test(search)) return search;
   const kept = raw.split("&").filter((pair) => {
     const eq = pair.indexOf("=");
     const encodedName = eq === -1 ? pair : pair.slice(0, eq);

@@ -254,6 +254,12 @@ describe("forwardableSearch (#108)", () => {
     expect(forwardableSearch("?port=3000&token=secret")).toBe("");
     expect(forwardableSearch("?token=secret&a=%20x")).toBe("?a=%20x");
   });
+
+  it("strips percent-encoded spellings of token/port (no token reaches the sandbox)", () => {
+    expect(forwardableSearch("?%74oken=secret&b=2")).toBe("?b=2");
+    expect(forwardableSearch("?%50ORT=3000&x=1")).toBe("?x=1");
+    expect(forwardableSearch("?%74%6F%6B%65%6E=secret")).toBe("");
+  });
 });
 
 describe("forwardableHeaders (#108)", () => {
