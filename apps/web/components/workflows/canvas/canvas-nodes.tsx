@@ -11,12 +11,14 @@ import type {
   CanvasNode,
   CanvasNodeData,
   ExitNodeData,
+  JoinNodeData,
 } from "@/lib/graph/canvas-document";
 
 /** React Flow node types as used by the canvas editor. */
 export type AgentFlowNode = Node<AgentNodeData, "agent">;
 export type ExitFlowNode = Node<ExitNodeData, "exit">;
-export type CanvasFlowNode = Node<CanvasNodeData, "agent" | "exit">;
+export type JoinFlowNode = Node<JoinNodeData, "join">;
+export type CanvasFlowNode = Node<CanvasNodeData, "agent" | "exit" | "join">;
 
 /**
  * Validation blocker counts per node id, provided by the editor so the cards
@@ -225,6 +227,43 @@ function ExitNodeCard({ id, data, selected }: NodeProps<ExitFlowNode>) {
 }
 
 /**
+ * Join/merge marker card (#115): renders in the editor for graphs authored
+ * with joins (the palette does not create them yet — API/graph-authored
+ * revisions round-trip through the canvas without corruption).
+ */
+function JoinNodeCard({ id, data, selected }: NodeProps<JoinFlowNode>) {
+  const issueCounts = useContext(NodeIssueCountsContext);
+  const hintCounts = useContext(NodeHintCountsContext);
+  return (
+    <div
+      className={cn(
+        "relative flex items-center gap-2 rounded-lg border border-dashed bg-surface px-3 py-3 shadow-2 transition-colors",
+        CANVAS_NODE_SIZE_CLASSES.exit.width,
+        CANVAS_NODE_SIZE_CLASSES.exit.height,
+        selected ? "border-accent" : "border-border",
+      )}
+      data-canvas-node="join"
+    >
+      <IssueBadges blockers={issueCounts.get(id) ?? 0} hints={hintCounts.get(id) ?? 0} />
+      <span
+        aria-hidden
+        className="flex size-4 shrink-0 items-center justify-center rounded-full border-2 border-accent bg-accent-subtle"
+      />
+      <div className="min-w-0">
+        <p className="truncate text-sm font-medium text-fg" title={data.name}>
+          {data.name.length > 0 ? data.name : "Join"}
+        </p>
+        <p className="text-[10px] tracking-wide text-muted-fg uppercase">
+          join · {data.config.mode}
+        </p>
+      </div>
+      <Handle type="target" position={Position.Left} className="!bg-muted-fg" />
+      <Handle type="source" position={Position.Right} className="!bg-accent" />
+    </div>
+  );
+}
+
+/**
  * Canvas nodes → React Flow nodes. The entry gets `deletable: false` so no
  * React Flow delete path can remove it (the editor's own delete planning
  * double-checks); the flag is runtime-only and never serialized.
@@ -251,4 +290,5 @@ export function toFlowNodes(nodes: readonly CanvasNode[]): CanvasFlowNode[] {
 export const canvasNodeTypes: NodeTypes = {
   agent: memo(AgentNodeCard) as unknown as NodeTypes["agent"],
   exit: memo(ExitNodeCard) as unknown as NodeTypes["exit"],
+  join: memo(JoinNodeCard) as unknown as NodeTypes["join"],
 };

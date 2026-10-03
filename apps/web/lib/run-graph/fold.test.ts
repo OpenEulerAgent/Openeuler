@@ -296,3 +296,98 @@ describe("fold: idempotence / replay safety", () => {
     expect(state.lastSeq).toBe(902); // cursor still advances (dedupe stays sound)
   });
 });
+
+// -------------------------------------------------------------------------
+// #115: parallel fan-out + join — the fold keeps concurrent node states.
+//
+
+describe("fold: parallel fan-out + join (#115)", () => {
+  /** Diamond a→(b, c)→j→d→exit with both branches running concurrently. */
+  function diamondRunEvents(): RunStreamEvent[] {
+    return [
+      runStatus("running"),
+      queued("a"),
+      started("a"),
+      completed("a", 1),
+      // Fan-out schedules both branches up front (branch edgeIds carried);
+      // no edge.taken for the fan-out itself.
+      { ...queued("b"), edgeId: "e-a-b" },
+      { ...queued("c"), edgeId: "e-a-c" },
+      { ...started("b"), edgeId: "e-a-b" },
+      { ...started("c"), edgeId: "e-a-c" },
+      completed("b", 1),
+      edgeTaken("e-b-j", "b", "j", 1),
+      completed("c", 1),
+      edgeTaken("e-c-j", "c", "j", 1),
+      // The join executes instantly with the merged outputs map.
+      queued("j"),
+      started("j"),
+      { ...completed("j", 1), output: '{"b":"B-OUT","c":"C-OUT"}' },
+      edgeTaken("e-j-d", "j", "d", 1),
+      queued("d"),
+      started("d"),
+      completed("d", 1),
+      edgeTaken("e-d-exit", "d", "exit", 1),
+      runStatus("success"),
+    ];
+  }
+
+  it("renders the diamond: two nodes running at once, branch edgeIds on executions", () => {
+    const events = diamondRunEvents();
+    // Slice up to both branches running: b and c are running CONCURRENTLY —
+    // the fold is keyed by node id, so both stay live independently.
+    const mid = buildRunGraphState(events.slice(0, 8));
+    expect(mid.nodes["a"]?.status).toBe("success");
+    expect(mid.nodes["b"]?.status).toBe("running");
+    expect(mid.nodes["c"]?.status).toBe("running");
+    expect(mid.nodes["b"]?.executions[0]).toMatchObject({ edgeId: "e-a-b" });
+    expect(mid.nodes["c"]?.executions[0]).toMatchObject({ edgeId: "e-a-c" });
+    expect(mid.totalExecutions).toBe(3); // a + b + c announced so far
+
+    const state = buildRunGraphState(events);
+    // Final state: every node settled, join included with its merged output.
+    expect(state.nodes["j"]?.status).toBe("success");
+    expect(state.nodes["j"]?.executions[0]).toMatchObject({
+      iteration: 1,
+      output: '{"b":"B-OUT","c":"C-OUT"}',
+    });
+    expect(state.nodes["d"]?.status).toBe("success");
+    expect(state.runStatus).toBe("success");
+    // Fan-out edges produce no edge.taken; only the merge/chain edges do.
+    expect(state.edges["e-b-j"]?.takeCount).toBe(1);
+    expect(state.edges["e-c-j"]?.takeCount).toBe(1);
+    expect(state.edges["e-a-b"]).toBeUndefined();
+    expect(state.edges["e-a-c"]).toBeUndefined();
+    // Timeline follows the breadcrumb: completions + taken edges in order.
+    expect(state.timeline.map((entry) => entry.id)).toEqual([
+      "a",
+      "b",
+      "e-b-j",
+      "c",
+      "e-c-j",
+      "j",
+      "e-j-d",
+      "d",
+      "e-d-exit",
+    ]);
+  });
+
+  it("settles still-running branches when the run terminalizes (fail-fast cancel)", () => {
+    const events = diamondRunEvents();
+    // Crash-cut variant: b done, c running, then the run fails (b's sibling
+    // cancelled → run.status failed sweeps c to failed).
+    const cut = [
+      ...events.slice(0, 3),
+      { ...queued("b"), edgeId: "e-a-b" },
+      { ...queued("c"), edgeId: "e-a-c" },
+      { ...started("b"), edgeId: "e-a-b" },
+      { ...started("c"), edgeId: "e-a-c" },
+      completed("b", 1, "failed"),
+      runStatus("failed"),
+    ];
+    const state = buildRunGraphState(cut);
+    expect(state.nodes["b"]?.status).toBe("failed");
+    expect(state.nodes["c"]?.status).toBe("failed"); // swept by the terminal
+    expect(state.nodes["c"]?.executions[0]?.status).toBe("failed");
+  });
+});

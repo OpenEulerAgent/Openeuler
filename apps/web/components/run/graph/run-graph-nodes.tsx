@@ -2,7 +2,7 @@
 
 import { memo } from "react";
 import { Handle, Position, type Node, type NodeProps, type NodeTypes } from "@xyflow/react";
-import type { AgentNodeData, ExitNodeData } from "@/lib/graph/canvas-document";
+import type { AgentNodeData, ExitNodeData, JoinNodeData } from "@/lib/graph/canvas-document";
 import type { NodeVisualSlice } from "@/lib/run-graph/document";
 import { cn } from "@/lib/cn";
 
@@ -19,6 +19,7 @@ export type RunAgentFlowNode = Node<
   "run-agent"
 >;
 export type RunExitFlowNode = Node<ExitNodeData & { visual: NodeVisualSlice | null }, "run-exit">;
+export type RunJoinFlowNode = Node<JoinNodeData & { visual: NodeVisualSlice | null }, "run-join">;
 
 /** Card frame per visual status (ring color + surface treatment). */
 const STATUS_CARD_CLASSES: Record<NodeVisualSlice["status"], string> = {
@@ -142,7 +143,39 @@ function ExitExecutionCard({ data }: NodeProps<RunExitFlowNode>) {
   );
 }
 
+/** Join/merge marker card (#115): a synchronizer, not a terminal. */
+function JoinExecutionCard({ data }: NodeProps<RunJoinFlowNode>) {
+  const { visual } = data;
+  const status = visual?.status ?? "not-reached";
+  return (
+    <div
+      className={cn(
+        "relative flex w-35 cursor-pointer items-center gap-2 rounded-lg border border-dashed bg-surface px-3 py-3 shadow-2 transition-colors",
+        statusCardClasses(status),
+      )}
+      data-run-node="join"
+      data-run-node-status={status}
+    >
+      <span
+        aria-hidden
+        className="flex size-4 shrink-0 items-center justify-center rounded-full border-2 border-accent bg-accent-subtle"
+      />
+      <div className="min-w-0">
+        <p className="truncate text-sm font-medium text-fg" title={data.name}>
+          {data.name.length > 0 ? data.name : "Join"}
+        </p>
+        <p className="text-[10px] tracking-wide text-muted-fg uppercase">
+          join · {data.config.mode}
+        </p>
+      </div>
+      <Handle type="target" position={Position.Left} className="!bg-muted-fg" />
+      <Handle type="source" position={Position.Right} className="!bg-accent" />
+    </div>
+  );
+}
+
 export const runGraphNodeTypes: NodeTypes = {
   "run-agent": memo(AgentExecutionCard) as unknown as NodeTypes["run-agent"],
   "run-exit": memo(ExitExecutionCard) as unknown as NodeTypes["run-exit"],
+  "run-join": memo(JoinExecutionCard) as unknown as NodeTypes["run-join"],
 };

@@ -51,9 +51,42 @@ export const ExitGraphNodeSchema = z.strictObject({
 
 export type ExitGraphNode = z.infer<typeof ExitGraphNodeSchema>;
 
+/**
+ * Join/merge configuration (#115): how the join decides its branches have
+ * settled. `all` (default) waits for EVERY incoming edge to arrive; `any`
+ * triggers on the first arrival (failures tolerated while another branch
+ * can still arrive).
+ */
+export const JoinNodeConfigSchema = z.strictObject({
+  mode: z.enum(["all", "any"]).default("all"),
+});
+
+export type JoinNodeConfig = z.infer<typeof JoinNodeConfigSchema>;
+
+/**
+ * Synchronizer node (#115): the fan-in counterpart of a fan-out. A join has
+ * multiple incoming edges (any condition type) and AT MOST ONE outgoing
+ * edge, which must be unconditional — a join synchronizes branches, it
+ * never routes. On trigger (per `config.mode`) the join "executes"
+ * instantly (no driver): its output is the JSON map
+ * `{<branchSourceNodeId>: <output>}` of the arrived branches, available
+ * downstream as `{{output:<joinId>}}` (the branch outputs themselves stay
+ * addressable as `{{output:<branchNodeId>}}`).
+ */
+export const JoinGraphNodeSchema = z.strictObject({
+  id: idSchema,
+  type: z.literal("join"),
+  name: z.string().min(1, "node name must be a non-empty string"),
+  position: GraphNodePositionSchema,
+  config: JoinNodeConfigSchema.default({ mode: "all" }),
+});
+
+export type JoinGraphNode = z.infer<typeof JoinGraphNodeSchema>;
+
 export const GraphNodeSchema = z.discriminatedUnion("type", [
   AgentGraphNodeSchema,
   ExitGraphNodeSchema,
+  JoinGraphNodeSchema,
 ]);
 
 export type GraphNode = z.infer<typeof GraphNodeSchema>;
@@ -61,10 +94,19 @@ export type GraphNode = z.infer<typeof GraphNodeSchema>;
 /**
  * A directed edge. `condition` decides (evaluated against the source node's
  * final output) whether the edge may be taken; `always` edges are the
- * unconditional chain/fallback. A node whose outgoing edges mix conditionals
- * with (at most one) `always` edge is a **router**: the engine evaluates the
- * conditional edges in `order` (first match wins, enforced by #45) and falls
- * back to the `always` edge — or, with none, ends the run.
+ * unconditional chain/fallback.
+ *
+ * A node's outgoing edges form one of three shapes (#115):
+ *
+ * - **chain/router** — a conditional set (evaluated in `order`, first match
+ *   wins, enforced by #45) plus AT MOST ONE `always` fallback edge; with no
+ *   match and no fallback the run ends. Mixing is rejected: a node with
+ *   conditionals may not carry more than one `always` edge.
+ * - **fan-out** — ALL outgoing edges unconditional: every one of them starts
+ *   a parallel branch (children run concurrently up to the run's inner
+ *   concurrency cap; the branches converge at `join` nodes). Fan-out edges
+ *   must target distinct AGENT nodes (a branch is agent work).
+ * - **terminal** — no outgoing edges (run ends `success`).
  *
  * `invert` negates the condition at evaluation time (`invert ? !match :
  * match`). It exists so legacy `loopBack` semantics — loop while the exit
@@ -120,8 +162,14 @@ export const DEFAULT_EDGE_MAX_ITERATIONS = 3;
 
 interface GraphIndex {
   nodeIds: Set<string>;
+  nodes: Map<string, GraphNode>;
   /** node id → outgoing edges (with their index in the edges array). */
   outgoing: Map<
+    string,
+    Array<{ edge: GraphEdgeInput & { id: string; source: string; target: string }; index: number }>
+  >;
+  /** node id → incoming edges (with their index in the edges array). */
+  incoming: Map<
     string,
     Array<{ edge: GraphEdgeInput & { id: string; source: string; target: string }; index: number }>
   >;
@@ -132,15 +180,23 @@ interface GraphIndex {
 /** Builds adjacency + transitive reachability over the valid edges. */
 function indexGraph(graph: WorkflowGraphShape): GraphIndex {
   const nodeIds = new Set(graph.nodes.map((node) => node.id));
+  const nodes = new Map(graph.nodes.map((node) => [node.id, node]));
   const outgoing = new Map<
+    string,
+    Array<{ edge: GraphEdgeInput & { id: string; source: string; target: string }; index: number }>
+  >();
+  const incoming = new Map<
     string,
     Array<{ edge: GraphEdgeInput & { id: string; source: string; target: string }; index: number }>
   >();
   for (const [index, edge] of graph.edges.entries()) {
     if (!nodeIds.has(edge.source) || !nodeIds.has(edge.target)) continue;
-    const bucket = outgoing.get(edge.source);
-    if (bucket === undefined) outgoing.set(edge.source, [{ edge, index }]);
-    else bucket.push({ edge, index });
+    const out = outgoing.get(edge.source);
+    if (out === undefined) outgoing.set(edge.source, [{ edge, index }]);
+    else out.push({ edge, index });
+    const inc = incoming.get(edge.target);
+    if (inc === undefined) incoming.set(edge.target, [{ edge, index }]);
+    else inc.push({ edge, index });
   }
   const reach = new Map<string, Set<string>>();
   for (const node of graph.nodes) {
@@ -154,7 +210,7 @@ function indexGraph(graph: WorkflowGraphShape): GraphIndex {
     }
     reach.set(node.id, seen);
   }
-  return { nodeIds, outgoing, reach };
+  return { nodeIds, nodes, outgoing, incoming, reach };
 }
 
 /**
@@ -164,10 +220,20 @@ function indexGraph(graph: WorkflowGraphShape): GraphIndex {
  * - `entryNodeId` references an existing agent node (exactly one entry)
  * - every node is reachable from the entry (BFS over edges)
  * - unconditional cycles rejected: the `always` (non-inverted) subgraph must
- *   be acyclic — every cycle has to include at least one conditional edge
- * - at most one unconditional outgoing edge per node; > 1 is ambiguous
- * - router `order` unique among a node's conditional outgoing edges
+ *   be acyclic — every cycle (fan-out/join cycles included) has to include
+ *   at least one conditional edge
+ * - outgoing shapes (#115): a node's edges are EITHER all `always`
+ *   (fan-out; the edges must target distinct agent nodes) OR a conditional
+ *   set with at most one `always` fallback (router). Mixing — multiple
+ *   `always` edges next to conditionals — is rejected.
+ * - `join` nodes merge branches: at least two incoming edges (any condition
+ *   type), at most one outgoing edge and it must be unconditional (a join
+ *   is a synchronizer, not a router)
+ * - `agent` nodes never receive unconditional edges from PARALLEL branches
+ *   (sources sharing a fan-out ancestor) — fan-in is a join's job; serial
+ *   loop shapes (`always` back-edges into a router node) stay valid
  * - exit nodes are terminals (no outgoing edges)
+ * - router `order` unique among a node's conditional outgoing edges
  * - `{{output:<nodeId>}}` template references point at upstream nodes only
  *   (nodes with a path to the referencing node, excluding itself)
  *
@@ -235,6 +301,8 @@ export function validateWorkflowGraph(graph: WorkflowGraphShape): GraphValidatio
   }
 
   // Unconditional cycles: the always (non-inverted) subgraph must be acyclic.
+  // The rule covers fan-out/join cycles too: a parallel loop needs at least
+  // one conditional edge somewhere on the cycle (its maxIterations guard).
   const alwaysOutgoing = new Map<string, Array<{ target: string; edgeIndex: number }>>();
   for (const [edgeIndex, edge] of graph.edges.entries()) {
     if (
@@ -258,24 +326,107 @@ export function validateWorkflowGraph(graph: WorkflowGraphShape): GraphValidatio
 
   for (const [nodeIndex, node] of graph.nodes.entries()) {
     const siblings = index.outgoing.get(node.id) ?? [];
+    const unconditional = siblings.filter((item) => isUnconditional(item.edge));
+    const conditional = siblings.filter((item) => !isUnconditional(item.edge));
 
     // Exit nodes are terminals.
     if (node.type === "exit" && siblings.length > 0) {
       push(["nodes", nodeIndex, "type"], `exit node "${node.id}" must not have outgoing edges`);
     }
 
-    // At most one unconditional outgoing edge per node.
-    const unconditional = siblings.filter((item) => isUnconditional(item.edge));
-    if (unconditional.length > 1) {
-      push(
-        ["edges", unconditional[1]?.index ?? 0],
-        `node "${node.id}" has ${unconditional.length} unconditional (always) outgoing edges; at most one is allowed (as the router fallback)`,
-      );
+    if (node.type === "join") {
+      const incoming = index.incoming.get(node.id) ?? [];
+      if (incoming.length < 2) {
+        push(
+          ["nodes", nodeIndex, "type"],
+          `join node "${node.id}" has ${incoming.length} incoming edge(s); a join merges at least two branches`,
+        );
+      }
+      if (siblings.length > 1) {
+        push(
+          ["nodes", nodeIndex, "type"],
+          `join node "${node.id}" has ${siblings.length} outgoing edges; at most one is allowed (a join synchronizes branches, it does not route)`,
+        );
+      }
+      const conditionalOut = siblings.filter((item) => !isUnconditional(item.edge));
+      if (conditionalOut.length > 0) {
+        push(
+          ["nodes", nodeIndex, "type"],
+          `join node "${node.id}" must not have conditional outgoing edges (a join synchronizes branches, it does not route)`,
+        );
+      }
+    } else if (node.type === "agent") {
+      // Parallel fan-in is a join's job: an agent node may not receive
+      // unconditional edges from two sources that can run CONCURRENTLY —
+      // i.e. sources sharing a fan-out ancestor. Serial shapes stay valid:
+      // legacy loops and template loops re-enter a router node through an
+      // `always` back-edge (one delivery at a time), and conditional
+      // incoming edges are unrestricted (one delivery per source routing).
+      const incoming = index.incoming.get(node.id) ?? [];
+      const incomingAlways = incoming.filter((item) => isUnconditional(item.edge));
+      if (incomingAlways.length > 1) {
+        const fanOutSources = new Set(
+          [...index.outgoing.entries()]
+            .filter(([, edges]) => edges.filter((item) => isUnconditional(item.edge)).length >= 2)
+            .map(([id]) => id),
+        );
+        const sources = [...new Set(incomingAlways.map((item) => item.edge.source))];
+        const descendsFrom = (fanOut: string, source: string): boolean =>
+          fanOut === source || (index.reach.get(fanOut) ?? new Set<string>()).has(source);
+        const parallelConvergence = sources.some((s1) =>
+          sources.some(
+            (s2) =>
+              s1 !== s2 &&
+              [...fanOutSources].some(
+                (fanOut) => descendsFrom(fanOut, s1) && descendsFrom(fanOut, s2),
+              ),
+          ),
+        );
+        if (parallelConvergence) {
+          push(
+            ["nodes", nodeIndex, "type"],
+            `agent node "${node.id}" receives unconditional (always) edges from parallel branches; merge them at a join node instead`,
+          );
+        }
+      }
+
+      // Outgoing shape: EITHER all-always (fan-out) OR conditionals + at
+      // most one always fallback (router). Mixing is ambiguous and rejected.
+      if (unconditional.length > 1 && conditional.length > 0) {
+        push(
+          ["edges", unconditional[1]?.index ?? 0],
+          `node "${node.id}" mixes ${unconditional.length} unconditional (always) outgoing edges with conditional edges; outgoing edges must be either all-always (fan-out) or conditionals with at most one always fallback (router)`,
+        );
+      }
+
+      // Fan-out: every always edge starts a parallel branch, so the targets
+      // must be distinct AGENT nodes (joins synchronize, exits terminate —
+      // neither is branch work).
+      if (unconditional.length > 1) {
+        const seenTargets = new Map<string, { edgeId: string; index: number }>();
+        for (const item of unconditional) {
+          const target = index.nodes.get(item.edge.target);
+          if (target !== undefined && target.type !== "agent") {
+            push(
+              ["edges", item.index],
+              `fan-out edge "${item.edge.id}" targets ${target.type} node "${target.id}"; parallel branches must start at agent nodes`,
+            );
+          }
+          const clash = seenTargets.get(item.edge.target);
+          if (clash !== undefined) {
+            push(
+              ["edges", item.index],
+              `fan-out edges "${clash.edgeId}" and "${item.edge.id}" of node "${node.id}" both target "${item.edge.target}"; parallel branches must be distinct nodes`,
+            );
+          } else {
+            seenTargets.set(item.edge.target, { edgeId: item.edge.id, index: item.index });
+          }
+        }
+      }
     }
 
     // Router order: unique effective order (explicit, else edges-array index)
     // among the node's conditional outgoing edges.
-    const conditional = siblings.filter((item) => !isUnconditional(item.edge));
     if (conditional.length > 0) {
       const byOrder = new Map<number, string>();
       for (const item of conditional) {
@@ -414,47 +565,65 @@ export function findGraphNode(graph: WorkflowGraph, nodeId: string): GraphNode |
  * renders instead of the legacy steps mirror. `hasLoop` = the graph has a
  * back-edge (an edge whose target can reach its source, closing a cycle;
  * validation guarantees every cycle runs through a conditional edge);
- * `hasRouter` = some node has more than one outgoing edge.
+ * `hasRouter` = some node routes between multiple outgoing edges via a
+ * conditional (#115: a conditional set + optional always fallback);
+ * `hasFanOut` = some node has multiple unconditional outgoing edges, i.e.
+ * starts parallel branches (#115).
  */
 export interface GraphSummary {
   nodeCount: number;
   edgeCount: number;
   hasLoop: boolean;
   hasRouter: boolean;
+  /** Some agent node fans out: ≥ 2 unconditional outgoing edges (#115). */
+  hasFanOut: boolean;
   /** Revision number the summary was computed from. */
   revision: number;
 }
 
+/** Whether an edge is unconditional (always, not inverted). */
+const isUnconditionalEdge = (edge: GraphEdge): boolean =>
+  edge.condition.type === "always" && edge.invert !== true;
+
 /** Computes the {@link GraphSummary} of a validated graph snapshot. */
 export function summarizeGraph(graph: WorkflowGraph, revision: number): GraphSummary {
-  const outgoing = new Map<string, string[]>();
+  const outgoing = new Map<string, GraphEdge[]>();
   for (const edge of graph.edges) {
     const bucket = outgoing.get(edge.source);
-    if (bucket === undefined) outgoing.set(edge.source, [edge.target]);
-    else bucket.push(edge.target);
+    if (bucket === undefined) outgoing.set(edge.source, [edge]);
+    else bucket.push(edge);
   }
   const reachCache = new Map<string, Set<string>>();
   const reachable = (start: string): Set<string> => {
     const cached = reachCache.get(start);
     if (cached !== undefined) return cached;
     const seen = new Set<string>();
-    const queue = [...(outgoing.get(start) ?? [])];
+    const queue = [...(outgoing.get(start) ?? [])].map((edge) => edge.target);
     while (queue.length > 0) {
       const next = queue.pop() as string;
       if (seen.has(next)) continue;
       seen.add(next);
-      queue.push(...(outgoing.get(next) ?? []));
+      for (const edge of outgoing.get(next) ?? []) queue.push(edge.target);
     }
     reachCache.set(start, seen);
     return seen;
   };
   const hasLoop = graph.edges.some((edge) => reachable(edge.target).has(edge.source));
-  const hasRouter = [...outgoing.values()].some((targets) => targets.length > 1);
+  let hasRouter = false;
+  let hasFanOut = false;
+  for (const edges of outgoing.values()) {
+    if (edges.length < 2) continue;
+    const conditional = edges.some((edge) => !isUnconditionalEdge(edge));
+    const unconditional = edges.some(isUnconditionalEdge);
+    if (conditional) hasRouter = true;
+    if (conditional === false && unconditional) hasFanOut = true;
+  }
   return {
     nodeCount: graph.nodes.length,
     edgeCount: graph.edges.length,
     hasLoop,
     hasRouter,
+    hasFanOut,
     revision,
   };
 }
@@ -639,6 +808,12 @@ export function graphToLinear(graph: WorkflowGraph): GraphToLinearResult {
         if (target.type === "exit") {
           exitEdge = edge;
           break;
+        }
+        if (target.type !== "agent") {
+          // Join nodes (#115) are fan-in synchronizers: no legacy shape.
+          return fail(
+            `chain edge "${edge.id}" targets ${target.type} node "${target.id}"; this has no legacy representation`,
+          );
         }
         if (seen.has(target.id)) {
           return fail(

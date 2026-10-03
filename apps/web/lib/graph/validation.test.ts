@@ -132,19 +132,42 @@ describe("validateCanvasDocument", () => {
     expect(pattern?.field).toContain("pattern");
   });
 
-  it("flags two unconditional outgoing edges (ambiguous router)", () => {
-    const doc: CanvasDocument = {
+  it("accepts fan-out (dual-always is legal parallelism, #115); mixing fan-out with routing is flagged", () => {
+    const fanOut: CanvasDocument = {
       nodes: [
         node("a", { isEntry: true }),
         node("b", { position: { x: 300, y: -100 } }),
         node("c", { position: { x: 300, y: 100 } }),
+        exit("x", { x: 600, y: 0 }),
       ],
-      edges: [edge("a", "b", "always"), edge("a", "c", "always")],
+      edges: [
+        edge("a", "b", "always"),
+        edge("a", "c", "always"),
+        edge("b", "x", "always"),
+        edge("c", "x", "always"),
+      ],
     };
-    const issues = validateCanvasDocument(doc);
-    expect(
-      issues.some((issue) => issue.message.includes("unconditional (always) outgoing edges")),
-    ).toBe(true);
+    expect(validateCanvasDocument(fanOut)).toEqual([]);
+
+    const mixed: CanvasDocument = {
+      nodes: [
+        node("a", { isEntry: true }),
+        node("b", { position: { x: 300, y: -100 } }),
+        node("c", { position: { x: 300, y: 100 } }),
+        exit("x", { x: 600, y: 0 }),
+      ],
+      edges: [
+        edge("a", "b", "always"),
+        edge("a", "c", "always"),
+        edge("a", "x", { pattern: "skip" }),
+        edge("b", "x", "always"),
+        edge("c", "x", "always"),
+      ],
+    };
+    const issues = validateCanvasDocument(mixed);
+    expect(issues.some((issue) => issue.message.includes("mixes 2 unconditional (always)"))).toBe(
+      true,
+    );
   });
 
   it("flags exit nodes with outgoing edges", () => {
@@ -279,18 +302,27 @@ describe("classifyIssue (severity split, #68)", () => {
   });
 
   it("hard graph rules are blockers", () => {
-    const dualAlways: CanvasDocument = {
+    // #115: fan-out is legal; MIXING fan-out with routing is the blocker.
+    const mixedAlways: CanvasDocument = {
       nodes: [
         node("a", { isEntry: true }),
         node("b", { position: { x: 300, y: -100 } }),
         node("c", { position: { x: 300, y: 100 } }),
+        exit("x", { x: 600, y: 0 }),
       ],
-      edges: [edge("a", "b", "always"), edge("a", "c", "always")],
+      edges: [
+        edge("a", "b", "always"),
+        edge("a", "c", "always"),
+        edge("a", "x", { pattern: "skip" }),
+        edge("b", "x", "always"),
+        edge("c", "x", "always"),
+      ],
     };
-    const dual = validateCanvasDocument(dualAlways).find((issue) =>
-      issue.message.includes("unconditional (always) outgoing edges"),
+    const mixed = validateCanvasDocument(mixedAlways).find((issue) =>
+      issue.message.includes("mixes 2 unconditional (always) outgoing edges"),
     );
-    expect(classifyIssue(dual as CanvasIssue)).toBe("blocker");
+    expect(mixed).toBeDefined();
+    expect(classifyIssue(mixed as CanvasIssue)).toBe("blocker");
 
     const exitOutgoing: CanvasDocument = {
       nodes: [node("a", { isEntry: true }), exit("x", { x: 300, y: 0 }), node("b")],

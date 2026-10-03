@@ -169,7 +169,7 @@ export function toRunFlowNodes(
 ): RunFlowNode[] {
   return doc.nodes.map((node: CanvasNode) => ({
     id: node.id,
-    type: node.type === "agent" ? "run-agent" : "run-exit",
+    type: node.type === "agent" ? "run-agent" : node.type === "join" ? "run-join" : "run-exit",
     position: node.position,
     data: runNodeData(node.data, (visuals[node.id] as NodeVisualSlice | undefined) ?? null),
     draggable: false,

@@ -131,6 +131,12 @@ export interface FlowEngineOptions {
   drivers: DriverRegistry;
   logger?: FlowLogger;
   /**
+   * Run-internal concurrency for graph fan-out (#115): how many node
+   * executions a single run may have in flight at once. Defaults to
+   * `DEFAULT_INNER_CONCURRENCY` (3); env/policy wiring is post-v0.2.
+   */
+  graphInnerConcurrency?: number;
+  /**
    * Invoked after every persisted `run.status` event (run started, terminal
    * transitions — both linear and graph paths funnel through one emission
    * point). The run row already carries the new status when it fires. The
@@ -471,6 +477,32 @@ export function createFlowEngine(options: FlowEngineOptions): FlowEngine {
   }
 
   /**
+   * Creates (or re-uses) a QUEUED StepRun row for a graph execution that was
+   * scheduled but not started yet (#115: parallel branches queue behind the
+   * run's inner concurrency cap — their pending state must survive a
+   * restart). Flipped to running by {@link beginStepRun} when they start.
+   */
+  function scheduleStepRun(runId: string, step: { stepId: string }, iteration: number): StepRun {
+    const existing = db.stepRuns
+      .listByRun(runId)
+      .find(
+        (row) =>
+          row.stepId === step.stepId &&
+          row.iteration === iteration &&
+          (row.status === "queued" || row.status === "interrupted"),
+      );
+    if (existing) return existing;
+    return db.stepRuns.create({
+      id: randomUUID(),
+      runId,
+      stepId: step.stepId,
+      iteration,
+      status: "queued",
+      output: "",
+    });
+  }
+
+  /**
    * Session a `continueSession` step should resume. Across loop iterations the
    * previous iteration's SAME-STEP StepRun wins (the reviewer keeps its own
    * full context, including what it said last pass); within the first
@@ -689,7 +721,7 @@ export function createFlowEngine(options: FlowEngineOptions): FlowEngine {
     }
   }
 
-  /** Shared machinery handed to the graph executor (#45). */
+  /** Shared machinery handed to the graph executor (#45, #115). */
   const graphDeps: GraphEngineDeps = {
     db,
     worktrees,
@@ -700,6 +732,7 @@ export function createFlowEngine(options: FlowEngineOptions): FlowEngine {
     abortRun,
     captureDiff,
     beginStepRun,
+    scheduleStepRun,
     appendEvent,
     redactText,
     runSecretsEnv: (runId) => runSecrets.get(runId)?.env,
@@ -851,10 +884,15 @@ export function createFlowEngine(options: FlowEngineOptions): FlowEngine {
       }
     }
 
-    // Graph dispatch: the serial DAG executor owns everything from here
-    // (node.* / edge.* events, per-node StepRuns, breadcrumb, resume).
+    // Graph dispatch: the parallel DAG executor owns everything from here
+    // (node.* / edge.* events, per-node StepRuns, fan-out/join, breadcrumb,
+    // resume).
     if (graph !== undefined) {
-      await executeGraphRun(graphDeps, run, graph, worktreePath, control);
+      await executeGraphRun(graphDeps, run, graph, worktreePath, control, {
+        ...(options.graphInnerConcurrency === undefined
+          ? {}
+          : { innerConcurrency: options.graphInnerConcurrency }),
+      });
       return;
     }
 

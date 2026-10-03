@@ -40,7 +40,14 @@ const graphEra: WorkflowListed = {
   projectId: "p-1",
   name: "canvas-flow",
   steps: [step("n1", "implement")],
-  graphSummary: { nodeCount: 3, edgeCount: 2, hasLoop: true, hasRouter: true, revision: 2 },
+  graphSummary: {
+    nodeCount: 3,
+    edgeCount: 2,
+    hasLoop: true,
+    hasRouter: true,
+    hasFanOut: false,
+    revision: 2,
+  },
 };
 
 /** Legacy rows (never saved as revisions): no summary, steps-based display. */
@@ -136,7 +143,14 @@ describe("WorkflowsList (#70: current graph shape + revision)", () => {
         projectId: "p-1",
         name: "chain",
         steps: [step("n1", "a")],
-        graphSummary: { nodeCount: 3, edgeCount: 2, hasLoop: false, hasRouter: false, revision: 1 },
+        graphSummary: {
+          nodeCount: 3,
+          edgeCount: 2,
+          hasLoop: false,
+          hasRouter: false,
+          hasFanOut: false,
+          revision: 1,
+        },
       },
     ];
     render(createElement(WorkflowsList, { projectId: "p-1" }));

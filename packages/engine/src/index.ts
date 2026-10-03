@@ -38,7 +38,14 @@ export {
   type StepDefinition,
 } from "./flow-engine.js";
 
-export { MAX_EDGE_ITERATIONS, executeGraphRun, type GraphEngineDeps } from "./graph-engine.js";
+export {
+  DEFAULT_INNER_CONCURRENCY,
+  MAX_EDGE_ITERATIONS,
+  MAX_INNER_CONCURRENCY,
+  executeGraphRun,
+  type GraphEngineDeps,
+  type GraphRunOptions,
+} from "./graph-engine.js";
 
 export { detectPorts, mergeDetectedPorts, runPortList } from "./port-detect.js";
 

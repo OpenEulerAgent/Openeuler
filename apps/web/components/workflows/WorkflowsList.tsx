@@ -150,7 +150,10 @@ export function WorkflowsList({ projectId }: { projectId: string }) {
                             <span>{graphSummaryLine(summary)}</span>
                             {summary.hasLoop ? <Badge variant="accent">loop</Badge> : null}
                             {summary.hasRouter ? <Badge variant="accent">router</Badge> : null}
-                            {!summary.hasLoop && !summary.hasRouter ? <Badge>linear</Badge> : null}
+                            {summary.hasFanOut ? <Badge variant="accent">parallel</Badge> : null}
+                            {!summary.hasLoop && !summary.hasRouter && !summary.hasFanOut ? (
+                              <Badge>linear</Badge>
+                            ) : null}
                           </>
                         ) : (
                           <>
