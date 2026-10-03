@@ -241,20 +241,30 @@ export function RunCompareView({ aId, bId }: { aId: string; bId: string }) {
   const [diffB, setDiffB] = useState<DiffState>({ phase: "loading" });
   const [reloadKey, setReloadKey] = useState(0);
 
-  const load = useCallback(async (): Promise<void> => {
-    void fetchRunDetail(aId).then(setSideA);
-    void fetchRunDetail(bId).then(setSideB);
-    void fetchCumulativeDiff(aId).then(setDiffA);
-    void fetchCumulativeDiff(bId).then(setDiffB);
-  }, [aId, bId]);
-
   useEffect(() => {
     setSideA({ phase: "loading" });
     setSideB({ phase: "loading" });
     setDiffA({ phase: "loading" });
     setDiffB({ phase: "loading" });
-    void load();
-  }, [load, reloadKey]);
+    // Stale-response guard: a slow fetch from a PREVIOUS (aId, bId) pair
+    // must not overwrite the freshly-loading sides after in-app navigation.
+    let cancelled = false;
+    void fetchRunDetail(aId).then((value) => {
+      if (!cancelled) setSideA(value);
+    });
+    void fetchRunDetail(bId).then((value) => {
+      if (!cancelled) setSideB(value);
+    });
+    void fetchCumulativeDiff(aId).then((value) => {
+      if (!cancelled) setDiffA(value);
+    });
+    void fetchCumulativeDiff(bId).then((value) => {
+      if (!cancelled) setDiffB(value);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [aId, bId, reloadKey]);
 
   const retry = useCallback((): void => setReloadKey((key) => key + 1), []);
 
@@ -326,8 +336,15 @@ export function RunCompareView({ aId, bId }: { aId: string; bId: string }) {
   const rows = alignRunSteps(detailA.steps, detailB.steps);
   const patchA = diffA.phase === "ready" ? diffA.diff.patch : "";
   const patchB = diffB.phase === "ready" ? diffB.diff.patch : "";
-  const fileSets =
-    diffA.phase === "ready" && diffB.phase === "ready" ? filesOnlyIn(patchA, patchB) : null;
+  // Chips are only trustworthy over COMPLETE patches — the server truncates
+  // at 20k lines, and a file in A's cut-off tail would misreport as
+  // "only in B". Suppress the chips entirely when either side is truncated.
+  const fileSetsComplete =
+    diffA.phase === "ready" &&
+    diffB.phase === "ready" &&
+    !diffA.diff.truncated &&
+    !diffB.diff.truncated;
+  const fileSets = fileSetsComplete ? filesOnlyIn(patchA, patchB) : null;
 
   return (
     <div className="flex flex-col gap-6" data-run-compare>
@@ -427,7 +444,10 @@ export function RunCompareView({ aId, bId }: { aId: string; bId: string }) {
         <CardContent className="flex flex-col gap-4">
           {fileSets === null ? (
             <p className="text-sm text-muted-fg">
-              File comparison appears once both cumulative diffs load.
+              {(diffA.phase === "ready" && diffA.diff.truncated) ||
+              (diffB.phase === "ready" && diffB.diff.truncated)
+                ? "File comparison is hidden — at least one cumulative diff was truncated at the server's line cap."
+                : "File comparison appears once both cumulative diffs load."}
             </p>
           ) : fileSets.onlyInA.length === 0 &&
             fileSets.onlyInB.length === 0 &&
