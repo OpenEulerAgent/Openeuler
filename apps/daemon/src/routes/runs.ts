@@ -12,6 +12,7 @@ import {
   RunHostingOptionsSchema,
   RunPortsSchema,
   RunStatusSchema,
+  WorkflowGraphSchema,
 } from "@openeuler/core";
 import type { Db } from "@openeuler/db";
 import { DriverError } from "@openeuler/drivers";
@@ -1079,7 +1080,23 @@ export function createRunsRouter(options: CreateRunsRouterOptions = {}): Hono<Ap
         `run ${id} has status ${run.status}; only interrupted runs can be resumed`,
       );
     }
-    const withoutSession = db.stepRuns.listByRun(id).filter((step) => step.sessionId === undefined);
+    // Sub-workflow node executions (#117) never record a sessionId (the
+    // child run's own StepRuns carry the sessions) — only AGENT rows need
+    // one for context-preserving resume. Look up the pinned graph's node
+    // kinds to exempt subworkflow steps from the guard.
+    const subworkflowStepIds = new Set<string>();
+    if (run.workflowRevisionId !== undefined) {
+      const revision = db.workflowRevisions.get(run.workflowRevisionId);
+      const parsed = revision === undefined ? undefined : WorkflowGraphSchema.safeParse(revision.graph);
+      if (parsed !== undefined && parsed.success) {
+        for (const node of parsed.data.nodes) {
+          if (node.type === "subworkflow") subworkflowStepIds.add(node.id);
+        }
+      }
+    }
+    const withoutSession = db.stepRuns
+      .listByRun(id)
+      .filter((step) => step.sessionId === undefined && !subworkflowStepIds.has(step.stepId));
     if (withoutSession.length > 0) {
       throw new HttpError(
         409,

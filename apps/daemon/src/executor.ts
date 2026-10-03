@@ -599,6 +599,22 @@ export function createExecutor(options: ExecutorOptions): Executor {
             // Unreachable (mode would be local); defensive.
             return undefined;
           }
+          // #105 cap applies to INLINE CHILD runs too (#117): without this
+          // check a fan-out × depth-3 parent could hold 1+f+f²+f³ live
+          // containers, blowing past MAX_SANDBOXES. A child at cap fails
+          // its parent node with this typed, actionable error (strict
+          // semantics) instead of over-committing the host.
+          try {
+            if ((await options.sandbox!.provider.list()).length >= maxSandboxes) {
+              throw new SandboxError(
+                "SANDBOX_UNAVAILABLE",
+                `sandbox cap reached (${maxSandboxes} live sandboxes, MAX_SANDBOXES); retry when other runs finish or raise the cap`,
+              );
+            }
+          } catch (err) {
+            if (err instanceof SandboxError) throw err;
+            logger.warn({ err, runId: run.id }, "sandbox cap check failed (assuming below cap)");
+          }
           // #110 restart hygiene: a sandbox left over from a pre-restart
           // execution of this run (the daemon died mid-run; the recovery
           // sweep marked it interrupted and the user resumed) must not
