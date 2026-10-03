@@ -78,8 +78,14 @@ const steps: StepRun[] = [
 /** SSE frames the daemon would replay for the finished run. */
 const replayFrames = [
   { event: "run.status", data: { type: "run.status", seq: 0, status: "running" } },
-  { event: "node.queued", data: { type: "node.queued", seq: 1, nodeId: "a", nodeName: "Worker A", iteration: 1 } },
-  { event: "node.started", data: { type: "node.started", seq: 2, nodeId: "a", nodeName: "Worker A", iteration: 1 } },
+  {
+    event: "node.queued",
+    data: { type: "node.queued", seq: 1, nodeId: "a", nodeName: "Worker A", iteration: 1 },
+  },
+  {
+    event: "node.started",
+    data: { type: "node.started", seq: 2, nodeId: "a", nodeName: "Worker A", iteration: 1 },
+  },
   {
     event: "node.completed",
     data: {
@@ -95,7 +101,15 @@ const replayFrames = [
   },
   {
     event: "edge.taken",
-    data: { type: "edge.taken", seq: 4, edgeId: "e-a-exit", source: "a", target: "exit", matchedCondition: "always", iteration: 1 },
+    data: {
+      type: "edge.taken",
+      seq: 4,
+      edgeId: "e-a-exit",
+      source: "a",
+      target: "exit",
+      matchedCondition: "always",
+      iteration: 1,
+    },
   },
   { event: "run.status", data: { type: "run.status", seq: 5, status: "success" } },
 ];
@@ -147,7 +161,9 @@ const runDetailResponse = {
 
 const fetchRoutes: Record<string, unknown> = {
   "/api/runs/run-1": runDetailResponse,
-  "/api/projects/p-1": { project: { id: "p-1", name: "demo", path: "/tmp/demo", defaultBranch: "main" } },
+  "/api/projects/p-1": {
+    project: { id: "p-1", name: "demo", path: "/tmp/demo", defaultBranch: "main" },
+  },
   "/api/workflows/wf-1/revisions/1": { revision: { id: "rev-1", number: 1, graph } },
   "/api/runs/run-1/diff": {
     scope: "cumulative",
@@ -245,9 +261,10 @@ const settle = async (): Promise<void> => {
 
 describe("RunDetailView 2.0 (client flow)", () => {
   it("defaults to the Graph tab and renders the replayed execution state", async () => {
-    nav.notify = () => render(() =>
-      createElement(ThemeProvider, null, createElement(RunDetailView, { runId: "run-1" })),
-    );
+    nav.notify = () =>
+      render(() =>
+        createElement(ThemeProvider, null, createElement(RunDetailView, { runId: "run-1" })),
+      );
     nav.notify();
     await settle();
     await act(async () => {
@@ -267,9 +284,10 @@ describe("RunDetailView 2.0 (client flow)", () => {
   });
 
   it("drawer diff deep link switches to the Diff tab scoped to the step run", async () => {
-    nav.notify = () => render(() =>
-      createElement(ThemeProvider, null, createElement(RunDetailView, { runId: "run-1" })),
-    );
+    nav.notify = () =>
+      render(() =>
+        createElement(ThemeProvider, null, createElement(RunDetailView, { runId: "run-1" })),
+      );
     nav.notify();
     await settle();
     await act(async () => {
@@ -307,15 +325,88 @@ describe("RunDetailView 2.0 (client flow)", () => {
       iterations: {},
       summary: { eventCount: 0 },
     };
-    nav.notify = () => render(() =>
-      createElement(ThemeProvider, null, createElement(RunDetailView, { runId: "run-1" })),
-    );
+    nav.notify = () =>
+      render(() =>
+        createElement(ThemeProvider, null, createElement(RunDetailView, { runId: "run-1" })),
+      );
     nav.notify();
     await settle();
 
     const tabs = [...document.querySelectorAll('[role="tab"]')].map((tab) => tab.textContent);
     expect(tabs).toEqual(["Events", "Diff", "Timeline"]);
     expect(document.querySelector("[data-run-graph-tab]")).toBeNull();
+    delete fetchRoutes["/api/runs/run-1"];
+    fetchRoutes["/api/runs/run-1"] = runDetailResponse;
+  });
+
+  it("hides the Preview tab without ports; ?tab=preview falls back to Graph", async () => {
+    nav.search = "?tab=preview";
+    nav.notify = () =>
+      render(() =>
+        createElement(ThemeProvider, null, createElement(RunDetailView, { runId: "run-1" })),
+      );
+    nav.notify();
+    await settle();
+
+    const tabs = [...document.querySelectorAll('[role="tab"]')].map((tab) => tab.textContent);
+    expect(tabs).toEqual(["Graph", "Events", "Diff", "Timeline"]);
+    // Fallback landed on Graph (the default), and nothing preview-shaped
+    // mounted or fetched.
+    expect(document.querySelector('[role="tab"][aria-selected="true"]')?.textContent).toBe("Graph");
+    expect(document.querySelector("[data-preview-tab]")).toBeNull();
+    expect(fetchCalls.some((href) => href.includes("/previews/"))).toBe(false);
+    nav.search = "";
+  });
+
+  it("shows the Preview tab for ported runs: lazy iframe + chips + HEAD probe (#109)", async () => {
+    fetchRoutes["/api/runs/run-1"] = {
+      ...runDetailResponse,
+      ports: [
+        { container: 3000, host: 49153, declared: true },
+        { container: 5173, declared: false, hint: "declare ports on the run to preview" },
+      ],
+    };
+    nav.notify = () =>
+      render(() =>
+        createElement(ThemeProvider, null, createElement(RunDetailView, { runId: "run-1" })),
+      );
+    nav.notify();
+    await settle();
+
+    // Tab offered, but nothing preview-related mounted or fetched yet.
+    const tabs = [...document.querySelectorAll('[role="tab"]')].map((tab) => tab.textContent);
+    expect(tabs).toEqual(["Graph", "Events", "Diff", "Timeline", "Preview"]);
+    expect(document.querySelector("[data-preview-tab]")).toBeNull();
+    expect(fetchCalls.some((href) => href.includes("/previews/"))).toBe(false);
+
+    // Selecting the tab mounts the panel lazily: chips + iframe + probe.
+    const previewTab = [...document.querySelectorAll('[role="tab"]')].find(
+      (tab) => tab.textContent === "Preview",
+    ) as HTMLElement;
+    act(() => {
+      previewTab.click();
+    });
+    await settle();
+
+    expect(nav.href).toBe("/runs/run-1?tab=preview");
+    const frame = document.querySelector("[data-preview-frame]") as HTMLIFrameElement;
+    expect(frame.getAttribute("src")).toBe("/previews/run-1/3000/");
+    expect(frame.getAttribute("sandbox")).toBe(
+      "allow-forms allow-scripts allow-same-origin allow-modals",
+    );
+    // First hosted port selected by default; detected chip disabled + hint.
+    expect(document.querySelector('[data-preview-chip="3000"]')?.getAttribute("aria-pressed")).toBe(
+      "true",
+    );
+    const detectedChip = document.querySelector('[data-preview-chip="5173"]') as HTMLButtonElement;
+    expect(detectedChip.disabled).toBe(true);
+    expect(detectedChip.getAttribute("title")).toBe("declare ports on the run to preview");
+    // HEAD probe fired through the proxy and reported live.
+    expect(fetchCalls.some((href) => href.startsWith("/previews/run-1/3000/"))).toBe(true);
+    expect(document.querySelector("[data-preview-state]")?.getAttribute("data-preview-state")).toBe(
+      "live",
+    );
+
     delete fetchRoutes["/api/runs/run-1"];
     fetchRoutes["/api/runs/run-1"] = runDetailResponse;
   });
