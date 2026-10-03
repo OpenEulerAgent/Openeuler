@@ -91,12 +91,19 @@ export async function runHostingSweep(deps: HostingSweepDeps): Promise<HostingSw
   const now = deps.now ?? Date.now;
   const counts: HostingSweepCounts = { expired: 0, kept: 0 };
   for (const run of hostedRuns(deps.db)) {
-    const until = Date.parse(run.hostedUntil ?? "");
+    // Re-read the row fresh: an extend/stop landing since the list snapshot
+    // (or while earlier iterations awaited destroys) must not be clobbered
+    // by this pass — an extended run stays hosted, a stopped one is done.
+    const fresh = deps.db.runs.get(run.id);
+    if (fresh === undefined || fresh.hostedUntil === undefined) {
+      continue;
+    }
+    const until = Date.parse(fresh.hostedUntil);
     if (Number.isFinite(until) && now() < until) {
       counts.kept += 1;
       continue;
     }
-    const expiredAt = run.hostedUntil ?? new Date(now()).toISOString();
+    const expiredAt = fresh.hostedUntil;
     const stopped = deps.stopHosted ? await deps.stopHosted(run.id) : false;
     if (!stopped) {
       await destroyByRunLabel(deps, run.id);

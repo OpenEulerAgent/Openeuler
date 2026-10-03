@@ -368,6 +368,36 @@ describe("hosting TTL sweep (#110)", () => {
     expect(await h.provider.list({ run: runId })).toHaveLength(1);
   });
 
+  it("an extend landing mid-sweep is honored — the fresh row re-read prevents clobbering", async () => {
+    const h = setup({ events: [{ type: "done", seq: 1, output: "up" }], output: "up" });
+    const runId = await hostRun(h);
+
+    // The sweep starts with a stale snapshot; the user extends BEFORE the
+    // loop reaches this run (as if an earlier iteration awaited a destroy).
+    const hostedSnapshot = h.db.runs.list().filter((run) => run.hostedUntil !== undefined);
+    expect(hostedSnapshot).toHaveLength(1);
+    const extendResult = await h.executor.extendHosting(runId, 30);
+    expect(extendResult.outcome).toBe("extended");
+
+    const counts = await runHostingSweep({
+      db: h.db,
+      provider: h.provider,
+      logger,
+      now: () => Date.now() + 10 * 60_000, // past the ORIGINAL 5-minute TTL
+      stopHosted: async () => {
+        throw new Error("must not stop a just-extended run");
+      },
+    });
+
+    expect(counts).toEqual({ expired: 0, kept: 1 });
+    expect(h.db.runs.get(runId)?.hostedUntil).toBeDefined();
+    expect(await h.provider.list({ run: runId })).toHaveLength(1);
+    const events = h.db.activity
+      .list({ limit: 20 })
+      .filter((row) => row.type === "ops.hosting-expired" && row.runId === runId);
+    expect(events).toEqual([]);
+  });
+
   it("the provider-label fallback expires hosting this executor does not own (post-restart)", async () => {
     const h = setup({ events: [{ type: "done", seq: 1, output: "up" }], output: "up" });
     const runId = await hostRun(h);
