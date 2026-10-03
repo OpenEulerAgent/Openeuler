@@ -1,5 +1,5 @@
 import type { RunStatus } from "@openeuler/core";
-import type { ReactNode } from "react";
+import type { HTMLAttributes, ReactNode } from "react";
 import { cn } from "@/lib/cn";
 
 /**
@@ -27,16 +27,15 @@ const VARIANT_CLASSES: Record<BadgeVariant, string> = {
 export function Badge({
   variant = "neutral",
   className,
-  title,
   children,
+  ...rest
 }: {
   variant?: BadgeVariant;
   className?: string;
-  title?: string;
   children: ReactNode;
-}) {
+} & HTMLAttributes<HTMLSpanElement>) {
   return (
-    <span title={title} className={cn(BASE_CLASS, VARIANT_CLASSES[variant], className)}>
+    <span className={cn(BASE_CLASS, VARIANT_CLASSES[variant], className)} {...rest}>
       {children}
     </span>
   );

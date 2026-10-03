@@ -1,21 +1,28 @@
 /**
  * URL wiring for the run detail page (#52): `?tab=` selects Graph | Events |
- * | Diff | Timeline, `?stepRunId=` scopes the Diff tab to one StepRun (the
- * node drawer's deep link). Pure string helpers — unit-tested without a
- * router.
+ * | Diff | Timeline | Preview (#109), `?stepRunId=` scopes the Diff tab to
+ * one StepRun (the node drawer's deep link). Pure string helpers —
+ * unit-tested without a router.
  */
 
-export type RunDetailTab = "graph" | "events" | "diff" | "timeline";
+export type RunDetailTab = "graph" | "events" | "diff" | "timeline" | "preview";
 
 export const RUN_DETAIL_TABS: ReadonlyArray<{ id: RunDetailTab; label: string }> = [
   { id: "graph", label: "Graph" },
   { id: "events", label: "Events" },
   { id: "diff", label: "Diff" },
   { id: "timeline", label: "Timeline" },
+  { id: "preview", label: "Preview" },
 ];
 
 export function isRunDetailTab(value: string | null | undefined): value is RunDetailTab {
-  return value === "graph" || value === "events" || value === "diff" || value === "timeline";
+  return (
+    value === "graph" ||
+    value === "events" ||
+    value === "diff" ||
+    value === "timeline" ||
+    value === "preview"
+  );
 }
 
 export interface RunDetailQuery {

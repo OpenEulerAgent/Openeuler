@@ -15,6 +15,7 @@ describe("run-detail query helpers", () => {
       stepRunId: "sr-1",
     });
     expect(parseRunDetailQuery("?tab=graph")).toEqual({ tab: "graph", stepRunId: null });
+    expect(parseRunDetailQuery("?tab=preview")).toEqual({ tab: "preview", stepRunId: null });
     expect(parseRunDetailQuery("?tab=bogus")).toEqual({ tab: null, stepRunId: null });
     expect(parseRunDetailQuery("")).toEqual({ tab: null, stepRunId: null });
     expect(parseRunDetailQuery("?stepRunId=")).toEqual({ tab: null, stepRunId: null });
@@ -36,8 +37,15 @@ describe("run-detail query helpers", () => {
   });
 
   it("knows the tab roster", () => {
-    expect(RUN_DETAIL_TABS.map((tab) => tab.id)).toEqual(["graph", "events", "diff", "timeline"]);
+    expect(RUN_DETAIL_TABS.map((tab) => tab.id)).toEqual([
+      "graph",
+      "events",
+      "diff",
+      "timeline",
+      "preview",
+    ]);
     expect(isRunDetailTab("graph")).toBe(true);
+    expect(isRunDetailTab("preview")).toBe(true);
     expect(isRunDetailTab("nope")).toBe(false);
     expect(isRunDetailTab(null)).toBe(false);
   });
