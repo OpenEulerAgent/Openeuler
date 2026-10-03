@@ -203,6 +203,10 @@ Out-of-range values answer 422 with the clamp message. The web editor is the pro
 - **Node overrides**: any agent node may carry `sandboxOverrides {image?, cpus?, memoryMb?, network?}` (canvas inspector → _Sandbox overrides_, empty = inherit). Overrides validate as part of the graph save (422 otherwise) and win per field at run time; the merge is the pure `buildSandboxSpec(policy, overrides, …)` in `@openeuler/engine`, which fills defaults (2 CPUs / 2048 MiB) and throws a typed `SANDBOX_INVALID_SPEC` naming the image endpoints when sandboxing is requested without an image. Executor wiring lands in #102.
 - **Honest limits (v0.2)**: `network: "limited"` means a dedicated bridge network with working DNS — **egress is NOT filtered yet** (documented in the UI next to the option). `none` is fully isolated, `default` is normal outbound access.
 
+## Run previews (sandbox proxy)
+
+While a sandboxed run executes, its **declared** ports (#107) are previewable through the daemon (#108): `/previews/:runId[/:port]/*` (alias `/api/previews/…`) is a streaming reverse proxy to the run's sandbox port — method passthrough (GET/HEAD/POST/PUT/PATCH/DELETE), bodies and responses streamed, hop-by-hop headers stripped, timeouts (10s connect / 120s overall) with an actionable `502 PREVIEW_UPSTREAM_UNAVAILABLE` when the sandbox app is down. Port resolution: the path form (`/previews/:runId/3000/app.js` — canonical, survives relative links) → `?port=` → the first declared port. Undeclared ports answer `403` with the declare-to-preview hint; finished/local runs answer `410 PREVIEW_GONE`; unknown runs `404`. Auth applies on both mounts (`?token=` works for GET iframes); with `PREVIEW_IFRAME=1` the responses are framable (`frame-ancestors 'self' <CORS allowlist>`, no `X-Frame-Options`). Link rewriting and WebSocket upgrades are documented v0.2 cuts. Details: **[docs/DEV.md](docs/DEV.md)**.
+
 ## Project layout
 
 ```

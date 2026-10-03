@@ -23,6 +23,8 @@ import { createPresetsRouter } from "./routes/presets.js";
 import { createSandboxRouter } from "./routes/sandbox.js";
 import type { SandboxRouterOptions } from "./routes/sandbox.js";
 import { createSecretsRouter } from "./routes/secrets.js";
+import { createPreviewRouter } from "./routes/previews.js";
+import type { PreviewRouterOptions } from "./routes/previews.js";
 import type { EventStreamOptions, GlobalStreamOptions } from "./routes/runs.js";
 import { createRunsRouter } from "./routes/runs.js";
 import type { SystemRouterOptions } from "./routes/system.js";
@@ -128,6 +130,12 @@ export interface CreateAppOptions {
    * project-delete cache-volume cleanup (tests script it).
    */
   projects?: ProjectsRouterOptions;
+  /**
+   * Preview proxy tuning (#108): injectable proxy service — tests shrink
+   * the connect/overall timeouts. Routes mount at BOTH `/previews/…` (the
+   * canonical iframe URL) and `/api/previews/…` (API-origin alias).
+   */
+  previews?: PreviewRouterOptions;
 }
 
 export interface DaemonApp {
@@ -257,6 +265,10 @@ export function createApp(options: CreateAppOptions = {}): DaemonApp {
     // `/metrics` (#94) sits outside /api but is token-gated too: bearer
     // header, or `?token=` on GET (scrapers often cannot set headers).
     app.use("/metrics", createAuthMiddleware({ token: authToken, logger }));
+    // #108: the canonical `/previews/:runId/…` mount also sits outside
+    // /api — same gate (GET previews accept `?token=` via the stream-route
+    // patterns in auth.ts, so header-less iframes still work).
+    app.use("/previews/*", createAuthMiddleware({ token: authToken, logger }));
   }
 
   app.use("*", (c, next) => {
@@ -321,6 +333,12 @@ export function createApp(options: CreateAppOptions = {}): DaemonApp {
     }),
   );
   app.route("/api/activity", createActivityRouter());
+
+  // Run preview proxy (#108): `/previews/:runId[/:port]/*` streams to the
+  // run's live sandbox port; `/api/previews/…` is the same router under the
+  // API prefix (auth + exemption patterns cover both mounts).
+  app.route("/previews", createPreviewRouter(options.previews));
+  app.route("/api/previews", createPreviewRouter(options.previews));
 
   app.onError((err, c) => {
     if (err instanceof HttpError) {
