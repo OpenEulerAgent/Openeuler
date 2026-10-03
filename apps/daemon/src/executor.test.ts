@@ -1074,3 +1074,115 @@ describe("createExecutor sandbox concurrency cap (#105)", () => {
     expect(resolveMaxSandboxes("2.5")).toBe(8);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Sub-workflow child runs (#117): the scheduler is UNAWARE of them.
+//
+
+describe("createExecutor (sub-workflow child runs, #117)", () => {
+  it("completes a parent + child chain with MAX_CONCURRENT_RUNS=1 — children run inline, never touching the scheduler", async () => {
+    const h = setup({ events: script, delayMs: 20 }, { maxConcurrentRuns: 1 });
+
+    const placeholder = {
+      id: "placeholder",
+      name: "placeholder",
+      driver: "fake",
+      mode: "auto" as const,
+      promptTemplate: "{{task}}",
+      continueSession: false,
+    };
+    const childWorkflow = h.db.workflows.create({
+      id: crypto.randomUUID(),
+      projectId: h.projectId,
+      name: "child",
+      steps: [placeholder],
+    });
+    const childRevision = h.db.workflowRevisions.create(childWorkflow.id, {
+      entryNodeId: "c1",
+      nodes: [
+        {
+          id: "c1",
+          type: "agent",
+          name: "c1",
+          position: { x: 0, y: 0 },
+          config: {
+            driver: "fake",
+            mode: "auto",
+            promptTemplate: "C1[{{task}}]",
+            continueSession: false,
+          },
+        },
+        { id: "c2", type: "exit", name: "Exit", position: { x: 280, y: 0 } },
+      ],
+      edges: [{ id: "e-c2", source: "c1", target: "c2", condition: { type: "always" } }],
+    });
+    const parentWorkflow = h.db.workflows.create({
+      id: crypto.randomUUID(),
+      projectId: h.projectId,
+      name: "parent",
+      steps: [placeholder],
+    });
+    const parentRevision = h.db.workflowRevisions.create(parentWorkflow.id, {
+      entryNodeId: "a",
+      nodes: [
+        {
+          id: "a",
+          type: "agent",
+          name: "a",
+          position: { x: 0, y: 0 },
+          config: {
+            driver: "fake",
+            mode: "auto",
+            promptTemplate: "A[{{task}}]",
+            continueSession: false,
+          },
+        },
+        {
+          id: "sub",
+          type: "subworkflow",
+          name: "spawn",
+          position: { x: 280, y: 0 },
+          config: { workflowId: childWorkflow.id, revision: "latest" },
+        },
+        { id: "exit", type: "exit", name: "Exit", position: { x: 560, y: 0 } },
+      ],
+      edges: [
+        { id: "e1", source: "a", target: "sub", condition: { type: "always" } },
+        { id: "e2", source: "sub", target: "exit", condition: { type: "always" } },
+      ],
+    });
+    expect(childRevision.number).toBe(1);
+    expect(parentRevision.number).toBe(1);
+
+    const runId = crypto.randomUUID();
+    const now = new Date().toISOString();
+    h.db.runs.create({
+      id: runId,
+      projectId: h.projectId,
+      workflowId: parentWorkflow.id,
+      workflowRevisionId: parentRevision.id,
+      status: "queued",
+      branch: `agentloop/${runId}`,
+      iteration: 0,
+      task: "compose",
+      createdAt: now,
+      updatedAt: now,
+    });
+    h.executor.startRun(runId);
+    await waitForStatus(h, runId, "success");
+    await waitForIdle(h);
+
+    // The child executed INLINE: it never entered the executor's active set
+    // (one slot total), yet both runs are terminal success and linked.
+    expect(h.executor.activeRunIds()).toEqual([]);
+    const children = h.db.runs.listByParentRun(runId);
+    expect(children).toHaveLength(1);
+    expect(children[0]).toMatchObject({
+      status: "success",
+      parentRunId: runId,
+      projectId: h.projectId,
+      workflowId: childWorkflow.id,
+    });
+    expect(h.db.runs.get(runId)?.status).toBe("success");
+  });
+});

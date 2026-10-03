@@ -31,6 +31,7 @@ import {
 import { DiffsTab } from "./DiffsTab";
 import { EventFeed } from "./EventFeed";
 import { HostedRunBanner } from "./HostedRunBanner";
+import { SubworkflowLinks } from "./SubworkflowLinks";
 import { InterruptedRunBanner } from "./InterruptedRunBanner";
 import { LocalFallbackBanner } from "./LocalFallbackBanner";
 import { OutputPanel } from "./OutputPanel";
@@ -41,7 +42,13 @@ import { RunGraphTab } from "./graph/RunGraphTab";
 import { TimelineTab } from "./TimelineTab";
 
 interface RunDetail {
-  run: Run & { workflowRevision?: { id: string; number: number } };
+  run: Run & {
+    workflowRevision?: { id: string; number: number };
+    /** Parent run id when this run is a sub-workflow child (#117). */
+    parentRunId?: string;
+    /** Child runs this run spawned via sub-workflow nodes (#117). */
+    childRunIds?: string[];
+  };
   steps: StepRun[];
   summary: { eventCount: number };
   /** Live sandbox snapshot while the run executes sandboxed (#102). */
@@ -305,6 +312,14 @@ export function RunDetailView({ runId }: { runId: string }) {
         runId={detail.run.id}
         hosting={detail.hosting ?? null}
         onChanged={() => void refresh()}
+      />
+
+      {/* #117: parent↔child links for sub-workflow chains ("child of …" up,
+          one link per spawned child run down). */}
+      <SubworkflowLinks
+        runId={detail.run.id}
+        parentRunId={detail.run.parentRunId}
+        childRunIds={detail.run.childRunIds}
       />
 
       <div className="flex flex-col gap-4" data-run-tabs>

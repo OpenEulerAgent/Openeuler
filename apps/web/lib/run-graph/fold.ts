@@ -41,6 +41,11 @@ export interface NodeExecutionInfo {
    * reported one — the parallel-branch marker in the drawer/timeline.
    */
   edgeId?: string;
+  /**
+   * The child run this sub-workflow execution spawned (#117), when the
+   * engine reported one — the parent↔child link in the node drawer.
+   */
+  childRunId?: string;
 }
 
 /** Folded state of one node. Referentially stable while the node is idle. */
@@ -129,7 +134,9 @@ function patchExecution(
     next.status === current.status &&
     next.output === current.output &&
     next.durationMs === current.durationMs &&
-    next.error === current.error
+    next.error === current.error &&
+    next.edgeId === current.edgeId &&
+    next.childRunId === current.childRunId
   ) {
     return executions;
   }
@@ -238,11 +245,16 @@ export function foldRunGraphEvent(
                 durationMs: event.durationMs,
                 ...(event.error === undefined ? {} : { error: event.error }),
               };
-      // #115: fan-out branch executions carry their branch edge id.
+      // #115: fan-out branch executions carry their branch edge id; #117:
+      // sub-workflow completions carry the child run id they spawned.
       const withEdge =
         "edgeId" in event && event.edgeId !== undefined
           ? { ...execution, edgeId: event.edgeId }
           : execution;
+      const withExtras =
+        event.type === "node.completed" && "childRunId" in event && event.childRunId !== undefined
+          ? { ...withEdge, childRunId: event.childRunId }
+          : withEdge;
       const nodes = patchNode(state.nodes, nodeId, {
         status:
           event.type === "node.queued"
@@ -250,7 +262,7 @@ export function foldRunGraphEvent(
             : event.type === "node.started"
               ? "running"
               : event.status,
-        execution: withEdge,
+        execution: withExtras,
       });
       let next: RunGraphFoldState = { ...state, lastSeq: event.seq };
       if (nodes !== state.nodes) next = { ...next, nodes };

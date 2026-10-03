@@ -12,6 +12,7 @@ import {
   RunHostingOptionsSchema,
   RunPortsSchema,
   RunStatusSchema,
+  WorkflowGraphSchema,
 } from "@openeuler/core";
 import type { Db } from "@openeuler/db";
 import { DriverError } from "@openeuler/drivers";
@@ -230,14 +231,17 @@ export interface RunStatsBody {
  * computed field present only while the run sits in the global queue, and
  * `workflowRevision` `{ id, number }`, resolved for runs pinned to a graph
  * revision snapshot. `project`/`workflow` carry resolved names for table
- * rendering (#51). All are deliberately NOT part of the persisted core
- * Run schema.
+ * rendering (#51). `childRunIds` lists the sub-workflow child runs this
+ * run spawned (#117), in spawn order. All are deliberately NOT part of the
+ * persisted core Run schema.
  */
 export type RunApiBody = Run & {
   queuePosition?: number;
   workflowRevision?: { id: string; number: number };
   project?: { id: string; name: string };
   workflow?: { id: string; name: string };
+  /** Sub-workflow child runs spawned by this run (#117), spawn order. */
+  childRunIds?: string[];
 };
 
 /**
@@ -301,6 +305,12 @@ function decorateRuns(db: Db, rows: readonly Run[], positions?: Map<string, numb
       if (revision !== undefined) {
         body = { ...body, workflowRevision: { id: revision.id, number: revision.number } };
       }
+    }
+    // #117: sub-workflow children (spawn order) — present only when the run
+    // spawned any, so ordinary runs keep their shape.
+    const children = db.runs.listByParentRun(run.id);
+    if (children.length > 0) {
+      body = { ...body, childRunIds: children.map((child) => child.id) };
     }
     if (run.status === "queued" && positions !== undefined) {
       const queuePosition = positions.get(run.id);
@@ -1070,7 +1080,23 @@ export function createRunsRouter(options: CreateRunsRouterOptions = {}): Hono<Ap
         `run ${id} has status ${run.status}; only interrupted runs can be resumed`,
       );
     }
-    const withoutSession = db.stepRuns.listByRun(id).filter((step) => step.sessionId === undefined);
+    // Sub-workflow node executions (#117) never record a sessionId (the
+    // child run's own StepRuns carry the sessions) — only AGENT rows need
+    // one for context-preserving resume. Look up the pinned graph's node
+    // kinds to exempt subworkflow steps from the guard.
+    const subworkflowStepIds = new Set<string>();
+    if (run.workflowRevisionId !== undefined) {
+      const revision = db.workflowRevisions.get(run.workflowRevisionId);
+      const parsed = revision === undefined ? undefined : WorkflowGraphSchema.safeParse(revision.graph);
+      if (parsed !== undefined && parsed.success) {
+        for (const node of parsed.data.nodes) {
+          if (node.type === "subworkflow") subworkflowStepIds.add(node.id);
+        }
+      }
+    }
+    const withoutSession = db.stepRuns
+      .listByRun(id)
+      .filter((step) => step.sessionId === undefined && !subworkflowStepIds.has(step.stepId));
     if (withoutSession.length > 0) {
       throw new HttpError(
         409,

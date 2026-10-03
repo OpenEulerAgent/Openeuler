@@ -1,5 +1,6 @@
 "use client";
 
+import Link from "next/link";
 import { useState } from "react";
 import type { StepRun } from "@openeuler/core";
 import { StatusBadge } from "@/components/StatusBadge";
@@ -19,6 +20,8 @@ export interface NodeIterationRow {
   error?: string;
   /** Matching StepRun row, when one exists (sessionId + diff link). */
   stepRun?: StepRun;
+  /** Child run this sub-workflow execution spawned (#117), when known. */
+  childRunId?: string;
 }
 
 /**
@@ -50,6 +53,7 @@ export function nodeIterationRows(
       output: execution.output ?? stepRun?.output ?? "",
       ...(execution.error === undefined ? {} : { error: execution.error }),
       ...(stepRun === undefined ? {} : { stepRun }),
+      ...(execution.childRunId === undefined ? {} : { childRunId: execution.childRunId }),
     };
   });
 }
@@ -98,6 +102,16 @@ function IterationSection({
         ) : null}
       </summary>
       <div className="flex flex-col gap-3 border-t border-border px-3 py-3">
+        {row.childRunId ? (
+          <Link
+            href={`/runs/${row.childRunId}`}
+            data-node-child-run-link={row.childRunId}
+            className="inline-flex w-fit items-center gap-1.5 rounded-lg border border-accent/50 bg-accent-subtle px-2.5 py-1.5 text-xs font-medium text-accent transition-colors hover:bg-accent/15 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
+          >
+            Open child run →
+            <code className="font-mono text-[10px] opacity-80">{row.childRunId.slice(0, 8)}</code>
+          </Link>
+        ) : null}
         {row.stepRun?.sessionId ? (
           <p className="flex flex-wrap items-center gap-2 text-xs text-muted-fg">
             <span>session</span>

@@ -56,7 +56,7 @@ function resolvePath(doc: CanvasDocument, path: readonly (string | number)[]): P
     return edge === undefined ? { field } : { edgeId: edge.id, field: field || undefined };
   }
   if (head === "entryNodeId") {
-    const entry = doc.nodes.find((node) => node.data.kind === "agent" && node.data.isEntry);
+    const entry = doc.nodes.find((node) => node.data.isEntry === true);
     return entry === undefined
       ? { field: "entryNodeId" }
       : { nodeId: entry.id, field: "entryNodeId" };
@@ -225,11 +225,7 @@ const JOIN_HINT = "connect at least two branches into this join";
  * tonal — both severities block the save; see the editor's save gating.
  */
 export function classifyIssue(issue: CanvasIssue): IssueSeverity {
-  if (
-    isUnreachableIssue(issue) ||
-    isMissingConditionIssue(issue) ||
-    isHalfWiredJoinIssue(issue)
-  ) {
+  if (isUnreachableIssue(issue) || isMissingConditionIssue(issue) || isHalfWiredJoinIssue(issue)) {
     return "hint";
   }
   return "blocker";

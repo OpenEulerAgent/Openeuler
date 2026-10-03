@@ -487,6 +487,29 @@ export function DashboardRunsTable() {
                           ? `${run.workflow.name}${run.workflowRevision !== undefined ? ` · r${run.workflowRevision.number}` : ""}`
                           : (run.task ?? "ad-hoc")}
                       </Link>
+                      {/* #117: sub-workflow lineage — "child of <run>" up to
+                          the parent, or the spawned child count linking into
+                          this run's detail (which lists every child). */}
+                      {run.parentRunId !== undefined ? (
+                        <Link
+                          href={`/runs/${encodeURIComponent(run.parentRunId)}`}
+                          data-runs-child-of={run.parentRunId}
+                          className="mt-0.5 block max-w-56 truncate rounded-sm text-xs text-muted-fg transition-colors hover:text-link focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
+                          title={`Child run of ${run.parentRunId}`}
+                        >
+                          child of {run.parentRunId.slice(0, 8)}
+                        </Link>
+                      ) : (run.childRunIds?.length ?? 0) > 0 ? (
+                        <Link
+                          href={`/runs/${encodeURIComponent(run.id)}`}
+                          data-runs-child-count={run.childRunIds?.length}
+                          className="mt-0.5 block rounded-sm text-xs text-muted-fg transition-colors hover:text-link focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
+                        >
+                          {(run.childRunIds as string[]).length === 1
+                            ? "1 child run"
+                            : `${run.childRunIds?.length} child runs`}
+                        </Link>
+                      ) : null}
                     </TableCell>
                     <TableCell>
                       <Link

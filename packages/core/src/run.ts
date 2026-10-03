@@ -137,6 +137,14 @@ export const RunSchema = z.strictObject({
    * pre-graph legacy runs.
    */
   workflowRevisionId: idSchema.optional(),
+  /**
+   * Set when this run is the CHILD of a sub-workflow node execution (#117):
+   * the id of the parent run whose graph spawned it. Child runs execute
+   * INLINE within their parent's execution context (they never occupy their
+   * own scheduler slot) but are ordinary rows in every other respect — own
+   * worktree/branch, own event log, own StepRuns.
+   */
+  parentRunId: idSchema.optional(),
   status: RunStatusSchema,
   branch: z.string().min(1, "branch must be a non-empty string"),
   /** Current loop iteration, 0-based (`0` on the first pass). */

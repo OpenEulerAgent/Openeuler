@@ -204,6 +204,11 @@ export interface RunRepo {
   list(projectId?: string, status?: RunStatus): Run[];
   /** Runs linked to a workflow, newest first. */
   listByWorkflow(workflowId: string): Run[];
+  /**
+   * Child runs spawned by a sub-workflow node of `parentRunId` (#117), in
+   * spawn (creation) order.
+   */
+  listByParentRun(parentRunId: string): Run[];
   updateStatus(id: string, status: RunStatus): Run | undefined;
   /** Patches mutable fields (`status`, `output`, `error`, `iteration`). */
   update(id: string, patch: RunPatch): Run | undefined;
@@ -704,6 +709,7 @@ export function createRunRepo(db: Db): RunRepo {
       projectId: row.projectId,
       ...(row.workflowId === null ? {} : { workflowId: row.workflowId }),
       ...(row.workflowRevisionId === null ? {} : { workflowRevisionId: row.workflowRevisionId }),
+      ...(row.parentRunId === null ? {} : { parentRunId: row.parentRunId }),
       status: row.status,
       branch: row.branch,
       iteration: row.iteration,
@@ -724,6 +730,7 @@ export function createRunRepo(db: Db): RunRepo {
     projectId: run.projectId,
     workflowId: run.workflowId ?? null,
     workflowRevisionId: run.workflowRevisionId ?? null,
+    parentRunId: run.parentRunId ?? null,
     status: run.status,
     branch: run.branch,
     iteration: run.iteration,
@@ -768,6 +775,15 @@ export function createRunRepo(db: Db): RunRepo {
         .from(schema.runs)
         .where(eq(schema.runs.workflowId, workflowId))
         .orderBy(sql`${schema.runs.createdAt} desc`, schema.runs.id)
+        .all();
+      return rows.map(toDomain);
+    },
+    listByParentRun(parentRunId) {
+      const rows = db
+        .select()
+        .from(schema.runs)
+        .where(eq(schema.runs.parentRunId, parentRunId))
+        .orderBy(schema.runs.createdAt, schema.runs.id)
         .all();
       return rows.map(toDomain);
     },

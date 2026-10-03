@@ -110,6 +110,11 @@ export const runs = sqliteTable(
     workflowId: text("workflow_id").references(() => workflows.id),
     /** Graph revision snapshot the run is pinned to; NULL for ad-hoc/legacy runs. */
     workflowRevisionId: text("workflow_revision_id").references(() => workflowRevisions.id),
+    /**
+     * Parent run id for sub-workflow child runs (#117); NULL for top-level
+     * runs. Child runs execute inline within their parent's execution.
+     */
+    parentRunId: text("parent_run_id"),
     status: text("status").notNull(),
     branch: text("branch").notNull(),
     iteration: integer("iteration").notNull(),
@@ -160,6 +165,7 @@ export const runs = sqliteTable(
     index("runs_project_id_idx").on(table.projectId),
     index("runs_workflow_id_idx").on(table.workflowId),
     index("runs_status_idx").on(table.status),
+    index("runs_parent_run_id_idx").on(table.parentRunId),
   ],
 );
 

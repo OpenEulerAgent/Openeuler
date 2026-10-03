@@ -33,6 +33,7 @@ import {
   createExitNode,
   createJoinNode,
   createPresetAgentNode,
+  createSubworkflowNode,
   fromCanvasDocument,
   nextCanvasPosition,
   toCanvasDocument,
@@ -110,6 +111,7 @@ import {
   deleteAgentPreset,
   fetchAgentPresets,
   fetchWorkflow,
+  fetchWorkflows,
   saveWorkflowGraph,
   updateAgentPreset,
   type AgentPresetUpdatePatch,
@@ -117,15 +119,17 @@ import {
 } from "@/lib/workflows-api";
 import { fetchWorkflowRevision } from "@/lib/run-graph/document";
 import {
-  canvasNodeTypes,
   NodeHintCountsContext,
   NodeIssueCountsContext,
   NodeWarningCountsContext,
+  SubworkflowIcon,
+  WorkflowNamesContext,
+  canvasNodeTypes,
   toFlowNodes,
   type CanvasFlowNode,
 } from "./canvas-nodes";
 import { EdgePropertiesDrawer } from "./EdgePropertiesDrawer";
-import { NodePropertiesDrawer } from "./NodePropertiesDrawer";
+import { NodePropertiesDrawer, type SubworkflowPickerWorkflow } from "./NodePropertiesDrawer";
 import {
   JoinIcon,
   Palette,
@@ -304,7 +308,9 @@ function miniMapNodeColorFor(
     if ((hintCounts.get(node.id) ?? 0) > 0) return "var(--warning)";
     const data = node.data as CanvasNodeData;
     if (data.kind === "exit") return "var(--danger)";
-    if (data.kind === "agent" && data.isEntry) return "var(--accent)";
+    if ((data.kind === "agent" || data.kind === "subworkflow") && data.isEntry) {
+      return "var(--accent)";
+    }
     return "var(--muted-fg)";
   };
 }
@@ -392,6 +398,38 @@ function GraphCanvasInner({
       // keep the last known roster
     }
   }, [workflow.projectId]);
+
+  // Project workflows (#117): the sub-workflow picker list + the name
+  // lookup the cards render. Best-effort — an older daemon or transient
+  // failure just leaves the picker empty (the inspector explains itself).
+  const [projectWorkflows, setProjectWorkflows] = useState<SubworkflowPickerWorkflow[]>([]);
+  useEffect(() => {
+    let cancelled = false;
+    void fetchWorkflows(workflow.projectId)
+      .then((rows) => {
+        if (!cancelled) {
+          setProjectWorkflows(
+            rows.map((row) => ({
+              id: row.id,
+              name: row.name,
+              ...(row.graphSummary?.revision === undefined
+                ? {}
+                : { latestRevision: row.graphSummary.revision }),
+            })),
+          );
+        }
+      })
+      .catch(() => {
+        // keep whatever we have (possibly nothing)
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [workflow.projectId]);
+  const workflowNames = useMemo(
+    () => new Map(projectWorkflows.map((row) => [row.id, row.name])),
+    [projectWorkflows],
+  );
 
   const doc = history.present;
   const [savedDoc, setSavedDoc] = useState<CanvasDocument>(initialDoc);
@@ -847,7 +885,9 @@ function GraphCanvasInner({
             })
           : kind === "join"
             ? createJoinNode(spot, uniqueNodeName("Join", takenNames))
-            : createExitNode(spot);
+            : kind === "subworkflow"
+              ? createSubworkflowNode(spot, uniqueNodeName("Sub-workflow", takenNames))
+              : createExitNode(spot);
       commitDoc({ nodes: [...current.nodes, node], edges: current.edges });
       setSelectedEdgeId(null);
       setSelectedNodeId(node.id);
@@ -976,6 +1016,16 @@ function GraphCanvasInner({
     (nodeId: string, mode: "all" | "any") => {
       patchDocDebounced((current) =>
         applyInspectorAction(current, { type: "patchJoinMode", nodeId, mode }),
+      );
+    },
+    [patchDocDebounced],
+  );
+
+  /** Sub-workflow picker (#117): workflow/revision ride the same path. */
+  const patchSubworkflow = useCallback(
+    (nodeId: string, patch: { workflowId?: string; revision?: "latest" | number }) => {
+      patchDocDebounced((current) =>
+        applyInspectorAction(current, { type: "patchSubworkflow", nodeId, ...patch }),
       );
     },
     [patchDocDebounced],
@@ -1330,6 +1380,12 @@ function GraphCanvasInner({
           description: "Merge parallel branches",
           icon: <JoinIcon />,
         },
+        {
+          kind: "subworkflow",
+          title: "Sub-workflow",
+          description: "Run another workflow as a child run",
+          icon: <SubworkflowIcon />,
+        },
       ],
     },
   ];
@@ -1500,7 +1556,14 @@ function GraphCanvasInner({
                 return;
               }
               const kind = event.dataTransfer.getData(CANVAS_NODE_MIME);
-              if (kind !== "agent" && kind !== "exit" && kind !== "join") return;
+              if (
+                kind !== "agent" &&
+                kind !== "exit" &&
+                kind !== "join" &&
+                kind !== "subworkflow"
+              ) {
+                return;
+              }
               addNode(kind, position);
             }}
             onDragOver={(event) => {
@@ -1513,69 +1576,71 @@ function GraphCanvasInner({
             <NodeIssueCountsContext.Provider value={issueCounts}>
               <NodeHintCountsContext.Provider value={hintCounts}>
                 <NodeWarningCountsContext.Provider value={warningCounts}>
-                  <ReactFlow
-                    nodes={nodes}
-                    edges={edges}
-                    nodeTypes={canvasNodeTypes}
-                    onNodesChange={onNodesChange}
-                    onEdgesChange={onEdgesChange}
-                    onConnect={onConnect}
-                    onNodeDragStart={onNodeDragStart}
-                    onNodeDragStop={onNodeDragStop}
-                    onNodeClick={(event, node) => {
-                      // Handle clicks drive connections (and the guided
-                      // edge flow, #69) — the bubbled node click must not
-                      // clobber the selection the connect just made.
-                      if (
-                        event.target instanceof Element &&
-                        event.target.closest(".react-flow__handle") !== null
-                      ) {
-                        return;
-                      }
-                      setSelectedEdgeId(null);
-                      setSelectedNodeId(node.id);
-                    }}
-                    onEdgeClick={(_, edge) => {
-                      setSelectedNodeId(null);
-                      setSelectedEdgeId(edge.id);
-                    }}
-                    onPaneClick={() => {
-                      setSelectedNodeId(null);
-                      setSelectedEdgeId(null);
-                    }}
-                    deleteKeyCode={null}
-                    multiSelectionKeyCode={["Shift"]}
-                    panOnScroll
-                    zoomOnScroll={false}
-                    zoomOnPinch
-                    selectionOnDrag={selectionMode === "marquee"}
-                    panOnDrag={selectionMode !== "marquee"}
-                    minZoom={0.2}
-                    maxZoom={2.5}
-                    fitView
-                    fitViewOptions={{ padding: 0.2, maxZoom: 1 }}
-                    colorMode="dark"
-                    attributionPosition="top-right"
-                  >
-                    <Background variant={BackgroundVariant.Dots} gap={24} size={1.5} />
-                    {/* Bottom-right (#72): the ValidationPanel owns bottom-left
+                  <WorkflowNamesContext.Provider value={workflowNames}>
+                    <ReactFlow
+                      nodes={nodes}
+                      edges={edges}
+                      nodeTypes={canvasNodeTypes}
+                      onNodesChange={onNodesChange}
+                      onEdgesChange={onEdgesChange}
+                      onConnect={onConnect}
+                      onNodeDragStart={onNodeDragStart}
+                      onNodeDragStop={onNodeDragStop}
+                      onNodeClick={(event, node) => {
+                        // Handle clicks drive connections (and the guided
+                        // edge flow, #69) — the bubbled node click must not
+                        // clobber the selection the connect just made.
+                        if (
+                          event.target instanceof Element &&
+                          event.target.closest(".react-flow__handle") !== null
+                        ) {
+                          return;
+                        }
+                        setSelectedEdgeId(null);
+                        setSelectedNodeId(node.id);
+                      }}
+                      onEdgeClick={(_, edge) => {
+                        setSelectedNodeId(null);
+                        setSelectedEdgeId(edge.id);
+                      }}
+                      onPaneClick={() => {
+                        setSelectedNodeId(null);
+                        setSelectedEdgeId(null);
+                      }}
+                      deleteKeyCode={null}
+                      multiSelectionKeyCode={["Shift"]}
+                      panOnScroll
+                      zoomOnScroll={false}
+                      zoomOnPinch
+                      selectionOnDrag={selectionMode === "marquee"}
+                      panOnDrag={selectionMode !== "marquee"}
+                      minZoom={0.2}
+                      maxZoom={2.5}
+                      fitView
+                      fitViewOptions={{ padding: 0.2, maxZoom: 1 }}
+                      colorMode="dark"
+                      attributionPosition="top-right"
+                    >
+                      <Background variant={BackgroundVariant.Dots} gap={24} size={1.5} />
+                      {/* Bottom-right (#72): the ValidationPanel owns bottom-left
                       whenever issues/warnings render, and overlapped zoom
                       buttons read as "the canvas is broken". The minimap
                       (#75) takes top-left inside the pane (the palette is a
                       sibling outside it) — clear of the top-right
                       attribution and bottom-right Controls — and only
                       appears once the graph is big enough to navigate. */}
-                    <Controls position="bottom-right" showInteractive={false} />
-                    {shouldShowMiniMap(doc.nodes.length) ? (
-                      <MiniMap
-                        position="top-left"
-                        pannable
-                        zoomable
-                        nodeColor={miniMapNodeColor}
-                        ariaLabel="Graph minimap"
-                      />
-                    ) : null}
-                  </ReactFlow>
+                      <Controls position="bottom-right" showInteractive={false} />
+                      {shouldShowMiniMap(doc.nodes.length) ? (
+                        <MiniMap
+                          position="top-left"
+                          pannable
+                          zoomable
+                          nodeColor={miniMapNodeColor}
+                          ariaLabel="Graph minimap"
+                        />
+                      ) : null}
+                    </ReactFlow>
+                  </WorkflowNamesContext.Provider>
                 </NodeWarningCountsContext.Provider>
               </NodeHintCountsContext.Provider>
             </NodeIssueCountsContext.Provider>
@@ -1662,6 +1727,12 @@ function GraphCanvasInner({
               ? (mode) => patchJoinMode(selectedNode.id, mode)
               : undefined
           }
+          onPatchSubworkflow={
+            selectedNode.data.kind === "subworkflow"
+              ? (patch) => patchSubworkflow(selectedNode.id, patch)
+              : undefined
+          }
+          workflows={selectedNode.data.kind === "subworkflow" ? projectWorkflows : undefined}
           onCommitEdit={flushPendingEdit}
           onDetachPreset={
             selectedNode.data.kind === "agent" && selectedNode.data.presetId !== undefined

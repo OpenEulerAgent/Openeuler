@@ -18,6 +18,7 @@ export const CANVAS_NODE_SIZES = {
   agent: { width: 240, height: 72 },
   exit: { width: 140, height: 64 },
   join: { width: 140, height: 64 },
+  subworkflow: { width: 240, height: 72 },
 } as const;
 
 /** Tailwind utilities pinning the card box to {@link CANVAS_NODE_SIZES}. */
@@ -25,4 +26,5 @@ export const CANVAS_NODE_SIZE_CLASSES = {
   agent: { width: "w-60", height: "h-18" },
   exit: { width: "w-35", height: "h-16" },
   join: { width: "w-35", height: "h-16" },
+  subworkflow: { width: "w-60", height: "h-18" },
 } as const;

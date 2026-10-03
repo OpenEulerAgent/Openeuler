@@ -83,13 +83,64 @@ export const JoinGraphNodeSchema = z.strictObject({
 
 export type JoinGraphNode = z.infer<typeof JoinGraphNodeSchema>;
 
+/**
+ * How a sub-workflow node (#117) pins the revision of the workflow it
+ * spawns: `'latest'` resolves at execution time (each child run pins what
+ * is latest when it starts), a number pins that exact revision.
+ */
+export const SubworkflowRevisionSchema = z.union([
+  z.literal("latest"),
+  z
+    .number()
+    .int("revision must be 'latest' or an integer >= 1")
+    .min(1, "revision must be 'latest' or an integer >= 1"),
+]);
+
+export type SubworkflowRevision = z.infer<typeof SubworkflowRevisionSchema>;
+
+/**
+ * Sub-workflow node (#117): composes teams of teams. On execution the
+ * engine spawns a CHILD RUN of the referenced workflow (pinned to the
+ * resolved revision) and waits for its completion — the node's output is
+ * the child run's final output, and the child run surfaces as a link
+ * (`parentRunId`) on the node and in the runs table. Child failure fails
+ * the node (v0.2 strict — no continue-on-fail); nesting is capped by the
+ * engine at {@link MAX_SUBWORKFLOW_DEPTH}. For graph-shape rules the node
+ * behaves like an agent node: it can be the entry, sit on branches, feed
+ * joins, and its output is addressable downstream as `{{output:<id>}}`.
+ */
+export const SubworkflowGraphNodeSchema = z.strictObject({
+  id: idSchema,
+  type: z.literal("subworkflow"),
+  name: z.string().min(1, "node name must be a non-empty string"),
+  position: GraphNodePositionSchema,
+  config: z.strictObject({
+    workflowId: idSchema,
+    revision: SubworkflowRevisionSchema,
+  }),
+});
+
+export type SubworkflowGraphNode = z.infer<typeof SubworkflowGraphNodeSchema>;
+
 export const GraphNodeSchema = z.discriminatedUnion("type", [
   AgentGraphNodeSchema,
   ExitGraphNodeSchema,
   JoinGraphNodeSchema,
+  SubworkflowGraphNodeSchema,
 ]);
 
 export type GraphNode = z.infer<typeof GraphNodeSchema>;
+
+/**
+ * Node kinds that execute work (#117): agent invocations and sub-workflow
+ * spawns (which execute a child run). Entry nodes, fan-out branch targets
+ * and other "executable" graph positions accept either kind.
+ */
+export function isExecutableGraphNode(
+  node: GraphNode,
+): node is AgentGraphNode | SubworkflowGraphNode {
+  return node.type === "agent" || node.type === "subworkflow";
+}
 
 /**
  * A directed edge. `condition` decides (evaluated against the source node's
@@ -217,7 +268,8 @@ function indexGraph(graph: WorkflowGraphShape): GraphIndex {
  * Cross-field validation for a workflow graph:
  *
  * - unique node/edge ids; edges reference existing nodes
- * - `entryNodeId` references an existing agent node (exactly one entry)
+ * - `entryNodeId` references an existing executable node (agent or
+ *   sub-workflow, #117) — exactly one entry
  * - every node is reachable from the entry (BFS over edges)
  * - unconditional cycles rejected: the `always` (non-inverted) subgraph must
  *   be acyclic — every cycle (fan-out/join cycles included) has to include
@@ -278,14 +330,15 @@ export function validateWorkflowGraph(graph: WorkflowGraphShape): GraphValidatio
 
   const index = indexGraph(graph);
 
-  // Exactly one entry: entryNodeId exists (and is an executable agent node).
+  // Exactly one entry: entryNodeId exists (and is an executable node — an
+  // agent or a sub-workflow spawn, #117).
   const entry = graph.nodes.find((node) => node.id === graph.entryNodeId);
   if (entry === undefined) {
     push(["entryNodeId"], `entryNodeId "${graph.entryNodeId}" does not reference any node`);
-  } else if (entry.type !== "agent") {
+  } else if (!isExecutableGraphNode(entry)) {
     push(
       ["entryNodeId"],
-      `entryNodeId "${graph.entryNodeId}" must reference an agent node, not an ${entry.type} node`,
+      `entryNodeId "${graph.entryNodeId}" must reference an agent or subworkflow node, not an ${entry.type} node`,
     );
   }
 
@@ -355,13 +408,14 @@ export function validateWorkflowGraph(graph: WorkflowGraphShape): GraphValidatio
           `join node "${node.id}" must not have conditional outgoing edges (a join synchronizes branches, it does not route)`,
         );
       }
-    } else if (node.type === "agent") {
-      // Parallel fan-in is a join's job: an agent node may not receive
-      // unconditional edges from two sources that can run CONCURRENTLY —
-      // i.e. sources sharing a fan-out ancestor. Serial shapes stay valid:
-      // legacy loops and template loops re-enter a router node through an
-      // `always` back-edge (one delivery at a time), and conditional
-      // incoming edges are unrestricted (one delivery per source routing).
+    } else if (node.type === "agent" || node.type === "subworkflow") {
+      // Parallel fan-in is a join's job: an executable node (agent or
+      // sub-workflow, #117) may not receive unconditional edges from two
+      // sources that can run CONCURRENTLY — i.e. sources sharing a fan-out
+      // ancestor. Serial shapes stay valid: legacy loops and template loops
+      // re-enter a router node through an `always` back-edge (one delivery
+      // at a time), and conditional incoming edges are unrestricted (one
+      // delivery per source routing).
       const incoming = index.incoming.get(node.id) ?? [];
       const incomingAlways = incoming.filter((item) => isUnconditional(item.edge));
       if (incomingAlways.length > 1) {
@@ -400,16 +454,16 @@ export function validateWorkflowGraph(graph: WorkflowGraphShape): GraphValidatio
       }
 
       // Fan-out: every always edge starts a parallel branch, so the targets
-      // must be distinct AGENT nodes (joins synchronize, exits terminate —
-      // neither is branch work).
+      // must be distinct EXECUTABLE nodes (agents or sub-workflows, #117 —
+      // joins synchronize, exits terminate — neither is branch work).
       if (unconditional.length > 1) {
         const seenTargets = new Map<string, { edgeId: string; index: number }>();
         for (const item of unconditional) {
           const target = index.nodes.get(item.edge.target);
-          if (target !== undefined && target.type !== "agent") {
+          if (target !== undefined && !isExecutableGraphNode(target)) {
             push(
               ["edges", item.index],
-              `fan-out edge "${item.edge.id}" targets ${target.type} node "${target.id}"; parallel branches must start at agent nodes`,
+              `fan-out edge "${item.edge.id}" targets ${target.type} node "${target.id}"; parallel branches must start at agent or subworkflow nodes`,
             );
           }
           const clash = seenTargets.get(item.edge.target);

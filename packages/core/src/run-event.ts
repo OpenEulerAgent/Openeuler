@@ -134,7 +134,9 @@ export type NodeStartedEvent = z.infer<typeof NodeStartedEventSchema>;
  * `output` is the node's final output (what routing evaluated against);
  * `durationMs` covers the driver invocation. Join nodes (#115) execute
  * instantly (no driver): their `output` is the JSON map of the arrived
- * branch outputs and `durationMs` is 0.
+ * branch outputs and `durationMs` is 0. Sub-workflow nodes (#117) execute
+ * a child run: their `output` is the child run's final output and
+ * `childRunId` links the run that produced it.
  */
 export const NodeCompletedEventSchema = z.strictObject({
   type: z.literal("node.completed"),
@@ -149,6 +151,8 @@ export const NodeCompletedEventSchema = z.strictObject({
   error: z.string().optional(),
   /** The branch edge this execution runs on (#115), when known. */
   edgeId: idSchema.optional(),
+  /** The child run this sub-workflow node executed (#117), when known. */
+  childRunId: idSchema.optional(),
 });
 
 export type NodeCompletedEvent = z.infer<typeof NodeCompletedEventSchema>;

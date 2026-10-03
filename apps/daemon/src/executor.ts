@@ -599,6 +599,22 @@ export function createExecutor(options: ExecutorOptions): Executor {
             // Unreachable (mode would be local); defensive.
             return undefined;
           }
+          // #105 cap applies to INLINE CHILD runs too (#117): without this
+          // check a fan-out × depth-3 parent could hold 1+f+f²+f³ live
+          // containers, blowing past MAX_SANDBOXES. A child at cap fails
+          // its parent node with this typed, actionable error (strict
+          // semantics) instead of over-committing the host.
+          try {
+            if ((await options.sandbox!.provider.list()).length >= maxSandboxes) {
+              throw new SandboxError(
+                "SANDBOX_UNAVAILABLE",
+                `sandbox cap reached (${maxSandboxes} live sandboxes, MAX_SANDBOXES); retry when other runs finish or raise the cap`,
+              );
+            }
+          } catch (err) {
+            if (err instanceof SandboxError) throw err;
+            logger.warn({ err, runId: run.id }, "sandbox cap check failed (assuming below cap)");
+          }
           // #110 restart hygiene: a sandbox left over from a pre-restart
           // execution of this run (the daemon died mid-run; the recovery
           // sweep marked it interrupted and the user resumed) must not
@@ -972,6 +988,13 @@ export function createExecutor(options: ExecutorOptions): Executor {
       // run leaves the active set, so "executor idle" implies "no sandbox of
       // the run is still being torn down".
       await disposeSandbox(runId);
+      // #117: sub-workflow child runs execute inline, so the executor never
+      // sees them in `active` — dispose their sandboxes (if any) here, with
+      // the parent. Children never host (they declare no ports), so this is
+      // a plain destroy-or-keep pass.
+      for (const child of db.runs.listByParentRun(runId)) {
+        await disposeSandbox(child.id);
+      }
       active.delete(runId);
     }
   }
@@ -1133,23 +1156,22 @@ export function createExecutor(options: ExecutorOptions): Executor {
     }
     // #102: sandboxes of runs that did not settle within the window would
     // otherwise leak containers — destroy them best-effort (debug-kept
-    // sandboxes are exempt by design).
-    for (const entry of entries) {
-      const sandbox = activeSandboxes.get(entry.runId);
-      if (sandbox === undefined) continue;
-      activeSandboxes.delete(entry.runId);
+    // sandboxes are exempt by design). #117: inline child runs never sit in
+    // `active`, so sweep the whole live map, not just the active entries.
+    for (const sandbox of [...activeSandboxes.values()]) {
+      activeSandboxes.delete(sandbox.runId);
       // #104: flush the log tail before the container goes away.
       await sandbox.tailer?.stop().catch(() => {});
       if (sandbox.keepForDebug) {
         recordSandboxKeptActivity(db, {
-          runId: entry.runId,
+          runId: sandbox.runId,
           container: sandbox.handle.id,
           image: sandbox.image,
         });
         continue;
       }
       await sandbox.handle.destroy().catch((err: unknown) => {
-        logger.warn({ err, runId: entry.runId }, "sandbox destroy during shutdown failed");
+        logger.warn({ err, runId: sandbox.runId }, "sandbox destroy during shutdown failed");
       });
     }
     logger.info("executor shutdown complete");

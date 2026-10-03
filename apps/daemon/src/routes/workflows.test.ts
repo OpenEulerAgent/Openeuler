@@ -1087,3 +1087,112 @@ describe("revision pinning on runs", () => {
     expect(detail.run.workflowRevision).toEqual({ id: pinnedId, number: 1 });
   });
 });
+
+// ---------------------------------------------------------------------------
+// Sub-workflow nodes (#117): save-time reference validation.
+//
+
+describe("sub-workflow graph validation (#117)", () => {
+  const subGraph = (workflowId: string, revision: "latest" | number = "latest") => ({
+    entryNodeId: "a",
+    nodes: [
+      {
+        id: "a",
+        type: "agent",
+        name: "a",
+        position: { x: 0, y: 0 },
+        config: {
+          driver: "first",
+          mode: "auto",
+          promptTemplate: "A[{{task}}]",
+          continueSession: false,
+        },
+      },
+      {
+        id: "sub",
+        type: "subworkflow",
+        name: "spawn",
+        position: { x: 280, y: 0 },
+        config: { workflowId, revision },
+      },
+      { id: "exit", type: "exit", name: "Exit", position: { x: 560, y: 0 } },
+    ],
+    edges: [
+      { id: "e1", source: "a", target: "sub", condition: { type: "always" } },
+      { id: "e2", source: "sub", target: "exit", condition: { type: "always" } },
+    ],
+  });
+
+  it("accepts a resolvable subworkflow reference (existing workflow, existing pinned revision)", async () => {
+    const h = setup();
+    const target = await createWorkflow(h, {
+      projectId: h.projectId,
+      name: "target",
+      steps: h.makeSteps("first"),
+    });
+    const parent = await createWorkflow(h, {
+      projectId: h.projectId,
+      name: "parent",
+      graph: subGraph(target.id, 1),
+    });
+    expect(parent.id).toEqual(expect.any(String));
+    const got = await h.request(`/api/workflows/${parent.id}`);
+    const body = (await got.json()) as { workflow: Workflow & { graph?: { nodes: unknown[] } } };
+    expect(
+      body.workflow.graph?.nodes.some((node) => (node as { type: string }).type === "subworkflow"),
+    ).toBe(true);
+  });
+
+  it("422s an unknown workflow id and a missing pinned revision (PUT /graph and POST)", async () => {
+    const h = setup();
+    const target = await createWorkflow(h, {
+      projectId: h.projectId,
+      name: "target",
+      steps: h.makeSteps("first"),
+    });
+    const parent = await createWorkflow(h, {
+      projectId: h.projectId,
+      name: "parent",
+      steps: h.makeSteps("first"),
+    });
+
+    const putGraph = (graph: unknown): Promise<Response> =>
+      h.request(`/api/workflows/${parent.id}/graph`, {
+        method: "PUT",
+        headers: { "content-Type": "application/json" },
+        body: JSON.stringify({ graph }),
+      });
+
+    const unknown = await putGraph(subGraph("no-such-workflow"));
+    expect(unknown.status).toBe(422);
+    const unknownBody = (await unknown.json()) as {
+      error: { message: string; details?: Array<{ path: string; message: string }> };
+    };
+    expect(unknownBody.error.message).toContain("unresolvable sub-workflow reference");
+    expect(unknownBody.error.details?.[0]?.path).toBe("graph.nodes.1.config.workflowId");
+    expect(unknownBody.error.details?.[0]?.message).toContain(
+      'references unknown workflow "no-such-workflow"',
+    );
+
+    const missingRevision = await putGraph(subGraph(target.id, 9));
+    expect(missingRevision.status).toBe(422);
+    const revisionBody = (await missingRevision.json()) as {
+      error: { details?: Array<{ path: string; message: string }> };
+    };
+    expect(revisionBody.error.details?.[0]?.path).toBe("graph.nodes.1.config.revision");
+    expect(revisionBody.error.details?.[0]?.message).toContain("revision 9");
+    expect(revisionBody.error.details?.[0]?.message).toContain("does not exist");
+
+    // POST with a graph validates the same way.
+    const created = await postWorkflow(h, {
+      projectId: h.projectId,
+      name: "bad",
+      graph: subGraph("no-such-workflow"),
+    });
+    expect(created.status).toBe(422);
+
+    // The parent was never mutated past its first revision.
+    const revisions = await h.request(`/api/workflows/${parent.id}/revisions`);
+    expect(((await revisions.json()) as { revisions: unknown[] }).revisions).toHaveLength(1);
+  });
+});

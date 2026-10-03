@@ -345,3 +345,115 @@ describe("canvas doc round-trip of sandbox overrides (#101)", () => {
     expect(legacy.success).toBe(true);
   });
 });
+
+describe("NodePropertiesDrawer sub-workflow picker (#117)", () => {
+  const subNode = (
+    config: { workflowId: string; revision: "latest" | number } = {
+      workflowId: "",
+      revision: "latest",
+    },
+  ): CanvasNode => ({
+    id: "sub",
+    type: "subworkflow",
+    position: { x: 0, y: 0 },
+    data: { kind: "subworkflow", name: "Spawn", config },
+  });
+
+  const workflows = [
+    { id: "wf-child", name: "Child flow", latestRevision: 2 },
+    { id: "wf-other", name: "Other flow", latestRevision: 1 },
+  ];
+
+  /** Renders the drawer for a sub-workflow doc; picker edits run the REAL reducer. */
+  const renderSubDrawer = (node: CanvasNode): void => {
+    doc = { nodes: [node], edges: [] };
+    container = document.createElement("div");
+    document.body.appendChild(container);
+    root = createRoot(container);
+    const renderAt = (): void => {
+      const inspected = doc.nodes[0] as CanvasNode;
+      act(() =>
+        root?.render(
+          createElement(NodePropertiesDrawer, {
+            node: inspected,
+            doc,
+            issues: [],
+            onPatchAgent: () => {},
+            onPatchName: () => {},
+            onPatchSubworkflow: (patch) => {
+              doc = applyInspectorAction(doc, {
+                type: "patchSubworkflow",
+                nodeId: "sub",
+                ...patch,
+              });
+              renderAt();
+            },
+            workflows,
+            onCommitEdit: () => {},
+            onDelete: () => {},
+            onClose: () => {},
+          }),
+        ),
+      );
+    };
+    renderAt();
+  };
+
+  const subConfig = (): { workflowId: string; revision: "latest" | number } =>
+    (doc.nodes[0]?.data as { config: { workflowId: string; revision: "latest" | number } }).config;
+
+  it("renders workflow + revision selects; unconfigured workflowId flags inline", () => {
+    renderSubDrawer(subNode());
+    expect(document.querySelector("h2")?.textContent).toBe("Sub-workflow node");
+    const workflowSelect = document.querySelector(
+      "[data-subworkflow-workflow]",
+    ) as HTMLSelectElement | null;
+    expect(workflowSelect).not.toBeNull();
+    expect([...(workflowSelect?.options ?? [])].map((option) => option.value)).toEqual([
+      "",
+      "wf-child",
+      "wf-other",
+    ]);
+    // Empty workflowId → inline field error (also a live save blocker).
+    const error = document.querySelector(
+      "#node-subworkflow-workflow ~ *, #node-subworkflow-workflow",
+    );
+    expect(error).not.toBeNull();
+    const revisionCopy = document.querySelector("[data-subworkflow-revision-copy]")?.textContent;
+    expect(revisionCopy).toContain("latest");
+  });
+
+  it("picker round-trip: selecting a workflow resets revision to latest, pinning stores the number", () => {
+    renderSubDrawer(subNode({ workflowId: "wf-child", revision: 2 }));
+    expect(subConfig()).toEqual({ workflowId: "wf-child", revision: 2 });
+
+    setSelect("node-subworkflow-workflow", "wf-other");
+    expect(subConfig()).toEqual({ workflowId: "wf-other", revision: "latest" });
+
+    setSelect("node-subworkflow-revision", "1");
+    expect(subConfig()).toEqual({ workflowId: "wf-other", revision: 1 });
+    expect(document.querySelector("[data-subworkflow-revision-copy]")?.textContent ?? "").toContain(
+      "revision 1",
+    );
+
+    setSelect("node-subworkflow-revision", "latest");
+    expect(subConfig()).toEqual({ workflowId: "wf-other", revision: "latest" });
+  });
+
+  it("the patched doc round-trips through the graph schema", () => {
+    doc = { nodes: [subNode({ workflowId: "wf-child", revision: 1 })], edges: [] };
+    const graph = fromCanvasDocument(doc);
+    expect(graph.nodes[0]).toMatchObject({
+      type: "subworkflow",
+      config: { workflowId: "wf-child", revision: 1 },
+    });
+    expect(() => WorkflowGraphSchema.parse({ ...graph, entryNodeId: "sub" })).not.toThrow();
+  });
+
+  it("flags a stale workflow reference (deleted workflow) with a warning", () => {
+    renderSubDrawer(subNode({ workflowId: "wf-gone", revision: "latest" }));
+    expect(document.querySelector("[data-subworkflow-stale]")?.textContent).toContain(
+      "no longer exists",
+    );
+  });
+});

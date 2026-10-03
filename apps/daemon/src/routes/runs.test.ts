@@ -31,7 +31,11 @@ interface RunBody {
 }
 
 interface RunDetailBody {
-  run: Run & { queuePosition?: number };
+  run: Run & {
+    queuePosition?: number;
+    parentRunId?: string;
+    childRunIds?: string[];
+  };
   steps: Array<StepRun & { name?: string; durationMs?: number }>;
   /** Step runs grouped by 1-based loop pass (same enrichment as `steps`). */
   iterations: Array<{
@@ -1020,4 +1024,98 @@ describe("GET /api/runs/:id step enrichment (#113)", () => {
     expect(body.steps[0]?.name).toBeUndefined();
     expect(body.steps[0]?.durationMs).toBeUndefined();
   });
+});
+
+// ---------------------------------------------------------------------------
+// Sub-workflow child runs (#117): parentRunId + childRunIds on the API.
+//
+
+describe("sub-workflow runs (#117)", () => {
+  const createWorkflow = async (
+    h: ApiHarness,
+    body: Record<string, unknown>,
+  ): Promise<{ id: string }> => {
+    const res = await h.request("/api/workflows", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    if (res.status !== 201) {
+      throw new Error(`workflow create failed: ${await res.text()}`);
+    }
+    const created = (await res.json()) as { workflow: { id: string } };
+    return created.workflow;
+  };
+
+  it("surfaces parentRunId on the child and childRunIds on the parent", async () => {
+    const h = setup({ events: script, delayMs: 10 });
+    const step = (id: string) => ({
+      id,
+      name: id,
+      driver: "fake",
+      mode: "auto",
+      promptTemplate: `{{task}} (${id})`,
+      continueSession: false,
+    });
+    const child = await createWorkflow(h, {
+      projectId: h.projectId,
+      name: "child",
+      steps: [step("c1"), step("c2")],
+    });
+    const parent = await createWorkflow(h, {
+      projectId: h.projectId,
+      name: "parent",
+      graph: {
+        entryNodeId: "a",
+        nodes: [
+          {
+            id: "a",
+            type: "agent",
+            name: "a",
+            position: { x: 0, y: 0 },
+            config: {
+              driver: "fake",
+              mode: "auto",
+              promptTemplate: "A[{{task}}]",
+              continueSession: false,
+            },
+          },
+          {
+            id: "sub",
+            type: "subworkflow",
+            name: "spawn",
+            position: { x: 280, y: 0 },
+            config: { workflowId: child.id, revision: "latest" },
+          },
+          { id: "exit", type: "exit", name: "Exit", position: { x: 560, y: 0 } },
+        ],
+        edges: [
+          { id: "e1", source: "a", target: "sub", condition: { type: "always" } },
+          { id: "e2", source: "sub", target: "exit", condition: { type: "always" } },
+        ],
+      },
+    });
+
+    const runRes = await h.request(`/api/workflows/${parent.id}/runs`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ task: "compose the teams" }),
+    });
+    expect(runRes.status).toBe(202);
+    const { run: parentRun } = (await runRes.json()) as RunBody;
+    const { final } = await pollRun(h, parentRun.id, "success");
+    expect(final.run.childRunIds).toHaveLength(1);
+    const childRunId = final.run.childRunIds?.[0];
+    expect(typeof childRunId).toBe("string");
+
+    // The child shows in the runs table (same project) with parentRunId set.
+    const list = await listRuns(h);
+    const childRow = list.runs.find((candidate) => candidate.id === childRunId);
+    expect(childRow).toMatchObject({ parentRunId: parentRun.id, status: "success" });
+
+    // Child detail links back up; it has no children of its own.
+    const childDetail = await getRun(h, childRunId as string);
+    expect(childDetail.run.parentRunId).toBe(parentRun.id);
+    expect("childRunIds" in childDetail.run).toBe(false);
+  }, 10_000);
 });

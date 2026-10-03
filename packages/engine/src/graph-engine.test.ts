@@ -2416,7 +2416,11 @@ describe("graph engine (parallel fan-out + join, #115)", () => {
         id: "d-b",
         events: [{ type: "session", seq: 1, sessionId: "s-b" }],
         output: "B-OUT",
-        delayMs: 150,
+        // Slow enough that z's branch chain (inner loop included) ALWAYS
+        // wins j1 first — b's late delivery is the suppressed loser. The
+        // chain is ~6 quick nodes; 1.5s leaves generous headroom under
+        // parallel test load (150ms was flaky-raced on slow machines).
+        delayMs: 1500,
       }),
     );
     h.registry.registerDriver(createFakeDriver({ id: "d-f", events: [], output: "F-OUT" }));
@@ -2445,9 +2449,21 @@ describe("graph engine (parallel fan-out + join, #115)", () => {
         agentNode("f", "d-f", { y: 160 }),
         agentNode("x", "d-x", { y: 80 }),
         agentNode("y", "d-y", { y: 240 }),
-        { id: "j2", type: "join", name: "inner", position: { x: 560, y: 160 }, config: { mode: "any" } },
+        {
+          id: "j2",
+          type: "join",
+          name: "inner",
+          position: { x: 560, y: 160 },
+          config: { mode: "any" },
+        },
         agentNode("z", "d-z", { y: 160, continueSession: true }),
-        { id: "j1", type: "join", name: "outer", position: { x: 760, y: 0 }, config: { mode: "any" } },
+        {
+          id: "j1",
+          type: "join",
+          name: "outer",
+          position: { x: 760, y: 0 },
+          config: { mode: "any" },
+        },
         agentNode("d", "d-d"),
         exitNode(),
       ],
@@ -2484,20 +2500,12 @@ describe("graph engine (parallel fan-out + join, #115)", () => {
     );
     expect(outerCompleted).toHaveLength(1);
     expect(dDriver.calls).toHaveLength(1);
-    expect(
-      h.db.stepRuns.listByRun(run.id).filter((row) => row.stepId === "d"),
-    ).toHaveLength(1);
+    expect(h.db.stepRuns.listByRun(run.id).filter((row) => row.stepId === "d")).toHaveLength(1);
     expect(h.db.runs.get(run.id)).toMatchObject({ status: "success", output: "D-OUT" });
     // The inner loop really ran (z twice, f twice) — execution numbers
     // diverged from the round, which is exactly what this test pins.
-    console.log("TAKEN", takenEdges(h, run.id));
-    console.log("ROWS", h.db.stepRuns.listByRun(run.id).map((r) => [r.stepId, r.iteration, r.status]));
-    console.log("ZOUT", eventsOf(h, run.id, "node.completed").filter((e) => e.nodeId === "z").map((e) => [e.status, e.output]));
-console.log("ZPROMPTS", zCycler.calls.map((c) => c.prompt));
     expect(zCycler.calls).toHaveLength(2);
-    expect(
-      h.db.stepRuns.listByRun(run.id).filter((row) => row.stepId === "f"),
-    ).toHaveLength(2);
+    expect(h.db.stepRuns.listByRun(run.id).filter((row) => row.stepId === "f")).toHaveLength(2);
   });
 
   it("legacy resume (round-less events): a triggered any-join still supersedes its interrupted sibling", async () => {
@@ -2523,7 +2531,13 @@ console.log("ZPROMPTS", zCycler.calls.map((c) => c.prompt));
         agentNode("a", "impl"),
         agentNode("b", "d-b", { y: -120 }),
         agentNode("c", "d-c", { y: 120 }),
-        { id: "j", type: "join", name: "merge", position: { x: 560, y: 0 }, config: { mode: "any" } },
+        {
+          id: "j",
+          type: "join",
+          name: "merge",
+          position: { x: 560, y: 0 },
+          config: { mode: "any" },
+        },
         agentNode("d", "d-d"),
         exitNode(),
       ],
@@ -2586,9 +2600,289 @@ console.log("ZPROMPTS", zCycler.calls.map((c) => c.prompt));
     expect(
       eventsOf(h, run.id, "node.completed").filter((event) => event.nodeId === "j"),
     ).toHaveLength(0);
-    expect(
-      h.db.stepRuns.listByRun(run.id).find((row) => row.stepId === "c"),
-    ).toMatchObject({ status: "aborted" });
+    expect(h.db.stepRuns.listByRun(run.id).find((row) => row.stepId === "c")).toMatchObject({
+      status: "aborted",
+    });
     expect(h.db.runs.get(run.id)).toMatchObject({ status: "success", output: "D-OUT" });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Sub-workflow nodes (#117): inline child runs.
+//
+
+describe("graph engine (sub-workflow nodes, #117)", () => {
+  /** An agent → subworkflow(target) → exit graph. */
+  const parentGraph = (targetWorkflowId: string, revision: "latest" | number = "latest") =>
+    WorkflowGraphSchema.parse({
+      entryNodeId: "a",
+      nodes: [
+        agentNode("a", "impl", { promptTemplate: "A[{{task}}]" }),
+        {
+          id: "sub",
+          type: "subworkflow",
+          name: "spawn",
+          position: { x: 280, y: 0 },
+          config: { workflowId: targetWorkflowId, revision },
+        },
+        exitNode(),
+      ],
+      edges: [
+        { id: "e-asub", source: "a", target: "sub", condition: { type: "always" } },
+        { id: "e-subexit", source: "sub", target: "exit", condition: { type: "always" } },
+      ],
+    });
+
+  /** A 2-step agent chain ending in `secondDriver`. */
+  const twoStepChildGraph = (firstDriver = "impl", secondDriver = "rev") =>
+    WorkflowGraphSchema.parse({
+      entryNodeId: "c1",
+      nodes: [
+        agentNode("c1", firstDriver, { promptTemplate: "C1[{{task}}]" }),
+        agentNode("c2", secondDriver, { promptTemplate: "C2[{{prevOutput}}]" }),
+        exitNode(),
+      ],
+      edges: [
+        { id: "e-c1c2", source: "c1", target: "c2", condition: { type: "always" } },
+        { id: "e-c2exit", source: "c2", target: "exit", condition: { type: "always" } },
+      ],
+    });
+
+  it("waits for a 2-step child run: child output becomes the node + run output, childRunId links parent↔child", async () => {
+    const h = setup();
+    const child = h.pinGraph(twoStepChildGraph());
+    const callsBefore = h.drivers.impl.calls.length;
+    const { revisionId } = h.pinGraph(parentGraph(child.workflow.id));
+    const run = h.enqueueRevisionRun(revisionId, "fix the docs");
+
+    await h.engine.executeRun(run.id, noAbort);
+    await awaitStatus(h, run.id, "success");
+
+    // Child run: own row (parentRunId, same project, pinned revision), own
+    // StepRuns, own event log — all terminal success.
+    const children = h.db.runs.listByParentRun(run.id);
+    expect(children).toHaveLength(1);
+    const childRun = children[0] as Run;
+    expect(childRun).toMatchObject({
+      projectId: run.projectId,
+      workflowId: child.workflow.id,
+      workflowRevisionId: child.revisionId,
+      parentRunId: run.id,
+      status: "success",
+      output: "REV-OUT",
+    });
+    const childSteps = h.db.stepRuns.listByRun(childRun.id);
+    expect(
+      childSteps
+        .map((row) => [row.stepId, row.status])
+        .sort((a, b) => String(a[0]).localeCompare(String(b[0]))),
+    ).toEqual([
+      ["c1", "success"],
+      ["c2", "success"],
+    ]);
+    expect(eventTypes(h, childRun.id)).toContain("node.started");
+    expect(h.db.events.count(childRun.id)).toBeGreaterThan(0);
+    // The child's first node rendered the parent task ({{task}}).
+    expect(h.drivers.impl.calls[callsBefore]?.prompt).toContain("fix the docs");
+
+    // Parent: the subworkflow node's output IS the child's final output, and
+    // node.completed carries childRunId for the UI link.
+    const subCompleted = eventsOf(h, run.id, "node.completed").find(
+      (event) => event.nodeId === "sub",
+    );
+    expect(subCompleted).toMatchObject({
+      status: "success",
+      output: "REV-OUT",
+      childRunId: childRun.id,
+    });
+    expect(h.db.runs.get(run.id)).toMatchObject({ status: "success", output: "REV-OUT" });
+    expect(h.db.stepRuns.listByRun(run.id).find((row) => row.stepId === "sub")).toMatchObject({
+      status: "success",
+      output: "REV-OUT",
+    });
+  });
+
+  it("resolves 'latest' at spawn time and an exact pinned revision when configured", async () => {
+    const h = setup();
+    // Child revision 1 ends in `impl`, revision 2 (later) ends in `ship`.
+    const child = h.pinGraph(twoStepChildGraph("impl", "impl"));
+    const childRev2 = h.db.workflowRevisions.create(
+      child.workflow.id,
+      twoStepChildGraph("impl", "ship"),
+    );
+    expect(childRev2.number).toBe(2);
+
+    const pinned = h.pinGraph(parentGraph(child.workflow.id, 1));
+    const pinnedRun = h.enqueueRevisionRun(pinned.revisionId);
+    await h.engine.executeRun(pinnedRun.id, noAbort);
+    await awaitStatus(h, pinnedRun.id, "success");
+    const pinnedChild = h.db.runs.listByParentRun(pinnedRun.id)[0] as Run;
+    expect(pinnedChild.workflowRevisionId).toBe(child.revisionId);
+    expect(pinnedChild.output).toBe("IMPL-OUT");
+
+    const latest = h.pinGraph(parentGraph(child.workflow.id, "latest"));
+    const latestRun = h.enqueueRevisionRun(latest.revisionId);
+    await h.engine.executeRun(latestRun.id, noAbort);
+    await awaitStatus(h, latestRun.id, "success");
+    const latestChild = h.db.runs.listByParentRun(latestRun.id)[0] as Run;
+    expect(latestChild.workflowRevisionId).toBe(childRev2.id);
+    expect(latestChild.output).toBe("SHIP-OUT");
+  });
+
+  it("child failure fails the parent node with child attribution", async () => {
+    const h = setup();
+    const child = h.pinGraph(twoStepChildGraph("impl", "boom"));
+    const { revisionId } = h.pinGraph(parentGraph(child.workflow.id));
+    const run = h.enqueueRevisionRun(revisionId);
+
+    await h.engine.executeRun(run.id, noAbort);
+    await awaitStatus(h, run.id, "failed");
+
+    const childRun = h.db.runs.listByParentRun(run.id)[0] as Run;
+    expect(childRun.status).toBe("failed");
+    expect(childRun.error).toContain("agent exited with code 7");
+
+    const parent = h.db.runs.get(run.id);
+    expect(parent?.status).toBe("failed");
+    expect(parent?.error).toContain('node "spawn" (sub) failed');
+    expect(parent?.error).toContain(`child run ${childRun.id} failed`);
+    expect(h.db.stepRuns.listByRun(run.id).find((row) => row.stepId === "sub")?.status).toBe(
+      "failed",
+    );
+  });
+
+  it("an unresolvable workflow reference fails the node with a clear error", async () => {
+    const h = setup();
+    const { revisionId } = h.pinGraph(parentGraph("no-such-workflow"));
+    const run = h.enqueueRevisionRun(revisionId);
+
+    await h.engine.executeRun(run.id, noAbort);
+    await awaitStatus(h, run.id, "failed");
+
+    const parent = h.db.runs.get(run.id);
+    expect(parent?.error).toContain('unknown workflow "no-such-workflow"');
+    // No child row was created for the unresolvable reference.
+    expect(h.db.runs.listByParentRun(run.id)).toHaveLength(0);
+  });
+
+  it("depth cap: a 4-deep chain stops with a clear nesting error and no runaway runs", async () => {
+    const h = setup();
+    // w1 → w2 → w3 → w4 → w1 closes the cycle: w4's spawn would sit at
+    // nesting depth 4 (one past the cap of 3), so the chain must terminate
+    // with the clear cap error instead of recursing forever.
+    const selfReferencing = (target: string) =>
+      WorkflowGraphSchema.parse({
+        entryNodeId: "a",
+        nodes: [
+          agentNode("a", "impl", { promptTemplate: "A[{{task}}]" }),
+          {
+            id: "sub",
+            type: "subworkflow",
+            name: "spawn",
+            position: { x: 280, y: 0 },
+            config: { workflowId: target, revision: "latest" },
+          },
+          exitNode(),
+        ],
+        edges: [
+          { id: "e-asub", source: "a", target: "sub", condition: { type: "always" } },
+          { id: "e-subexit", source: "sub", target: "exit", condition: { type: "always" } },
+        ],
+      });
+
+    const placeholder = {
+      id: "placeholder",
+      name: "placeholder",
+      driver: "impl",
+      mode: "auto" as const,
+      promptTemplate: "{{task}}",
+      continueSession: false,
+    };
+    const mkWorkflow = (name: string) =>
+      h.db.workflows.create({
+        id: crypto.randomUUID(),
+        projectId: h.projectId,
+        name,
+        steps: [placeholder],
+      });
+    const wf1 = mkWorkflow("w1");
+    const wf2 = mkWorkflow("w2");
+    const wf3 = mkWorkflow("w3");
+    const wf4 = mkWorkflow("w4");
+    const leaf = mkWorkflow("leaf");
+    h.db.workflowRevisions.create(leaf.id, twoStepChildGraph());
+    const rev4 = h.db.workflowRevisions.create(wf4.id, selfReferencing(wf1.id));
+    h.db.workflowRevisions.create(wf3.id, selfReferencing(wf4.id));
+    h.db.workflowRevisions.create(wf2.id, selfReferencing(wf3.id));
+    const rev1 = h.db.workflowRevisions.create(wf1.id, selfReferencing(wf2.id));
+    expect(rev1.number).toBe(1);
+    expect(rev4.number).toBe(1);
+    const run = h.enqueueRevisionRun(rev1.id);
+
+    await h.engine.executeRun(run.id, noAbort);
+    await awaitStatus(h, run.id, "failed");
+
+    // Exactly four runs: the top plus children at depths 1..3 — the depth-4
+    // spawn failed its node BEFORE creating a row.
+    const all = h.db.runs.list();
+    expect(all).toHaveLength(4);
+    const deepest = all.find((row) => row.parentRunId !== undefined && row.workflowId === wf4.id);
+    expect(deepest?.status).toBe("failed");
+    expect(deepest?.error).toContain("sub-workflow nesting depth exceeds the maximum of 3");
+    expect(h.db.runs.get(run.id)?.error).toContain("child run");
+    expect(h.db.runs.get(run.id)?.error).toContain("nesting depth exceeds the maximum of 3");
+  });
+
+  it("aborting the parent mid-child aborts the child (shared abort chain)", async () => {
+    const h = setup();
+    const slow = createFakeDriver({
+      id: "slow",
+      events: [
+        { type: "session", seq: 1, sessionId: "s-slow" },
+        { type: "message-delta", seq: 2, delta: "working" },
+      ],
+      output: "SLOW-OUT",
+      delayMs: 40,
+    });
+    h.registry.registerDriver(slow);
+    const child = h.pinGraph(
+      WorkflowGraphSchema.parse({
+        entryNodeId: "c1",
+        nodes: [agentNode("c1", "slow"), exitNode()],
+        edges: [{ id: "e-c1exit", source: "c1", target: "exit", condition: { type: "always" } }],
+      }),
+    );
+    const { revisionId } = h.pinGraph(parentGraph(child.workflow.id));
+    const run = h.enqueueRevisionRun(revisionId);
+
+    let abortRequested = false;
+    let handleCount = 0;
+    const control = {
+      isAbortRequested: (): boolean => abortRequested,
+      onHandle: (handle: AgentHandle | undefined): void => {
+        if (handle === undefined) return;
+        handleCount += 1;
+        // 1st handle: the parent's entry node. 2nd: the CHILD's node —
+        // abort the parent while the child is mid-flight.
+        if (handleCount === 2) {
+          setTimeout(() => {
+            abortRequested = true;
+            void handle.abort();
+          }, 5);
+        }
+      },
+    };
+
+    await h.engine.executeRun(run.id, control);
+    await awaitStatus(h, run.id, "aborted");
+
+    const childRun = h.db.runs.listByParentRun(run.id)[0] as Run;
+    expect(childRun.status).toBe("aborted");
+    expect(h.db.stepRuns.listByRun(childRun.id).find((row) => row.stepId === "c1")?.status).toBe(
+      "aborted",
+    );
+    expect(h.db.stepRuns.listByRun(run.id).find((row) => row.stepId === "sub")?.status).toBe(
+      "aborted",
+    );
   });
 });
