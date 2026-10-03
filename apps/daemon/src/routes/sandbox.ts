@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { cpus } from "node:os";
+import type { Db } from "@openeuler/db";
 import type { SandboxProvider, SandboxUsage, SandboxSummary } from "@openeuler/sandbox";
 import { SandboxError } from "@openeuler/sandbox";
 import type { SandboxImagesOptions } from "@openeuler/sandbox";
@@ -16,7 +17,6 @@ import {
 import { DEFAULT_SANDBOX_MEMORY_MB } from "@openeuler/engine";
 import { Hono } from "hono";
 import { z } from "zod";
-import type { Db } from "@openeuler/db";
 import { recordImageJobActivity } from "../activity.js";
 import type { AppEnv } from "../app.js";
 import { resolveExecutionMode } from "../executor.js";
@@ -479,7 +479,7 @@ export function createSandboxRouter(options: SandboxRouterOptions = {}): Hono<Ap
   const requireKnownInstance = async (
     sandboxProvider: SandboxProvider,
     id: string,
-  ): Promise<void> => {
+  ): Promise<SandboxSummary | undefined> => {
     let listed: SandboxSummary[];
     try {
       listed = await sandboxProvider.list();
@@ -487,8 +487,37 @@ export function createSandboxRouter(options: SandboxRouterOptions = {}): Hono<Ap
       if (err instanceof SandboxError) throw sandboxHttpError(err);
       throw err;
     }
-    if (!listed.some((summary) => summary.id === id)) {
+    const summary = listed.find((candidate) => candidate.id === id);
+    if (summary === undefined) {
       throw new HttpError(404, "SANDBOX_NOT_FOUND", `no sandbox with id ${id}`);
+    }
+    return summary;
+  };
+
+  /**
+   * Destroying a sandbox out-of-band (this dashboard path) must not leave a
+   * zombie hosted banner (#112 QA): if the destroyed sandbox belonged to a
+   * hosted run, clear its `hostedUntil` so the UI stops advertising a dead
+   * preview as extendable.
+   */
+  const clearHostingIfHeld = (db: Db | undefined, summary: SandboxSummary): void => {
+    const runId = summary.labels["run"];
+    if (db === undefined || runId === undefined) return;
+    const run = db.runs.get(runId);
+    if (run === undefined || run.hostedUntil === undefined) return;
+    try {
+      db.runs.update(runId, { hostedUntil: null });
+      db.activity.append({
+        type: "ops.hosting-expired",
+        runId,
+        payload: { runId, until: run.hostedUntil, reason: "sandbox-destroyed-externally" },
+      });
+      db.activity.append({
+        type: "ops.gc",
+        payload: { note: `hosting cleared: sandbox ${summary.id} destroyed externally` },
+      });
+    } catch {
+      // Bookkeeping must never fail the destroy response.
     }
   };
 
@@ -516,7 +545,7 @@ export function createSandboxRouter(options: SandboxRouterOptions = {}): Hono<Ap
   router.delete("/instances/:id", async (c) => {
     const sandboxProvider = provider();
     const id = c.req.param("id");
-    await requireKnownInstance(sandboxProvider, id);
+    const summary = await requireKnownInstance(sandboxProvider, id);
     if (sandboxProvider.destroy === undefined) {
       throw new HttpError(
         501,
@@ -530,6 +559,7 @@ export function createSandboxRouter(options: SandboxRouterOptions = {}): Hono<Ap
       if (err instanceof SandboxError) throw sandboxHttpError(err);
       throw err;
     }
+    if (summary !== undefined) clearHostingIfHeld(c.get("db"), summary);
     c.get("logger").info({ sandbox: id }, "sandbox destroyed from the dashboard");
     return c.json({ deleted: id });
   });

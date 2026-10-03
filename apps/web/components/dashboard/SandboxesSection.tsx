@@ -82,6 +82,7 @@ function ConfirmAction({
   busyLabel,
   busy,
   danger,
+  hint,
   onConfirm,
   testId,
 }: {
@@ -90,6 +91,8 @@ function ConfirmAction({
   busyLabel: string;
   busy: boolean;
   danger?: boolean;
+  /** Extra warning shown while armed (e.g. "this fails the run"). */
+  hint?: string;
   onConfirm: () => void;
   testId: string;
 }) {
@@ -121,6 +124,11 @@ function ConfirmAction({
         if (event.key === "Escape") setArmed(false);
       }}
     >
+      {hint !== undefined ? (
+        <span className="max-w-48 truncate text-xs text-warning" title={hint}>
+          {hint}
+        </span>
+      ) : null}
       <Button
         variant={danger ? "danger" : "secondary"}
         size="sm"
@@ -259,6 +267,11 @@ function SandboxCard({
             busyLabel="Stopping…"
             busy={stopping}
             testId="sandbox-stop"
+            hint={
+              instance.run?.status === "running" || instance.run?.status === "queued"
+                ? "Stopping this sandbox fails its run at the next step."
+                : undefined
+            }
             onConfirm={() => onStop(instance)}
           />
         ) : null}
@@ -269,6 +282,11 @@ function SandboxCard({
           busy={destroying}
           danger
           testId="sandbox-destroy"
+          hint={
+            instance.run?.status === "running" || instance.run?.status === "queued"
+              ? "Destroying this sandbox fails its run at the next step."
+              : undefined
+          }
           onConfirm={() => onDestroy(instance)}
         />
       </div>

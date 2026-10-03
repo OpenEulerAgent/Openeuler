@@ -42,7 +42,9 @@ export function startSandboxInstancesPolling(
 ): () => void {
   const intervalMs = options.intervalMs ?? SANDBOX_INSTANCES_POLL_MS;
   const fetcher = options.fetcher ?? fetchSandboxInstances;
-  const doc = options.document;
+  // Injected for tests; fall back to the REAL document so the
+  // pause-when-hidden gating actually runs in the browser.
+  const doc = options.document ?? (typeof document === "undefined" ? undefined : document);
   let cancelled = false;
   let timer: ReturnType<typeof setInterval> | null = null;
 
