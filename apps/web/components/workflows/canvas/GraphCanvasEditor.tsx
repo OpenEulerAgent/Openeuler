@@ -31,6 +31,7 @@ import {
   canvasDocsEquivalent,
   createAgentNode,
   createExitNode,
+  createJoinNode,
   createPresetAgentNode,
   fromCanvasDocument,
   nextCanvasPosition,
@@ -88,8 +89,10 @@ import { useUnsavedChanges } from "@/lib/use-unsaved-changes";
 import {
   applyEdgeInspectorAction,
   edgeChipLabel,
+  fanOutNotices,
   needsConditionConfig,
   routerFallbackWarnings,
+  MISSING_FALLBACK_MESSAGE,
 } from "@/lib/graph/edge-inspector";
 import {
   classifyIssue,
@@ -124,6 +127,7 @@ import {
 import { EdgePropertiesDrawer } from "./EdgePropertiesDrawer";
 import { NodePropertiesDrawer } from "./NodePropertiesDrawer";
 import {
+  JoinIcon,
   Palette,
   type PaletteNodeKind,
   type PaletteSection,
@@ -833,17 +837,17 @@ function GraphCanvasInner({
     (kind: PaletteNodeKind, position?: { x: number; y: number }) => {
       const current = historyRef.current.present;
       const spot = position ?? nextCanvasPosition(current);
+      const takenNames = new Set(current.nodes.map((existing) => existing.data.name));
       const node: CanvasNode =
         kind === "agent"
           ? createAgentNode({
               position: spot,
               driver: drivers[0] ?? "opencode",
-              name: uniqueNodeName(
-                "Agent",
-                new Set(current.nodes.map((existing) => existing.data.name)),
-              ),
+              name: uniqueNodeName("Agent", takenNames),
             })
-          : createExitNode(spot);
+          : kind === "join"
+            ? createJoinNode(spot, uniqueNodeName("Join", takenNames))
+            : createExitNode(spot);
       commitDoc({ nodes: [...current.nodes, node], edges: current.edges });
       setSelectedEdgeId(null);
       setSelectedNodeId(node.id);
@@ -962,6 +966,16 @@ function GraphCanvasInner({
     (nodeId: string, name: string) => {
       patchDocDebounced((current) =>
         applyInspectorAction(current, { type: "patchName", nodeId, name }),
+      );
+    },
+    [patchDocDebounced],
+  );
+
+  /** Join mode toggle (#116): all/any rides the same debounced patch path. */
+  const patchJoinMode = useCallback(
+    (nodeId: string, mode: "all" | "any") => {
+      patchDocDebounced((current) =>
+        applyInspectorAction(current, { type: "patchJoinMode", nodeId, mode }),
       );
     },
     [patchDocDebounced],
@@ -1199,22 +1213,27 @@ function GraphCanvasInner({
     () => miniMapNodeColorFor(issueCounts, hintCounts),
     [issueCounts, hintCounts],
   );
-  // Advisory warnings (router with no `always` fallback) are live, not
-  // save-gated — they should appear and clear as the user edits. Same
-  // signature-keyed identity trick as the badge counts above (#88).
-  const warnings = useMemo(() => routerFallbackWarnings(doc), [doc]);
+  // Advisory warnings are live, not save-gated — they should appear and
+  // clear as the user edits. Same signature-keyed identity trick as the
+  // badge counts above (#88). Fan-out notices (#116) join the panel list
+  // but NOT the node badge counts: the amber card badge is specifically
+  // the "no fallback" marker, and a healthy fan-out node must not wear it.
+  const warnings = useMemo(() => [...routerFallbackWarnings(doc), ...fanOutNotices(doc)], [doc]);
   const warningCountsRef = useRef<{
     signature: string;
     counts: ReadonlyMap<string, number>;
   } | null>(null);
   const warningCounts = useMemo(() => {
-    const signature = warnings
+    const fallbackWarnings = warnings.filter(
+      (warning) => warning.message === MISSING_FALLBACK_MESSAGE,
+    );
+    const signature = fallbackWarnings
       .map((warning) => `${warning.nodeId}:${warning.message}`)
       .sort()
       .join("|");
     if (warningCountsRef.current?.signature === signature) return warningCountsRef.current.counts;
     const counts = new Map<string, number>();
-    for (const warning of warnings) {
+    for (const warning of fallbackWarnings) {
       counts.set(warning.nodeId, (counts.get(warning.nodeId) ?? 0) + 1);
     }
     warningCountsRef.current = { signature, counts };
@@ -1304,6 +1323,12 @@ function GraphCanvasInner({
               />
             </svg>
           ),
+        },
+        {
+          kind: "join",
+          title: "Join",
+          description: "Merge parallel branches",
+          icon: <JoinIcon />,
         },
       ],
     },
@@ -1475,7 +1500,7 @@ function GraphCanvasInner({
                 return;
               }
               const kind = event.dataTransfer.getData(CANVAS_NODE_MIME);
-              if (kind !== "agent" && kind !== "exit") return;
+              if (kind !== "agent" && kind !== "exit" && kind !== "join") return;
               addNode(kind, position);
             }}
             onDragOver={(event) => {
@@ -1632,6 +1657,11 @@ function GraphCanvasInner({
           }
           onPatchAgent={(patch) => patchNodeConfig(selectedNode.id, patch)}
           onPatchName={(name) => patchNodeName(selectedNode.id, name)}
+          onPatchJoinMode={
+            selectedNode.data.kind === "join"
+              ? (mode) => patchJoinMode(selectedNode.id, mode)
+              : undefined
+          }
           onCommitEdit={flushPendingEdit}
           onDetachPreset={
             selectedNode.data.kind === "agent" && selectedNode.data.presetId !== undefined

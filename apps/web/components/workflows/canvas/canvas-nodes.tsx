@@ -227,9 +227,10 @@ function ExitNodeCard({ id, data, selected }: NodeProps<ExitFlowNode>) {
 }
 
 /**
- * Join/merge marker card (#115): renders in the editor for graphs authored
- * with joins (the palette does not create them yet — API/graph-authored
- * revisions round-trip through the canvas without corruption).
+ * Join/merge marker card (#115/#116): the fan-in counterpart of a fan-out —
+ * a synchronizer, not a terminal. Distinct geometry token from the exit
+ * card (same 140×64 box today, its own entry so the two can diverge), with
+ * both handles: branches converge in, one unconditional edge flows out.
  */
 function JoinNodeCard({ id, data, selected }: NodeProps<JoinFlowNode>) {
   const issueCounts = useContext(NodeIssueCountsContext);
@@ -238,8 +239,8 @@ function JoinNodeCard({ id, data, selected }: NodeProps<JoinFlowNode>) {
     <div
       className={cn(
         "relative flex items-center gap-2 rounded-lg border border-dashed bg-surface px-3 py-3 shadow-2 transition-colors",
-        CANVAS_NODE_SIZE_CLASSES.exit.width,
-        CANVAS_NODE_SIZE_CLASSES.exit.height,
+        CANVAS_NODE_SIZE_CLASSES.join.width,
+        CANVAS_NODE_SIZE_CLASSES.join.height,
         selected ? "border-accent" : "border-border",
       )}
       data-canvas-node="join"

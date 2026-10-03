@@ -11,6 +11,7 @@ import {
   canvasDocsEquivalent,
   canvasEdgeId,
   createAgentNode,
+  createJoinNode,
   createPresetAgentNode,
   DEFAULT_AGENT_PROMPT_TEMPLATE,
   fromCanvasDocument,
@@ -160,11 +161,44 @@ function selfLoopGraph(): WorkflowGraph {
   });
 }
 
+/**
+ * Diamond (#116): entry fans out unconditionally over two branches that
+ * converge at a `join` (mode any) before the exit — the canonical
+ * fan-out/join shape the canvas has to serialize, persist and re-serve.
+ */
+function diamondGraph(mode: "all" | "any" = "any"): WorkflowGraph {
+  return WorkflowGraphSchema.parse({
+    entryNodeId: "split",
+    nodes: [
+      agent("split", "split", { x: 0, y: 0 }),
+      agent("left", "left", { x: 300, y: -120 }),
+      agent("right", "right", { x: 300, y: 120 }),
+      {
+        id: "j",
+        type: "join",
+        name: "Merge",
+        position: { x: 600, y: 0 },
+        config: { mode },
+      },
+      exit("x", { x: 900, y: 0 }),
+    ],
+    edges: [
+      edge("split", "left"),
+      edge("split", "right"),
+      edge("left", "j"),
+      edge("right", "j"),
+      edge("j", "x"),
+    ],
+  });
+}
+
 const CASES: Array<[string, () => WorkflowGraph]> = [
   ["implement → review → conditional fix loop", fixLoopGraph],
   ["chain (legacy translation)", chainGraph],
   ["router with always fallback", routerGraph],
   ["self-loop", selfLoopGraph],
+  ["diamond fan-out → join (mode any)", () => diamondGraph("any")],
+  ["diamond fan-out → join (mode all)", () => diamondGraph("all")],
   ["single entry node", () => WorkflowGraphSchema.parse(starterGraph())],
 ];
 
@@ -194,6 +228,64 @@ describe("canvas serialization round-trip", () => {
     const entries = doc.nodes.filter((node) => node.data.kind === "agent" && node.data.isEntry);
     expect(entries).toHaveLength(1);
     expect(entries[0]?.id).toBe("implement");
+  });
+
+  it("join mode survives the round-trip and re-parsing (persist path, #116)", () => {
+    for (const mode of ["all", "any"] as const) {
+      const graph = diamondGraph(mode);
+      // graph → canvas: the join keeps kind, name and its mode config.
+      const doc = toCanvasDocument(graph);
+      const join = doc.nodes.find((node) => node.data.kind === "join");
+      expect(join).toMatchObject({
+        id: "j",
+        type: "join",
+        data: { kind: "join", name: "Merge", config: { mode } },
+      });
+      // canvas → graph → schema: the persisted shape re-validates and the
+      // mode is still there (what the daemon stores and re-serves).
+      const roundTrip = fromCanvasDocument(doc);
+      expect(roundTrip).toEqual(graph);
+      const reparsed = WorkflowGraphSchema.parse(roundTrip);
+      expect(reparsed.nodes.find((node) => node.type === "join")).toMatchObject({
+        config: { mode },
+      });
+    }
+  });
+
+  it("createJoinNode: palette defaults are mode all, name/position/mode overridable (#116)", () => {
+    const drop = createJoinNode();
+    expect(drop.type).toBe("join");
+    expect(drop.data).toEqual({ kind: "join", name: "Join", config: { mode: "all" } });
+    expect(drop.id).toMatch(/[\w-]{36}/); // crypto.randomUUID
+
+    const spot = { x: 480, y: 120 };
+    const named = createJoinNode(spot, "Merge 2", "any");
+    expect(named.position).toEqual(spot);
+    expect(named.data).toEqual({ kind: "join", name: "Merge 2", config: { mode: "any" } });
+
+    // A dropped join is one wiring step from valid: it passes the save-time
+    // schema as soon as its edges exist (two in, one unconditional out).
+    const wired = WorkflowGraphSchema.parse({
+      entryNodeId: "a",
+      nodes: [
+        agent("a", "a", { x: 0, y: 0 }),
+        agent("b", "b", { x: 300, y: -120 }),
+        agent("c", "c", { x: 300, y: 120 }),
+        {
+          id: "j",
+          type: "join",
+          name: named.data.name,
+          position: { x: 600, y: 0 },
+          config: named.data.config,
+        },
+        exit("x", { x: 900, y: 0 }),
+      ],
+      edges: [edge("a", "b"), edge("a", "c"), edge("b", "j"), edge("c", "j"), edge("j", "x")],
+    });
+    expect(wired.nodes.find((node) => node.id === "j")).toMatchObject({
+      type: "join",
+      config: { mode: "any" },
+    });
   });
 
   it("preserves edge conditions, orders, iteration caps and inverts", () => {
@@ -262,7 +354,14 @@ describe("palette-drop prompt prefill (#68)", () => {
   it("the default prompt parses under the save-time schema (one connection from valid)", () => {
     const doc: CanvasDocument = {
       nodes: [createAgentNode({ id: "entry", isEntry: true }), createAgentNode({ id: "next" })],
-      edges: [{ id: "e-entry-next", source: "entry", target: "next", data: { condition: { type: "always" } } }],
+      edges: [
+        {
+          id: "e-entry-next",
+          source: "entry",
+          target: "next",
+          data: { condition: { type: "always" } },
+        },
+      ],
     };
     expect(() => WorkflowGraphSchema.parse(fromCanvasDocument(doc))).not.toThrow();
   });
