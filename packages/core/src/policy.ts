@@ -64,7 +64,8 @@ const memoryMbSchema = z
 const cachePathSchema = z
   .string()
   .min(1, "cache paths must be non-empty")
-  .startsWith("/", "cache paths must be absolute container paths starting with /");
+  .startsWith("/", "cache paths must be absolute container paths starting with /")
+  .refine((value) => !value.includes(":"), "cache paths must not contain ':' — they become container-side mount targets");
 
 /**
  * The whole-project sandbox policy. PATCHed atomically via
