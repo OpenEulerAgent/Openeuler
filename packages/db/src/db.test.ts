@@ -109,13 +109,13 @@ describe("createDatabase", () => {
 
     // Rewind the file to its pre-0008 shape: forget the last applied
     // migrations (0008 hwm + 0009 run ports + 0010 hosting + 0011 sub-workflow
-    // parentRunId + 0012 approval awaiting + 0013 step attempt) and drop the
-    // columns they added. (Journal rows carry no usable id — order by
-    // created_at.)
+    // parentRunId + 0012 approval awaiting + 0013 step attempt + 0014
+    // workflow webhooks) and drop the columns/tables they added. (Journal
+    // rows carry no usable id — order by created_at.)
     const raw = new Database(join(dir, "test.db"));
     try {
       raw.exec(
-        "delete from __drizzle_migrations where created_at >= (select distinct created_at from __drizzle_migrations order by created_at desc limit 1 offset 5)",
+        "delete from __drizzle_migrations where created_at >= (select distinct created_at from __drizzle_migrations order by created_at desc limit 1 offset 6)",
       );
       raw.exec("alter table runs drop column event_seq_hwm");
       raw.exec("alter table runs drop column ports");
@@ -127,6 +127,8 @@ describe("createDatabase", () => {
       raw.exec("alter table runs drop column awaiting_node_id");
       raw.exec("alter table runs drop column awaiting_since");
       raw.exec("alter table step_runs drop column attempt");
+      raw.exec("drop table if exists webhook_deliveries");
+      raw.exec("drop table if exists workflow_webhooks");
     } finally {
       raw.close();
     }

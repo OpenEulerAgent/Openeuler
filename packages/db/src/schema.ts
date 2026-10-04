@@ -225,6 +225,56 @@ export const projectSecrets = sqliteTable(
 );
 
 /**
+ * Per-workflow inbound webhook (#120): one trigger endpoint per workflow at
+ * `POST /api/hooks/:id`. `secretEnc` holds the AES-256-GCM envelope of the
+ * HMAC signing secret (same master key + envelope format as project
+ * secrets); the plaintext is shown exactly once at create/rotate time and
+ * never leaves the daemon again. `defaultTask` backs trigger bodies that
+ * carry no `task` of their own.
+ */
+export const workflowWebhooks = sqliteTable(
+  "workflow_webhooks",
+  {
+    id: text("id").primaryKey(),
+    workflowId: text("workflow_id")
+      .notNull()
+      .references(() => workflows.id),
+    secretEnc: text("secret_enc").notNull(),
+    defaultTask: text("default_task"),
+    createdAt: text("created_at").notNull(),
+    updatedAt: text("updated_at").notNull(),
+  },
+  (table) => [uniqueIndex("workflow_webhooks_workflow_id_unique").on(table.workflowId)],
+);
+
+/**
+ * Webhook delivery log (#120): one row per inbound POST, accepted or
+ * rejected. Deliberately ring-shaped, not an audit trail: the repository
+ * keeps only the newest `WEBHOOK_DELIVERY_LOG_LIMIT` rows per webhook (the
+ * workflow settings drawer renders this). Plain-text `webhookId`, no FK —
+ * same shape as `activity`, so deleting a webhook stays trivial.
+ */
+export const webhookDeliveries = sqliteTable(
+  "webhook_deliveries",
+  {
+    id: integer("id").primaryKey({ autoIncrement: true }),
+    webhookId: text("webhook_id").notNull(),
+    /** `accepted` (run created) or `rejected` (validation/auth refused). */
+    outcome: text("outcome").notNull(),
+    /** HTTP status the trigger was answered with. */
+    statusCode: integer("status_code").notNull(),
+    /** `signature` or `token`; NULL when the request never authenticated. */
+    authMode: text("auth_mode"),
+    /** Run minted by an accepted delivery. */
+    runId: text("run_id"),
+    /** Error code of a rejected delivery. */
+    errorCode: text("error_code"),
+    createdAt: text("created_at").notNull(),
+  },
+  (table) => [index("webhook_deliveries_webhook_id_idx").on(table.webhookId)],
+);
+
+/**
  * Append-only agent event log. `seq` is assigned per run by the repository
  * (max(runs.event_seq_hwm, max(seq)) + 1 inside a transaction, then hwm is
  * raised); `payload` stores the event JSON without its `seq` so the column

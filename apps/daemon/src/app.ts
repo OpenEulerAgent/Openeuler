@@ -32,6 +32,8 @@ import { createSystemRouter } from "./routes/system.js";
 import { createWorktreesRouter } from "./routes/worktrees.js";
 import type { WorktreesRouterOptions } from "./routes/worktrees.js";
 import { createWorkflowsRouter } from "./routes/workflows.js";
+import { createWorkflowWebhooksRouter } from "./routes/webhooks.js";
+import { createHooksRouter } from "./routes/webhooks.js";
 import { createActivityRouter } from "./routes/activity.js";
 import { createRateLimitMiddleware, resolveRateLimits, resolveTrustProxy } from "./rate-limit.js";
 import {
@@ -334,6 +336,11 @@ export function createApp(options: CreateAppOptions = {}): DaemonApp {
     }),
   );
   app.route("/api/workflows", createWorkflowsRouter());
+  // #120: per-workflow webhook management (normal auth) + the signature-
+  // authenticated inbound trigger mount (own auth — see routes/webhooks.ts;
+  // the bearer gate exempts the /api/hooks/ prefix).
+  app.route("/api/workflows", createWorkflowWebhooksRouter());
+  app.route("/api/hooks", createHooksRouter({ authToken }));
   app.route(
     "/api/runs",
     createRunsRouter({

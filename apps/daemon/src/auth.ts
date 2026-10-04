@@ -19,6 +19,14 @@ export const AUTH_TOKEN_ENV = "OPENEULER_TOKEN";
 export const AUTH_STATUS_PATH = "/api/system/auth-status";
 
 /**
+ * Inbound webhook triggers (#120): `POST /api/hooks/:id` authenticates on
+ * its own — an HMAC signature over the body, OR this same bearer token
+ * (see `routes/webhooks.ts`). Exempting the prefix keeps CI callers
+ * signature-only while every other `/api` route stays behind the gate.
+ */
+export const HOOKS_PATH_PREFIX = "/api/hooks/";
+
+/**
  * Streaming / scrape routes: the SSE endpoints, the (v0.2) preview streams
  * and the Prometheus scrape endpoint. Originally defined for the `?token=`
  * fallback below; also reused by the rate limiter (#97), which exempts these
@@ -108,6 +116,8 @@ export function createAuthMiddleware(options: AuthMiddlewareOptions): Middleware
   const { token, logger } = options;
   return async (c, next) => {
     if (c.req.path === AUTH_STATUS_PATH) return next();
+    // #120: the hook router enforces signature-or-token itself.
+    if (c.req.path.startsWith(HOOKS_PATH_PREFIX)) return next();
 
     const headerToken = bearerFromHeader(c.req.header("Authorization"));
     if (typeof headerToken === "string" && tokensMatch(token, headerToken)) return next();

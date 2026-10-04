@@ -1,4 +1,4 @@
-import { and, eq, inArray, sql } from "drizzle-orm";
+import { and, eq, inArray, notInArray, sql } from "drizzle-orm";
 import type { BetterSQLite3Database } from "drizzle-orm/better-sqlite3";
 import { z } from "zod";
 import {
@@ -182,6 +182,70 @@ export interface ProjectSecretRepo {
   list(projectId: string): ProjectSecret[];
   /** Deletes every secret of a project (project delete path). Returns rows removed. */
   deleteAllForProject(projectId: string): number;
+}
+
+/** Fields of a workflow webhook that may change after creation; `null` clears `defaultTask`. */
+export type WorkflowWebhookPatch = {
+  secretEnc?: string;
+  defaultTask?: string | null;
+};
+
+/** One stored workflow webhook (#120); the signing secret stays encrypted. */
+export interface WorkflowWebhook {
+  id: string;
+  workflowId: string;
+  /** AES-256-GCM ciphertext envelope of the HMAC secret (see secrets-crypto). */
+  secretEnc: string;
+  defaultTask?: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface WorkflowWebhookRepo {
+  /** Inserts the row (the caller mints id/timestamps/secret envelope). */
+  create(webhook: WorkflowWebhook): WorkflowWebhook;
+  get(id: string): WorkflowWebhook | undefined;
+  /** The workflow's webhook, when one exists (at most one, unique index). */
+  getByWorkflow(workflowId: string): WorkflowWebhook | undefined;
+  /** Patches mutable fields and bumps `updatedAt`; undefined when missing. */
+  update(id: string, patch: WorkflowWebhookPatch): WorkflowWebhook | undefined;
+  /** Deletes the webhook; true when a row was removed. */
+  delete(id: string): boolean;
+  /** Deletes the workflow's webhook (workflow delete path). Returns rows removed. */
+  deleteForWorkflow(workflowId: string): number;
+}
+
+/** How many deliveries the log keeps per webhook (#120). */
+export const WEBHOOK_DELIVERY_LOG_LIMIT = 50;
+
+export type WebhookDeliveryOutcome = "accepted" | "rejected";
+
+/** One inbound webhook delivery (#120), as rendered by the settings drawer. */
+export interface WebhookDelivery {
+  id: number;
+  webhookId: string;
+  outcome: WebhookDeliveryOutcome;
+  statusCode: number;
+  authMode?: "signature" | "token";
+  runId?: string;
+  errorCode?: string;
+  createdAt: string;
+}
+
+/** Fields of a delivery the repository assigns itself. */
+export type WebhookDeliveryInput = Omit<WebhookDelivery, "id" | "createdAt">;
+
+export interface WebhookDeliveryRepo {
+  /**
+   * Appends a delivery row, then prunes the webhook's log to the newest
+   * {@link WEBHOOK_DELIVERY_LOG_LIMIT} rows in the same transaction — the
+   * ring truncation is atomic with the append.
+   */
+  append(delivery: WebhookDeliveryInput): WebhookDelivery;
+  /** The webhook's deliveries, newest first. */
+  list(webhookId: string): WebhookDelivery[];
+  /** Deletes every delivery of a webhook (webhook delete path). Returns rows removed. */
+  deleteForWebhook(webhookId: string): number;
 }
 
 /** Fields of an agent preset that may change after creation; `null` clears `icon`. */
@@ -520,6 +584,151 @@ export function createWorkflowRevisionRepo(db: Db): WorkflowRevisionRepo {
       const result = db
         .delete(schema.workflowRevisions)
         .where(eq(schema.workflowRevisions.workflowId, workflowId))
+        .run();
+      return result.changes;
+    },
+  };
+}
+
+export function createWorkflowWebhookRepo(db: Db): WorkflowWebhookRepo {
+  const toDomain = (row: typeof schema.workflowWebhooks.$inferSelect): WorkflowWebhook => ({
+    id: row.id,
+    workflowId: row.workflowId,
+    secretEnc: row.secretEnc,
+    ...(row.defaultTask === null ? {} : { defaultTask: row.defaultTask }),
+    createdAt: row.createdAt,
+    updatedAt: row.updatedAt,
+  });
+
+  return {
+    create(webhook) {
+      db.insert(schema.workflowWebhooks)
+        .values({
+          id: webhook.id,
+          workflowId: webhook.workflowId,
+          secretEnc: webhook.secretEnc,
+          defaultTask: webhook.defaultTask ?? null,
+          createdAt: webhook.createdAt,
+          updatedAt: webhook.updatedAt,
+        })
+        .run();
+      return webhook;
+    },
+    get(id) {
+      const row = db
+        .select()
+        .from(schema.workflowWebhooks)
+        .where(eq(schema.workflowWebhooks.id, id))
+        .get();
+      return row ? toDomain(row) : undefined;
+    },
+    getByWorkflow(workflowId) {
+      const row = db
+        .select()
+        .from(schema.workflowWebhooks)
+        .where(eq(schema.workflowWebhooks.workflowId, workflowId))
+        .get();
+      return row ? toDomain(row) : undefined;
+    },
+    update(id, patch) {
+      const row = db
+        .update(schema.workflowWebhooks)
+        .set({
+          ...(patch.secretEnc === undefined ? {} : { secretEnc: patch.secretEnc }),
+          ...(patch.defaultTask === undefined
+            ? {}
+            : { defaultTask: patch.defaultTask === null ? null : patch.defaultTask }),
+          updatedAt: new Date().toISOString(),
+        })
+        .where(eq(schema.workflowWebhooks.id, id))
+        .returning()
+        .get();
+      return row ? toDomain(row) : undefined;
+    },
+    delete(id) {
+      const result = db
+        .delete(schema.workflowWebhooks)
+        .where(eq(schema.workflowWebhooks.id, id))
+        .run();
+      return result.changes > 0;
+    },
+    deleteForWorkflow(workflowId) {
+      const result = db
+        .delete(schema.workflowWebhooks)
+        .where(eq(schema.workflowWebhooks.workflowId, workflowId))
+        .run();
+      return result.changes;
+    },
+  };
+}
+
+export function createWebhookDeliveryRepo(db: Db): WebhookDeliveryRepo {
+  const toDomain = (row: typeof schema.webhookDeliveries.$inferSelect): WebhookDelivery => ({
+    id: row.id,
+    webhookId: row.webhookId,
+    outcome: row.outcome === "accepted" ? "accepted" : "rejected",
+    statusCode: row.statusCode,
+    ...(row.authMode === null
+      ? {}
+      : { authMode: row.authMode === "token" ? "token" : "signature" }),
+    ...(row.runId === null ? {} : { runId: row.runId }),
+    ...(row.errorCode === null ? {} : { errorCode: row.errorCode }),
+    createdAt: row.createdAt,
+  });
+
+  return {
+    append(delivery) {
+      return db.transaction((tx) => {
+        const row = tx
+          .insert(schema.webhookDeliveries)
+          .values({
+            webhookId: delivery.webhookId,
+            outcome: delivery.outcome,
+            statusCode: delivery.statusCode,
+            authMode: delivery.authMode ?? null,
+            runId: delivery.runId ?? null,
+            errorCode: delivery.errorCode ?? null,
+            createdAt: new Date().toISOString(),
+          })
+          .returning()
+          .get();
+        // Ring truncation (#120): keep only the newest LIMIT rows for this
+        // webhook. SQLite cannot DELETE with a LIMIT, so select the keep-set
+        // and delete the complement.
+        const keep = tx
+          .select({ id: schema.webhookDeliveries.id })
+          .from(schema.webhookDeliveries)
+          .where(eq(schema.webhookDeliveries.webhookId, delivery.webhookId))
+          .orderBy(sql`${schema.webhookDeliveries.id} desc`)
+          .limit(WEBHOOK_DELIVERY_LOG_LIMIT)
+          .all();
+        tx.delete(schema.webhookDeliveries)
+          .where(
+            and(
+              eq(schema.webhookDeliveries.webhookId, delivery.webhookId),
+              notInArray(
+                schema.webhookDeliveries.id,
+                keep.map((entry) => entry.id),
+              ),
+            ),
+          )
+          .run();
+        return toDomain(row as typeof schema.webhookDeliveries.$inferSelect);
+      });
+    },
+    list(webhookId) {
+      const rows = db
+        .select()
+        .from(schema.webhookDeliveries)
+        .where(eq(schema.webhookDeliveries.webhookId, webhookId))
+        .orderBy(sql`${schema.webhookDeliveries.id} desc`)
+        .all();
+      return rows.map(toDomain);
+    },
+    deleteForWebhook(webhookId) {
+      const result = db
+        .delete(schema.webhookDeliveries)
+        .where(eq(schema.webhookDeliveries.webhookId, webhookId))
         .run();
       return result.changes;
     },

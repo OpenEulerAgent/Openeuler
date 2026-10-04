@@ -209,6 +209,40 @@ Out-of-range values answer 422 with the clamp message. The web editor is the pro
 
 While a sandboxed run executes, its **declared** ports (#107) are previewable through the daemon (#108): `/previews/:runId[/:port]/*` (alias `/api/previews/…`) is a streaming reverse proxy to the run's sandbox port — method passthrough (GET/HEAD/POST/PUT/PATCH/DELETE), bodies and responses streamed, hop-by-hop headers stripped, timeouts (10s connect / 120s overall) with an actionable `502 PREVIEW_UPSTREAM_UNAVAILABLE` when the sandbox app is down. Port resolution: the path form (`/previews/:runId/3000/app.js` — canonical, survives relative links) → `?port=` → the first declared port. Undeclared ports answer `403` with the declare-to-preview hint; finished/local runs answer `410 PREVIEW_GONE`; unknown runs `404`. Auth applies on both mounts (`?token=` works for GET iframes); with `PREVIEW_IFRAME=1` the responses are framable (`frame-ancestors 'self' <CORS allowlist>`, no `X-Frame-Options`). Link rewriting and WebSocket upgrades are documented v0.2 cuts. Details: **[docs/DEV.md](docs/DEV.md)**.
 
+## Workflow webhooks (inbound triggers)
+
+Any workflow can expose an inbound webhook (#120): a per-workflow URL + signing secret that queues a run of that workflow's latest revision — wire it to CI, cron, or a `curl` one-liner.
+
+- **Create** (management API, normal auth): `POST /api/workflows/:id/webhook` with an optional `{defaultTask}` — the response returns the hook `id` and the **signing secret exactly once** (rotate via `PATCH` with `{rotateSecret: true}`, delete via `DELETE`; `GET` returns the webhook plus the **delivery log** — the last 50 attempts against the hook, accepted or rejected). In the web UI the canvas editor's **webhook** chip opens the same settings drawer.
+- **Trigger**: `POST /api/hooks/:id` with `{task?, inputs?}` (missing `task` falls back to the webhook's `defaultTask`; `inputs` is appended to the task as JSON). Answers `202 {runId, run}`.
+
+```bash
+# create the webhook — the secret is shown ONCE, store it
+curl -s localhost:8787/api/workflows/<workflow-id>/webhook \
+  -H 'content-type: application/json' -d '{"defaultTask":"nightly build"}'
+# → {"webhook":{"id":"Ab3xK9...","defaultTask":"nightly build", ...},"secret":"<48-hex-chars>"}
+
+HOOK=<hook-id>; SECRET=<secret>; BODY='{"task":"deploy staging","inputs":{"ref":"main"}}'
+TS=$(date +%s); NONCE=$(uuidgen)
+SIG=$(printf '%s.%s.%s' "$TS" "$NONCE" "$BODY" | openssl dgst -sha256 -hmac "$SECRET" -hex | cut -d' ' -f2)
+
+# trigger it — HMAC-SHA256 over "<timestamp>.<nonce>.<raw body>"
+curl -s -X POST "localhost:8787/api/hooks/$HOOK" \
+  -H 'content-type: application/json' \
+  -H "x-openeuler-timestamp: $TS" \
+  -H "x-openeuler-nonce: $NONCE" \
+  -H "x-openeuler-signature: sha256=$SIG" \
+  -d "$BODY"
+# → 202 {"runId":"…","run":{…}}
+
+# token mode instead: when OPENEULER_TOKEN is set, the plain bearer token works too
+curl -s -X POST "localhost:8787/api/hooks/$HOOK" -H "authorization: Bearer $OPENEULER_TOKEN" \
+  -H 'content-type: application/json' -d '{"task":"deploy staging"}'
+```
+
+- **Replay protection**: the timestamp must be within ±5 minutes of daemon time (`401 HOOK_TIMESTAMP_STALE`), the nonce must be fresh for the webhook (`409 HOOK_NONCE_REPLAYED` on reuse — one signed request = at most one run), and the signature is compared in constant time (`401 HOOK_SIGNATURE_INVALID`). In open mode (no `OPENEULER_TOKEN`) the signature is the only accepted auth; the trigger never accepts anonymous calls.
+- **Everything else applies unchanged**: the trigger sits under the global `/api` rate limits and the 1 MiB payload cap, and its runs are ordinary workflow runs (revision-pinned, secret-redacted, visible in the dashboard).
+
 ## Project layout
 
 ```
