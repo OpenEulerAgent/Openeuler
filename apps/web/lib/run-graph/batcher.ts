@@ -1,4 +1,4 @@
-import { foldRunGraphEvent, type RunGraphFoldState } from "./fold";
+import { EMPTY_RUN_GRAPH_STATE, foldRunGraphEvent, type RunGraphFoldState } from "./fold";
 import type { RunStreamEvent } from "@/lib/run-events";
 
 /**
@@ -44,16 +44,7 @@ export class RunGraphFoldBatcher {
     this.#schedule =
       (options.schedule as ScheduleFn | undefined) ?? ((handler, ms) => setTimeout(handler, ms));
     this.#cancel = (options.cancel as CancelFn | undefined) ?? ((timer) => clearTimeout(timer));
-    this.#state = options.initial ?? {
-      lastSeq: -1,
-      runStatus: null,
-      nodes: {},
-      edges: {},
-      breadcrumb: [],
-      timeline: [],
-      lastTakenEdgeId: null,
-      totalExecutions: 0,
-    };
+    this.#state = options.initial ?? { ...EMPTY_RUN_GRAPH_STATE };
   }
 
   /** The state including every pushed event (never throttled). */

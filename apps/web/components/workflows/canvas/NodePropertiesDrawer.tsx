@@ -1,7 +1,7 @@
 "use client";
 
 import { useMemo, useRef, useState, type ComponentProps } from "react";
-import type { SandboxOverrides, StepConfig } from "@openeuler/core";
+import type { NodeRetryConfig, SandboxOverrides, StepConfig } from "@openeuler/core";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Dialog } from "@/components/ui/dialog";
@@ -585,6 +585,12 @@ function AgentInspector({
         fieldErrors={fieldErrors}
         onPatchAgent={onPatchAgent}
       />
+
+      <RetryPolicySection
+        retry={config.retry}
+        fieldErrors={fieldErrors}
+        onPatchAgent={onPatchAgent}
+      />
     </>
   );
 }
@@ -978,6 +984,137 @@ function ModeOption({
       <span className="block text-xs font-medium">{title}</span>
       <span className="block text-[10px] opacity-80">{hint}</span>
     </button>
+  );
+}
+
+/**
+ * Node retry policy (#119), collapsible: max attempts (1–5), base backoff
+ * and what triggers a retry. Absent = exactly one attempt (the previous
+ * behavior); the engine waits `backoffMs * 2^(attempt-1) + jitter` between
+ * attempts, inside the SAME node execution — retries never consume edge
+ * iteration caps or spawn new iterations, and a continueSession node keeps
+ * its session across attempts.
+ */
+function RetryPolicySection({
+  retry,
+  fieldErrors,
+  onPatchAgent,
+}: {
+  retry: NodeRetryConfig | undefined;
+  fieldErrors: InspectorFieldErrors;
+  onPatchAgent: (patch: Partial<StepConfig>) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  /** The policy with defaults filled in — what a field edit patches onto. */
+  const base: NodeRetryConfig = retry ?? { maxAttempts: 3, backoffMs: 1000, retryOn: "failure" };
+  /** Patches one field; numeric edits on an absent policy create it. */
+  const patchRetry = (patch: Partial<NodeRetryConfig>) =>
+    onPatchAgent({ retry: { ...base, ...patch } });
+
+  return (
+    <div className="rounded-lg border border-border bg-elevated/40">
+      <button
+        type="button"
+        aria-expanded={open}
+        data-retry-policy-toggle
+        onClick={() => setOpen((current) => !current)}
+        className="flex w-full items-center justify-between gap-2 rounded-lg px-3 py-2 text-left text-sm font-medium text-fg transition-colors hover:bg-elevated focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
+      >
+        <span>Retry policy</span>
+        {retry !== undefined ? (
+          <Badge variant="neutral" data-retry-badge>
+            {retry.maxAttempts} attempt{retry.maxAttempts === 1 ? "" : "s"}
+          </Badge>
+        ) : null}
+        <span aria-hidden className="text-muted-fg">
+          {open ? "−" : "+"}
+        </span>
+      </button>
+      {open ? (
+        <div className="flex flex-col gap-3 border-t border-border px-3 py-3">
+          <p className="text-xs text-muted-fg">
+            A flaky agent heals itself: attempts re-run after an exponential backoff (base ×2 per
+            attempt + jitter), inside the same node execution — no new iteration, edge iteration
+            caps are never consumed, and a &quot;continue session&quot; node keeps its session
+            across attempts.
+          </p>
+          <div className="grid grid-cols-2 gap-3">
+            <Field
+              label="Max attempts"
+              hint="(1–5)"
+              htmlFor="node-retry-max-attempts"
+              error={fieldErrors["config.retry.maxAttempts"]}
+            >
+              <Input
+                id="node-retry-max-attempts"
+                type="number"
+                min={1}
+                max={5}
+                step={1}
+                value={retry?.maxAttempts ?? ""}
+                invalid={fieldErrors["config.retry.maxAttempts"] !== undefined}
+                onChange={(event) => {
+                  const raw = event.target.value;
+                  // Empty keeps the current value (clearing is "Remove" below).
+                  if (raw !== "") patchRetry({ maxAttempts: Number(raw) });
+                }}
+                placeholder="no retry"
+                data-retry-max-attempts
+              />
+            </Field>
+            <Field
+              label="Backoff (ms)"
+              hint="(base, ×2 per attempt)"
+              htmlFor="node-retry-backoff"
+              error={fieldErrors["config.retry.backoffMs"]}
+            >
+              <Input
+                id="node-retry-backoff"
+                type="number"
+                min={0}
+                max={60000}
+                step={100}
+                value={retry?.backoffMs ?? ""}
+                invalid={fieldErrors["config.retry.backoffMs"] !== undefined}
+                onChange={(event) => {
+                  const raw = event.target.value;
+                  if (raw !== "") patchRetry({ backoffMs: Number(raw) });
+                }}
+                placeholder="1000"
+                data-retry-backoff-ms
+              />
+            </Field>
+          </div>
+          <Field label="Retry on" htmlFor="node-retry-on">
+            <Select
+              id="node-retry-on"
+              value={retry?.retryOn ?? ""}
+              invalid={fieldErrors["config.retry.retryOn"] !== undefined}
+              onChange={(event) => {
+                const raw = event.target.value;
+                if (raw === "") onPatchAgent({ retry: undefined });
+                else patchRetry({ retryOn: raw as NodeRetryConfig["retryOn"] });
+              }}
+              data-retry-on
+            >
+              <option value="">no retry (single attempt)</option>
+              <option value="failure">failure — retry failed attempts</option>
+              <option value="always">always — retry any outcome</option>
+            </Select>
+          </Field>
+          {retry !== undefined ? (
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={() => onPatchAgent({ retry: undefined })}
+              data-retry-clear
+            >
+              Remove retry policy
+            </Button>
+          ) : null}
+        </div>
+      ) : null}
+    </div>
   );
 }
 

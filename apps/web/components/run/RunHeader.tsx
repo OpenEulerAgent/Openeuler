@@ -19,6 +19,7 @@ export function RunHeader({
   nowMs,
   endedMs,
   executions,
+  attempts,
   extraActions,
   onAborted,
 }: {
@@ -28,6 +29,11 @@ export function RunHeader({
   endedMs?: number | null;
   /** Total node executions announced so far (graph fold); null = none. */
   executions?: number | null;
+  /**
+   * Total attempts across executions (#119, graph fold); shown only when
+   * retries pushed it past the execution count. null/absent = not tracked.
+   */
+  attempts?: number | null;
   /** Extra action controls (Retry button). */
   extraActions?: ReactNode;
   onAborted: () => void;
@@ -62,6 +68,16 @@ export function RunHeader({
             <span className="text-sm text-muted-fg" title="Total node executions">
               <span className="font-medium text-fg">{executions}</span> execution
               {executions === 1 ? "" : "s"}
+            </span>
+          ) : null}
+          {attempts !== null && attempts !== undefined && attempts > (executions ?? 0) ? (
+            <span
+              className="text-sm text-muted-fg"
+              title="Total attempts across executions (retries included)"
+              data-run-attempts
+            >
+              <span className="font-medium text-fg">{attempts}</span> attempt
+              {attempts === 1 ? "" : "s"}
             </span>
           ) : null}
           <span className="text-sm text-muted-fg" title="Elapsed time">

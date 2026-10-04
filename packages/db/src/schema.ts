@@ -190,6 +190,12 @@ export const stepRuns = sqliteTable(
     status: text("status").notNull(),
     output: text("output").notNull(),
     diff: text("diff"),
+    /**
+     * Attempt count this execution settled on (#119): NULL = 1 (the node
+     * ran once, or a pre-#119 row); higher when a retry policy re-executed
+     * the node. One row per node execution — attempts update in place.
+     */
+    attempt: integer("attempt"),
   },
   (table) => [index("step_runs_run_id_idx").on(table.runId)],
 );

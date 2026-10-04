@@ -4,6 +4,7 @@ import {
   createAgentNode,
   createExitNode,
   fromCanvasDocument,
+  toCanvasDocument,
   type CanvasDocument,
   type CanvasNode,
 } from "./canvas-document";
@@ -366,6 +367,66 @@ describe("inspectorReducer (doc round-trip)", () => {
   it("ignores edits to unknown nodes", () => {
     const doc = base();
     expect(applyInspectorAction(doc, { type: "patchName", nodeId: "ghost", name: "x" })).toBe(doc);
+  });
+});
+
+describe("inspector: node retry policy (#119)", () => {
+  const base = (): CanvasDocument => ({
+    nodes: [node("a", { isEntry: true }), node("b", { position: { x: 300, y: 0 } })],
+    edges: [edge("a", "b")],
+  });
+
+  it("a retry policy patch round-trips through fromCanvasDocument (and toCanvasDocument)", () => {
+    let doc = base();
+    doc = inspectorReducer(doc, {
+      type: "patchConfig",
+      nodeId: "b",
+      patch: { retry: { maxAttempts: 3, backoffMs: 500, retryOn: "failure" } },
+    });
+
+    const graph = fromCanvasDocument(doc);
+    const target = graph.nodes.find((candidate) => candidate.id === "b");
+    expect(target).toMatchObject({
+      config: { retry: { maxAttempts: 3, backoffMs: 500, retryOn: "failure" } },
+    });
+    // ...and survives a canvas → graph → canvas round-trip unchanged.
+    const back = toCanvasDocument(graph).nodes.find((candidate) => candidate.id === "b");
+    expect(back?.data.kind === "agent" && back.data.config.retry).toEqual({
+      maxAttempts: 3,
+      backoffMs: 500,
+      retryOn: "failure",
+    });
+  });
+
+  it("clearing the policy (retry: undefined) strips the key entirely", () => {
+    let doc = base();
+    doc = inspectorReducer(doc, {
+      type: "patchConfig",
+      nodeId: "b",
+      patch: { retry: { maxAttempts: 2, backoffMs: 100, retryOn: "always" } },
+    });
+    doc = inspectorReducer(doc, {
+      type: "patchConfig",
+      nodeId: "b",
+      patch: { retry: undefined },
+    });
+    const target = doc.nodes.find((candidate) => candidate.id === "b");
+    if (target?.data.kind !== "agent") throw new Error("expected an agent node");
+    expect("retry" in target.data.config).toBe(false);
+    expect(inspectorFieldErrors(doc, "b")).toEqual({});
+  });
+
+  it("out-of-bounds policies flag their fields inline", () => {
+    let doc = base();
+    doc = inspectorReducer(doc, {
+      type: "patchConfig",
+      nodeId: "b",
+      patch: { retry: { maxAttempts: 6, backoffMs: 60_001, retryOn: "failure" } },
+    });
+    expect(inspectorFieldErrors(doc, "b")).toMatchObject({
+      "config.retry.maxAttempts": expect.stringContaining("<= 5"),
+      "config.retry.backoffMs": expect.stringContaining("<= 60000"),
+    });
   });
 });
 

@@ -58,6 +58,17 @@ export interface NodeExecutionInfo {
    * its `node.approved` event) — the drawer shows note + verdict.
    */
   approval?: { approved: boolean; note?: string };
+  /**
+   * #119: attempts this execution has run (from `node.retry` /
+   * `node.completed` events) — 1 (or absent) when the node ran once, the
+   * settled count when a retry policy re-executed it.
+   */
+  attempt?: number;
+  /**
+   * #119: the pending backoff after the latest `node.retry` — the drawer
+   * shows "retrying in Nms" while the node waits to re-execute.
+   */
+  retryInMs?: number;
 }
 
 /** Folded state of one node. Referentially stable while the node is idle. */
@@ -114,6 +125,13 @@ export interface RunGraphFoldState {
   lastTakenEdgeId: string | null;
   /** Total node executions announced (header "iterations" chip). */
   totalExecutions: number;
+  /**
+   * Total attempts across executions (#119): every announced execution
+   * counts 1, every `node.retry` one more (the re-execution). Equals
+   * `totalExecutions` when no node retried — the run summary only surfaces
+   * it above that.
+   */
+  totalAttempts: number;
 }
 
 export const EMPTY_RUN_GRAPH_STATE: RunGraphFoldState = {
@@ -125,6 +143,7 @@ export const EMPTY_RUN_GRAPH_STATE: RunGraphFoldState = {
   timeline: [],
   lastTakenEdgeId: null,
   totalExecutions: 0,
+  totalAttempts: 0,
 };
 
 /** True for statuses a run never leaves. */
@@ -149,7 +168,9 @@ function patchExecution(
     next.error === current.error &&
     next.edgeId === current.edgeId &&
     next.childRunId === current.childRunId &&
-    next.approval === current.approval
+    next.approval === current.approval &&
+    next.attempt === current.attempt &&
+    next.retryInMs === current.retryInMs
   ) {
     return executions;
   }
@@ -270,6 +291,17 @@ export function foldRunGraphEvent(
         event.type === "node.completed" && "childRunId" in event && event.childRunId !== undefined
           ? { ...withEdge, childRunId: event.childRunId }
           : withEdge;
+      // #119: the settled attempt count rides node.completed (absent = 1).
+      // A completed execution also clears a pending retry countdown, even
+      // when it settles on attempt 1 (e.g. aborted mid-backoff).
+      const withAttempt =
+        event.type === "node.completed"
+          ? {
+              ...withExtras,
+              attempt: event.attempt !== undefined && event.attempt > 1 ? event.attempt : undefined,
+              retryInMs: undefined,
+            }
+          : withExtras;
       const nodes = patchNode(state.nodes, nodeId, {
         status:
           event.type === "node.queued"
@@ -277,7 +309,7 @@ export function foldRunGraphEvent(
             : event.type === "node.started"
               ? "running"
               : event.status,
-        execution: withExtras,
+        execution: withAttempt,
       });
       let next: RunGraphFoldState = { ...state, lastSeq: event.seq };
       if (nodes !== state.nodes) next = { ...next, nodes };
@@ -298,11 +330,18 @@ export function foldRunGraphEvent(
           timeline: [...state.timeline, entry],
         };
       }
-      // Total executions counts every newly announced (nodeId, iteration).
+      // Total executions counts every newly announced (nodeId, iteration);
+      // every announced execution also starts at one attempt (#119).
       const known = (state.nodes[nodeId]?.executions ?? []).some(
         (row) => row.iteration === iteration,
       );
-      if (!known) next = { ...next, totalExecutions: state.totalExecutions + 1 };
+      if (!known) {
+        next = {
+          ...next,
+          totalExecutions: state.totalExecutions + 1,
+          totalAttempts: next.totalAttempts + 1,
+        };
+      }
       return next;
     }
 
@@ -335,6 +374,29 @@ export function foldRunGraphEvent(
         ...state,
         lastSeq: event.seq,
         nodes: { ...state.nodes, [event.nodeId]: { ...current, executions: execution } },
+      };
+    }
+
+    // #119 node retries: an attempt is being re-executed after `nextInMs`.
+    // The node stays visually "running" (no new execution — retries live
+    // INSIDE one execution), the upcoming attempt number and pending
+    // backoff land on the execution row, and the run summary's attempts
+    // count grows by the re-execution.
+    case "node.retry": {
+      const nodes = patchNode(state.nodes, event.nodeId, {
+        status: "running",
+        execution: {
+          iteration: event.iteration,
+          status: "running" as const,
+          attempt: event.attempt + 1,
+          retryInMs: event.nextInMs,
+        },
+      });
+      return {
+        ...state,
+        lastSeq: event.seq,
+        nodes,
+        totalAttempts: state.totalAttempts + 1,
       };
     }
 
@@ -373,6 +435,8 @@ export function foldRunGraphEvent(
         (row) => row.iteration === iteration,
       );
       if (!known) next = { ...next, totalExecutions: state.totalExecutions + 1 };
+      // Legacy rows have no retry policy in practice; count stays in lockstep.
+      if (!known) next = { ...next, totalAttempts: next.totalAttempts + 1 };
       return next;
     }
 

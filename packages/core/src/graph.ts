@@ -871,6 +871,7 @@ export function linearToGraph(workflow: {
       mode: step.mode,
       promptTemplate: step.promptTemplate,
       continueSession: step.continueSession,
+      ...(step.retry === undefined ? {} : { retry: step.retry }),
     } satisfies StepConfig,
   }));
   const takenIds = new Set(nodes.map((node) => node.id));
@@ -1051,6 +1052,7 @@ export function graphToLinear(graph: WorkflowGraph): GraphToLinearResult {
     mode: node.config.mode,
     promptTemplate: node.config.promptTemplate,
     continueSession: node.config.continueSession,
+    ...(node.config.retry === undefined ? {} : { retry: node.config.retry }),
   }));
 
   let loopBack: LoopBack | undefined;

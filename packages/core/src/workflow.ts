@@ -4,6 +4,43 @@ import { isValidRegex } from "./regex.js";
 import { SandboxOverridesSchema } from "./policy.js";
 
 /**
+ * Largest accepted `retry.maxAttempts` (#119): five attempts is plenty for a
+ * flaky agent, and bounds the worst-case run time a node can accumulate.
+ */
+export const MAX_RETRY_ATTEMPTS = 5;
+
+/** Largest accepted `retry.backoffMs` (#119) — one minute. */
+export const MAX_RETRY_BACKOFF_MS = 60_000;
+
+/**
+ * Node retry policy (#119): a flaky agent heals itself. When an attempt
+ * fails (`retryOn: "failure"`) — or regardless of outcome
+ * (`retryOn: "always"`) — the engine re-executes the node up to
+ * `maxAttempts` times, waiting `backoffMs * 2^(attempt-1) + jitter` between
+ * attempts. Retries stay INSIDE one node execution: no new StepRun
+ * iteration, no edge traversal, no consumption of edge cycle/iteration
+ * caps; a `continueSession` node keeps its session across attempts.
+ */
+export const NodeRetryConfigSchema = z.strictObject({
+  /** Total attempts per node execution, 1 (no retry) .. {@link MAX_RETRY_ATTEMPTS}. */
+  maxAttempts: z
+    .number()
+    .int("maxAttempts must be an integer")
+    .min(1, "maxAttempts must be >= 1")
+    .max(MAX_RETRY_ATTEMPTS, `maxAttempts must be <= ${MAX_RETRY_ATTEMPTS}`),
+  /** Base backoff delay; the attempt-N delay is this times 2^(N-1), plus jitter. */
+  backoffMs: z
+    .number()
+    .int("backoffMs must be an integer")
+    .min(0, "backoffMs must be >= 0")
+    .max(MAX_RETRY_BACKOFF_MS, `backoffMs must be <= ${MAX_RETRY_BACKOFF_MS} (1 minute)`),
+  /** `failure` retries failed attempts only; `always` retries any outcome. */
+  retryOn: z.enum(["failure", "always"]),
+});
+
+export type NodeRetryConfig = z.infer<typeof NodeRetryConfigSchema>;
+
+/**
  * Invocation config shared by linear steps and graph nodes: which driver
  * (optionally model/agent) to talk to, in which mode, with what prompt
  * template and session-chaining behavior.
@@ -23,6 +60,11 @@ export const StepConfigSchema = z.strictObject({
    * happens at run time (`buildSandboxSpec`).
    */
   sandboxOverrides: SandboxOverridesSchema.optional(),
+  /**
+   * Per-node retry policy (#119), additive: absent on pre-#119 revisions =
+   * exactly one attempt (the previous behavior, byte-identical).
+   */
+  retry: NodeRetryConfigSchema.optional(),
 });
 
 export type StepConfig = z.infer<typeof StepConfigSchema>;

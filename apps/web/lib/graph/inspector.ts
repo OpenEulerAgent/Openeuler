@@ -119,7 +119,10 @@ export type InspectorField =
   | "config.workflowId"
   | "config.revision"
   | "config.prompt"
-  | "config.timeoutMinutes";
+  | "config.timeoutMinutes"
+  | "config.retry.maxAttempts"
+  | "config.retry.backoffMs"
+  | "config.retry.retryOn";
 
 export type InspectorFieldErrors = Partial<Record<InspectorField, string>>;
 
@@ -194,6 +197,10 @@ export function inspectorFieldErrors(doc: CanvasDocument, nodeId: string): Inspe
       }
       // Sandbox overrides (#101): clamp/rule errors surface on their fields.
       if (field.startsWith("config.sandboxOverrides.")) {
+        errors[field as InspectorField] ??= issue.message;
+      }
+      // Node retry policy (#119): bounds errors surface on their fields.
+      if (field.startsWith("config.retry.")) {
         errors[field as InspectorField] ??= issue.message;
       }
     }

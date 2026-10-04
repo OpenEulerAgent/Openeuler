@@ -9,6 +9,7 @@ import type {
   NodeAwaitingEvent,
   NodeCompletedEvent,
   NodeQueuedEvent,
+  NodeRetryEvent,
   NodeStartedEvent,
   RunStatusEvent,
   SandboxLogEvent,
@@ -181,6 +182,20 @@ function EdgeCapReachedItem({ event }: { event: EdgeCapReachedEvent }) {
   );
 }
 
+// --- node retry events (#119): an attempt is re-executed after backoff. ---
+
+function NodeRetryItem({ event }: { event: NodeRetryEvent }) {
+  return (
+    <SystemLine>
+      <span className="text-warning">
+        node {event.nodeName} attempt {event.attempt} retried
+        {event.error === undefined ? "" : `: ${event.error}`}
+      </span>{" "}
+      — next attempt in {event.nextInMs}ms (attempt {event.attempt + 1})
+    </SystemLine>
+  );
+}
+
 // --- sandbox log events (#104): quiet mono gray lines; the run feed shows
 // them under "All" only (filters hide them), the graph fold ignores them. ---
 
@@ -261,6 +276,8 @@ export function FeedItem({ entry }: { entry: FeedEntry }) {
       return <NodeAwaitingItem event={event} />;
     case "node.approved":
       return <NodeApprovedItem event={event} />;
+    case "node.retry":
+      return <NodeRetryItem event={event} />;
     case "edge.taken":
       return <EdgeTakenItem event={event} />;
     case "edge.cap-reached":

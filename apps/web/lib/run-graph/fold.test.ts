@@ -6,6 +6,7 @@ import type {
   NodeAwaitingEvent,
   NodeCompletedEvent,
   NodeQueuedEvent,
+  NodeRetryEvent,
   NodeStartedEvent,
   RunStatusEvent,
   StepCompletedEvent,
@@ -138,6 +139,21 @@ const approved = (
   iteration,
   approved: approvedFlag,
   ...(note === undefined ? {} : { note }),
+});
+
+const retry = (
+  nodeId: string,
+  attempt: number,
+  iteration = 1,
+  nextInMs = 100 * 2 ** (attempt - 1),
+): NodeRetryEvent => ({
+  type: "node.retry",
+  seq: seq(),
+  nodeId,
+  nodeName: nodeId,
+  iteration,
+  attempt,
+  nextInMs,
 });
 
 /** One full loop-graph execution: a → b → (loop b) → b → exit. */
@@ -279,6 +295,73 @@ describe("fold: approval gates (#118)", () => {
   it("node.awaiting carries the timeout window through", () => {
     const state = buildRunGraphState([awaiting("gate", 1, { timeoutMinutes: 5 })]);
     expect(state.nodes["gate"]?.executions[0]?.status).toBe("awaiting");
+  });
+});
+
+describe("fold: node retries (#119)", () => {
+  it("retries stay inside ONE execution: attempt + pending backoff on the row, node stays running", () => {
+    const state = buildRunGraphState([
+      queued("a"),
+      started("a"),
+      retry("a", 1, 1, 100),
+      retry("a", 2, 1, 200),
+    ]);
+    const a = state.nodes["a"];
+    expect(a?.status).toBe("running");
+    expect(a?.executions).toHaveLength(1);
+    expect(a?.executions[0]).toMatchObject({
+      iteration: 1,
+      status: "running",
+      attempt: 3,
+      retryInMs: 200,
+    });
+  });
+
+  it("the settled completion records the final attempt and clears the pending backoff", () => {
+    const state = buildRunGraphState([
+      started("a"),
+      retry("a", 1),
+      completed("a", 1, "success", { attempt: 2 }),
+    ]);
+    expect(state.nodes["a"]?.executions[0]).toMatchObject({
+      status: "success",
+      attempt: 2,
+      retryInMs: undefined,
+    });
+  });
+
+  it("a completion without an attempt clears a pending retry (aborted mid-backoff)", () => {
+    const state = buildRunGraphState([started("a"), retry("a", 1), completed("a", 1, "aborted")]);
+    expect(state.nodes["a"]?.executions[0]).toMatchObject({
+      status: "aborted",
+      attempt: undefined,
+      retryInMs: undefined,
+    });
+  });
+
+  it("summary counts: executions +1 per execution, attempts +1 per execution and per retry", () => {
+    const plain = buildRunGraphState([started("a"), completed("a", 1)]);
+    expect(plain.totalExecutions).toBe(1);
+    expect(plain.totalAttempts).toBe(1);
+
+    const retried = buildRunGraphState([
+      started("a"),
+      retry("a", 1),
+      retry("a", 2),
+      completed("a", 1, "success", { attempt: 3 }),
+      started("b"),
+      completed("b", 1),
+    ]);
+    expect(retried.totalExecutions).toBe(2);
+    // a ran 3 attempts (1 + 2 retries), b ran 1.
+    expect(retried.totalAttempts).toBe(4);
+  });
+
+  it("retries on a not-yet-announced node create the execution running", () => {
+    const state = buildRunGraphState([retry("a", 1)]);
+    expect(state.nodes["a"]?.status).toBe("running");
+    expect(state.nodes["a"]?.executions[0]).toMatchObject({ attempt: 2, retryInMs: 100 });
+    expect(state.totalAttempts).toBe(1);
   });
 });
 

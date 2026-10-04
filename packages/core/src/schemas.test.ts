@@ -460,6 +460,97 @@ describe("invalid fixtures are rejected with clear messages", () => {
   });
 });
 
+describe("node retry policies (#119)", () => {
+  const expectRejected = (schema: z.ZodType, input: unknown, ...fragments: string[]) => {
+    const result = schema.safeParse(input);
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      const text = result.error.issues.map((issue) => issue.message).join(" | ");
+      for (const fragment of fragments) {
+        expect(text).toContain(fragment);
+      }
+    }
+  };
+
+  it("parses a full retry policy on a step config", () => {
+    expect(
+      StepSchema.parse({
+        ...validStep,
+        retry: { maxAttempts: 5, backoffMs: 30_000, retryOn: "always" },
+      }),
+    ).toMatchObject({
+      retry: { maxAttempts: 5, backoffMs: 30_000, retryOn: "always" },
+    });
+  });
+
+  it("bounds maxAttempts to 1..5 and backoffMs to 0..60000, integers", () => {
+    expectRejected(
+      StepSchema,
+      { ...validStep, retry: { maxAttempts: 0, backoffMs: 100, retryOn: "failure" } },
+      "maxAttempts must be >= 1",
+    );
+    expectRejected(
+      StepSchema,
+      { ...validStep, retry: { maxAttempts: 6, backoffMs: 100, retryOn: "failure" } },
+      "maxAttempts must be <= 5",
+    );
+    expectRejected(
+      StepSchema,
+      { ...validStep, retry: { maxAttempts: 2, backoffMs: 60_001, retryOn: "failure" } },
+      "backoffMs must be <= 60000",
+    );
+    expectRejected(
+      StepSchema,
+      { ...validStep, retry: { maxAttempts: 2.5, backoffMs: 100, retryOn: "failure" } },
+      "maxAttempts must be an integer",
+    );
+    expectRejected(
+      StepSchema,
+      { ...validStep, retry: { maxAttempts: 2, backoffMs: 100, retryOn: "sometimes" } },
+      "failure",
+      "always",
+    );
+  });
+
+  it("parses node.retry events and rejects non-positive attempt/nextInMs", () => {
+    expect(
+      RunEventSchema.parse({
+        type: "node.retry",
+        seq: 9,
+        nodeId: "n1",
+        nodeName: "implement",
+        iteration: 1,
+        attempt: 2,
+        nextInMs: 400,
+        error: "agent exited with code 1",
+      }),
+    ).toMatchObject({ type: "node.retry", attempt: 2, nextInMs: 400 });
+    expectRejected(
+      RunEventSchema,
+      {
+        type: "node.retry",
+        seq: 10,
+        nodeId: "n1",
+        nodeName: "implement",
+        iteration: 1,
+        attempt: 0,
+        nextInMs: 0,
+      },
+      "attempt must be an integer >= 1",
+    );
+  });
+
+  it("StepRun carries an optional attempt count (absent = ran once)", () => {
+    expect(StepRunSchema.parse({ ...validStepRun, attempt: 3 })).toMatchObject({ attempt: 3 });
+    expect("attempt" in StepRunSchema.parse(validStepRun)).toBe(false);
+    expectRejected(
+      StepRunSchema,
+      { ...validStepRun, attempt: 0 },
+      "attempt must be an integer >= 1",
+    );
+  });
+});
+
 describe("renderPromptTemplate", () => {
   it("renders all documented variables", () => {
     expect(

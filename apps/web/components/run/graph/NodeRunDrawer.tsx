@@ -20,6 +20,8 @@ export interface NodeIterationRow {
   error?: string;
   /** The approval decision this execution resolved with (#118), if any. */
   approval?: { approved: boolean; note?: string };
+  /** Attempts this execution ran (#119); absent/1 = ran once. */
+  attempt?: number;
   /** Matching StepRun row, when one exists (sessionId + diff link). */
   stepRun?: StepRun;
   /** Child run this sub-workflow execution spawned (#117), when known. */
@@ -55,6 +57,10 @@ export function nodeIterationRows(
       output: execution.output ?? stepRun?.output ?? "",
       ...(execution.error === undefined ? {} : { error: execution.error }),
       ...(execution.approval === undefined ? {} : { approval: execution.approval }),
+      // #119: fold first (live), then the settled StepRun row.
+      ...((execution.attempt ?? stepRun?.attempt) === undefined
+        ? {}
+        : { attempt: execution.attempt ?? stepRun?.attempt }),
       ...(stepRun === undefined ? {} : { stepRun }),
       ...(execution.childRunId === undefined ? {} : { childRunId: execution.childRunId }),
     };
@@ -109,6 +115,11 @@ function IterationSection({
             {row.approval.note === undefined || row.approval.note.length === 0
               ? ""
               : `: ${row.approval.note}`}
+          </span>
+        ) : null}
+        {row.attempt !== undefined && row.attempt > 1 ? (
+          <span className="text-xs text-muted-fg" data-iteration-attempts title="Attempts">
+            {row.attempt} attempts
           </span>
         ) : null}
       </summary>

@@ -111,6 +111,19 @@ describe("createFakeDriver", () => {
     await expect(handle.exited).resolves.toMatchObject({ code: 3, reason: "exit" });
   });
 
+  it("cycles per-start exit codes by call count (#119: fail N times then succeed)", async () => {
+    const driver = createFakeDriver({ events: [], exitCodes: [1, 1, 0] });
+    const codes: number[] = [];
+    for (let call = 0; call < 4; call += 1) {
+      const handle = driver.start(startOpts);
+      await collect(handle);
+      const exit = await handle.exited;
+      codes.push(exit.code ?? -1);
+    }
+    // exitCodes[n % exitCodes.length]; wins over the default exit code 0.
+    expect(codes).toEqual([1, 1, 0, 1]);
+  });
+
   it("falls back to accumulated message-delta/tool-output text as final output", async () => {
     const handle = createFakeDriver({ events: script }).start(startOpts);
     await collect(handle);
