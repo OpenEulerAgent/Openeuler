@@ -158,6 +158,49 @@ export const NodeCompletedEventSchema = z.strictObject({
 export type NodeCompletedEvent = z.infer<typeof NodeCompletedEventSchema>;
 
 /**
+ * Engine-emitted event: an approval gate node (#118) opened its wait —
+ * the run is paused (`run.status` stays `running`; the run row carries
+ * `awaitingNodeId`/`awaitingSince`). `prompt` is the question shown to
+ * the approver; `timeoutMinutes` echoes the configured auto-reject
+ * window, when set. Exactly one per gate execution (a resume after a
+ * daemon restart re-enters the wait WITHOUT re-emitting this).
+ */
+export const NodeAwaitingEventSchema = z.strictObject({
+  type: z.literal("node.awaiting"),
+  seq: seqSchema,
+  nodeId: idSchema,
+  nodeName: z.string().min(1, "nodeName must be a non-empty string"),
+  iteration: iterationSchema,
+  /** The approval prompt shown to the approver. */
+  prompt: z.string(),
+  /** Configured auto-reject window, when set. */
+  timeoutMinutes: z.number().int().min(1).optional(),
+});
+
+export type NodeAwaitingEvent = z.infer<typeof NodeAwaitingEventSchema>;
+
+/**
+ * Engine-emitted event: an approval gate resolved. `approved` carries the
+ * decision; `note` is the approver's note (`"timed out"` for a timeout
+ * rejection). Emitted before the node's `node.completed` — the node always
+ * COMPLETES (approve → output note ?? "approved"; reject → output
+ * `rejected: <note>`) and routing decides what happens next. Not emitted
+ * when the gate is cut short by an abort.
+ */
+export const NodeApprovedEventSchema = z.strictObject({
+  type: z.literal("node.approved"),
+  seq: seqSchema,
+  nodeId: idSchema,
+  nodeName: z.string().min(1, "nodeName must be a non-empty string"),
+  iteration: iterationSchema,
+  approved: z.boolean(),
+  /** Approver note / rejection reason; ≤2000 chars. */
+  note: z.string().max(2000, "note must be at most 2000 characters").optional(),
+});
+
+export type NodeApprovedEvent = z.infer<typeof NodeApprovedEventSchema>;
+
+/**
  * Engine-emitted event: an outgoing edge was traversed after its source
  * node completed. `iteration` is the source node's 1-based execution number
  * whose output routed; `matchedCondition` describes the condition that
@@ -247,6 +290,8 @@ export const RunEventSchema = z.discriminatedUnion("type", [
   NodeQueuedEventSchema,
   NodeStartedEventSchema,
   NodeCompletedEventSchema,
+  NodeAwaitingEventSchema,
+  NodeApprovedEventSchema,
   EdgeTakenEventSchema,
   EdgeCapReachedEventSchema,
   SandboxLogEventSchema,

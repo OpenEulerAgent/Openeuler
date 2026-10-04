@@ -8,6 +8,7 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/com
 import { Tabs, type TabItem } from "@/components/ui/tabs";
 import { SkeletonLines } from "@/components/ui/skeleton";
 import { apiFetch, ApiError } from "@/lib/api";
+import type { RunAwaitingView } from "@/lib/approval";
 import type { RunHostingView } from "@/lib/hosting";
 import type { PreviewPortView } from "@/lib/preview";
 import { connectRunEvents, type RunStreamEvent, type RunStreamState } from "@/lib/run-events";
@@ -32,6 +33,7 @@ import { DiffsTab } from "./DiffsTab";
 import { EventFeed } from "./EventFeed";
 import { HostedRunBanner } from "./HostedRunBanner";
 import { SubworkflowLinks } from "./SubworkflowLinks";
+import { ApprovalBanner } from "./ApprovalBanner";
 import { InterruptedRunBanner } from "./InterruptedRunBanner";
 import { LocalFallbackBanner } from "./LocalFallbackBanner";
 import { OutputPanel } from "./OutputPanel";
@@ -57,6 +59,8 @@ interface RunDetail {
   ports?: PreviewPortView[];
   /** Hosting view (#110): expiry + live mappings while the run is hosted. */
   hosting?: RunHostingView | null;
+  /** The open approval gate (#118), while the run is paused at one. */
+  awaiting?: RunAwaitingView;
 }
 
 type LoadState =
@@ -114,6 +118,8 @@ export function RunDetailView({ runId }: { runId: string }) {
   const [endedMs, setEndedMs] = useState<number | null>(null);
   const [nowMs, setNowMs] = useState(() => Date.now());
   const [graphVisited, setGraphVisited] = useState(false);
+  /** #118: the open approval gate — synced from the detail, driven by SSE. */
+  const [awaiting, setAwaiting] = useState<RunAwaitingView | null>(null);
   const runRef = useRef<Run | null>(null);
 
   const refresh = useCallback(async (): Promise<void> => {
@@ -130,6 +136,7 @@ export function RunDetailView({ runId }: { runId: string }) {
     setEndedMs(null);
     setGraphVisited(false);
     setStreamState("connecting");
+    setAwaiting(null);
     void refresh();
   }, [refresh]);
 
@@ -146,8 +153,23 @@ export function RunDetailView({ runId }: { runId: string }) {
       onEvent: (event: RunStreamEvent) => {
         setEntries((prev) => appendFeedEvent(prev, event));
         batcher.push(event);
+        // #118: the approval banner tracks the gate live — opened by
+        // node.awaiting, closed by node.approved / the run ending.
+        if (event.type === "node.awaiting") {
+          setAwaiting((prev) => ({
+            nodeId: event.nodeId,
+            nodeName: event.nodeName,
+            prompt: event.prompt,
+            // SSE replay would otherwise restart the elapsed clock on every
+            // page load/reconnect; a detail-synced `since` is authoritative.
+            since: prev?.nodeId === event.nodeId ? prev.since : new Date().toISOString(),
+          }));
+        } else if (event.type === "node.approved") {
+          setAwaiting(null);
+        }
         if (event.type === "run.status" && isTerminalRunStatus(event.status)) {
           setTerminalStatus(event.status);
+          setAwaiting(null);
           batcher.flush();
           // A run row that is already terminal carries the authoritative end
           // time; Date.now() only approximates a live→terminal transition
@@ -164,6 +186,17 @@ export function RunDetailView({ runId }: { runId: string }) {
       batcher.dispose();
     };
   }, [streamRunId]);
+
+  // #118: detail fetches are the source of truth for the gate (a fresh
+  // page load lands here before any SSE event arrives); SSE mutations
+  // above win until the next refetch replaces them.
+  const detailAwaiting = load.phase === "ready" ? (load.detail.awaiting ?? null) : null;
+  const detailAwaitingSeq = `${detailAwaiting?.nodeId ?? ""}|${detailAwaiting?.since ?? ""}`;
+  useEffect(() => {
+    setAwaiting(detailAwaiting);
+    // Identity changes per refresh; the composed key avoids re-running on
+    // unrelated re-renders while still syncing every real refetch.
+  }, [detailAwaitingSeq]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const run = load.phase === "ready" ? load.detail.run : null;
   runRef.current = run;
@@ -305,6 +338,16 @@ export function RunDetailView({ runId }: { runId: string }) {
       />
 
       <InterruptedRunBanner run={shownRun} steps={steps} onChanged={() => void refresh()} />
+
+      {/* #118: approval gate — the run is paused waiting for a human;
+          approve/reject (with a note) resolves it and the run continues. */}
+      <ApprovalBanner
+        runId={detail.run.id}
+        awaiting={awaiting}
+        nowMs={nowMs}
+        live={live}
+        onChanged={() => void refresh()}
+      />
 
       {/* #110: hosted banner — the sandbox outlives the successful run for
           a TTL window; extend (+30m) or stop hosting inline. */}

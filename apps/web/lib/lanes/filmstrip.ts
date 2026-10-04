@@ -1,6 +1,6 @@
 "use client";
 
-import type { RunStatus, StepRun } from "@openeuler/core";
+import type { StepRun, StepRunStatus } from "@openeuler/core";
 import { formatDuration, runDuration } from "../time";
 
 /**
@@ -30,7 +30,7 @@ export interface FilmstripBlock {
   name: string;
   /** 1-based execution iteration of the node. */
   iteration: number;
-  status: RunStatus;
+  status: StepRunStatus;
   /** Driver duration in ms; null when the log could not provide one. */
   durationMs: number | null;
   /** Share of the row width, in percent (clamped + renormalized; sums to 100). */
@@ -43,7 +43,7 @@ export const FILMSTRIP_MIN_BLOCK_PCT = 4;
 /** Semantic tone of a block (mapped to a color class by the component). */
 export type FilmstripTone = "success" | "failed" | "warning" | "info";
 
-export function blockTone(status: RunStatus): FilmstripTone {
+export function blockTone(status: StepRunStatus): FilmstripTone {
   if (status === "success") return "success";
   if (status === "failed") return "failed";
   if (status === "aborted" || status === "interrupted") return "warning";

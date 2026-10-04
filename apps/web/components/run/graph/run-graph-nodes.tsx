@@ -4,6 +4,7 @@ import { memo } from "react";
 import { Handle, Position, type Node, type NodeProps, type NodeTypes } from "@xyflow/react";
 import type {
   AgentNodeData,
+  ApprovalNodeData,
   ExitNodeData,
   JoinNodeData,
   SubworkflowNodeData,
@@ -29,12 +30,17 @@ export type RunSubworkflowFlowNode = Node<
   SubworkflowNodeData & { visual: NodeVisualSlice | null },
   "run-subworkflow"
 >;
+export type RunApprovalFlowNode = Node<
+  ApprovalNodeData & { visual: NodeVisualSlice | null },
+  "run-approval"
+>;
 
 /** Card frame per visual status (ring color + surface treatment). */
 const STATUS_CARD_CLASSES: Record<NodeVisualSlice["status"], string> = {
   "not-reached": "border-border opacity-55",
   queued: "border-border bg-elevated text-muted-fg",
   running: "run-node-running bg-surface",
+  awaiting: "run-node-awaiting bg-warning-subtle/30",
   success: "border-success/70 bg-success-subtle/40",
   failed: "border-danger bg-danger-subtle/50",
   aborted: "border-warning/70 bg-surface",
@@ -46,6 +52,7 @@ const STATUS_DOT_CLASSES: Record<NodeVisualSlice["status"], string> = {
   "not-reached": "bg-muted-fg/50",
   queued: "bg-muted-fg",
   running: "bg-accent",
+  awaiting: "bg-warning",
   success: "bg-success",
   failed: "bg-danger",
   aborted: "bg-warning",
@@ -64,7 +71,7 @@ function StatusDot({ status }: { status: NodeVisualSlice["status"] }) {
       className={cn(
         "size-2 shrink-0 rounded-full",
         STATUS_DOT_CLASSES[status],
-        status === "running" && "animate-pulse",
+        (status === "running" || status === "awaiting") && "animate-pulse",
       )}
     />
   );
@@ -231,9 +238,58 @@ function SubworkflowExecutionCard({ data }: NodeProps<RunSubworkflowFlowNode>) {
   );
 }
 
+/**
+ * Approval gate execution card (#118): amber while a human decides (the
+ * whole card pulses via `.run-node-awaiting`), carrying the gate's prompt
+ * snippet. The decision (approve/reject + note) lands on the drawer
+ * through the execution's `approval` record.
+ */
+function ApprovalExecutionCard({ data }: NodeProps<RunApprovalFlowNode>) {
+  const { visual } = data;
+  const status = visual?.status ?? "not-reached";
+  return (
+    <div
+      className={cn(
+        "relative w-56 cursor-pointer rounded-lg border bg-surface p-3 shadow-2 transition-colors",
+        statusCardClasses(status),
+      )}
+      data-run-node="approval"
+      data-run-node-status={status}
+    >
+      <IterationBadge count={visual?.executionCount ?? 0} />
+      <div className="flex items-center gap-2">
+        <span
+          aria-hidden
+          className="flex size-4 shrink-0 items-center justify-center rounded-full border-2 border-warning bg-warning-subtle"
+        >
+          <span className="size-1.5 rounded-full bg-warning" />
+        </span>
+        <p className="min-w-0 flex-1 truncate text-sm font-medium text-fg" title={data.name}>
+          {data.name.length > 0 ? data.name : "Approval"}
+        </p>
+      </div>
+      <p
+        className="mt-2 line-clamp-2 text-xs text-muted-fg"
+        title={data.config.prompt}
+        data-approval-prompt
+      >
+        {data.config.prompt.length > 0 ? data.config.prompt : "waits for a human decision"}
+      </p>
+      {data.config.timeoutMinutes !== undefined ? (
+        <span className="mt-1.5 inline-block rounded-full bg-elevated px-2 py-0.5 text-[10px] text-muted-fg">
+          timeout {data.config.timeoutMinutes}m
+        </span>
+      ) : null}
+      <Handle type="target" position={Position.Left} className="!bg-muted-fg" />
+      <Handle type="source" position={Position.Right} className="!bg-accent" />
+    </div>
+  );
+}
+
 export const runGraphNodeTypes: NodeTypes = {
   "run-agent": memo(AgentExecutionCard) as unknown as NodeTypes["run-agent"],
   "run-exit": memo(ExitExecutionCard) as unknown as NodeTypes["run-exit"],
   "run-join": memo(JoinExecutionCard) as unknown as NodeTypes["run-join"],
   "run-subworkflow": memo(SubworkflowExecutionCard) as unknown as NodeTypes["run-subworkflow"],
+  "run-approval": memo(ApprovalExecutionCard) as unknown as NodeTypes["run-approval"],
 };

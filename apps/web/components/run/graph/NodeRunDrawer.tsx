@@ -2,7 +2,7 @@
 
 import Link from "next/link";
 import { useState } from "react";
-import type { StepRun } from "@openeuler/core";
+import type { StepRun, StepRunStatus } from "@openeuler/core";
 import { StatusBadge } from "@/components/StatusBadge";
 import { Button } from "@/components/ui/button";
 import { Drawer } from "@/components/ui/drawer";
@@ -14,10 +14,12 @@ const OUTPUT_PREVIEW_LINES = 12;
 
 export interface NodeIterationRow {
   iteration: number;
-  status: NodeExecutionInfo["status"];
+  status: NodeExecutionInfo["status"] | StepRunStatus;
   durationMs?: number;
   output: string;
   error?: string;
+  /** The approval decision this execution resolved with (#118), if any. */
+  approval?: { approved: boolean; note?: string };
   /** Matching StepRun row, when one exists (sessionId + diff link). */
   stepRun?: StepRun;
   /** Child run this sub-workflow execution spawned (#117), when known. */
@@ -52,6 +54,7 @@ export function nodeIterationRows(
       // Prefer the fold's copy (live); fall back to the recorded row.
       output: execution.output ?? stepRun?.output ?? "",
       ...(execution.error === undefined ? {} : { error: execution.error }),
+      ...(execution.approval === undefined ? {} : { approval: execution.approval }),
       ...(stepRun === undefined ? {} : { stepRun }),
       ...(execution.childRunId === undefined ? {} : { childRunId: execution.childRunId }),
     };
@@ -98,6 +101,14 @@ function IterationSection({
         {row.durationMs !== undefined ? (
           <span className="text-xs text-muted-fg" title="Duration">
             {formatElapsed(0, row.durationMs)}
+          </span>
+        ) : null}
+        {row.approval ? (
+          <span className="text-xs text-muted-fg" data-approval-decision>
+            {row.approval.approved ? "approved" : "rejected"}
+            {row.approval.note === undefined || row.approval.note.length === 0
+              ? ""
+              : `: ${row.approval.note}`}
           </span>
         ) : null}
       </summary>

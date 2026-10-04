@@ -23,10 +23,17 @@ import type { RunStreamEvent } from "@/lib/run-events";
 
 /** Visual state of one node, derived from its latest event. */
 export type NodeVisualStatus =
-  "not-reached" | "queued" | "running" | "success" | "failed" | "aborted" | "interrupted";
+  | "not-reached"
+  | "queued"
+  | "running"
+  | "awaiting"
+  | "success"
+  | "failed"
+  | "aborted"
+  | "interrupted";
 
 /** Statuses a node execution itself reports (event order decides "latest"). */
-export type NodeExecutionStatus = "queued" | "running" | RunStatus;
+export type NodeExecutionStatus = "queued" | "running" | "awaiting" | RunStatus;
 
 /** One execution of a node (a loop re-entry appends another). */
 export interface NodeExecutionInfo {
@@ -46,6 +53,11 @@ export interface NodeExecutionInfo {
    * engine reported one — the parent↔child link in the node drawer.
    */
   childRunId?: string;
+  /**
+   * #118: the approval decision this gate execution resolved with (from
+   * its `node.approved` event) — the drawer shows note + verdict.
+   */
+  approval?: { approved: boolean; note?: string };
 }
 
 /** Folded state of one node. Referentially stable while the node is idle. */
@@ -136,7 +148,8 @@ function patchExecution(
     next.durationMs === current.durationMs &&
     next.error === current.error &&
     next.edgeId === current.edgeId &&
-    next.childRunId === current.childRunId
+    next.childRunId === current.childRunId &&
+    next.approval === current.approval
   ) {
     return executions;
   }
@@ -195,20 +208,22 @@ function settleNodes(
   let changed = false;
   const next: Record<string, NodeFoldState> = {};
   for (const [id, node] of Object.entries(nodes)) {
-    if (node.status === "queued" || node.status === "running") {
+    if (node.status === "queued" || node.status === "running" || node.status === "awaiting") {
       next[id] = { ...node, status };
       changed = true;
     } else {
       next[id] = node;
     }
     const liveExecution = next[id].executions.find(
-      (exec) => exec.status === "queued" || exec.status === "running",
+      (exec) => exec.status === "queued" || exec.status === "running" || exec.status === "awaiting",
     );
     if (liveExecution) {
       next[id] = {
         ...next[id],
         executions: next[id].executions.map((exec) =>
-          exec.status === "queued" || exec.status === "running" ? { ...exec, status } : exec,
+          exec.status === "queued" || exec.status === "running" || exec.status === "awaiting"
+            ? { ...exec, status }
+            : exec,
         ),
       };
       changed = true;
@@ -289,6 +304,38 @@ export function foldRunGraphEvent(
       );
       if (!known) next = { ...next, totalExecutions: state.totalExecutions + 1 };
       return next;
+    }
+
+    // #118 approval gates: the wait shows as an amber "awaiting" state on
+    // the node (no timeline row — node.started already announced it); the
+    // resolution records the decision + note on the execution.
+    case "node.awaiting": {
+      const nodes = patchNode(state.nodes, event.nodeId, {
+        status: "awaiting",
+        execution: { iteration: event.iteration, status: "awaiting" },
+      });
+      return nodes === state.nodes
+        ? { ...state, lastSeq: event.seq }
+        : { ...state, lastSeq: event.seq, nodes };
+    }
+
+    case "node.approved": {
+      const current = state.nodes[event.nodeId];
+      if (current === undefined) return { ...state, lastSeq: event.seq };
+      const execution = patchExecution(current.executions, {
+        iteration: event.iteration,
+        status: "running",
+        approval: {
+          approved: event.approved,
+          ...(event.note === undefined ? {} : { note: event.note }),
+        },
+      });
+      if (execution === current.executions) return { ...state, lastSeq: event.seq };
+      return {
+        ...state,
+        lastSeq: event.seq,
+        nodes: { ...state.nodes, [event.nodeId]: { ...current, executions: execution } },
+      };
     }
 
     // Legacy linear runs: same fold, minus outputs/durations (StepRun rows

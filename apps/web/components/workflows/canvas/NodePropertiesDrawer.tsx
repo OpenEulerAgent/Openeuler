@@ -9,6 +9,7 @@ import { Drawer } from "@/components/ui/drawer";
 import { Field, Input, Select, Textarea } from "@/components/ui/input";
 import type {
   AgentNodeData,
+  ApprovalNodeData,
   CanvasDocument,
   CanvasNode,
   JoinNodeData,
@@ -48,6 +49,7 @@ export function NodePropertiesDrawer({
   onPatchName,
   onPatchJoinMode,
   onPatchSubworkflow,
+  onPatchApproval,
   onCommitEdit,
   onDelete,
   onClose,
@@ -65,10 +67,15 @@ export function NodePropertiesDrawer({
   /** Join mode toggle (#116): `all` waits for every branch, `any` = first winner. */
   onPatchJoinMode?: (mode: "all" | "any") => void;
   /**
-   * Sub-workflow picker (#117): which workflow the node spawns + how its
-   * revision is pinned.
+   * Sub-workflow picker (#117): which workflow the node spawns + how
+   * its revision is pinned.
    */
   onPatchSubworkflow?: (patch: { workflowId?: string; revision?: "latest" | number }) => void;
+  /**
+   * Approval gate edits (#118): the approver prompt + the optional
+   * auto-reject window (`null` clears the timeout).
+   */
+  onPatchApproval?: (patch: { prompt?: string; timeoutMinutes?: number | null }) => void;
   /** Settles a pending debounced edit into one history entry (field blur). */
   onCommitEdit: () => void;
   onDelete: () => void;
@@ -102,7 +109,9 @@ export function NodePropertiesDrawer({
                   ? "Join node"
                   : node.data.kind === "subworkflow"
                     ? "Sub-workflow node"
-                    : "Exit node"}
+                    : node.data.kind === "approval"
+                      ? "Approval node"
+                      : "Exit node"}
             </h2>
             {node.data.kind === "agent" && node.data.isEntry ? (
               <Badge variant="accent" className="mt-1">
@@ -175,6 +184,14 @@ export function NodePropertiesDrawer({
             workflows={workflows ?? []}
             fieldErrors={fieldErrors}
             onPatchSubworkflow={onPatchSubworkflow}
+          />
+        ) : null}
+
+        {node.data.kind === "approval" ? (
+          <ApprovalInspector
+            node={node as CanvasNode & { data: ApprovalNodeData }}
+            fieldErrors={fieldErrors}
+            onPatchApproval={onPatchApproval}
           />
         ) : null}
 
@@ -717,6 +734,71 @@ function SubworkflowInspector({
             ? "latest: each run pins the workflow's newest revision when the child starts — edits never mutate a running run."
             : `pinned: the child always runs revision ${revision}, exactly as saved.`}
         </p>
+      </Field>
+    </>
+  );
+}
+
+/**
+ * Approval-only fields (#118): the whole config is the question shown to
+ * the approver plus an optional auto-reject window. Empty input clears
+ * the timeout (wait indefinitely).
+ */
+function ApprovalInspector({
+  node,
+  fieldErrors,
+  onPatchApproval,
+}: {
+  node: CanvasNode & { data: ApprovalNodeData };
+  fieldErrors: InspectorFieldErrors;
+  onPatchApproval?: (patch: { prompt?: string; timeoutMinutes?: number | null }) => void;
+}) {
+  const { prompt, timeoutMinutes } = node.data.config;
+  return (
+    <>
+      <Field
+        label="Approval prompt"
+        htmlFor="node-approval-prompt"
+        error={fieldErrors["config.prompt"]}
+      >
+        <Textarea
+          id="node-approval-prompt"
+          rows={4}
+          value={prompt}
+          invalid={fieldErrors["config.prompt"] !== undefined}
+          onChange={(event) => onPatchApproval?.({ prompt: event.target.value })}
+          placeholder="e.g. Ship these changes to production?"
+          data-approval-prompt-input
+        />
+        <p className="text-xs text-muted-fg">
+          Shown to the approver while the run waits at this node. Approve continues the run (the
+          note becomes this node&apos;s output); reject routes on{" "}
+          <span className="font-mono">rejected</span> — branch with conditional edges on the node
+          output.
+        </p>
+      </Field>
+
+      <Field
+        label="Timeout (minutes)"
+        hint="(optional — auto-reject after)"
+        htmlFor="node-approval-timeout"
+        error={fieldErrors["config.timeoutMinutes"]}
+      >
+        <Input
+          id="node-approval-timeout"
+          type="number"
+          min={1}
+          max={1440}
+          step={1}
+          value={timeoutMinutes ?? ""}
+          invalid={fieldErrors["config.timeoutMinutes"] !== undefined}
+          onChange={(event) => {
+            const raw = event.target.value;
+            onPatchApproval?.({ timeoutMinutes: raw === "" ? null : Number(raw) });
+          }}
+          placeholder="wait indefinitely"
+          data-approval-timeout-input
+        />
       </Field>
     </>
   );

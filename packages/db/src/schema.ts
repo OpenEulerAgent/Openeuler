@@ -151,6 +151,14 @@ export const runs = sqliteTable(
      */
     hostedUntil: text("hosted_until"),
     /**
+     * While the run is paused at an approval gate (#118): the approval
+     * node id the engine awaits. NULL when not awaiting; survives a
+     * daemon restart so resume re-enters the wait.
+     */
+    awaitingNodeId: text("awaiting_node_id"),
+    /** When the current approval gate opened (#118); ISO timestamp. */
+    awaitingSince: text("awaiting_since"),
+    /**
      * High-water mark of the event seqs assigned for this run (#149):
      * `events.append` sets seq = max(hwm, max(seq)) + 1 and raises hwm in
      * the same transaction, so ring eviction (`deleteOldestByType`) can

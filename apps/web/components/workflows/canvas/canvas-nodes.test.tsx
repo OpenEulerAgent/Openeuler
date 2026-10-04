@@ -433,7 +433,13 @@ describe("toFlowNodes (#88)", () => {
 
 describe("canvasNodeTypes identity (#88)", () => {
   it("is the module-scope registry with all card kinds", () => {
-    expect(Object.keys(canvasNodeTypes)).toEqual(["agent", "exit", "join", "subworkflow"]);
+    expect(Object.keys(canvasNodeTypes)).toEqual([
+      "agent",
+      "exit",
+      "join",
+      "subworkflow",
+      "approval",
+    ]);
   });
 
   it("keeps cards mounted across re-renders (stable component identity)", async () => {

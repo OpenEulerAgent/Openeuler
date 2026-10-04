@@ -5,6 +5,7 @@ import {
 } from "@openeuler/core";
 import type {
   AgentGraphNode,
+  ApprovalGraphNode,
   BreadcrumbEntry,
   GraphEdge,
   GraphNode,
@@ -18,14 +19,14 @@ import type {
 import type { Db, EventInput } from "@openeuler/db";
 import type { PersistedEvent } from "@openeuler/core";
 import type { AgentDriver, AgentHandle, DriverRegistry } from "@openeuler/drivers";
+import type { ApprovalGateOutcome, RunControl, RunSandboxContext } from "./flow-engine.js";
+import type { WorktreeManager } from "./worktree.js";
 import {
   compileExitCondition,
   describeCondition,
   evaluateExitCondition,
   type ExitEvaluator,
 } from "./conditions.js";
-import type { RunControl, RunSandboxContext } from "./flow-engine.js";
-import type { WorktreeManager } from "./worktree.js";
 
 /**
  * Parallel DAG graph execution engine (#45 serial semantics, #115 parallel
@@ -181,6 +182,17 @@ const isUnconditional = (edge: GraphEdge): boolean =>
   edge.condition.type === "always" && edge.invert !== true;
 
 /**
+ * Nodes the scheduler can run (#118 adds approval gates): agent work,
+ * sub-workflow spawns, and approval waits. Deliberately distinct from
+ * core's {@link isExecutableGraphNode}, which also gates ENTRY selection
+ * and fan-out branch targets — an approval gate may sit mid-graph only.
+ */
+const isRunnableGraphNode = (
+  node: GraphNode,
+): node is AgentGraphNode | SubworkflowGraphNode | ApprovalGraphNode =>
+  node.type === "agent" || node.type === "subworkflow" || node.type === "approval";
+
+/**
  * Shared machinery from the flow engine (single source of truth for the
  * per-step executor behaviors: StepRun lifecycle, diff capture, event
  * persistence, run finalization).
@@ -255,6 +267,21 @@ export interface GraphEngineDeps {
     | { ok: true; runId: string; status: RunStatus; output: string; error: string | undefined }
     | { ok: false; error: string }
   >;
+  /**
+   * #118: opens one approval gate for this node execution and resolves
+   * when it settles (decision / timeout / abort — branch cancellation
+   * arrives through the caller's gate-scoped `control`). Owns the awaiting
+   * persistence (`node.awaiting` event, run-row `awaitingNodeId`). The
+   * caller owns the StepRun lifecycle around it.
+   */
+  awaitApproval(params: {
+    runId: string;
+    node: ApprovalGraphNode;
+    iteration: number;
+    control: RunControl;
+    /** True when re-entering a persisted wait after a restart (#118). */
+    resumed: boolean;
+  }): Promise<ApprovalGateOutcome>;
 }
 
 /** Options for {@link executeGraphRun} (#115). */
@@ -276,6 +303,20 @@ interface NodeOutcome {
   error: string | undefined;
   /** Session this execution ran in (announced, restarted or inherited). */
   sessionId: string | undefined;
+  /**
+   * #118: set when an approval gate resolved REJECTED (decision or
+   * timeout). The node still completes `success` with output
+   * `rejected: <note>` — the scheduler turns this into a run failure
+   * unless the node's conditional outgoing edges route on it.
+   */
+  approvalRejected?: { note: string };
+  /**
+   * Routing text that overrides `output` for edge-condition evaluation
+   * (#118): approval routing branches on the sentinel (`"approved"` /
+   * `"rejected"`), never on free-form approver note text embedded in the
+   * output. Undefined = route on `output` verbatim.
+   */
+  routingOutput?: string;
 }
 
 /**
@@ -318,15 +359,23 @@ type TaskVerdict =
    */
   | { kind: "suppressed" }
   | { kind: "fail-run"; error: string; output?: string }
-  | { kind: "abort" };
+  | { kind: "abort" }
+  /** Graceful shutdown while an approval gate holds the run (#118). */
+  | { kind: "interrupt" };
 
 /** Live per-execution context: driver handle + branch-cancellation flag. */
 interface ExecContext {
   exec: ScheduledExec;
-  node: AgentGraphNode | SubworkflowGraphNode;
+  node: AgentGraphNode | SubworkflowGraphNode | ApprovalGraphNode;
   handle: AgentHandle | undefined;
   /** Set when a fail-fast / any-trigger cancels this branch (#115). */
   cancelRequested: boolean;
+  /**
+   * Wakes this execution's approval gate when branch cancellation lands
+   * (#118): a gate holds no driver handle to abort, so cancelExecutions
+   * fires this listener and the wait settles `aborted`.
+   */
+  cancelApproval: (() => void) | undefined;
   /**
    * The execution's full task promise (driver run + completion processing),
    * never rejecting. Resolves to the verdict the scheduler acts on.
@@ -908,7 +957,13 @@ function reconstructGraphResume(
     return false;
   };
   for (const row of rows) {
-    if (row.status !== "queued" && row.status !== "running" && row.status !== "interrupted") {
+    if (
+      row.status !== "queued" &&
+      row.status !== "running" &&
+      row.status !== "interrupted" &&
+      // #118: a gate interrupted mid-wait re-enters the await on resume.
+      row.status !== "awaiting_approval"
+    ) {
       continue;
     }
     if (isSupersededLoser(row.stepId, row.iteration)) {
@@ -967,7 +1022,7 @@ function reconstructGraphResume(
       }
       // Scheduling follows the edge append synchronously; a target with no
       // row at the expected iteration was never scheduled (crash window).
-      if (isExecutableGraphNode(target)) {
+      if (isRunnableGraphNode(target)) {
         const iteration = (state.execCount.get(target.id) ?? 0) + 1;
         if (rowsByKey.get(`${target.id}#${iteration}`) === undefined) {
           state.execCount.set(target.id, iteration);
@@ -1008,7 +1063,7 @@ async function runNode(
   deps: GraphEngineDeps,
   runId: string,
   worktreePath: string,
-  node: AgentGraphNode | SubworkflowGraphNode,
+  node: AgentGraphNode | SubworkflowGraphNode | ApprovalGraphNode,
   exec: ScheduledExec,
   state: GraphRunState,
   control: RunControl,
@@ -1018,6 +1073,9 @@ async function runNode(
 ): Promise<NodeOutcome> {
   if (node.type === "subworkflow") {
     return runSubworkflowNode(deps, runId, node, exec, state, control, ctx, depth);
+  }
+  if (node.type === "approval") {
+    return runApprovalNode(deps, runId, node, exec, state, control, ctx);
   }
   const { iteration } = exec;
   const stepRun = deps.beginStepRun(runId, { stepId: node.id }, iteration);
@@ -1291,6 +1349,179 @@ async function runSubworkflowNode(
   return settle("failed", "", `child run ${child.runId} ${verb}`, child.runId);
 }
 
+/**
+ * Executes one approval gate node execution (#118): StepRun lifecycle +
+ * `node.started` like an agent node, but the "work" is a human PAUSE —
+ * {@link GraphEngineDeps.awaitApproval} opens the gate (persisting
+ * `awaitingNodeId`/`awaitingSince` on the run row and emitting
+ * `node.awaiting` on a fresh wait) and the engine blocks on it. On
+ * resolution:
+ *
+ * - **approve** — the node completes `success` with the note (default
+ *   `"approved"`) as its output, addressable downstream; routing branches
+ *   on the sentinel `"approved"`, never the note text.
+ * - **reject / timeout** — the node ALSO completes `success`, with output
+ *   `rejected: <note>` (`"timed out"` for a timeout) and the outcome
+ *   carries `approvalRejected`: the scheduler fails the run UNLESS the
+ *   node's conditional outgoing edges branch on the `"rejected"` sentinel.
+ * - **abort** — the node settles `aborted` exactly like an aborted
+ *   driver, and the run follows the abort path.
+ *
+ * A resume after a daemon restart re-enters the wait through the same
+ * row (`resumed` keeps the persisted `node.awaiting` event singular) and
+ * never re-executes anything — there is nothing to re-execute. Never
+ * throws — failures land in the outcome.
+ */
+async function runApprovalNode(
+  deps: GraphEngineDeps,
+  runId: string,
+  node: ApprovalGraphNode,
+  exec: ScheduledExec,
+  state: GraphRunState,
+  control: RunControl,
+  ctx: ExecContext,
+): Promise<NodeOutcome> {
+  const { iteration } = exec;
+  const stepRun = deps.beginStepRun(runId, { stepId: node.id }, iteration);
+  const startedAtMs = Date.now();
+  deps.appendEvent(runId, {
+    type: "node.started",
+    nodeId: node.id,
+    nodeName: node.name,
+    iteration,
+    ...(exec.viaEdgeId === undefined ? {} : { edgeId: exec.viaEdgeId }),
+    rounds: exec.rounds,
+  });
+  deps.log.info({ runId, nodeId: node.id, iteration }, "approval node started");
+
+  /** Settles the node execution (StepRun + node.completed + breadcrumb). */
+  const settle = (
+    status: RunStatus,
+    output: string,
+    approvalRejected: { note: string } | undefined,
+    routingOutput?: string,
+  ): NodeOutcome => {
+    deps.db.stepRuns.update(stepRun.id, {
+      status,
+      output: output === "" ? "" : deps.redactText(runId, output),
+    });
+    deps.appendEvent(runId, {
+      type: "node.completed",
+      nodeId: node.id,
+      nodeName: node.name,
+      iteration,
+      status,
+      output: output === "" ? "" : deps.redactText(runId, output),
+      durationMs: Math.max(0, Date.now() - startedAtMs),
+      ...(exec.viaEdgeId === undefined ? {} : { edgeId: exec.viaEdgeId }),
+    });
+    appendBreadcrumb(deps, runId, state, { kind: "node", nodeId: node.id, iteration });
+    deps.log.info({ runId, nodeId: node.id, iteration, status }, "approval node finished");
+    return {
+      status,
+      output,
+      error: undefined,
+      sessionId: undefined,
+      ...(approvalRejected === undefined ? {} : { approvalRejected }),
+      ...(routingOutput === undefined ? {} : { routingOutput }),
+    };
+  };
+
+  // A resumed wait keeps the pre-restart node.awaiting event: the run row
+  // still carries awaitingNodeId for exactly this node.
+  const runRow = deps.db.runs.get(runId);
+  const resumed = runRow?.awaitingNodeId === node.id;
+
+  // The execution is now PAUSED (#118): the row reflects the wait (it
+  // flips back through running → its settle below on resolution).
+  deps.db.stepRuns.update(stepRun.id, { status: "awaiting_approval" });
+
+  // Branch cancellation (fail-fast / any-trigger loser) must wake the gate
+  // like run abort does; wiring the ctx flag through a gate-scoped control
+  // lets the ONE onAbort listener serve both wake sources.
+  const gateControl: RunControl = {
+    isAbortRequested: () => control.isAbortRequested() || ctx.cancelRequested,
+    onHandle: control.onHandle,
+    onAbort: (listener) => {
+      ctx.cancelApproval = listener;
+      const offRunAbort = control.onAbort?.(listener);
+      return () => {
+        if (ctx.cancelApproval === listener) ctx.cancelApproval = undefined;
+        offRunAbort?.();
+      };
+    },
+  };
+  let outcome: ApprovalGateOutcome;
+  try {
+    outcome = await deps.awaitApproval({
+      runId,
+      node,
+      iteration,
+      control: gateControl,
+      resumed,
+    });
+  } finally {
+    ctx.cancelApproval = undefined;
+  }
+
+  if (outcome.reason === "suspend") {
+    // Graceful daemon shutdown: settle interrupted while KEEPING the run
+    // row's awaiting fields, so resume re-enters this exact wait.
+    return settle("interrupted", "", undefined);
+  }
+
+  if (outcome.reason === "abort") {
+    // Run abort / branch cancellation mid-wait: settle like an aborted
+    // driver so the run's abort path proceeds unchanged.
+    return settle("aborted", "", undefined);
+  }
+
+  if (outcome.reason === "timeout") {
+    deps.appendEvent(runId, {
+      type: "node.approved",
+      nodeId: node.id,
+      nodeName: node.name,
+      iteration,
+      approved: false,
+      note: APPROVAL_TIMEOUT_NOTE,
+    });
+    return settle(
+      "success",
+      `rejected: ${APPROVAL_TIMEOUT_NOTE}`,
+      {
+        note: APPROVAL_TIMEOUT_NOTE,
+      },
+      "rejected",
+    );
+  }
+
+  const decisionNote = outcome.note?.trim();
+  deps.appendEvent(runId, {
+    type: "node.approved",
+    nodeId: node.id,
+    nodeName: node.name,
+    iteration,
+    approved: outcome.approved,
+    ...(decisionNote === undefined || decisionNote.length === 0
+      ? {}
+      : { note: deps.redactText(runId, decisionNote) }),
+  });
+
+  if (outcome.approved) {
+    const output =
+      decisionNote !== undefined && decisionNote.length > 0 ? decisionNote : "approved";
+    // Route on the sentinel, never the note: a note containing "rejected"
+    // must not steer an approved gate onto the fix-up branch.
+    return settle("success", output, undefined, output === "approved" ? undefined : "approved");
+  }
+  const note = decisionNote !== undefined && decisionNote.length > 0 ? decisionNote : "";
+  const rejectedOutput = note.length > 0 ? `rejected: ${note}` : "rejected";
+  return settle("success", rejectedOutput, { note }, "rejected");
+}
+
+/** Rejection note used when an approval gate times out (#118). */
+export const APPROVAL_TIMEOUT_NOTE = "timed out";
+
 /** Appends a breadcrumb entry in memory + onto the run row (cheap, sync). */
 function appendBreadcrumb(
   deps: GraphEngineDeps,
@@ -1371,7 +1602,10 @@ export async function executeGraphRun(
   const contexts = new Set<ExecContext>();
   /** Terminal action once the in-flight branches drain; set = run is dying. */
   let terminal:
-    { kind: "fail-run"; error: string; output?: string } | { kind: "abort" } | undefined;
+    | { kind: "fail-run"; error: string; output?: string }
+    | { kind: "abort" }
+    | { kind: "interrupt" }
+    | undefined;
 
   /**
    * Schedules one execution: queued StepRun row + `node.queued` event.
@@ -1382,20 +1616,22 @@ export async function executeGraphRun(
    */
   const scheduleExec = (exec: ScheduledExec): void => {
     const node = topology.nodesById.get(exec.nodeId);
-    if (node === undefined || !isExecutableGraphNode(node)) return;
+    if (node === undefined || !isRunnableGraphNode(node)) return;
     state.execCount.set(
       exec.nodeId,
       Math.max(state.execCount.get(exec.nodeId) ?? 0, exec.iteration),
     );
     state.execRounds.set(`${exec.nodeId}#${exec.iteration}`, exec.rounds);
-    const adopted = deps.db.stepRuns
-      .listByRun(runId)
-      .find(
-        (row) =>
-          row.stepId === node.id &&
-          row.iteration === exec.iteration &&
-          (row.status === "queued" || row.status === "running" || row.status === "interrupted"),
-      );
+    const adopted = deps.db.stepRuns.listByRun(runId).find(
+      (row) =>
+        row.stepId === node.id &&
+        row.iteration === exec.iteration &&
+        (row.status === "queued" ||
+          row.status === "running" ||
+          row.status === "interrupted" ||
+          // #118: an interrupted approval wait (not yet swept).
+          row.status === "awaiting_approval"),
+    );
     if (adopted === undefined) {
       deps.scheduleStepRun(runId, { stepId: node.id }, exec.iteration);
       deps.appendEvent(runId, {
@@ -1430,7 +1666,8 @@ export async function executeGraphRun(
           candidate.iteration === exec.iteration &&
           (candidate.status === "queued" ||
             candidate.status === "running" ||
-            candidate.status === "interrupted"),
+            candidate.status === "interrupted" ||
+            candidate.status === "awaiting_approval"),
       );
     if (row !== undefined) deps.db.stepRuns.update(row.id, { status: "aborted", output: "" });
     deps.appendEvent(runId, {
@@ -1460,6 +1697,9 @@ export async function executeGraphRun(
       if (!scope(ctx.node.id)) continue;
       ctx.cancelRequested = true;
       if (ctx.handle !== undefined) void ctx.handle.abort().catch(() => {});
+      // Approval gates have no handle — the registered gate listener is
+      // their abort signal (#118).
+      ctx.cancelApproval?.();
     }
     for (let i = ready.length - 1; i >= 0; i -= 1) {
       const exec = ready[i];
@@ -1813,6 +2053,11 @@ export async function executeGraphRun(
     const { node } = ctx;
     const { iteration } = ctx.exec;
 
+    if (outcome.status === "interrupted") {
+      // Graceful shutdown suspended an approval gate (#118).
+      return { kind: "interrupt" };
+    }
+
     if (outcome.status === "aborted") {
       // Branch cancellation (fail-fast / any-trigger): already accounted for.
       if (ctx.cancelRequested) return { kind: "branch-done" };
@@ -1848,7 +2093,37 @@ export async function executeGraphRun(
     // runs only; persists detectedPorts on the run row as it goes).
     deps.recordDetectedPorts(runId, outcome.output);
 
-    const verdict = advance(node, outcome.output, iteration, ctx.exec.rounds);
+    // #118: a REJECTED approval gate fails the run — unless the node has
+    // conditional outgoing edges, in which case routing owns the outcome
+    // (e.g. `outputContains "rejected"` → a fix-up branch, `"approved"` →
+    // the shipping branch; the node's output is `rejected: <note>`).
+    if (outcome.approvalRejected !== undefined) {
+      const branchable = (topology.outgoing.get(node.id) ?? []).some(
+        (edge) => !isUnconditional(edge),
+      );
+      if (!branchable) {
+        const note = outcome.approvalRejected.note;
+        return failRun(
+          `approval node "${node.name}" (${node.id}) rejected${note.length > 0 ? `: ${note}` : ""}`,
+          outcome.output,
+        );
+      }
+    }
+
+    const verdict = advance(
+      node,
+      outcome.routingOutput ?? outcome.output,
+      iteration,
+      ctx.exec.rounds,
+    );
+    // A rejected gate with conditional branches that match NONE of them must
+    // not dead-end into a false success (#118).
+    if (outcome.approvalRejected !== undefined && verdict.kind === "branch-done") {
+      return failRun(
+        `approval node "${node.name}" (${node.id}) rejected and no outgoing branch matched`,
+        outcome.output,
+      );
+    }
     // A superseded loser's output is never the run's final verdict text
     // (#115): the winner (or the join's downstream path) already decided it.
     if (verdict.kind !== "suppressed") state.runOutput = outcome.output;
@@ -1970,10 +2245,10 @@ export async function executeGraphRun(
         const exec = ready.shift();
         if (exec === undefined) break;
         const node = topology.nodesById.get(exec.nodeId);
-        if (node === undefined || !isExecutableGraphNode(node)) {
+        if (node === undefined || !isRunnableGraphNode(node)) {
           terminal = {
             kind: "fail-run",
-            error: `node "${exec.nodeId}" does not exist as an executable (agent/subworkflow) node in the pinned graph revision`,
+            error: `node "${exec.nodeId}" does not exist as a runnable (agent/subworkflow/approval) node in the pinned graph revision`,
           };
           break;
         }
@@ -1989,6 +2264,7 @@ export async function executeGraphRun(
           node,
           handle: undefined,
           cancelRequested: false,
+          cancelApproval: undefined,
           done: Promise.resolve({ kind: "continue" }),
         };
         const task = runTask(ctx);
@@ -2009,6 +2285,8 @@ export async function executeGraphRun(
       contexts.delete(settled.ctx);
       if (settled.verdict.kind === "abort" && terminal === undefined) {
         terminal = { kind: "abort" };
+      } else if (settled.verdict.kind === "interrupt" && terminal === undefined) {
+        terminal = { kind: "interrupt" };
       } else if (settled.verdict.kind === "fail-run" && terminal === undefined) {
         terminal = settled.verdict;
       }
@@ -2020,6 +2298,8 @@ export async function executeGraphRun(
       await drain();
       if (terminal.kind === "abort") {
         deps.abortRun(runId);
+      } else if (terminal.kind === "interrupt") {
+        deps.finalizeRun(runId, "interrupted", {});
       } else {
         deps.finalizeRun(runId, "failed", {
           error: terminal.error,

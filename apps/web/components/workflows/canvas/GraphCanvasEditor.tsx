@@ -30,6 +30,7 @@ import { ApiError } from "@/lib/api";
 import {
   canvasDocsEquivalent,
   createAgentNode,
+  createApprovalNode,
   createExitNode,
   createJoinNode,
   createPresetAgentNode,
@@ -89,6 +90,7 @@ import {
 import { useUnsavedChanges } from "@/lib/use-unsaved-changes";
 import {
   applyEdgeInspectorAction,
+  approvalOutcomeNotices,
   edgeChipLabel,
   fanOutNotices,
   needsConditionConfig,
@@ -119,6 +121,7 @@ import {
 } from "@/lib/workflows-api";
 import { fetchWorkflowRevision } from "@/lib/run-graph/document";
 import {
+  ApprovalIcon,
   NodeHintCountsContext,
   NodeIssueCountsContext,
   NodeWarningCountsContext,
@@ -887,7 +890,9 @@ function GraphCanvasInner({
             ? createJoinNode(spot, uniqueNodeName("Join", takenNames))
             : kind === "subworkflow"
               ? createSubworkflowNode(spot, uniqueNodeName("Sub-workflow", takenNames))
-              : createExitNode(spot);
+              : kind === "approval"
+                ? createApprovalNode(spot, uniqueNodeName("Approval", takenNames))
+                : createExitNode(spot);
       commitDoc({ nodes: [...current.nodes, node], edges: current.edges });
       setSelectedEdgeId(null);
       setSelectedNodeId(node.id);
@@ -1026,6 +1031,16 @@ function GraphCanvasInner({
     (nodeId: string, patch: { workflowId?: string; revision?: "latest" | number }) => {
       patchDocDebounced((current) =>
         applyInspectorAction(current, { type: "patchSubworkflow", nodeId, ...patch }),
+      );
+    },
+    [patchDocDebounced],
+  );
+
+  /** Approval gate edits (#118): prompt/timeout ride the same path. */
+  const patchApproval = useCallback(
+    (nodeId: string, patch: { prompt?: string; timeoutMinutes?: number | null }) => {
+      patchDocDebounced((current) =>
+        applyInspectorAction(current, { type: "patchApproval", nodeId, patch }),
       );
     },
     [patchDocDebounced],
@@ -1268,7 +1283,10 @@ function GraphCanvasInner({
   // badge counts above (#88). Fan-out notices (#116) join the panel list
   // but NOT the node badge counts: the amber card badge is specifically
   // the "no fallback" marker, and a healthy fan-out node must not wear it.
-  const warnings = useMemo(() => [...routerFallbackWarnings(doc), ...fanOutNotices(doc)], [doc]);
+  const warnings = useMemo(
+    () => [...routerFallbackWarnings(doc), ...fanOutNotices(doc), ...approvalOutcomeNotices(doc)],
+    [doc],
+  );
   const warningCountsRef = useRef<{
     signature: string;
     counts: ReadonlyMap<string, number>;
@@ -1385,6 +1403,12 @@ function GraphCanvasInner({
           title: "Sub-workflow",
           description: "Run another workflow as a child run",
           icon: <SubworkflowIcon />,
+        },
+        {
+          kind: "approval",
+          title: "Approval",
+          description: "Pause for a human decision",
+          icon: <ApprovalIcon />,
         },
       ],
     },
@@ -1560,7 +1584,8 @@ function GraphCanvasInner({
                 kind !== "agent" &&
                 kind !== "exit" &&
                 kind !== "join" &&
-                kind !== "subworkflow"
+                kind !== "subworkflow" &&
+                kind !== "approval"
               ) {
                 return;
               }
@@ -1730,6 +1755,11 @@ function GraphCanvasInner({
           onPatchSubworkflow={
             selectedNode.data.kind === "subworkflow"
               ? (patch) => patchSubworkflow(selectedNode.id, patch)
+              : undefined
+          }
+          onPatchApproval={
+            selectedNode.data.kind === "approval"
+              ? (patch) => patchApproval(selectedNode.id, patch)
               : undefined
           }
           workflows={selectedNode.data.kind === "subworkflow" ? projectWorkflows : undefined}

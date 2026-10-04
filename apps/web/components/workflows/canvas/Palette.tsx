@@ -19,7 +19,7 @@ import { Skeleton } from "@/components/ui/skeleton";
 export const CANVAS_NODE_MIME = "application/openeuler-canvas-node";
 export const CANVAS_PRESET_MIME = "application/openeuler-canvas-preset";
 
-export type PaletteNodeKind = "agent" | "exit" | "join" | "subworkflow";
+export type PaletteNodeKind = "agent" | "exit" | "join" | "subworkflow" | "approval";
 
 export interface PaletteSection {
   id: string;

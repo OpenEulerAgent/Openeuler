@@ -13,6 +13,7 @@ import {
   RunStatusEventSchema,
   RunStatusSchema,
   StepRunSchema,
+  StepRunStatusSchema,
   WorkflowGraphSchema,
   WorkflowSchema,
 } from "@openeuler/core";
@@ -29,6 +30,7 @@ import type {
   RunStatusEvent,
   Step,
   StepRun,
+  StepRunStatus,
   Workflow,
   WorkflowGraph,
 } from "@openeuler/core";
@@ -60,12 +62,16 @@ export type RunPatch = {
   hosting?: RunHostingOptions | null;
   /** Hosting expiry timestamp (#110); `null` ends hosting on the row. */
   hostedUntil?: string | null;
+  /** Approval gate the run awaits (#118); `null` clears the wait. */
+  awaitingNodeId?: string | null;
+  /** When the current approval gate opened (#118); `null` clears it. */
+  awaitingSince?: string | null;
 };
 
 /** Fields of a step run that may change after creation; `null` clears a field. */
 export type StepRunPatch = {
   sessionId?: string | null;
-  status?: RunStatus;
+  status?: StepRunStatus;
   output?: string;
   diff?: string | null;
 };
@@ -721,6 +727,8 @@ export function createRunRepo(db: Db): RunRepo {
       ...((row.detectedPorts ?? []).length === 0 ? {} : { detectedPorts: row.detectedPorts ?? [] }),
       ...(row.hosting === null ? {} : { hosting: RunHostingOptionsSchema.parse(row.hosting) }),
       ...(row.hostedUntil === null ? {} : { hostedUntil: row.hostedUntil }),
+      ...(row.awaitingNodeId === null ? {} : { awaitingNodeId: row.awaitingNodeId }),
+      ...(row.awaitingSince === null ? {} : { awaitingSince: row.awaitingSince }),
       createdAt: row.createdAt,
       updatedAt: row.updatedAt,
     });
@@ -742,6 +750,8 @@ export function createRunRepo(db: Db): RunRepo {
     detectedPorts: run.detectedPorts ?? null,
     hosting: run.hosting ?? null,
     hostedUntil: run.hostedUntil ?? null,
+    awaitingNodeId: run.awaitingNodeId ?? null,
+    awaitingSince: run.awaitingSince ?? null,
     createdAt: run.createdAt,
     updatedAt: run.updatedAt,
   });
@@ -811,6 +821,8 @@ export function createRunRepo(db: Db): RunRepo {
                   patch.hosting === null ? null : RunHostingOptionsSchema.parse(patch.hosting),
               }),
           ...(patch.hostedUntil === undefined ? {} : { hostedUntil: patch.hostedUntil }),
+          ...(patch.awaitingNodeId === undefined ? {} : { awaitingNodeId: patch.awaitingNodeId }),
+          ...(patch.awaitingSince === undefined ? {} : { awaitingSince: patch.awaitingSince }),
           updatedAt: new Date().toISOString(),
         })
         .where(eq(schema.runs.id, id))
@@ -856,7 +868,9 @@ export function createStepRunRepo(db: Db): StepRunRepo {
         .update(schema.stepRuns)
         .set({
           ...(patch.sessionId === undefined ? {} : { sessionId: patch.sessionId }),
-          ...(patch.status === undefined ? {} : { status: RunStatusSchema.parse(patch.status) }),
+          ...(patch.status === undefined
+            ? {}
+            : { status: StepRunStatusSchema.parse(patch.status) }),
           ...(patch.output === undefined ? {} : { output: patch.output }),
           ...(patch.diff === undefined ? {} : { diff: patch.diff }),
         })

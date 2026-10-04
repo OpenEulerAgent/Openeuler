@@ -64,6 +64,7 @@ export type {
 
 export {
   AgentGraphNodeSchema,
+  ApprovalGraphNodeSchema,
   DEFAULT_EDGE_MAX_ITERATIONS,
   ExitGraphNodeSchema,
   GraphEdgeSchema,
@@ -71,6 +72,8 @@ export {
   GraphNodeSchema,
   JoinGraphNodeSchema,
   JoinNodeConfigSchema,
+  MAX_APPROVAL_TIMEOUT_MINUTES,
+  MIN_APPROVAL_TIMEOUT_MINUTES,
   SubworkflowGraphNodeSchema,
   SubworkflowRevisionSchema,
   WorkflowGraphSchema,
@@ -83,6 +86,7 @@ export {
 } from "./graph.js";
 export type {
   AgentGraphNode,
+  ApprovalGraphNode,
   ExitGraphNode,
   GraphEdge,
   GraphNode,
@@ -110,6 +114,7 @@ export {
   RunSchema,
   RunStatusSchema,
   StepRunSchema,
+  StepRunStatusSchema,
   TERMINAL_RUN_STATUSES,
   TerminalRunStatusSchema,
   hostingKeepAliveMinutes,
@@ -121,6 +126,7 @@ export type {
   RunPorts,
   RunStatus,
   StepRun,
+  StepRunStatus,
   TerminalRunStatus,
 } from "./run.js";
 
@@ -151,6 +157,8 @@ export {
   EdgeTakenEventSchema,
   LoopIterationEventSchema,
   LoopVerdictSchema,
+  NodeApprovedEventSchema,
+  NodeAwaitingEventSchema,
   NodeCompletedEventSchema,
   NodeQueuedEventSchema,
   NodeStartedEventSchema,
@@ -167,6 +175,8 @@ export type {
   EdgeTakenEvent,
   LoopIterationEvent,
   LoopVerdict,
+  NodeApprovedEvent,
+  NodeAwaitingEvent,
   NodeCompletedEvent,
   NodeQueuedEvent,
   NodeStartedEvent,

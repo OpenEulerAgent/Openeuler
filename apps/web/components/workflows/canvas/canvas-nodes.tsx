@@ -8,6 +8,7 @@ import { cn } from "@/lib/cn";
 import { CANVAS_NODE_SIZE_CLASSES } from "@/lib/graph/canvas-geometry";
 import type {
   AgentNodeData,
+  ApprovalNodeData,
   CanvasNode,
   CanvasNodeData,
   ExitNodeData,
@@ -20,7 +21,11 @@ export type AgentFlowNode = Node<AgentNodeData, "agent">;
 export type ExitFlowNode = Node<ExitNodeData, "exit">;
 export type JoinFlowNode = Node<JoinNodeData, "join">;
 export type SubworkflowFlowNode = Node<SubworkflowNodeData, "subworkflow">;
-export type CanvasFlowNode = Node<CanvasNodeData, "agent" | "exit" | "join" | "subworkflow">;
+export type ApprovalFlowNode = Node<ApprovalNodeData, "approval">;
+export type CanvasFlowNode = Node<
+  CanvasNodeData,
+  "agent" | "exit" | "join" | "subworkflow" | "approval"
+>;
 
 /**
  * Validation blocker counts per node id, provided by the editor so the cards
@@ -352,6 +357,69 @@ export function SubworkflowIcon({ className }: { className?: string }) {
   );
 }
 
+/** Person-in-a-badge glyph — a human decision point (#118). */
+export function ApprovalIcon({ className }: { className?: string }) {
+  return (
+    <svg
+      aria-hidden
+      viewBox="0 0 16 16"
+      className={cn("size-4", className)}
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="1.5"
+    >
+      <circle cx="8" cy="5.5" r="2.5" />
+      <path d="M3 13.5c.7-2.4 2.6-3.5 5-3.5s4.3 1.1 5 3.5" strokeLinecap="round" />
+    </svg>
+  );
+}
+
+/**
+ * Approval gate card (#118): same deterministic box as an agent card, with
+ * a person glyph and the gate's prompt snippet. Both handles — it chains
+ * like an agent, and its outcome routes via conditional edges
+ * (`outputContains "approved"/"rejected"`). Never the entry node.
+ */
+function ApprovalNodeCard({ id, data, selected }: NodeProps<ApprovalFlowNode>) {
+  const issueCounts = useContext(NodeIssueCountsContext);
+  const hintCounts = useContext(NodeHintCountsContext);
+  return (
+    <div
+      className={cn(
+        "relative flex flex-col rounded-lg border border-dashed border-warning/50 bg-warning-subtle/20 bg-surface p-3 shadow-2 transition-colors",
+        CANVAS_NODE_SIZE_CLASSES.approval.width,
+        CANVAS_NODE_SIZE_CLASSES.approval.height,
+        selected ? "border-accent" : "hover:border-muted-fg",
+      )}
+      data-canvas-node="approval"
+    >
+      <IssueBadges blockers={issueCounts.get(id) ?? 0} hints={hintCounts.get(id) ?? 0} />
+      <div className="flex items-center gap-2">
+        <ApprovalIcon className="size-3.5 shrink-0 text-warning" />
+        <p className="min-w-0 flex-1 truncate text-sm font-medium text-fg" title={data.name}>
+          {data.name.length > 0 ? data.name : "Approval"}
+        </p>
+      </div>
+      <div className="mt-2 flex flex-nowrap items-center gap-1.5">
+        <span
+          className="min-w-0 flex-1 truncate rounded-full bg-elevated px-2 py-0 text-[10px] text-muted-fg"
+          title={data.config.prompt}
+          data-approval-prompt-chip
+        >
+          {data.config.prompt.length > 0 ? data.config.prompt : "set the approval prompt…"}
+        </span>
+        {data.config.timeoutMinutes !== undefined ? (
+          <span className="shrink-0 rounded-full bg-elevated px-2 py-0 text-[10px] text-muted-fg">
+            {data.config.timeoutMinutes}m
+          </span>
+        ) : null}
+      </div>
+      <Handle type="target" position={Position.Left} className="!bg-muted-fg" />
+      <Handle type="source" position={Position.Right} className="!bg-accent" />
+    </div>
+  );
+}
+
 /**
  * Canvas nodes → React Flow nodes. The entry gets `deletable: false` so no
  * React Flow delete path can remove it (the editor's own delete planning
@@ -383,4 +451,5 @@ export const canvasNodeTypes: NodeTypes = {
   exit: memo(ExitNodeCard) as unknown as NodeTypes["exit"],
   join: memo(JoinNodeCard) as unknown as NodeTypes["join"],
   subworkflow: memo(SubworkflowNodeCard) as unknown as NodeTypes["subworkflow"],
+  approval: memo(ApprovalNodeCard) as unknown as NodeTypes["approval"],
 };

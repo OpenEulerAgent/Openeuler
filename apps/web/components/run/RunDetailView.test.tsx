@@ -116,6 +116,8 @@ const replayFrames = [
 
 type Listener = (event: { data?: unknown }) => void;
 
+let replayFramesForTest: Array<{ event: string; data: unknown }> | null = null;
+
 class MockEventSource {
   static last: MockEventSource | null = null;
   readonly url: string;
@@ -140,7 +142,7 @@ class MockEventSource {
 
   /** Delivers the full replay + terminal frame (async, like the daemon). */
   async flushReplay(): Promise<void> {
-    for (const frame of replayFrames) {
+    for (const frame of replayFramesForTest ?? replayFrames) {
       await Promise.resolve();
       for (const listener of this.listeners.get(frame.event) ?? []) {
         listener({ data: JSON.stringify(frame.data) });
@@ -230,6 +232,7 @@ const render = (node: () => ReactNode): void => {
 
 beforeEach(() => {
   fetchCalls.length = 0;
+  replayFramesForTest = null;
   globalThis.fetch = vi.fn(async (url: RequestInfo | URL) => {
     const href = String(url);
     fetchCalls.push(href);
@@ -451,5 +454,44 @@ describe("RunDetailView 2.0 (client flow)", () => {
     delete fetchRoutes["/api/runs/run-1"];
     fetchRoutes["/api/runs/run-1"] = runDetailResponse;
     nav.search = "";
+  });
+
+  it("an SSE replay keeps the banner's server-authoritative waiting timestamp (#118)", async () => {
+    const since = new Date(Date.now() - 60 * 60_000).toISOString();
+    fetchRoutes["/api/runs/run-1"] = {
+      ...runDetailResponse,
+      run: { ...run, status: "running" },
+      awaiting: { nodeId: "gate", nodeName: "Human check", prompt: "Ship it?", since },
+    };
+    replayFramesForTest = [
+      {
+        event: "node.awaiting",
+        data: {
+          type: "node.awaiting",
+          seq: 0,
+          nodeId: "gate",
+          nodeName: "Human check",
+          iteration: 1,
+          prompt: "Ship it?",
+        },
+      },
+    ];
+    nav.notify = () =>
+      render(() =>
+        createElement(ThemeProvider, null, createElement(RunDetailView, { runId: "run-1" })),
+      );
+    nav.notify();
+    await settle();
+    await act(async () => {
+      await MockEventSource.last?.flushReplay();
+    });
+    await settle();
+
+    const banner = document.querySelector("[data-approval-banner]") as HTMLElement;
+    expect(banner.getAttribute("data-approval-node")).toBe("gate");
+    expect(banner.querySelector("[data-approval-since]")?.textContent).toContain("1h");
+
+    delete fetchRoutes["/api/runs/run-1"];
+    fetchRoutes["/api/runs/run-1"] = runDetailResponse;
   });
 });

@@ -32,6 +32,7 @@ function nodeSize(node: CanvasNode): { width: number; height: number } {
   if (node.data.kind === "agent") return NODE_SIZES.agent;
   if (node.data.kind === "join") return NODE_SIZES.join;
   if (node.data.kind === "subworkflow") return NODE_SIZES.subworkflow;
+  if (node.data.kind === "approval") return NODE_SIZES.approval;
   return NODE_SIZES.exit;
 }
 
