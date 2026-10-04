@@ -595,6 +595,16 @@ describe("linearToGraph / graphToLinear", () => {
     expect(loop).toEqual({ ok: true, steps, loopBack });
   });
 
+  it("round-trips a step retry policy through the graph shape (#119)", () => {
+    const retry = { maxAttempts: 3, backoffMs: 250, retryOn: "failure" as const };
+    const result = graphToLinear(linearToGraph({ steps: [{ ...(steps[0] as Step), retry }] }));
+    expect(result).toEqual({
+      ok: true,
+      steps: [{ ...(steps[0] as Step), retry }],
+      loopBack: undefined,
+    });
+  });
+
   it("round-trips every exit-condition shape", () => {
     const whens = [
       { type: "outputContains", pattern: "ok" },

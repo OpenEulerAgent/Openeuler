@@ -330,6 +330,15 @@ describe("fold: node retries (#119)", () => {
     });
   });
 
+  it("a completion without an attempt clears a pending retry (aborted mid-backoff)", () => {
+    const state = buildRunGraphState([started("a"), retry("a", 1), completed("a", 1, "aborted")]);
+    expect(state.nodes["a"]?.executions[0]).toMatchObject({
+      status: "aborted",
+      attempt: undefined,
+      retryInMs: undefined,
+    });
+  });
+
   it("summary counts: executions +1 per execution, attempts +1 per execution and per retry", () => {
     const plain = buildRunGraphState([started("a"), completed("a", 1)]);
     expect(plain.totalExecutions).toBe(1);

@@ -419,11 +419,11 @@ interface ExecContext {
   /** Set when a fail-fast / any-trigger cancels this branch (#115). */
   cancelRequested: boolean;
   /**
-   * Wakes this execution's approval gate when branch cancellation lands
-   * (#118): a gate holds no driver handle to abort, so cancelExecutions
-   * fires this listener and the wait settles `aborted`.
+   * Wakes this execution's handle-less wait (approval gate or retry backoff)
+   * when branch cancellation lands (#118/#119): cancelExecutions fires the
+   * listener so the node settles `aborted` instead of sleeping out its wait.
    */
-  cancelApproval: (() => void) | undefined;
+  cancelWait: (() => void) | undefined;
   /**
    * The execution's full task promise (driver run + completion processing),
    * never rejecting. Resolves to the verdict the scheduler acts on.
@@ -1222,13 +1222,15 @@ async function runNode(
         if (settled) return;
         settled = true;
         live.timer?.cancel();
+        if (ctx.cancelWait === settle) ctx.cancelWait = undefined;
         live.off?.();
         resolve();
       };
+      ctx.cancelWait = settle;
       live.timer = retrySeams.timer(nextInMs, settle);
       live.off = control.onAbort?.(settle);
-      // A fake timer may have fired synchronously before `off` existed.
-      if (settled) live.off?.();
+      // A fake timer may have fired synchronously before the attachments.
+      if (settled && ctx.cancelWait === settle) ctx.cancelWait = undefined;
     });
 
   let attempt = 1;
@@ -1240,6 +1242,7 @@ async function runNode(
   for (;;) {
     lastErrorMessage = undefined;
     sessionFromEvents = undefined;
+    error = undefined;
     const handle = driver.start({
       cwd: sandbox?.workspacePath ?? worktreePath,
       prompt,
@@ -1343,6 +1346,10 @@ async function runNode(
   const settledError = error === undefined ? undefined : `${error}${attemptDetail}`;
   deps.db.stepRuns.update(stepRun.id, {
     status,
+    // A configured policy always records its settled attempt; a resumed row
+    // that already carried one resets it (the retry budget restarts with the
+    // execution). Plain single-attempt rows keep absent-means-1.
+    ...(retry === undefined && stepRun.attempt === undefined ? {} : { attempt }),
     output: deps.redactText(runId, exit.output),
     ...(diff.length > 0 ? { diff: deps.redactText(runId, diff) } : {}),
   });
@@ -1581,10 +1588,10 @@ async function runApprovalNode(
     isAbortRequested: () => control.isAbortRequested() || ctx.cancelRequested,
     onHandle: control.onHandle,
     onAbort: (listener) => {
-      ctx.cancelApproval = listener;
+      ctx.cancelWait = listener;
       const offRunAbort = control.onAbort?.(listener);
       return () => {
-        if (ctx.cancelApproval === listener) ctx.cancelApproval = undefined;
+        if (ctx.cancelWait === listener) ctx.cancelWait = undefined;
         offRunAbort?.();
       };
     },
@@ -1599,7 +1606,7 @@ async function runApprovalNode(
       resumed,
     });
   } finally {
-    ctx.cancelApproval = undefined;
+    ctx.cancelWait = undefined;
   }
 
   if (outcome.reason === "suspend") {
@@ -1837,9 +1844,9 @@ export async function executeGraphRun(
       if (!scope(ctx.node.id)) continue;
       ctx.cancelRequested = true;
       if (ctx.handle !== undefined) void ctx.handle.abort().catch(() => {});
-      // Approval gates have no handle — the registered gate listener is
-      // their abort signal (#118).
-      ctx.cancelApproval?.();
+      // Approval gates and retry backoffs have no handle — the registered
+      // wait listener is their abort signal (#118/#119).
+      ctx.cancelWait?.();
     }
     for (let i = ready.length - 1; i >= 0; i -= 1) {
       const exec = ready[i];
@@ -2405,7 +2412,7 @@ export async function executeGraphRun(
           node,
           handle: undefined,
           cancelRequested: false,
-          cancelApproval: undefined,
+          cancelWait: undefined,
           done: Promise.resolve({ kind: "continue" }),
         };
         const task = runTask(ctx);

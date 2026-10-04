@@ -292,9 +292,15 @@ export function foldRunGraphEvent(
           ? { ...withEdge, childRunId: event.childRunId }
           : withEdge;
       // #119: the settled attempt count rides node.completed (absent = 1).
+      // A completed execution also clears a pending retry countdown, even
+      // when it settles on attempt 1 (e.g. aborted mid-backoff).
       const withAttempt =
-        event.type === "node.completed" && event.attempt !== undefined && event.attempt > 1
-          ? { ...withExtras, attempt: event.attempt, retryInMs: undefined }
+        event.type === "node.completed"
+          ? {
+              ...withExtras,
+              attempt: event.attempt !== undefined && event.attempt > 1 ? event.attempt : undefined,
+              retryInMs: undefined,
+            }
           : withExtras;
       const nodes = patchNode(state.nodes, nodeId, {
         status:

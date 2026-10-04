@@ -288,9 +288,11 @@ describe("node retry policies (#119)", () => {
     expect(retryEvents[0]).toMatchObject({ attempt: 1, nextInMs: 100 });
     expect(retryEvents[1]).toMatchObject({ attempt: 2, nextInMs: 200 });
 
-    // The settled state carries the attempt count everywhere.
+    // The settled state carries the attempt count everywhere; a healed run
+    // must not keep the failed attempt's error text.
     const completed = h.db.events.getSince(run.id).find((event) => event.type === "node.completed");
     expect(completed).toMatchObject({ status: "success", attempt: 3 });
+    expect(completed?.error).toBeUndefined();
     const stepRun = h.db.stepRuns.listByRun(run.id).find((row) => row.stepId === "a");
     expect(stepRun).toMatchObject({ status: "success", attempt: 3 });
 
@@ -432,5 +434,71 @@ describe("node retry policies (#119)", () => {
     expect(fails.calls.length).toBe(1);
     const stepRun = h.db.stepRuns.listByRun(run.id).find((row) => row.stepId === "a");
     expect(stepRun?.status).toBe("aborted");
+  });
+
+  it("branch cancellation during a backoff wakes the wait and fails the run promptly", async () => {
+    const clock = fakeRetryClock();
+    const fails = createFakeDriver({ id: "flaky", events: [], output: "", exitCode: 1 });
+    const h = setup({
+      flaky: fails,
+      retryTimer: (delayMs, fire) => clock.factory(delayMs, fire),
+      retryJitter: () => 0,
+    });
+    const root = createFakeDriver({ id: "root", events: [], output: "ROOT" });
+    // Slow failure: the retrying sibling is already in its backoff when this
+    // branch fails and fail-fast cancels it.
+    const bad = createFakeDriver({
+      id: "bad",
+      events: [],
+      output: "",
+      exitCode: 1,
+      delayMs: 100,
+    });
+    h.registry.registerDriver(root);
+    h.registry.registerDriver(bad);
+
+    const agent = (id: string, driver: string, retry?: unknown): unknown => ({
+      id,
+      type: "agent",
+      name: id,
+      position: { x: 0, y: 0 },
+      config: {
+        driver,
+        mode: "auto",
+        promptTemplate: `{{task}} (${id})`,
+        continueSession: false,
+        ...(retry === undefined ? {} : { retry }),
+      },
+    });
+    const { revisionId } = h.pinGraph(
+      WorkflowGraphSchema.parse({
+        entryNodeId: "root",
+        nodes: [
+          agent("root", "root"),
+          agent("flaky", "flaky", { maxAttempts: 3, backoffMs: 60_000, retryOn: "failure" }),
+          agent("bad", "bad"),
+          { id: "exit", type: "exit", name: "Exit", position: { x: 800, y: 0 } },
+        ],
+        edges: [
+          { id: "e-root-flaky", source: "root", target: "flaky", condition: { type: "always" } },
+          { id: "e-root-bad", source: "root", target: "bad", condition: { type: "always" } },
+          { id: "e-flaky-exit", source: "flaky", target: "exit", condition: { type: "always" } },
+          { id: "e-bad-exit", source: "bad", target: "exit", condition: { type: "always" } },
+        ],
+      }),
+    );
+    const run = h.enqueueRevisionRun(revisionId);
+    void startRun(h, run.id, makeControl().control);
+
+    const deadline = Date.now() + 5_000;
+    while (clock.timers.length === 0 && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+    expect(clock.timers[0]?.delayMs).toBe(60_000);
+
+    const finished = await awaitStatus(h, run.id, "failed");
+    expect(finished.error).toContain('node "bad"');
+    expect(fails.calls.length).toBe(1);
+    expect(clock.timers[0]?.cancelled).toBe(true);
   });
 });
