@@ -14,7 +14,7 @@ import {
   runPortList,
   SANDBOX_WORKSPACE_PATH,
 } from "@openeuler/engine";
-import type { RunSandboxAcquirer, WorktreeManager } from "@openeuler/engine";
+import type { ArtifactStore, RunSandboxAcquirer, WorktreeManager } from "@openeuler/engine";
 import { SandboxError, dockerAvailable } from "@openeuler/sandbox";
 import type {
   SandboxHandle,
@@ -273,6 +273,12 @@ export interface ExecutorOptions {
    * execute without secret injection or redaction.
    */
   secretsKey?: Buffer;
+  /**
+   * Durable run artifacts (#122): handed to the flow engine, which copies
+   * pattern-matched files out of a terminal run's worktree. Absent = no
+   * capture (tests / minimal embeddings).
+   */
+  artifacts?: ArtifactStore;
   /**
    * Sandboxed run execution (#102). Absent = every run executes locally
    * (byte-identical to pre-v0.2). When set, runs of projects whose policy
@@ -856,6 +862,7 @@ export function createExecutor(options: ExecutorOptions): Executor {
     onRunStatus: (runId) => notifyRunStatus(runId),
     ...(secrets === undefined ? {} : { loadRunSecrets: secrets.loadRunSecrets }),
     ...(acquireRunSandbox === undefined ? {} : { acquireRunSandbox }),
+    ...(options.artifacts === undefined ? {} : { artifactStore: options.artifacts }),
   });
 
   /** Global semaphore: at most `maxConcurrentRuns` runs execute at once. */

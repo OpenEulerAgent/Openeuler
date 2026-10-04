@@ -282,8 +282,13 @@ export function createWorktreesRouter(options: WorktreesRouterOptions = {}): Hon
         ? rows.filter((row) => row.entry.runId === body.runId)
         : rows.filter((row) => row.status === "orphan");
     const removed: WorktreePruneRemoved[] = [];
+    const artifacts = c.get("artifacts");
     for (const target of targets) {
       const result = await worktrees.remove(target.entry.runId);
+      // #122: artifact sets of runs whose row is gone are garbage-collected
+      // WITH the worktree cleanup; sets of real runs must SURVIVE pruning
+      // (that is the artifacts feature's whole point).
+      if (target.run === undefined) artifacts?.remove(target.entry.runId);
       // The directory is the disk footprint: when it survives (nothing was
       // removable) the entry was effectively kept, not pruned.
       if (existsSync(target.entry.path)) continue;

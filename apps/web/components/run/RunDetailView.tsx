@@ -34,6 +34,7 @@ import { EventFeed } from "./EventFeed";
 import { HostedRunBanner } from "./HostedRunBanner";
 import { SubworkflowLinks } from "./SubworkflowLinks";
 import { ApprovalBanner } from "./ApprovalBanner";
+import { ArtifactsTab } from "./ArtifactsTab";
 import { InterruptedRunBanner } from "./InterruptedRunBanner";
 import { LocalFallbackBanner } from "./LocalFallbackBanner";
 import { OutputPanel } from "./OutputPanel";
@@ -399,6 +400,12 @@ export function RunDetailView({ runId }: { runId: string }) {
         ) : null}
 
         {activeTab === "timeline" ? <TimelineTab state={foldState} /> : null}
+
+        {/* Artifacts (#122): the durable capture of a terminal run's
+            patterns — list, download, copy path. Lazy per activation. */}
+        {activeTab === "artifacts" ? (
+          <ArtifactsTab runId={detail.run.id} terminal={effectiveStatus !== undefined && !live} />
+        ) : null}
 
         {/* Preview (#109): mounted only while active — the iframe and its
             HEAD poll are lazy by construction and torn down on switch.

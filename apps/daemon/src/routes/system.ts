@@ -446,7 +446,18 @@ export function createSystemRouter(options: SystemRouterOptions = {}): Hono<AppE
       if (!worktrees) {
         throw new HttpError(503, "WORKTREES_UNAVAILABLE", "worktree manager is not configured");
       }
-      return c.json({ action: body.action, ...(await pruneWorktrees(worktrees, logger)) });
+      const result = await pruneWorktrees(worktrees, logger);
+      // #122: orphaned artifact sets (run rows gone) go with the worktree
+      // cleanup; sets of known runs always survive.
+      const artifacts = c.get("artifacts");
+      const artifactsPruned = artifacts
+        ? artifacts.removeOrphans(
+            requireDbFor(c)
+              .runs.list()
+              .map((run) => run.id),
+          ).length
+        : 0;
+      return c.json({ action: body.action, ...result, artifactsPruned });
     }
     const db = requireDbFor(c);
     if (body.action === "purge-events") {

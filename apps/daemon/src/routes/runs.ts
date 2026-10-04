@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { readFile, stat } from "node:fs/promises";
 import type {
   PersistedEvent,
   Run,
@@ -17,7 +18,7 @@ import {
 import type { Db } from "@openeuler/db";
 import { DriverError } from "@openeuler/drivers";
 import { ADHOC_STEP_ID, branchForRun } from "@openeuler/engine";
-import type { WorktreeManager } from "@openeuler/engine";
+import type { ArtifactStore, WorktreeManager } from "@openeuler/engine";
 import { Hono, type Context } from "hono";
 import { streamSSE } from "hono/streaming";
 import { z } from "zod";
@@ -27,6 +28,7 @@ import { buildRunPortViews, buildRunHostingView } from "../executor.js";
 import type { RunPortView, RunHostingView } from "../executor.js";
 import { HttpError } from "../errors.js";
 import { redactorForProject } from "../secrets.js";
+import { realpathWithinRoot, resolveWithinRoot } from "./files.js";
 import { ensureLatestRevision } from "./workflows.js";
 
 /**
@@ -577,6 +579,11 @@ export interface CreateRunsRouterOptions {
    * per-step scope only reads stored rows and works without it.
    */
   worktrees?: WorktreeManager;
+  /**
+   * Artifact store for the run artifacts API (#122). Falls back to the
+   * app-scoped instance from the context; absent → 503 ARTIFACTS_UNAVAILABLE.
+   */
+  artifacts?: ArtifactStore;
 }
 
 export function createRunsRouter(options: CreateRunsRouterOptions = {}): Hono<AppEnv> {
@@ -926,6 +933,109 @@ export function createRunsRouter(options: CreateRunsRouterOptions = {}): Hono<Ap
       maxLines: MAX_DIFF_PATCH_LINES,
     };
     return c.json(body);
+  });
+
+  // ---------------------------------------------------------------------------
+  // GET /api/runs/:id/artifacts[/:file] — durable run artifacts (#122).
+  //
+  // The engine copies pattern-matched files out of a terminal run's worktree
+  // into the artifact store (data/artifacts/<runId>/, manifest.json
+  // alongside); the copy survives worktree cleanup. Listing and download are
+  // TERMINAL-ONLY — nothing exists to show before the run finishes.
+
+  /** Resolves the artifact store; 503 when the daemon runs without one. */
+  const requireArtifacts = (c: Context<AppEnv>): ArtifactStore => {
+    const artifacts = options.artifacts ?? c.get("artifacts");
+    if (!artifacts) {
+      throw new HttpError(
+        503,
+        "ARTIFACTS_UNAVAILABLE",
+        "artifact store is not configured; run artifacts are unavailable",
+      );
+    }
+    return artifacts;
+  };
+
+  /**
+   * The run's capture manifest — 409 while the run is live (artifacts are
+   * captured at terminal), 404 when no capture exists (the workflow declared
+   * no artifact patterns, or capture never matched).
+   */
+  const requireArtifactManifest = (
+    artifacts: ArtifactStore,
+    run: Run,
+  ): NonNullable<ReturnType<ArtifactStore["manifest"]>> => {
+    if (!isTerminalRunStatus(run.status)) {
+      throw new HttpError(
+        409,
+        "RUN_NOT_TERMINAL",
+        `run ${run.id} is still ${run.status}; artifacts are captured when the run finishes`,
+      );
+    }
+    const manifest = artifacts.manifest(run.id);
+    if (manifest === null) {
+      throw new HttpError(
+        404,
+        "ARTIFACTS_NOT_FOUND",
+        `run ${run.id} has no captured artifacts — its workflow revision declared no artifact patterns, or the capture matched no files`,
+      );
+    }
+    return manifest;
+  };
+
+  runs.get("/:id/artifacts", (c) => {
+    const db = requireDb(c);
+    const artifacts = requireArtifacts(c);
+    const run = requireRun(db, c.req.param("id"));
+    const manifest = requireArtifactManifest(artifacts, run);
+    return c.json(manifest);
+  });
+
+  runs.get("/:id/artifacts/:file{.+}", async (c) => {
+    const db = requireDb(c);
+    const artifacts = requireArtifacts(c);
+    const run = requireRun(db, c.req.param("id"));
+    const manifest = requireArtifactManifest(artifacts, run);
+
+    const file = c.req.param("file") ?? "";
+    // Two independent guards (#122): lexical containment (resolveWithinRoot
+    // → 403 PATH_ESCAPE on `..`/absolute traversal) and realpath containment
+    // (a symlink planted in the store cannot serve bytes from outside it).
+    const resolved = resolveWithinRoot(artifacts.dirFor(run.id), file, "artifact store");
+    const real = await realpathWithinRoot(artifacts.dirFor(run.id), resolved, "artifact store");
+
+    let stats;
+    try {
+      stats = await stat(real);
+    } catch {
+      throw new HttpError(
+        404,
+        "ARTIFACT_NOT_FOUND",
+        `artifact "${file}" of run ${run.id} is not on disk (its capture may have been pruned)`,
+      );
+    }
+    if (!stats.isFile()) {
+      throw new HttpError(422, "ARTIFACT_NOT_FILE", `artifact "${file}" is not a regular file`);
+    }
+    // Defense in depth: only files the manifest recorded are servable, so a
+    // stray leftover in the store directory cannot be probed.
+    if (!manifest.files.some((entry) => entry.path === file)) {
+      throw new HttpError(
+        404,
+        "ARTIFACT_NOT_FOUND",
+        `artifact "${file}" is not part of run ${run.id}'s captured set`,
+      );
+    }
+
+    const bytes = await readFile(real);
+    const basename = file.split("/").pop() ?? "artifact";
+    const safeName = basename.replace(/[^\w.-]+/g, "_") || "artifact";
+    c.header("Content-Type", "application/octet-stream");
+    c.header(
+      "Content-Disposition",
+      `attachment; filename="${safeName}"; filename*=UTF-8''${encodeURIComponent(basename)}`,
+    );
+    return c.body(new Uint8Array(bytes.buffer, bytes.byteOffset, bytes.byteLength), 200);
   });
 
   // SSE live stream: replay persisted events (from the cursor) in seq order,

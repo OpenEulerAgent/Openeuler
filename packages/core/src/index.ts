@@ -60,6 +60,18 @@ export { FileContentSchema, FileNodeSchema, FileTypeSchema } from "./file.js";
 export type { FileContent, FileNode, FileType } from "./file.js";
 
 export {
+  MAX_ARTIFACT_FILES,
+  MAX_ARTIFACT_PATTERNS,
+  MAX_ARTIFACT_PATTERN_LENGTH,
+  MAX_ARTIFACT_TOTAL_BYTES,
+  ArtifactPatternSchema,
+  WorkflowArtifactsSchema,
+  artifactPatternIssue,
+  compileArtifactPattern,
+  matchesArtifactPath,
+} from "./artifacts.js";
+
+export {
   AlwaysConditionSchema,
   ExitConditionSchema,
   LoopBackSchema,

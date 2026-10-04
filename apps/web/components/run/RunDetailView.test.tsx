@@ -283,7 +283,7 @@ describe("RunDetailView 2.0 (client flow)", () => {
 
     // All four tabs offered.
     const tabs = [...document.querySelectorAll('[role="tab"]')].map((tab) => tab.textContent);
-    expect(tabs).toEqual(["Graph", "Events", "Diff", "Timeline"]);
+    expect(tabs).toEqual(["Graph", "Events", "Diff", "Timeline", "Artifacts"]);
   });
 
   it("drawer diff deep link switches to the Diff tab scoped to the step run", async () => {
@@ -336,7 +336,7 @@ describe("RunDetailView 2.0 (client flow)", () => {
     await settle();
 
     const tabs = [...document.querySelectorAll('[role="tab"]')].map((tab) => tab.textContent);
-    expect(tabs).toEqual(["Events", "Diff", "Timeline"]);
+    expect(tabs).toEqual(["Events", "Diff", "Timeline", "Artifacts"]);
     expect(document.querySelector("[data-run-graph-tab]")).toBeNull();
     delete fetchRoutes["/api/runs/run-1"];
     fetchRoutes["/api/runs/run-1"] = runDetailResponse;
@@ -352,7 +352,7 @@ describe("RunDetailView 2.0 (client flow)", () => {
     await settle();
 
     const tabs = [...document.querySelectorAll('[role="tab"]')].map((tab) => tab.textContent);
-    expect(tabs).toEqual(["Graph", "Events", "Diff", "Timeline"]);
+    expect(tabs).toEqual(["Graph", "Events", "Diff", "Timeline", "Artifacts"]);
     // Fallback landed on Graph (the default), and nothing preview-shaped
     // mounted or fetched.
     expect(document.querySelector('[role="tab"][aria-selected="true"]')?.textContent).toBe("Graph");
@@ -378,7 +378,7 @@ describe("RunDetailView 2.0 (client flow)", () => {
 
     // Tab offered, but nothing preview-related mounted or fetched yet.
     const tabs = [...document.querySelectorAll('[role="tab"]')].map((tab) => tab.textContent);
-    expect(tabs).toEqual(["Graph", "Events", "Diff", "Timeline", "Preview"]);
+    expect(tabs).toEqual(["Graph", "Events", "Diff", "Timeline", "Preview", "Artifacts"]);
     expect(document.querySelector("[data-preview-tab]")).toBeNull();
     expect(fetchCalls.some((href) => href.includes("/previews/"))).toBe(false);
 
