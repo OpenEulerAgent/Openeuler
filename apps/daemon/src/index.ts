@@ -10,6 +10,7 @@ import { createExecutor } from "./executor.js";
 import { reattachHostedRuns, startHostingSweeper } from "./hosting.js";
 import { createLogger } from "./logger.js";
 import { sweepInterruptedRuns } from "./recovery.js";
+import { startScheduleTicker } from "./scheduler.js";
 import { startPeriodicSandboxGc } from "./sandbox-gc.js";
 import { createDockerStatusService } from "./sandbox-status.js";
 import { loadOrCreateSecretKey } from "./secrets-crypto.js";
@@ -151,6 +152,18 @@ export async function main(): Promise<void> {
     stopHosted: async (runId) => (await executor.stopHosting(runId)).outcome === "stopped",
   });
 
+  // Startup task #4 (#121): the workflow cron ticker — every minute, mint
+  // at most one run per due schedule (active-run skips + missed-tick
+  // coalescing documented in scheduler.ts). Runs handed over before a
+  // shutdown are ordinary runs; the persisted lastFiredAt cursor resumes
+  // on the next boot.
+  const scheduleTicker = startScheduleTicker({
+    db,
+    executor,
+    logger,
+    secretsKey: secretKey.key,
+  });
+
   const { app, onShutdown, handleShutdown, authRequired } = createApp({
     db,
     logger,
@@ -162,9 +175,11 @@ export async function main(): Promise<void> {
     sandbox: { provider: sandboxProvider, status: { service: dockerStatus } },
   });
 
-  // LIFO: http-server → hosting-sweeper → sandbox-gc → executor → db.
+  // LIFO: http-server → schedule-ticker → hosting-sweeper → sandbox-gc →
+  // executor → db.
   onShutdown(() => db.close(), "db");
   onShutdown(() => executor.shutdown(), "executor");
+  onShutdown(() => scheduleTicker.stop(), "schedule-ticker");
   onShutdown(() => hostingSweeper.stop(), "hosting-sweeper");
   onShutdown(() => sandboxGc.stop(), "sandbox-gc");
 

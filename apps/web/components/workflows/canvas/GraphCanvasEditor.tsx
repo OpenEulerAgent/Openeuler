@@ -147,6 +147,7 @@ import { RevisionHistoryDrawer } from "./RevisionHistoryDrawer";
 import { ShortcutsPopover } from "./ShortcutsPopover";
 import { ValidationPanel } from "./ValidationPanel";
 import { WebhookDrawer } from "./WebhookDrawer";
+import { ScheduleDrawer } from "./ScheduleDrawer";
 
 /** Debounce window that collapses a burst of inspector edits into one undo entry. */
 const EDIT_COMMIT_DEBOUNCE_MS = 500;
@@ -475,6 +476,8 @@ function GraphCanvasInner({
   const [revisionsOpen, setRevisionsOpen] = useState(false);
   // Webhook settings (#120): trigger management + delivery log drawer.
   const [webhookOpen, setWebhookOpen] = useState(false);
+  // Schedule settings (#121): cron + timezone + task template drawer.
+  const [scheduleOpen, setScheduleOpen] = useState(false);
   const [viewingRevision, setViewingRevision] = useState<{
     number: number;
     doc: CanvasDocument | null;
@@ -1480,6 +1483,18 @@ function GraphCanvasInner({
         >
           webhook
         </button>
+        {/* Schedule settings affordance (#121): cron, timezone, task
+            template, upcoming-run preview. */}
+        <button
+          type="button"
+          data-schedule-button
+          aria-label="Schedule settings"
+          title="Schedule settings"
+          onClick={() => setScheduleOpen(true)}
+          className="inline-flex items-center rounded-full bg-elevated px-2.5 py-0.5 text-xs font-medium text-muted-fg transition-colors hover:text-fg focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
+        >
+          schedule
+        </button>
         {/* Focus-probe banner (#76): someone saved a newer revision while
             this tab was away; dismissible, and it self-clears once the
             editor catches up (reload or a successful save). */}
@@ -1869,6 +1884,12 @@ function GraphCanvasInner({
         open={webhookOpen}
         workflowId={workflow.id}
         onClose={() => setWebhookOpen(false)}
+      />
+
+      <ScheduleDrawer
+        open={scheduleOpen}
+        workflowId={workflow.id}
+        onClose={() => setScheduleOpen(false)}
       />
 
       <Dialog open={leaveGuard.confirmOpen} onClose={leaveGuard.stay} label="Unsaved changes">

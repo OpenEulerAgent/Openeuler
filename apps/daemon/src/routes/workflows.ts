@@ -6,6 +6,7 @@ import type {
   Step,
   Workflow,
   WorkflowGraph,
+  WorkflowScheduleSummary,
 } from "@openeuler/core";
 import {
   LoopBackSchema,
@@ -292,14 +293,29 @@ export function ensureLatestRevision(db: Db, workflow: Workflow): WorkflowRevisi
  * for graphs the linear shape cannot represent (routers, branches). The
  * summary is absent for never-saved legacy workflows without revisions;
  * those keep the steps-based display. Full graph blobs stay off the list.
+ * #121: a `schedule` summary rides along when the workflow has a cron
+ * schedule (drives the list's "scheduled"/"paused" badge).
  */
 export function workflowListBody(
   db: Db,
   workflow: Workflow,
-): Workflow & { graphSummary?: GraphSummary } {
+): Workflow & { graphSummary?: GraphSummary; schedule?: WorkflowScheduleSummary } {
   const latest = db.workflowRevisions.latest(workflow.id);
-  if (latest === undefined) return { ...workflow };
-  return { ...workflow, graphSummary: summarizeGraph(latest.graph, latest.number) };
+  const schedule = db.workflowSchedules.getByWorkflow(workflow.id);
+  return {
+    ...workflow,
+    ...(latest === undefined ? {} : { graphSummary: summarizeGraph(latest.graph, latest.number) }),
+    ...(schedule === undefined
+      ? {}
+      : {
+          schedule: {
+            enabled: schedule.enabled,
+            cron: schedule.cron,
+            timezone: schedule.timezone,
+            ...(schedule.lastFiredAt === undefined ? {} : { lastFiredAt: schedule.lastFiredAt }),
+          },
+        }),
+  };
 }
 
 /** Workflow API body: the row plus its latest revision pointer and graph. */
@@ -310,14 +326,29 @@ export function workflowBody(
   latestRevision?: { id: string; number: number };
   graph?: WorkflowGraph;
   graphSummary?: GraphSummary;
+  schedule?: WorkflowScheduleSummary;
 } {
   const latest = db.workflowRevisions.latest(workflow.id);
-  if (latest === undefined) return { ...workflow };
+  const schedule = db.workflowSchedules.getByWorkflow(workflow.id);
   return {
     ...workflow,
-    latestRevision: { id: latest.id, number: latest.number },
-    graph: latest.graph,
-    graphSummary: summarizeGraph(latest.graph, latest.number),
+    ...(latest === undefined
+      ? {}
+      : {
+          latestRevision: { id: latest.id, number: latest.number },
+          graph: latest.graph,
+          graphSummary: summarizeGraph(latest.graph, latest.number),
+        }),
+    ...(schedule === undefined
+      ? {}
+      : {
+          schedule: {
+            enabled: schedule.enabled,
+            cron: schedule.cron,
+            timezone: schedule.timezone,
+            ...(schedule.lastFiredAt === undefined ? {} : { lastFiredAt: schedule.lastFiredAt }),
+          },
+        }),
   };
 }
 
@@ -471,6 +502,8 @@ export function createWorkflowsRouter(): Hono<AppEnv> {
       db.webhookDeliveries.deleteForWebhook(webhook.id);
       db.workflowWebhooks.delete(webhook.id);
     }
+    // #121: the workflow's cron schedule goes with it too.
+    db.workflowSchedules.deleteForWorkflow(id);
     db.workflowRevisions.deleteAllForWorkflow(id);
     if (!db.workflows.delete(id)) {
       throw new HttpError(404, "WORKFLOW_NOT_FOUND", `no workflow with id ${id}`);

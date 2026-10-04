@@ -30,7 +30,7 @@ flowchart LR
 ```
 
 - **`apps/web`** (Next.js 15, port 3000): dashboard (project cards, activity feed, live runs table), the **canvas editor** for workflow graphs (palette, node/edge inspectors, presets manager, validation panel), and the run detail page with a live **Graph** tab plus Events / Diff / Timeline tabs.
-- **`apps/daemon`** (Hono, port 8787): REST APIs for projects/files/workflows/graph-revisions/runs/presets/drivers/system-check, the executor (two-layer scheduler: global semaphore + per-project gate), a boot recovery sweep, and SSE streaming (per-run event replay + a global run-status stream).
+- **`apps/daemon`** (Hono, port 8787): REST APIs for projects/files/workflows/graph-revisions/runs/presets/drivers/system-check, the executor (two-layer scheduler: global semaphore + per-project gate), a boot recovery sweep, a workflow cron-schedule ticker (#121), and SSE streaming (per-run event replay + a global run-status stream).
 - **`packages/engine`**: the **serial graph executor** — one edge per node completion, conditional routing, per-edge cycle guards — plus the legacy linear flow/loop engine for pre-graph workflows, and the git worktree manager (one worktree + branch per run).
 - **`packages/drivers`**: the pluggable agent layer — the `AgentDriver` contract, a registry, a scripted `fake` driver, and the real `opencode` driver. See [packages/drivers/README.md](packages/drivers/README.md).
 - **`packages/db`**: Drizzle ORM over SQLite (WAL), repositories for projects/workflows/workflow-revisions/runs/step-runs/events/agent-presets.
@@ -242,6 +242,24 @@ curl -s -X POST "localhost:8787/api/hooks/$HOOK" -H "authorization: Bearer $OPEN
 
 - **Replay protection**: the timestamp must be within ±5 minutes of daemon time (`401 HOOK_TIMESTAMP_STALE`), the nonce must be fresh for the webhook (`409 HOOK_NONCE_REPLAYED` on reuse — one signed request = at most one run), and the signature is compared in constant time (`401 HOOK_SIGNATURE_INVALID`). In open mode (no `OPENEULER_TOKEN`) the signature is the only accepted auth; the trigger never accepts anonymous calls.
 - **Everything else applies unchanged**: the trigger sits under the global `/api` rate limits and the 1 MiB payload cap, and its runs are ordinary workflow runs (revision-pinned, secret-redacted, visible in the dashboard).
+
+## Workflow schedules (cron triggers)
+
+Any workflow can carry a cron schedule (#121): `{enabled, cron (strict 5-field), taskTemplate, timezone (IANA)}`. The daemon ticks every minute and queues a run of the workflow's **latest revision** — same run path as the run modal and webhooks (revision-pinned, secret-redacted).
+
+- **Create/edit** (management API, normal auth): `PUT /api/workflows/:id/schedule` is an idempotent full-config upsert — exactly one schedule per workflow, duplicates impossible. `GET` returns it (404 when none), `DELETE` removes it. Invalid crons (`61 9 * * *`) and unknown timezones answer 422 with field-attributed details.
+
+```bash
+curl -s -X PUT localhost:8787/api/workflows/<workflow-id>/schedule \
+  -H 'content-type: application/json' \
+  -d '{"enabled":true,"cron":"30 9 * * 1-5","taskTemplate":"morning triage","timezone":"America/New_York"}'
+```
+
+- **Timezone semantics**: the cron is evaluated in the schedule's timezone wall clock (via `Intl`, no tz database dependency of our own). Wall times that don't exist (spring-forward gap) never fire — a `30 2 * * *` New York schedule next fires Mar 9 after the Mar 8 gap.
+- **Active-run skip**: while the workflow has a run `queued`/`running`, the slot is dropped with an `ops.schedule-skipped` line in the activity feed (workflow, minute, blocking run) — the next scheduled minute gets its chance.
+- **Missed ticks & restarts**: the last handled minute is persisted. A daemon that was down through several slots fires **once** for the newest missed slot on its next tick (no catch-up storm), and a schedule created after its slot time never backfills.
+- **Pause**: untick `enabled` (or the drawer's Pause button) — the ticker ignores paused schedules but keeps nothing stale; resume fires the next slot after now.
+- **Web UI**: the canvas editor's **schedule** chip opens the settings drawer — cron input with live humanized wording ("Monday, Tuesday… at 09:30"), timezone (defaults to your browser's zone), task template, the next 5 runs previewed client-side, and the pause toggle. The workflows list shows a **scheduled** badge (or **schedule paused**).
 
 ## Project layout
 

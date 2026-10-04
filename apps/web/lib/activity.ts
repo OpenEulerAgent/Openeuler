@@ -18,8 +18,9 @@ export type ActivityType =
   | "ops.gc"
   | "ops.image-pull"
   | "ops.image-build"
-  | "ops.sandbox-kept";
-
+  | "ops.sandbox-kept"
+  | "ops.hosting-expired"
+  | "ops.schedule-skipped";
 /**
  * ops.* rows (#94) are daemon-level system lines (boot, recovery sweep,
  * GC): rendered as small gray text without badge or run link.

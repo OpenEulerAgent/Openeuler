@@ -14,10 +14,12 @@ export type WorkflowFetcher = typeof apiFetch;
 /**
  * A workflow row as the LIST serves it (#70): the row plus the
  * daemon-computed graph summary of the latest revision (absent for legacy
- * workflows that were never saved as revisions).
+ * workflows that were never saved as revisions) and, when a cron schedule
+ * exists (#121), its summary (drives the scheduled/paused badge).
  */
 export type WorkflowListed = Workflow & {
   graphSummary?: GraphSummary;
+  schedule?: { enabled: boolean; cron: string; timezone: string };
 };
 
 /** A workflow row plus the latest-revision graph the daemon serves with it. */

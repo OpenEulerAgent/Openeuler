@@ -16,6 +16,7 @@ import {
   createWebhookDeliveryRepo,
   createWorkflowRepo,
   createWorkflowRevisionRepo,
+  createWorkflowScheduleRepo,
   createWorkflowWebhookRepo,
 } from "./repos.js";
 import type {
@@ -29,6 +30,7 @@ import type {
   WebhookDeliveryRepo,
   WorkflowRepo,
   WorkflowRevisionRepo,
+  WorkflowScheduleRepo,
   WorkflowWebhookRepo,
 } from "./repos.js";
 
@@ -49,6 +51,10 @@ export type {
   WorkflowPatch,
   WorkflowRevision,
   WorkflowRevisionRepo,
+  WorkflowScheduleConfigInput,
+  WorkflowSchedulePatch,
+  WorkflowScheduleRepo,
+  WorkflowScheduleRow,
   WorkflowWebhook,
   WorkflowWebhookPatch,
   WorkflowWebhookRepo,
@@ -82,6 +88,7 @@ export interface Db {
   readonly workflowRevisions: WorkflowRevisionRepo;
   readonly workflowWebhooks: WorkflowWebhookRepo;
   readonly webhookDeliveries: WebhookDeliveryRepo;
+  readonly workflowSchedules: WorkflowScheduleRepo;
   readonly runs: RunRepo;
   readonly stepRuns: StepRunRepo;
   readonly events: EventRepo;
@@ -139,6 +146,7 @@ export function createDatabase(opts: CreateDatabaseOptions = {}): Db {
     workflowRevisions: createWorkflowRevisionRepo(db),
     workflowWebhooks: createWorkflowWebhookRepo(db),
     webhookDeliveries: createWebhookDeliveryRepo(db),
+    workflowSchedules: createWorkflowScheduleRepo(db),
     runs: createRunRepo(db),
     stepRuns: createStepRunRepo(db),
     events: createEventRepo(db),

@@ -2166,10 +2166,10 @@ describe("graph engine (parallel fan-out + join, #115)", () => {
           resolveExit = resolve;
         });
         const events = (async function* () {
-          await new Promise((resolve) => setTimeout(resolve, 80));
+          await new Promise((resolve) => setTimeout(resolve, 250));
           yield { type: "session", seq: 1, sessionId: "s-zombie" } as const;
         })();
-        setTimeout(() => resolveExit({ code: 0, reason: "exit", output: "ZOMBIE-OUT" }), 80);
+        setTimeout(() => resolveExit({ code: 0, reason: "exit", output: "ZOMBIE-OUT" }), 250);
         return { events, exited, abort: async () => {} };
       },
     };
