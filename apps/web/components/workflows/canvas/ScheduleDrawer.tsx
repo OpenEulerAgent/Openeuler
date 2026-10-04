@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { humanizeCron, isValidTimezone, nextCronRuns, parseCron } from "@openeuler/core";
 import type { WorkflowSchedule } from "@openeuler/core";
 import { Badge } from "@/components/ui/badge";
@@ -49,11 +49,14 @@ export function ScheduleDrawer({
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [confirmDelete, setConfirmDelete] = useState(false);
+  const reloadSeqRef = useRef(0);
 
   const reload = useCallback(() => {
+    const reloadSeq = ++reloadSeqRef.current;
     setState({ phase: "loading" });
     return fetchWorkflowSchedule(workflowId)
       .then((schedule) => {
+        if (reloadSeq !== reloadSeqRef.current) return;
         setState({ phase: "ready", schedule });
         if (schedule !== null) {
           setEnabled(schedule.enabled);
@@ -68,6 +71,7 @@ export function ScheduleDrawer({
         }
       })
       .catch((cause) => {
+        if (reloadSeq !== reloadSeqRef.current) return;
         setState({
           phase: "error",
           message: cause instanceof ApiError ? cause.message : "Failed to load schedule",
@@ -133,6 +137,10 @@ export function ScheduleDrawer({
           timezone: timezone.trim(),
         },
       });
+      setEnabled(saved.enabled);
+      setCron(saved.cron);
+      setTaskTemplate(saved.taskTemplate);
+      setTimezone(saved.timezone);
       setState({ phase: "ready", schedule: saved });
     });
 
@@ -171,8 +179,8 @@ export function ScheduleDrawer({
       </div>
       <p className="mt-1 text-sm text-muted-fg">
         The daemon ticks every minute and queues a run of the latest revision — cron is evaluated in
-        your timezone&apos;s wall clock, and a slot is skipped (logged in the activity feed) while a
-        previous run is still active.
+        the configured timezone&apos;s wall clock, and a slot is skipped (logged in the activity
+        feed) while a previous run is still active.
       </p>
 
       {state.phase === "loading" ? (

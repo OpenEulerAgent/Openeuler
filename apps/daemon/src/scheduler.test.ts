@@ -307,6 +307,35 @@ describe("schedule ticker (fake clock)", () => {
     expect(h.tick()).toEqual({ fired: 0, skipped: 0, idle: 0 });
   });
 
+  it("resumes from now, not from a slot that elapsed while paused", async () => {
+    const h = setup();
+    h.schedule({ cron: "0 * * * *", createdAt: "2026-01-01T09:00:00Z" });
+    h.clock.now = Date.parse("2026-01-01T10:00:00Z");
+    expect(h.tick()).toEqual({ fired: 1, skipped: 0, idle: 0 });
+    await waitForQuiet(h);
+
+    const row = h.db.workflowSchedules.getByWorkflow(h.workflow.id);
+    expect(row).toBeDefined();
+    if (row) {
+      h.db.workflowSchedules.update(row.id, { enabled: false });
+    }
+    h.clock.now = Date.parse("2026-01-01T12:20:00Z");
+    expect(h.tick()).toEqual({ fired: 0, skipped: 0, idle: 0 });
+
+    if (row) h.db.workflowSchedules.update(row.id, { enabled: true });
+    // Model the repo's resume-time cursor reset on the fake clock explicitly
+    // (the repo-level test covers the real upsert timestamp).
+    const resumed = h.db.workflowSchedules.getByWorkflow(h.workflow.id);
+    if (resumed) {
+      h.db.workflowSchedules.update(resumed.id, {
+        lastFiredAt: "2026-01-01T12:20:00.000Z",
+      });
+    }
+    expect(h.tick()).toEqual({ fired: 0, skipped: 0, idle: 1 });
+    h.clock.now = Date.parse("2026-01-01T13:00:00Z");
+    expect(h.tick()).toEqual({ fired: 1, skipped: 0, idle: 0 });
+  });
+
   it("one broken schedule row (hand-edited cron) never breaks the tick", () => {
     const h = setup();
     h.schedule({ cron: "0 * * * *", createdAt: "2026-01-01T09:00:00Z" });
@@ -349,6 +378,12 @@ describe("schedule ticker (fake clock)", () => {
       dueSlotMs(
         { cron: "0 * * * *", timezone: "UTC", createdAt: "2026-01-01T09:00:00Z" },
         Date.parse("2026-01-01T09:59:00Z"),
+      ),
+    ).toBeUndefined();
+    expect(
+      dueSlotMs(
+        { cron: "0 * * * *", timezone: "Mars/Olympus", createdAt: "2026-01-01T09:00:00Z" },
+        Date.parse("2026-01-01T10:00:00Z"),
       ),
     ).toBeUndefined();
   });

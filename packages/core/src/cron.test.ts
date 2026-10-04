@@ -215,6 +215,12 @@ describe("humanizeCron", () => {
     expect(humanizeCron("0 9 1 * *")).toBe("On day 1 of every month at 09:00");
     expect(humanizeCron("0 9 1 1 *")).toBe("On day 1 of every month in January at 09:00");
     expect(humanizeCron("0,30 9 * * *")).toBe("Every day at 09:00 and 09:30");
+    expect(humanizeCron("0,30 */6 * * *")).toBe(
+      "Every day at 00:00, 00:30, 06:00, 06:30, 12:00, 12:30, 18:00 and 18:30",
+    );
+    expect(humanizeCron("0 0 13 * 5")).toBe("On day 13 or on Friday at 00:00");
+    expect(humanizeCron("* * * * 0")).toBe("Every minute on Sunday");
+    expect(humanizeCron("*/5 * * * 0")).toBe("Every 5 minutes on Sunday");
   });
 
   it("names the parse error for invalid expressions", () => {

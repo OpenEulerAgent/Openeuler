@@ -276,6 +276,8 @@ export interface RunRepo {
   list(projectId?: string, status?: RunStatus): Run[];
   /** Runs linked to a workflow, newest first. */
   listByWorkflow(workflowId: string): Run[];
+  /** The workflow's newest queued/running run, if any (schedule overlap guard). */
+  findActiveByWorkflow(workflowId: string): Run | undefined;
   /**
    * Child runs spawned by a sub-workflow node of `parentRunId` (#117), in
    * spawn (creation) order.
@@ -858,6 +860,13 @@ export function createWorkflowScheduleRepo(db: Db): WorkflowScheduleRepo {
             .get();
           return toDomain(row as typeof schema.workflowSchedules.$inferSelect);
         }
+        // Resume and timing edits never backfill: an enabled save after a
+        // pause, or a cron/timezone change, starts waiting from NOW.
+        const resetCursor =
+          config.enabled &&
+          (!existing.enabled ||
+            existing.cron !== config.cron ||
+            existing.timezone !== config.timezone);
         const row = tx
           .update(schema.workflowSchedules)
           .set({
@@ -865,6 +874,7 @@ export function createWorkflowScheduleRepo(db: Db): WorkflowScheduleRepo {
             cron: config.cron,
             taskTemplate: config.taskTemplate,
             timezone: config.timezone,
+            ...(resetCursor ? { lastFiredAt: now } : {}),
             updatedAt: now,
           })
           .where(eq(schema.workflowSchedules.id, existing.id))
@@ -1177,6 +1187,21 @@ export function createRunRepo(db: Db): RunRepo {
         .orderBy(sql`${schema.runs.createdAt} desc`, schema.runs.id)
         .all();
       return rows.map(toDomain);
+    },
+    findActiveByWorkflow(workflowId) {
+      const row = db
+        .select()
+        .from(schema.runs)
+        .where(
+          and(
+            eq(schema.runs.workflowId, workflowId),
+            inArray(schema.runs.status, ["queued", "running"]),
+          ),
+        )
+        .orderBy(sql`${schema.runs.createdAt} desc`, schema.runs.id)
+        .limit(1)
+        .get();
+      return row ? toDomain(row) : undefined;
     },
     listByParentRun(parentRunId) {
       const rows = db

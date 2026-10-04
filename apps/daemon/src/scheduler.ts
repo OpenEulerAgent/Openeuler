@@ -1,4 +1,4 @@
-import { nextCronRunMs, parseCron } from "@openeuler/core";
+import { isValidTimezone, nextCronRunMs, parseCron } from "@openeuler/core";
 import type { Db, WorkflowScheduleRow } from "@openeuler/db";
 import type { Logger } from "./logger.js";
 import { recordScheduleSkippedActivity } from "./activity.js";
@@ -57,10 +57,7 @@ export interface ScheduleTickerDeps {
 
 /** Runs the workflow if it has no queued/running run; returns the active run otherwise. */
 function activeRunOf(db: Db, workflowId: string): { id: string } | undefined {
-  for (const run of db.runs.listByWorkflow(workflowId)) {
-    if (run.status === "queued" || run.status === "running") return run;
-  }
-  return undefined;
+  return db.runs.findActiveByWorkflow(workflowId);
 }
 
 /**
@@ -72,7 +69,7 @@ export function dueSlotMs(
   currentMinuteMs: number,
 ): number | undefined {
   const parsed = parseCron(schedule.cron);
-  if (!parsed.ok) return undefined;
+  if (!parsed.ok || !isValidTimezone(schedule.timezone)) return undefined;
   const cursorMs = Date.parse(schedule.lastFiredAt ?? schedule.createdAt);
   if (!Number.isFinite(cursorMs)) return undefined;
   let slot: number | undefined;
@@ -194,6 +191,8 @@ export function startScheduleTicker(options: ScheduleTickerOptions): ScheduleTic
     tick();
   }, intervalMs);
   timer.unref?.();
+  // A slot that became due during boot should not wait a full interval.
+  tick();
   return {
     runNow: tick,
     stop: () => {

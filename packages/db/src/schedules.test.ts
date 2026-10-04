@@ -92,6 +92,28 @@ describe("workflow schedule repo", () => {
     expect(db.workflowSchedules.getByWorkflow(workflow.id)?.id).toBe(first.id);
   });
 
+  it("resets the missed-tick cursor on resume and on timing edits", () => {
+    const workflow = makeWorkflow(db);
+    const created = db.workflowSchedules.upsertByWorkflow(workflow.id, config);
+    db.workflowSchedules.update(created.id, { lastFiredAt: "2026-01-01T09:30:00.000Z" });
+
+    const paused = db.workflowSchedules.upsertByWorkflow(workflow.id, {
+      ...config,
+      enabled: false,
+    });
+    expect(paused.lastFiredAt).toBe("2026-01-01T09:30:00.000Z");
+
+    const resumed = db.workflowSchedules.upsertByWorkflow(workflow.id, config);
+    expect(resumed.lastFiredAt).toBe(resumed.updatedAt);
+
+    db.workflowSchedules.update(resumed.id, { lastFiredAt: "2026-01-01T09:30:00.000Z" });
+    const retimed = db.workflowSchedules.upsertByWorkflow(workflow.id, {
+      ...config,
+      cron: "0 12 * * *",
+    });
+    expect(retimed.lastFiredAt).toBe(retimed.updatedAt);
+  });
+
   it("refuses a second schedule row for the same workflow (unique index)", () => {
     const workflow = makeWorkflow(db);
     db.workflowSchedules.upsertByWorkflow(workflow.id, config);

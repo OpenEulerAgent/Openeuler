@@ -1,5 +1,4 @@
 import { z } from "zod";
-import { timestampSchema } from "./common.js";
 
 /**
  * Dependency-free 5-field cron support (#121): a strict parser, a
@@ -349,9 +348,9 @@ export function nextCronRun(expression: string, afterMs: number, timeZone: strin
  */
 export function nextCronRuns(
   expression: string,
-  options: { from?: string; timeZone: string; count?: number } = { timeZone: "UTC" },
+  options: { from?: string; timeZone?: string; count?: number } = {},
 ): string[] {
-  const { from, timeZone, count = 5 } = options;
+  const { from, timeZone = "UTC", count = 5 } = options;
   const parsed = parseCron(expression);
   if (!parsed.ok || !isValidTimezone(timeZone)) return [];
   const out: string[] = [];
@@ -470,8 +469,8 @@ export function humanizeCron(expression: string): string {
     return `Every ${minuteStep} minutes`;
   }
   const hourStep = stepOf(hour, 0, 23);
-  if (hourStep !== null && everyDom && everyMonth && everyDow) {
-    return minute.length === 1 && minute[0] === 0
+  if (hourStep !== null && everyDom && everyMonth && everyDow && minute.length === 1) {
+    return minute[0] === 0
       ? `Every ${hourStep} hours`
       : `Every ${hourStep} hours at :${String(minute[0]).padStart(2, "0")}`;
   }
@@ -483,6 +482,20 @@ export function humanizeCron(expression: string): string {
         month.map((value) => value - 1),
         MONTH_LABELS,
       )}`;
+  const dayPhrase =
+    everyDom && everyDow
+      ? ""
+      : everyDom
+        ? ` on ${listValues(dow, DOW_LABELS)}`
+        : everyDow
+          ? ` on day ${listValues(dom)}`
+          : ` on day ${listValues(dom)} or on ${listValues(dow, DOW_LABELS)}`;
+
+  // High-frequency crons with day restrictions would otherwise enumerate
+  // every matching time of day; collapse them to the interval + day phrase.
+  if (everyMinute && everyHour) return `Every minute${monthPhrase}${dayPhrase}`;
+  if (minuteStep !== null && everyHour)
+    return `Every ${minuteStep} minutes${monthPhrase}${dayPhrase}`;
 
   if (everyDom && everyDow) return `Every day${monthPhrase} ${timePhrase}`.replace("  ", " ");
   if (everyDom && !everyDow) {
@@ -494,7 +507,10 @@ export function humanizeCron(expression: string): string {
       " ",
     );
   }
-  return `On day ${listValues(dom)}${monthPhrase} ${timePhrase}`.replace("  ", " ");
+  return `On day ${listValues(dom)} or on ${listValues(dow, DOW_LABELS)}${monthPhrase} ${timePhrase}`.replace(
+    "  ",
+    " ",
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -513,8 +529,9 @@ export const SCHEDULE_TASK_TEMPLATE_MAX = 20_000;
  */
 export const WorkflowScheduleConfigSchema = z.strictObject({
   enabled: z.boolean(),
-  cron: z.string().refine((value) => parseCron(value).ok, {
-    message: "cron must be a valid 5-field expression (minute hour day-of-month month day-of-week)",
+  cron: z.string().superRefine((value, ctx) => {
+    const parsed = parseCron(value);
+    if (!parsed.ok) ctx.addIssue({ code: "custom", message: parsed.error });
   }),
   taskTemplate: z
     .string()
@@ -551,15 +568,3 @@ export interface WorkflowScheduleSummary {
   timezone: string;
   lastFiredAt?: string;
 }
-
-export const WorkflowScheduleSchema = z.strictObject({
-  id: z.string().min(1),
-  workflowId: z.string().min(1),
-  enabled: z.boolean(),
-  cron: z.string().min(1),
-  taskTemplate: z.string().min(1),
-  timezone: z.string().min(1),
-  lastFiredAt: timestampSchema.optional(),
-  createdAt: timestampSchema,
-  updatedAt: timestampSchema,
-});

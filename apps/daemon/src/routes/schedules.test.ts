@@ -149,6 +149,7 @@ describe("workflow schedule API (#121)", () => {
     const body = (await res.json()) as ErrorResponseBody;
     expect(body.error.code).toBe("VALIDATION_ERROR");
     expect(body.error.details?.[0]?.path).toContain("cron");
+    expect(body.error.details?.[0]?.message).toContain("minute");
   });
 
   it("PUT rejects invalid timezones and empty task templates", async () => {
