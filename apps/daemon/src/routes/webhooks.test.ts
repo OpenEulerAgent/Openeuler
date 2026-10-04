@@ -110,7 +110,7 @@ afterEach(() => {
   }
 });
 
-/** Full signature header set over `ts.body`; ts/nonce overridable (used for BOTH signing and headers). */
+/** Full signature header set over `ts.nonce.body`; ts/nonce overridable (used for BOTH signing and headers). */
 const signedHeaders = (
   secret: string,
   body: string,
@@ -118,7 +118,8 @@ const signedHeaders = (
 ): Record<string, string> => {
   const ts = opts.timestamp ?? String(Math.floor(Date.now() / 1000));
   const nonce = opts.nonce ?? crypto.randomUUID();
-  const signature = "sha256=" + createHmac("sha256", secret).update(`${ts}.${body}`).digest("hex");
+  const signature =
+    "sha256=" + createHmac("sha256", secret).update(`${ts}.${nonce}.${body}`).digest("hex");
   return {
     "content-type": "application/json",
     "x-openeuler-timestamp": ts,
@@ -167,6 +168,22 @@ describe("webhook management API", () => {
     });
     expect(res.status).toBe(409);
     expect(((await res.json()) as ErrorResponseBody).error.code).toBe("WEBHOOK_EXISTS");
+  });
+
+  it("maps a concurrent-create unique race to 409 WEBHOOK_EXISTS", async () => {
+    const h = setup();
+    const path = `/api/workflows/${h.workflowId}/webhook`;
+    const requests = [0, 1].map(() =>
+      h.request(path, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: "{}",
+      }),
+    );
+    const results = await Promise.all(requests);
+    expect(results.map((res) => res.status).sort((a, b) => a - b)).toEqual([201, 409]);
+    const rejected = results.find((res) => res.status === 409);
+    expect(((await rejected?.json()) as ErrorResponseBody).error.code).toBe("WEBHOOK_EXISTS");
   });
 
   it("GET serves the webhook + deliveries and never the secret", async () => {
@@ -372,6 +389,22 @@ describe("POST /api/hooks/:id — signature auth", () => {
     expect(h.db.runs.list().length).toBe(1);
     const log = await deliveries(h, hookId);
     expect(log[0]).toMatchObject({ outcome: "rejected", statusCode: 409, authMode: "signature" });
+  });
+
+  it("signs the nonce — swapping it on a captured request fails the signature", async () => {
+    const h = setup();
+    const { hookId, secret } = await createWebhook(h);
+    const body = '{"task":"captured"}';
+    const headers = signedHeaders(secret, body);
+
+    const swapped = {
+      ...headers,
+      "x-openeuler-nonce": crypto.randomUUID(),
+    };
+    const res = await trigger(h, hookId, body, swapped);
+    expect(res.status).toBe(401);
+    expect(((await res.json()) as ErrorResponseBody).error.code).toBe("HOOK_SIGNATURE_INVALID");
+    expect(h.db.runs.list().length).toBe(0);
   });
 
   it("rejects invalid bodies (422) after auth, without creating a run", async () => {

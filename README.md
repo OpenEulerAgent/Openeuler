@@ -213,7 +213,7 @@ While a sandboxed run executes, its **declared** ports (#107) are previewable th
 
 Any workflow can expose an inbound webhook (#120): a per-workflow URL + signing secret that queues a run of that workflow's latest revision — wire it to CI, cron, or a `curl` one-liner.
 
-- **Create** (management API, normal auth): `POST /api/workflows/:id/webhook` with an optional `{defaultTask}` — the response returns the hook `id` and the **signing secret exactly once** (rotate via `PATCH` with `{rotateSecret: true}`, delete via `DELETE`; `GET` returns the webhook plus the **delivery log** — the last 50 attempts, accepted or rejected). In the web UI the canvas editor's **webhook** chip opens the same settings drawer.
+- **Create** (management API, normal auth): `POST /api/workflows/:id/webhook` with an optional `{defaultTask}` — the response returns the hook `id` and the **signing secret exactly once** (rotate via `PATCH` with `{rotateSecret: true}`, delete via `DELETE`; `GET` returns the webhook plus the **delivery log** — the last 50 attempts against the hook, accepted or rejected). In the web UI the canvas editor's **webhook** chip opens the same settings drawer.
 - **Trigger**: `POST /api/hooks/:id` with `{task?, inputs?}` (missing `task` falls back to the webhook's `defaultTask`; `inputs` is appended to the task as JSON). Answers `202 {runId, run}`.
 
 ```bash
@@ -223,14 +223,14 @@ curl -s localhost:8787/api/workflows/<workflow-id>/webhook \
 # → {"webhook":{"id":"Ab3xK9...","defaultTask":"nightly build", ...},"secret":"<48-hex-chars>"}
 
 HOOK=<hook-id>; SECRET=<secret>; BODY='{"task":"deploy staging","inputs":{"ref":"main"}}'
-TS=$(date +%s)
-SIG=$(printf '%s.%s' "$TS" "$BODY" | openssl dgst -sha256 -hmac "$SECRET" -hex | cut -d' ' -f2)
+TS=$(date +%s); NONCE=$(uuidgen)
+SIG=$(printf '%s.%s.%s' "$TS" "$NONCE" "$BODY" | openssl dgst -sha256 -hmac "$SECRET" -hex | cut -d' ' -f2)
 
-# trigger it — HMAC-SHA256 over "<timestamp>.<raw body>"
+# trigger it — HMAC-SHA256 over "<timestamp>.<nonce>.<raw body>"
 curl -s -X POST "localhost:8787/api/hooks/$HOOK" \
   -H 'content-type: application/json' \
   -H "x-openeuler-timestamp: $TS" \
-  -H "x-openeuler-nonce: $(uuidgen)" \
+  -H "x-openeuler-nonce: $NONCE" \
   -H "x-openeuler-signature: sha256=$SIG" \
   -d "$BODY"
 # → 202 {"runId":"…","run":{…}}

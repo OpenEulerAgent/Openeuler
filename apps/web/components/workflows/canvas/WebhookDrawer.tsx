@@ -39,6 +39,8 @@ export function WebhookDrawer({
 }) {
   const [state, setState] = useState<LoadState>({ phase: "loading" });
   const [secret, setSecret] = useState<string | null>(null);
+  /** Hook id paired with `secret`; keeps the one-time block renderable. */
+  const [secretHookId, setSecretHookId] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [defaultTask, setDefaultTask] = useState("");
@@ -62,6 +64,7 @@ export function WebhookDrawer({
   useEffect(() => {
     if (!open) return;
     setSecret(null);
+    setSecretHookId(null);
     setError(null);
     setConfirmDelete(false);
     reload();
@@ -84,14 +87,25 @@ export function WebhookDrawer({
         workflowId,
         ...(trimmed.length === 0 ? {} : { defaultTask: trimmed }),
       });
+      // Render from the create response itself: a failed follow-up reload
+      // must never hide a secret the daemon will never return again.
       setSecret(created.secret);
-      await reload();
+      setSecretHookId(created.webhook.id);
+      setState({ phase: "ready", detail: { webhook: created.webhook, deliveries: [] } });
     });
 
   const rotate = () =>
     run(async () => {
       const rotated = await patchWorkflowWebhook({ workflowId, rotateSecret: true });
-      if (rotated.secret !== undefined) setSecret(rotated.secret);
+      if (rotated.secret !== undefined) {
+        setSecret(rotated.secret);
+        setSecretHookId(rotated.webhook.id);
+      }
+      setState((prev) =>
+        prev.phase === "ready" && prev.detail !== null
+          ? { phase: "ready", detail: { ...prev.detail, webhook: rotated.webhook } }
+          : prev,
+      );
     });
 
   const saveDefaultTask = () =>
@@ -106,8 +120,10 @@ export function WebhookDrawer({
 
   const remove = () =>
     run(async () => {
+      setConfirmDelete(false);
       await deleteWorkflowWebhook(workflowId);
       setSecret(null);
+      setSecretHookId(null);
       await reload();
     });
 
@@ -136,6 +152,27 @@ export function WebhookDrawer({
         >
           {state.message}
         </p>
+      ) : null}
+
+      {secret !== null && secretHookId !== null ? (
+        <div
+          className="mt-4 flex flex-col gap-2 rounded-lg border border-warning/50 bg-warning-subtle p-3"
+          data-webhook-secret
+          role="status"
+        >
+          <p className="text-sm font-medium text-fg">Signing secret — shown once, store it now</p>
+          <code className="break-all rounded bg-surface px-2 py-1 font-mono text-xs text-fg">
+            {secret}
+          </code>
+          <pre className="overflow-x-auto rounded bg-surface p-2 font-mono text-xs text-fg">{`SECRET='${secret}'; TS=$(date +%s); BODY='{"task":"ship it"}'; NONCE=$(uuidgen)
+SIG=$(printf '%s.%s.%s' "$TS" "$NONCE" "$BODY" | openssl dgst -sha256 -hmac "$SECRET" -hex | cut -d' ' -f2)
+curl -X POST ${webhookTriggerUrl(secretHookId)} \\
+  -H "content-type: application/json" \\
+  -H "x-openeuler-timestamp: $TS" \\
+  -H "x-openeuler-nonce: $NONCE" \\
+  -H "x-openeuler-signature: sha256=$SIG" \\
+  -d "$BODY"`}</pre>
+        </div>
       ) : null}
 
       {state.phase === "ready" && state.detail === null ? (
@@ -176,29 +213,6 @@ export function WebhookDrawer({
               {state.detail.deliveries.length === 1 ? "y" : "ies"}
             </p>
           </div>
-
-          {secret !== null ? (
-            <div
-              className="flex flex-col gap-2 rounded-lg border border-warning/50 bg-warning-subtle p-3"
-              data-webhook-secret
-              role="status"
-            >
-              <p className="text-sm font-medium text-fg">
-                Signing secret — shown once, store it now
-              </p>
-              <code className="break-all rounded bg-surface px-2 py-1 font-mono text-xs text-fg">
-                {secret}
-              </code>
-              <pre className="overflow-x-auto rounded bg-surface p-2 font-mono text-xs text-fg">{`TS=$(date +%s); BODY='{"task":"ship it"}'
-SIG=$(printf '%s.%s' "$TS" "$BODY" | openssl dgst -sha256 -hmac "$SECRET" -hex | cut -d' ' -f2)
-curl -X POST ${webhookTriggerUrl(state.detail.webhook.id)} \\
-  -H "content-type: application/json" \\
-  -H "x-openeuler-timestamp: $TS" \\
-  -H "x-openeuler-nonce: $(uuidgen)" \\
-  -H "x-openeuler-signature: sha256=$SIG" \\
-  -d "$BODY"`}</pre>
-            </div>
-          ) : null}
 
           <Field
             label="Default task"

@@ -18,15 +18,16 @@ import { createAndStartWorkflowRun } from "./workflows.js";
  * shown exactly once), `DELETE /:id/webhook`.
  *
  * Trigger (`POST /api/hooks/:id`, mounted separately): authenticates via
- * EITHER an HMAC-SHA256 signature over `<timestamp>.<raw body>`
+ * EITHER an HMAC-SHA256 signature over `<timestamp>.<nonce>.<raw body>`
  * (`X-Openeuler-Signature: sha256=<hex>`, `X-Openeuler-Timestamp` unix
  * seconds, `X-Openeuler-Nonce` unique per request) OR the daemon's normal
  * bearer token when one is configured. Replay protection: the timestamp
- * must sit inside a ±5-minute window and the nonce is cached for as long
- * as its timestamp can still pass validation — a replay answers 409
- * instead of minting a second run. Every attempt (accepted or rejected)
- * lands in the webhook's delivery ring (newest 50 kept, db-side). No run
- * is created and no body is parsed before authentication fully validates.
+ * must sit inside a ±5-minute window and the signed nonce is cached for as
+ * long as its timestamp can still pass validation — a replay answers 409
+ * instead of minting a second run. Every attempt against an existing hook
+ * lands in the webhook's delivery ring (newest 50 kept, db-side).
+ * No run is created and no body is parsed before authentication fully
+ * validates.
  */
 
 /** Signature validity window, both directions (clock skew). */
@@ -56,10 +57,14 @@ export function newWebhookSecret(): string {
 export function hookSignatureMatches(
   secret: string,
   timestamp: string,
+  nonce: string,
   body: Buffer,
   presented: string,
 ): boolean {
-  const digest = createHmac("sha256", secret).update(`${timestamp}.`).update(body).digest("hex");
+  const digest = createHmac("sha256", secret)
+    .update(`${timestamp}.${nonce}.`)
+    .update(body)
+    .digest("hex");
   const hash = (value: string): Buffer => createHash("sha256").update(value, "utf8").digest();
   return timingSafeEqual(hash(digest), hash(presented));
 }
@@ -171,14 +176,28 @@ export function createWorkflowWebhooksRouter(): Hono<AppEnv> {
     const body = CreateWebhookBodySchema.parse(await parseJsonBody(c));
     const secret = newWebhookSecret();
     const now = new Date().toISOString();
-    const webhook = db.workflowWebhooks.create({
-      id: newWebhookId(),
-      workflowId: workflow.id,
-      secretEnc: encryptSecretValue(key, secret),
-      ...(body.defaultTask === undefined ? {} : { defaultTask: body.defaultTask }),
-      createdAt: now,
-      updatedAt: now,
-    });
+    let webhook;
+    try {
+      webhook = db.workflowWebhooks.create({
+        id: newWebhookId(),
+        workflowId: workflow.id,
+        secretEnc: encryptSecretValue(key, secret),
+        ...(body.defaultTask === undefined ? {} : { defaultTask: body.defaultTask }),
+        createdAt: now,
+        updatedAt: now,
+      });
+    } catch (err) {
+      // A concurrent create can slip past the exists-check above and lose
+      // the unique-workflow race here.
+      if (err instanceof Error && err.message.includes("UNIQUE constraint failed")) {
+        throw new HttpError(
+          409,
+          "WEBHOOK_EXISTS",
+          `workflow ${workflow.id} already has a webhook; PATCH it to rotate the secret or edit the default task`,
+        );
+      }
+      throw err;
+    }
     // The ONLY moment the plaintext secret crosses the wire.
     c.get("logger").info({ webhookId: webhook.id, workflowId: workflow.id }, "webhook created");
     return c.json({ webhook: webhookBody(webhook), secret }, 201);
@@ -249,10 +268,15 @@ export function createWorkflowWebhooksRouter(): Hono<AppEnv> {
       throw new HttpError(404, "WORKFLOW_NOT_FOUND", `no workflow with id ${c.req.param("id")}`);
     }
     const webhook = db.workflowWebhooks.getByWorkflow(workflow.id);
-    if (!webhook || !db.workflowWebhooks.delete(webhook.id)) {
+    if (!webhook) {
       throw new HttpError(404, "WEBHOOK_NOT_FOUND", `workflow ${workflow.id} has no webhook`);
     }
+    // Deliveries first: an in-flight trigger that already loaded the webhook
+    // must never append a row for a deleted hook.
     db.webhookDeliveries.deleteForWebhook(webhook.id);
+    if (!db.workflowWebhooks.delete(webhook.id)) {
+      throw new HttpError(404, "WEBHOOK_NOT_FOUND", `workflow ${workflow.id} has no webhook`);
+    }
     c.get("logger").info({ webhookId: webhook.id, workflowId: workflow.id }, "webhook deleted");
     return c.body(null, 204);
   });
@@ -352,10 +376,26 @@ export function createHooksRouter(options: HooksRouterOptions = {}): Hono<AppEnv
       }
       const key = c.get("secretsKey");
       if (!key) {
-        throw new HttpError(
+        reject(
+          db,
+          webhook.id,
           503,
           "SECRETS_UNAVAILABLE",
           "webhooks are not configured on this daemon (no secret key loaded)",
+          authMode,
+        );
+      }
+      // The nonce is SIGNED: a captured request cannot swap it for a fresh
+      // value and bypass the replay cache inside the timestamp window.
+      const nonce = c.req.header(HOOK_NONCE_HEADER) ?? "";
+      if (!NonceSchema.test(nonce)) {
+        reject(
+          db,
+          webhook.id,
+          401,
+          "HOOK_NONCE_INVALID",
+          `missing or malformed ${HOOK_NONCE_HEADER} header (8..128 URL-safe chars expected)`,
+          authMode,
         );
       }
       const presented = /^sha256=([0-9a-f]{64})$/i.exec(signature.trim())?.[1];
@@ -374,34 +414,26 @@ export function createHooksRouter(options: HooksRouterOptions = {}): Hono<AppEnv
         secret = decryptSecretValue(key, webhook.secretEnc);
       } catch {
         c.get("logger").error({ webhookId: webhook.id }, "webhook secret undecryptable");
-        throw new HttpError(
+        reject(
+          db,
+          webhook.id,
           500,
           "WEBHOOK_SECRET_UNREADABLE",
           "the webhook secret could not be decrypted (wrong or tampered master key)",
+          authMode,
         );
       }
-      if (!hookSignatureMatches(secret, timestampRaw, raw, presented.toLowerCase())) {
+      if (!hookSignatureMatches(secret, timestampRaw, nonce, raw, presented.toLowerCase())) {
         reject(
           db,
           webhook.id,
           401,
           "HOOK_SIGNATURE_INVALID",
-          "signature does not match the body (HMAC-SHA256 over `<timestamp>.<raw body>`)",
+          "signature does not match the request (HMAC-SHA256 over `<timestamp>.<nonce>.<raw body>`)",
           authMode,
         );
       }
-      // Signature proven → nonce replay guard.
-      const nonce = c.req.header(HOOK_NONCE_HEADER) ?? "";
-      if (!NonceSchema.test(nonce)) {
-        reject(
-          db,
-          webhook.id,
-          401,
-          "HOOK_NONCE_INVALID",
-          `missing or malformed ${HOOK_NONCE_HEADER} header (8..128 URL-safe chars expected)`,
-          authMode,
-        );
-      }
+      // Signature proven → replay guard.
       const nowMs = now();
       const expiry = (timestamp + HOOK_TIMESTAMP_WINDOW_SEC + 5) * 1000;
       if (nonces.size > 10_000) {
@@ -442,14 +474,17 @@ export function createHooksRouter(options: HooksRouterOptions = {}): Hono<AppEnv
     // --- Authenticated; parse the payload and mint the run.
 
     if (!executor) {
-      throw new HttpError(503, "EXECUTOR_UNAVAILABLE", "executor is not configured");
+      reject(db, webhook.id, 503, "EXECUTOR_UNAVAILABLE", "executor is not configured", authMode);
     }
     const workflow = db.workflows.get(webhook.workflowId);
     if (!workflow) {
-      throw new HttpError(
+      reject(
+        db,
+        webhook.id,
         409,
         "WORKFLOW_MISSING",
         `workflow ${webhook.workflowId} of this webhook no longer exists`,
+        authMode,
       );
     }
 

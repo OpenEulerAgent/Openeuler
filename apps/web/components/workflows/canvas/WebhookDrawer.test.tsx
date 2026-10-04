@@ -120,7 +120,9 @@ describe("WebhookDrawer", () => {
     const secretBlock = document.querySelector("[data-webhook-secret]");
     expect(secretBlock).toBeTruthy();
     expect(secretBlock?.textContent).toContain("one-time-secret-value");
-    // The curl snippet signs via $SECRET, not the literal value.
+    // The snippet is self-contained: it assigns the one-time secret and
+    // signs timestamp + nonce + body with it.
+    expect(secretBlock?.textContent).toContain("SECRET='one-time-secret-value'");
     expect(secretBlock?.textContent).toContain("openssl dgst -sha256 -hmac");
   });
 
@@ -164,6 +166,20 @@ describe("WebhookDrawer", () => {
     });
     expect(api.deleteWorkflowWebhook).toHaveBeenCalledWith("w1");
     expect(document.querySelector("[data-webhook-empty]")).toBeTruthy();
+
+    // Re-creating in the same drawer must not inherit the old delete confirm.
+    vi.mocked(api.createWorkflowWebhook).mockResolvedValue({
+      webhook: detail.webhook,
+      secret: "fresh-secret",
+    });
+    const createAgain = [...document.querySelectorAll("button")].find(
+      (b) => b.textContent === "Create webhook",
+    );
+    await act(async () => {
+      createAgain?.click();
+    });
+    expect(document.querySelector("[data-webhook-secret]")?.textContent).toContain("fresh-secret");
+    expect(text()).not.toContain("Delete this webhook?");
   });
 
   it("surfaces load failures inline", async () => {
