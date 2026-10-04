@@ -145,6 +145,15 @@ export function WorkflowsList({ projectId }: { projectId: string }) {
                         {workflow.name}
                       </span>
                       <span className="mt-0.5 flex flex-wrap items-center gap-2 text-xs text-muted-fg">
+                        {/* #121: schedule badge — "scheduled" while the cron
+                            fires, "schedule paused" when parked. */}
+                        {workflow.schedule ? (
+                          workflow.schedule.enabled ? (
+                            <Badge variant="accent">scheduled</Badge>
+                          ) : (
+                            <Badge>schedule paused</Badge>
+                          )
+                        ) : null}
                         {summary ? (
                           <>
                             <span>{graphSummaryLine(summary)}</span>

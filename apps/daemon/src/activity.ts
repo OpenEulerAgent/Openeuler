@@ -26,6 +26,8 @@ export type ActivityType =
  * sandbox GC; the helper exists so the feed rendering is final now.
  * `ops.image-pull` / `ops.image-build` (#100) record image-job completions.
  * `ops.hosting-expired` (#110) records a hosted run's TTL expiry.
+ * `ops.schedule-skipped` (#121) records a cron slot dropped because the
+ * workflow still had an active run.
  */
 export type OpsActivityType =
   | "ops.daemon-boot"
@@ -34,7 +36,8 @@ export type OpsActivityType =
   | "ops.image-pull"
   | "ops.image-build"
   | "ops.sandbox-kept"
-  | "ops.hosting-expired";
+  | "ops.hosting-expired"
+  | "ops.schedule-skipped";
 
 /** True for `ops.*` rows: rendered as small gray system lines in the web feed. */
 export function isOpsActivityType(type: ActivityType): type is OpsActivityType {
@@ -231,6 +234,42 @@ export function recordHostingExpiredActivity(db: Db, payload: HostingExpiredActi
     });
   } catch {
     // Feed appends must never break the sweep.
+  }
+}
+
+/** Payload of {@link recordScheduleSkippedActivity} (#121). */
+export interface ScheduleSkippedActivityPayload {
+  /** Workflow whose scheduled slot was dropped. */
+  workflowId: string;
+  /** The cron expression in force. */
+  cron: string;
+  /** The scheduled minute that was skipped (ISO). */
+  minute: string;
+  /** The run that was still active when the slot came due. */
+  activeRunId?: string;
+}
+
+/**
+ * Records a cron slot dropped because the workflow still had an active run
+ * (`ops.schedule-skipped`, #121) — the feed is the operator-visible trace
+ * that a scheduled fire did not happen. Same never-throw guard.
+ */
+export function recordScheduleSkippedActivity(
+  db: Db,
+  payload: ScheduleSkippedActivityPayload,
+): void {
+  try {
+    db.activity.append({
+      type: "ops.schedule-skipped",
+      workflowId: payload.workflowId,
+      payload: {
+        cron: payload.cron,
+        minute: payload.minute,
+        ...(payload.activeRunId === undefined ? {} : { activeRunId: payload.activeRunId }),
+      },
+    });
+  } catch {
+    // Feed appends must never break the scheduler tick.
   }
 }
 

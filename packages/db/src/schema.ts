@@ -275,6 +275,34 @@ export const webhookDeliveries = sqliteTable(
 );
 
 /**
+ * Per-workflow cron schedule (#121): at most one row per workflow (unique
+ * index). The daemon's minute ticker evaluates `cron` in `timezone`'s wall
+ * clock and queues a run of the workflow's latest revision with the task
+ * taken from `task_template`. `last_fired_at` is the ISO minute of the last
+ * scheduled slot the daemon handled (fired OR skipped) — the missed-tick
+ * cursor: after a restart the newest unhandled slot ≤ now fires once, all
+ * older missed slots are deliberately dropped.
+ */
+export const workflowSchedules = sqliteTable(
+  "workflow_schedules",
+  {
+    id: text("id").primaryKey(),
+    workflowId: text("workflow_id")
+      .notNull()
+      .references(() => workflows.id),
+    enabled: integer("enabled", { mode: "boolean" }).notNull(),
+    cron: text("cron").notNull(),
+    taskTemplate: text("task_template").notNull(),
+    timezone: text("timezone").notNull(),
+    /** Missed-tick cursor: last scheduled minute handled (ISO), null until the first. */
+    lastFiredAt: text("last_fired_at"),
+    createdAt: text("created_at").notNull(),
+    updatedAt: text("updated_at").notNull(),
+  },
+  (table) => [uniqueIndex("workflow_schedules_workflow_id_unique").on(table.workflowId)],
+);
+
+/**
  * Append-only agent event log. `seq` is assigned per run by the repository
  * (max(runs.event_seq_hwm, max(seq)) + 1 inside a transaction, then hwm is
  * raised); `payload` stores the event JSON without its `seq` so the column

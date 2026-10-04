@@ -735,6 +735,185 @@ export function createWebhookDeliveryRepo(db: Db): WebhookDeliveryRepo {
   };
 }
 
+/** Config fields of a workflow schedule (#121); the repo mints ids/timestamps. */
+export type WorkflowScheduleConfigInput = {
+  enabled: boolean;
+  cron: string;
+  taskTemplate: string;
+  timezone: string;
+};
+
+/** Fields of a workflow schedule that may change after creation. */
+export type WorkflowSchedulePatch = WorkflowScheduleConfigInput & {
+  /** Missed-tick cursor advance (the scheduler writes the handled minute). */
+  lastFiredAt?: string;
+};
+
+/** One stored workflow schedule (#121); at most one per workflow. */
+export interface WorkflowScheduleRow {
+  id: string;
+  workflowId: string;
+  enabled: boolean;
+  cron: string;
+  taskTemplate: string;
+  timezone: string;
+  /** ISO minute of the last scheduled slot the daemon handled, if any. */
+  lastFiredAt?: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface WorkflowScheduleRepo {
+  /** Inserts the row (the caller mints id/timestamps). */
+  create(schedule: WorkflowScheduleRow): WorkflowScheduleRow;
+  get(id: string): WorkflowScheduleRow | undefined;
+  /** The workflow's schedule, when one exists (at most one, unique index). */
+  getByWorkflow(workflowId: string): WorkflowScheduleRow | undefined;
+  /**
+   * Replaces the workflow's schedule config in one transaction — inserts
+   * when absent, updates in place when present (keeping id, `lastFiredAt`
+   * and `createdAt`). Duplicate schedule records are impossible by
+   * construction; the unique workflow index is the backstop.
+   */
+  upsertByWorkflow(workflowId: string, config: WorkflowScheduleConfigInput): WorkflowScheduleRow;
+  /** Patches mutable fields (including `lastFiredAt`) and bumps `updatedAt`. */
+  update(id: string, patch: Partial<WorkflowSchedulePatch>): WorkflowScheduleRow | undefined;
+  /** Deletes the schedule; true when a row was removed. */
+  delete(id: string): boolean;
+  /** Deletes the workflow's schedule (workflow delete path). Returns rows removed. */
+  deleteForWorkflow(workflowId: string): number;
+  /** Every enabled schedule (the daemon ticker's due-scan input). */
+  listEnabled(): WorkflowScheduleRow[];
+}
+
+export function createWorkflowScheduleRepo(db: Db): WorkflowScheduleRepo {
+  const toDomain = (row: typeof schema.workflowSchedules.$inferSelect): WorkflowScheduleRow => ({
+    id: row.id,
+    workflowId: row.workflowId,
+    enabled: row.enabled,
+    cron: row.cron,
+    taskTemplate: row.taskTemplate,
+    timezone: row.timezone,
+    ...(row.lastFiredAt === null ? {} : { lastFiredAt: row.lastFiredAt }),
+    createdAt: row.createdAt,
+    updatedAt: row.updatedAt,
+  });
+
+  return {
+    create(schedule) {
+      db.insert(schema.workflowSchedules)
+        .values({
+          id: schedule.id,
+          workflowId: schedule.workflowId,
+          enabled: schedule.enabled,
+          cron: schedule.cron,
+          taskTemplate: schedule.taskTemplate,
+          timezone: schedule.timezone,
+          lastFiredAt: schedule.lastFiredAt ?? null,
+          createdAt: schedule.createdAt,
+          updatedAt: schedule.updatedAt,
+        })
+        .run();
+      return schedule;
+    },
+    get(id) {
+      const row = db
+        .select()
+        .from(schema.workflowSchedules)
+        .where(eq(schema.workflowSchedules.id, id))
+        .get();
+      return row ? toDomain(row) : undefined;
+    },
+    getByWorkflow(workflowId) {
+      const row = db
+        .select()
+        .from(schema.workflowSchedules)
+        .where(eq(schema.workflowSchedules.workflowId, workflowId))
+        .get();
+      return row ? toDomain(row) : undefined;
+    },
+    upsertByWorkflow(workflowId, config) {
+      return db.transaction((tx) => {
+        const existing = tx
+          .select()
+          .from(schema.workflowSchedules)
+          .where(eq(schema.workflowSchedules.workflowId, workflowId))
+          .get();
+        const now = new Date().toISOString();
+        if (existing === undefined) {
+          const row = tx
+            .insert(schema.workflowSchedules)
+            .values({
+              id: crypto.randomUUID(),
+              workflowId,
+              enabled: config.enabled,
+              cron: config.cron,
+              taskTemplate: config.taskTemplate,
+              timezone: config.timezone,
+              lastFiredAt: null,
+              createdAt: now,
+              updatedAt: now,
+            })
+            .returning()
+            .get();
+          return toDomain(row as typeof schema.workflowSchedules.$inferSelect);
+        }
+        const row = tx
+          .update(schema.workflowSchedules)
+          .set({
+            enabled: config.enabled,
+            cron: config.cron,
+            taskTemplate: config.taskTemplate,
+            timezone: config.timezone,
+            updatedAt: now,
+          })
+          .where(eq(schema.workflowSchedules.id, existing.id))
+          .returning()
+          .get();
+        return toDomain(row as typeof schema.workflowSchedules.$inferSelect);
+      });
+    },
+    update(id, patch) {
+      const row = db
+        .update(schema.workflowSchedules)
+        .set({
+          ...(patch.enabled === undefined ? {} : { enabled: patch.enabled }),
+          ...(patch.cron === undefined ? {} : { cron: patch.cron }),
+          ...(patch.taskTemplate === undefined ? {} : { taskTemplate: patch.taskTemplate }),
+          ...(patch.timezone === undefined ? {} : { timezone: patch.timezone }),
+          ...(patch.lastFiredAt === undefined ? {} : { lastFiredAt: patch.lastFiredAt }),
+          updatedAt: new Date().toISOString(),
+        })
+        .where(eq(schema.workflowSchedules.id, id))
+        .returning()
+        .get();
+      return row ? toDomain(row) : undefined;
+    },
+    delete(id) {
+      const result = db
+        .delete(schema.workflowSchedules)
+        .where(eq(schema.workflowSchedules.id, id))
+        .run();
+      return result.changes > 0;
+    },
+    deleteForWorkflow(workflowId) {
+      const result = db
+        .delete(schema.workflowSchedules)
+        .where(eq(schema.workflowSchedules.workflowId, workflowId))
+        .run();
+      return result.changes;
+    },
+    listEnabled() {
+      const rows = db
+        .select()
+        .from(schema.workflowSchedules)
+        .where(eq(schema.workflowSchedules.enabled, true))
+        .all();
+      return rows.map(toDomain);
+    },
+  };
+}
+
 export function createAgentPresetRepo(db: Db): AgentPresetRepo {
   const toDomain = (row: typeof schema.agentPresets.$inferSelect): AgentPreset =>
     AgentPresetSchema.parse({

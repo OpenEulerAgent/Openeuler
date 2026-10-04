@@ -106,6 +106,13 @@
       "when": 1791094579058,
       "tag": "0014_graceful_star_brand",
       "breakpoints": true
+    },
+    {
+      "idx": 15,
+      "version": "6",
+      "when": 1791099176033,
+      "tag": "0015_next_amazoness",
+      "breakpoints": true
     }
   ]
 }

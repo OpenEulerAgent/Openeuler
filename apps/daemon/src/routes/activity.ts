@@ -72,7 +72,11 @@ function plural(count: number, label: string): string {
   return `${count} ${label}${count === 1 ? "" : "s"}`;
 }
 
-function opsMessage(type: OpsActivityType, payload: Record<string, unknown> | undefined): string {
+function opsMessage(
+  type: OpsActivityType,
+  payload: Record<string, unknown> | undefined,
+  workflowName: string | undefined,
+): string {
   const numberish = (value: unknown): number =>
     typeof value === "number" && Number.isFinite(value) ? value : 0;
   switch (type) {
@@ -113,8 +117,13 @@ function opsMessage(type: OpsActivityType, payload: Record<string, unknown> | un
       return `Sandbox kept for debugging${image === "" ? "" : ` (${image})`}`;
     }
     case "ops.hosting-expired": {
-      const until = typeof payload?.["until"] === "string" ? (payload["until"] as string) : "";
+      const until = typeof payload?.["until"] === "string" ? payload["until"] : "";
       return `Hosted run expired${until === "" ? "" : ` (was live until ${until})`} — sandbox destroyed`;
+    }
+    case "ops.schedule-skipped": {
+      const minute = typeof payload?.["minute"] === "string" ? payload["minute"] : "";
+      const when = minute === "" ? "" : ` (${minute.slice(0, 16).replace("T", " ")})`;
+      return `Scheduled run of ${workflowName ?? "a workflow"} skipped${when} — a previous run is still active`;
     }
   }
 }
@@ -128,7 +137,7 @@ function activityMessage(
     payload?: Record<string, unknown>;
   },
 ): string {
-  if (isOpsActivityType(type)) return opsMessage(type, refs.payload);
+  if (isOpsActivityType(type)) return opsMessage(type, refs.payload, refs.workflowName);
   switch (type) {
     case "project.created":
       return `Project ${refs.projectName ?? "unknown"} registered`;

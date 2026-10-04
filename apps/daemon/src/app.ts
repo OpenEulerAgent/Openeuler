@@ -34,6 +34,7 @@ import type { WorktreesRouterOptions } from "./routes/worktrees.js";
 import { createWorkflowsRouter } from "./routes/workflows.js";
 import { createWorkflowWebhooksRouter } from "./routes/webhooks.js";
 import { createHooksRouter } from "./routes/webhooks.js";
+import { createWorkflowSchedulesRouter } from "./routes/schedules.js";
 import { createActivityRouter } from "./routes/activity.js";
 import { createRateLimitMiddleware, resolveRateLimits, resolveTrustProxy } from "./rate-limit.js";
 import {
@@ -341,6 +342,9 @@ export function createApp(options: CreateAppOptions = {}): DaemonApp {
   // the bearer gate exempts the /api/hooks/ prefix).
   app.route("/api/workflows", createWorkflowWebhooksRouter());
   app.route("/api/hooks", createHooksRouter({ authToken }));
+  // #121: per-workflow cron schedule management (normal auth); the daemon's
+  // minute ticker (scheduler.ts, started in index.ts) mints the runs.
+  app.route("/api/workflows", createWorkflowSchedulesRouter());
   app.route(
     "/api/runs",
     createRunsRouter({
