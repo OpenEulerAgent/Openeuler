@@ -122,6 +122,21 @@ Kept for ad-hoc runs and pre-revision workflow rows; a migrated workflow's runs 
 
 After every node/step the engine snapshots the worktree: `git add -A` → `diff` vs the previous snapshot tree + `git write-tree` for the next base (starts at `HEAD`). So each StepRun's stored `diff` is **only that step's changes** (`stat\npatch` combined). Diff-capture failures never fail the run — the step just stores no diff. Snapshot trees are not persisted, so on a resume the diff base resets to `HEAD`: the first step after a resume captures everything since HEAD (later steps are incremental again); the cumulative diff view is unaffected.
 
+### Run artifacts (#122)
+
+A workflow graph may declare `artifacts: string[]` — safe, ordered globs (`dist/**`, `reports/**/coverage.*`, `*.log`; leading `!` negates, last match wins, a pattern naming a directory includes its subtree, slash-free patterns match at any depth). Patterns are validated at save time (`packages/core/src/artifacts.ts`: relative POSIX globs, only `*`/`**`/`?` wildcards, no `..`/absolute/brace forms) and snapshotted with the graph revision, so a run's patterns are frozen at creation.
+
+When a run turns **terminal** (success/failed/aborted/interrupted), the flow engine copies every matching regular file out of the run's worktree into the artifact store — `data/artifacts/<runId>/` next to the daemon db, with a `manifest.json` (`runStatus`, `patterns`, `files: [{path, size}]`, `totalBytes`, `truncated` + partial-capture `warning`). Because the copy happens before anyone prunes the worktree, **artifacts survive worktree cleanup** — that is the point — and re-capture (a resumed run finishing again) replaces the set wholesale. Hard caps bound the capture: **200 files / 50 MiB total** per run, deterministic path-order truncation, and the manifest's `warning` records what was left behind. Symlinks are never followed (walk or download), `.git` is skipped, and capture failures only log — they never change a run's outcome. Ad-hoc runs and pre-#122 revisions capture nothing (byte-identical behavior).
+
+Garbage collection rides along with worktree cleanup: `POST /api/system/maintenance {action: prune-worktrees}` and the orphan paths of `POST /api/projects/:id/worktrees/prune` also drop artifact sets whose run row no longer exists; sets of known runs always survive.
+
+The API (daemon `routes/runs.ts`) is terminal-only:
+
+- `GET /api/runs/:id/artifacts` — the manifest (`409 RUN_NOT_TERMINAL` while live, `404 ARTIFACTS_NOT_FOUND` when nothing was captured, `503 ARTIFACTS_UNAVAILABLE` without a store).
+- `GET /api/runs/:id/artifacts/:file` — authenticated octet-stream download of one captured file (Content-Disposition attachment). Path-escape protection mirrors the project files API: lexical containment (`resolveWithinRoot` → `403 PATH_ESCAPE`), realpath containment (a symlink inside the store → `403 PATH_ESCAPE`), manifest membership (`404 ARTIFACT_NOT_FOUND` for anything the capture did not record).
+
+The web run-detail page gains an **Artifacts** tab (`components/run/ArtifactsTab.tsx`): list with sizes/totals, truncated banner, authenticated blob download (the daemon token cannot ride a plain link), and a copy-path affordance.
+
 ## Daemon internals
 
 ### Hardening middleware (#97)

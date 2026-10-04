@@ -73,6 +73,7 @@ The wizard has four steps, skippable at any time via **Skip setup** (bottom-left
 - **Graph** — the run's pinned revision rendered read-only; nodes light up queued/running/success/failed as events stream in, taken edges brighten and the last taken edge animates; clicking a node opens its executions and diffs. Finished runs get a **replay scrubber** (prev/next/play through the execution breadcrumb).
 - **Events** — the raw SSE feed (agent deltas, tool calls, `node.*`/`edge.*` routing events, `run.status` transitions) with reconnect and replay-from-cursor.
 - **Diff** — per-step (per-node) incremental diffs and the cumulative run diff, split view.
+- **Artifacts** — the durable capture of a terminal run's `artifacts` globs (e.g. `dist/**`): list with sizes, authenticated download, copy path — the files survive worktree pruning (capped at 200 files / 50 MiB per run).
 - **Timeline** — the execution breadcrumb as a flat list.
 
 **Watching the team** — the lanes page (`/lanes`) is the parallelism surface: one live column per active run (project, workflow + revision, status, executions, ticking elapsed), patched in place by the global run-status stream — new runs appear as they queue, finished lanes fade out after 5s. The **History** toggle swaps in a filmstrip of the last 20 terminal runs as swimlanes: one block per node execution, width proportional to its duration, colored by outcome, with a run-level start→end ruler. To watch wider batches, raise the daemon's `MAX_CONCURRENT_RUNS` (e.g. `MAX_CONCURRENT_RUNS=4` for a 4-lane demo) before starting runs.

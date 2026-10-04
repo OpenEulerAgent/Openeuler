@@ -1,9 +1,9 @@
 import { serve } from "@hono/node-server";
 import { createDatabase, migrateLinearWorkflowsToGraphs } from "@openeuler/db";
 import { createDriverRegistry, createFakeDriver, createOpenCodeDriver } from "@openeuler/drivers";
-import { WorktreeManager } from "@openeuler/engine";
+import { ArtifactStore, WorktreeManager } from "@openeuler/engine";
 import { createDockerSandboxProvider, registerSandboxProvider } from "@openeuler/sandbox";
-import { dirname } from "node:path";
+import { dirname, join } from "node:path";
 import { createApp } from "./app.js";
 import { recordDaemonBootActivity } from "./activity.js";
 import { createExecutor } from "./executor.js";
@@ -51,6 +51,11 @@ export async function main(): Promise<void> {
 
   const worktrees = new WorktreeManager();
 
+  // Durable run artifacts (#122): captured next to the db (data/artifacts/)
+  // so they share its backup story; one store backs the executor's capture
+  // and the API's list/download routes.
+  const artifacts = new ArtifactStore({ storeRoot: join(dirname(db.path), "artifacts") });
+
   // Sandbox composition at boot (#100 + #102): ONE docker provider instance
   // backs the image management API, the run executor's sandboxed execution
   // and the /metrics sandbox gauge. Registered on the module-level default
@@ -87,6 +92,7 @@ export async function main(): Promise<void> {
     drivers,
     logger,
     secretsKey: secretKey.key,
+    artifacts,
     sandbox: { provider: sandboxProvider },
   });
 
@@ -170,6 +176,7 @@ export async function main(): Promise<void> {
     executor,
     drivers,
     worktrees,
+    artifacts,
     maxConcurrentRuns: executor.maxConcurrentRuns,
     secretsKey: secretKey.key,
     sandbox: { provider: sandboxProvider, status: { service: dockerStatus } },

@@ -34,6 +34,7 @@ import { EventFeed } from "./EventFeed";
 import { HostedRunBanner } from "./HostedRunBanner";
 import { SubworkflowLinks } from "./SubworkflowLinks";
 import { ApprovalBanner } from "./ApprovalBanner";
+import { ArtifactsTab } from "./ArtifactsTab";
 import { InterruptedRunBanner } from "./InterruptedRunBanner";
 import { LocalFallbackBanner } from "./LocalFallbackBanner";
 import { OutputPanel } from "./OutputPanel";
@@ -290,19 +291,27 @@ export function RunDetailView({ runId }: { runId: string }) {
   // the source of truth (`?tab=` deep links; `?stepRunId=` scopes Diff).
   const graphAvailable = detail.run.workflowId !== undefined;
   // Preview (#109) is visible only when the run tracks ports at all —
-  // declared or detected (#107).
+  // declared or detected (#107). Artifacts (#122) require a pinned graph.
   const previewAvailable = (detail.ports?.length ?? 0) > 0;
+  const artifactsAvailable = detail.run.workflowRevisionId !== undefined;
   const defaultTab: RunDetailTab = graphAvailable ? "graph" : "events";
   // Guard: `?tab=graph` on an ad-hoc run (no workflow) and `?tab=preview`
   // on a portless run fall back to the default tab.
   const activeTab: RunDetailTab =
     query.tab === null ||
     (query.tab === "graph" && !graphAvailable) ||
-    (query.tab === "preview" && !previewAvailable)
+    (query.tab === "preview" && !previewAvailable) ||
+    (query.tab === "artifacts" && !artifactsAvailable)
       ? defaultTab
       : query.tab;
   const tabs: ReadonlyArray<TabItem<RunDetailTab>> = RUN_DETAIL_TABS.filter((tab) =>
-    tab.id === "graph" ? graphAvailable : tab.id === "preview" ? previewAvailable : true,
+    tab.id === "graph"
+      ? graphAvailable
+      : tab.id === "preview"
+        ? previewAvailable
+        : tab.id === "artifacts"
+          ? artifactsAvailable
+          : true,
   );
 
   const selectTab = (tab: RunDetailTab, stepRunId?: string): void => {
@@ -399,6 +408,12 @@ export function RunDetailView({ runId }: { runId: string }) {
         ) : null}
 
         {activeTab === "timeline" ? <TimelineTab state={foldState} /> : null}
+
+        {/* Artifacts (#122): the durable capture of a terminal run's
+            patterns — list, download, copy path. Lazy per activation. */}
+        {activeTab === "artifacts" ? (
+          <ArtifactsTab runId={detail.run.id} terminal={effectiveStatus !== undefined && !live} />
+        ) : null}
 
         {/* Preview (#109): mounted only while active — the iframe and its
             HEAD poll are lazy by construction and torn down on switch.

@@ -1,11 +1,11 @@
 /**
  * URL wiring for the run detail page (#52): `?tab=` selects Graph | Events |
- * | Diff | Timeline | Preview (#109), `?stepRunId=` scopes the Diff tab to
- * one StepRun (the node drawer's deep link). Pure string helpers —
- * unit-tested without a router.
+ * | Diff | Timeline | Preview (#109) | Artifacts (#122), `?stepRunId=` scopes
+ * the Diff tab to one StepRun (the node drawer's deep link). Pure string
+ * helpers — unit-tested without a router.
  */
 
-export type RunDetailTab = "graph" | "events" | "diff" | "timeline" | "preview";
+export type RunDetailTab = "graph" | "events" | "diff" | "timeline" | "preview" | "artifacts";
 
 export const RUN_DETAIL_TABS: ReadonlyArray<{ id: RunDetailTab; label: string }> = [
   { id: "graph", label: "Graph" },
@@ -13,6 +13,7 @@ export const RUN_DETAIL_TABS: ReadonlyArray<{ id: RunDetailTab; label: string }>
   { id: "diff", label: "Diff" },
   { id: "timeline", label: "Timeline" },
   { id: "preview", label: "Preview" },
+  { id: "artifacts", label: "Artifacts" },
 ];
 
 export function isRunDetailTab(value: string | null | undefined): value is RunDetailTab {
@@ -21,7 +22,8 @@ export function isRunDetailTab(value: string | null | undefined): value is RunDe
     value === "events" ||
     value === "diff" ||
     value === "timeline" ||
-    value === "preview"
+    value === "preview" ||
+    value === "artifacts"
   );
 }
 

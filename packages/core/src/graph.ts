@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { WorkflowArtifactsSchema } from "./artifacts.js";
 import { idSchema } from "./common.js";
 import { extractOutputReferences } from "./prompt.js";
 import { ExitConditionSchema, StepConfigSchema } from "./workflow.js";
@@ -238,6 +239,14 @@ export const WorkflowGraphShapeSchema = z.strictObject({
   entryNodeId: idSchema,
   nodes: z.array(GraphNodeSchema).min(1, "a workflow graph needs at least one node"),
   edges: z.array(GraphEdgeSchema).default([]),
+  /**
+   * Workflow-level artifact patterns (#122): safe globs (`dist/**`) whose
+   * worktree matches are copied into `data/artifacts/<runId>/` when a run
+   * of this graph turns terminal. Absent on pre-#122 revisions = no capture
+   * (byte-identical behavior). Because revisions are immutable, runs pinned
+   * to older revisions simply keep their era's patterns.
+   */
+  artifacts: WorkflowArtifactsSchema.optional(),
 });
 
 /** Structural graph shape before cross-field validation/normalization. */
@@ -245,6 +254,8 @@ export type WorkflowGraphShape = {
   entryNodeId: string;
   nodes: GraphNode[];
   edges: Array<GraphEdgeInput & { id: string; source: string; target: string }>;
+  /** Workflow-level artifact patterns (#122); absent on pre-#122 graphs. */
+  artifacts?: string[];
 };
 
 /** A validation problem attributed to a node/edge path, for API 422 details. */
@@ -701,7 +712,12 @@ function normalizeWorkflowGraph(graph: WorkflowGraphShape): WorkflowGraph {
     }
     return next;
   });
-  return { entryNodeId: graph.entryNodeId, nodes: graph.nodes, edges };
+  return {
+    entryNodeId: graph.entryNodeId,
+    nodes: graph.nodes,
+    edges,
+    ...(graph.artifacts === undefined ? {} : { artifacts: graph.artifacts }),
+  };
 }
 
 export const WorkflowGraphSchema = WorkflowGraphShapeSchema.superRefine((graph, ctx) => {
@@ -715,6 +731,8 @@ export interface WorkflowGraph {
   entryNodeId: string;
   nodes: GraphNode[];
   edges: GraphEdge[];
+  /** Workflow-level artifact patterns (#122); absent on pre-#122 graphs. */
+  artifacts?: string[];
 }
 
 /** Node lookup helper (undefined when the id is unknown). */

@@ -1,6 +1,6 @@
 import type { Db } from "@openeuler/db";
 import type { DriverRegistry } from "@openeuler/drivers";
-import type { WorktreeManager } from "@openeuler/engine";
+import type { ArtifactStore, WorktreeManager } from "@openeuler/engine";
 import { Hono } from "hono";
 import type { ContentfulStatusCode } from "hono/utils/http-status";
 import { cors } from "hono/cors";
@@ -56,6 +56,8 @@ export interface AppEnv {
     executor: Executor | undefined;
     /** Worktree manager; required for live cumulative diffs (`GET /api/runs/:id/diff`). */
     worktrees: WorktreeManager | undefined;
+    /** Artifact store (#122); backs the run artifacts list/download routes. */
+    artifacts: ArtifactStore | undefined;
     /** Master key for project secrets (#93); unset = secrets routes answer 503. */
     secretsKey: Buffer | undefined;
   };
@@ -67,6 +69,11 @@ export interface CreateAppOptions {
   executor?: Executor;
   /** Worktree manager backing cumulative run diffs; index.ts passes the daemon-wide instance. */
   worktrees?: WorktreeManager;
+  /**
+   * Artifact store backing the run artifacts API (#122); index.ts passes the
+   * daemon-wide instance rooted at `<data dir>/artifacts`.
+   */
+  artifacts?: ArtifactStore;
   /** Driver registry composed at boot; backs `GET /api/drivers`. */
   drivers?: DriverRegistry;
   corsOrigin?: string;
@@ -172,6 +179,7 @@ export function createApp(options: CreateAppOptions = {}): DaemonApp {
   const db = options.db;
   const executor = options.executor;
   const worktrees = options.worktrees;
+  const artifacts = options.artifacts;
   // CORS allowlist (#97): `CORS_ORIGIN` may be a comma-separated list;
   // every entry must match a request's Origin exactly for the ACAO header
   // to be sent (hono cors: string = single exact match, array = any exact
@@ -287,6 +295,7 @@ export function createApp(options: CreateAppOptions = {}): DaemonApp {
     c.set("db", db);
     c.set("executor", executor);
     c.set("worktrees", worktrees);
+    c.set("artifacts", artifacts);
     c.set("secretsKey", options.secretsKey);
     return next();
   });
@@ -351,6 +360,7 @@ export function createApp(options: CreateAppOptions = {}): DaemonApp {
       eventStream: options.eventStream,
       globalStream: options.globalStream,
       worktrees,
+      artifacts,
     }),
   );
   app.route("/api/activity", createActivityRouter());

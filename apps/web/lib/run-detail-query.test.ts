@@ -43,9 +43,11 @@ describe("run-detail query helpers", () => {
       "diff",
       "timeline",
       "preview",
+      "artifacts",
     ]);
     expect(isRunDetailTab("graph")).toBe(true);
     expect(isRunDetailTab("preview")).toBe(true);
+    expect(isRunDetailTab("artifacts")).toBe(true);
     expect(isRunDetailTab("nope")).toBe(false);
     expect(isRunDetailTab(null)).toBe(false);
   });

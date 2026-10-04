@@ -39,6 +39,15 @@ export {
 } from "./flow-engine.js";
 
 export {
+  ARTIFACT_MANIFEST_FILE,
+  ArtifactStore,
+  type ArtifactCaptureResult,
+  type ArtifactFileEntry,
+  type ArtifactManifest,
+  type ArtifactStoreOptions,
+} from "./artifacts.js";
+
+export {
   DEFAULT_INNER_CONCURRENCY,
   MAX_EDGE_ITERATIONS,
   MAX_INNER_CONCURRENCY,

@@ -26,27 +26,33 @@ const FileQuerySchema = z.strictObject({
 
 /**
  * Resolves `relative` against `root` and asserts the result stays inside the
- * project root. Blocks `..` traversal and absolute paths pointing outside the
- * root. Symlink escapes are caught afterwards by {@link realpathWithinRoot}.
- * Throws 403 PATH_ESCAPE on violation.
+ * root. Blocks `..` traversal and absolute paths pointing outside the root.
+ * Symlink escapes are caught afterwards by {@link realpathWithinRoot}.
+ * Throws 403 PATH_ESCAPE on violation. `label` names the root in errors
+ * ("project root", "artifact store" — shared with the run-artifacts routes,
+ * #122).
  */
-export function resolveWithinRoot(root: string, relative: string): string {
+export function resolveWithinRoot(root: string, relative: string, label = "project root"): string {
   if (relative.includes("\0")) {
     throw new HttpError(422, "INVALID_PATH", "path must not contain null bytes");
   }
   const resolved = resolvePath(root, relative);
   if (resolved !== root && !resolved.startsWith(root + sep)) {
-    throw new HttpError(403, "PATH_ESCAPE", `path escapes the project root: ${relative}`);
+    throw new HttpError(403, "PATH_ESCAPE", `path escapes the ${label}: ${relative}`);
   }
   return resolved;
 }
 
 /**
  * Canonicalizes both paths with fs.realpath and re-asserts containment, so a
- * symlink inside the project that points outside is rejected with 403.
+ * symlink inside the root that points outside is rejected with 403.
  * Returns the canonical target path (a 404 when it does not exist).
  */
-async function realpathWithinRoot(root: string, resolved: string): Promise<string> {
+export async function realpathWithinRoot(
+  root: string,
+  resolved: string,
+  label = "project root",
+): Promise<string> {
   let realRoot: string;
   let realTarget: string;
   try {
@@ -54,10 +60,10 @@ async function realpathWithinRoot(root: string, resolved: string): Promise<strin
   } catch (err) {
     const code = (err as NodeJS.ErrnoException).code;
     if (code === "ENOENT" || code === "ENOTDIR") {
-      throw new HttpError(404, "PATH_NOT_FOUND", `path does not exist in project: ${resolved}`);
+      throw new HttpError(404, "PATH_NOT_FOUND", "requested path does not exist");
     }
     if (code === "EINVAL" || code === "ERR_INVALID_ARG_VALUE") {
-      throw new HttpError(422, "INVALID_PATH", `path is not a valid filesystem path: ${resolved}`);
+      throw new HttpError(422, "INVALID_PATH", "path is not a valid filesystem path");
     }
     throw err;
   }
@@ -65,7 +71,7 @@ async function realpathWithinRoot(root: string, resolved: string): Promise<strin
     throw new HttpError(
       403,
       "PATH_ESCAPE",
-      `path resolves outside the project root (symlink?): ${resolved}`,
+      `path resolves outside the ${label} (symlink?): ${resolved}`,
     );
   }
   return realTarget;

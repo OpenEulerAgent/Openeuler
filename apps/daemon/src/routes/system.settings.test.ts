@@ -233,14 +233,24 @@ describe("POST /api/system/maintenance: prune-worktrees (#95)", () => {
 
     const res = await postMaintenance({ action: "prune-worktrees" });
     expect(res.status).toBe(200);
-    expect(await res.json()).toEqual({ action: "prune-worktrees", removed: 1, remaining: 0 });
+    expect(await res.json()).toEqual({
+      action: "prune-worktrees",
+      removed: 1,
+      remaining: 0,
+      artifactsPruned: 0,
+    });
 
     expect(existsSync(join(harness.storeRoot, "run-stale"))).toBe(false);
     expect(existsSync(join(harness.storeRoot, "run-live"))).toBe(true);
 
     // Second run: nothing left to remove.
     const again = await postMaintenance({ action: "prune-worktrees" });
-    expect(await again.json()).toEqual({ action: "prune-worktrees", removed: 0, remaining: 0 });
+    expect(await again.json()).toEqual({
+      action: "prune-worktrees",
+      removed: 0,
+      remaining: 0,
+      artifactsPruned: 0,
+    });
   });
 
   it("answers 503 WORKTREES_UNAVAILABLE without a worktree manager", async () => {

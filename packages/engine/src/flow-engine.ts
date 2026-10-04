@@ -21,6 +21,7 @@ import type {
   AgentMode,
   DriverRegistry,
 } from "@openeuler/drivers";
+import { captureTerminalArtifacts, type ArtifactStore } from "./artifacts.js";
 import {
   compileExitCondition,
   describeCondition,
@@ -221,6 +222,14 @@ export interface FlowEngineOptions {
    * timings. Defaults to a uniform random value in `[0, backoffMs)`.
    */
   retryJitter?: (backoffMs: number) => number;
+  /**
+   * Durable run artifacts (#122). Absent = no capture (byte-identical to
+   * pre-#122). When set, every run that turns terminal with `artifacts`
+   * patterns on its pinned graph gets them copied out of its worktree
+   * (best-effort — capture failures are logged, never surfaced into the
+   * run's outcome).
+   */
+  artifactStore?: ArtifactStore;
 }
 
 export interface FlowEngine {
@@ -1059,6 +1068,17 @@ export function createFlowEngine(options: FlowEngineOptions): FlowEngine {
     } finally {
       runSecrets.delete(childRunId);
       runSandboxes.delete(childRunId);
+      // #122: child runs capture their own artifacts (own worktree, own
+      // pinned graph) — same terminal-only, best-effort contract.
+      if (options.artifactStore !== undefined) {
+        await captureTerminalArtifacts({
+          store: options.artifactStore,
+          db,
+          worktrees,
+          runId: childRunId,
+          log,
+        });
+      }
     }
 
     const final = db.runs.get(childRunId);
@@ -1389,6 +1409,17 @@ export function createFlowEngine(options: FlowEngineOptions): FlowEngine {
         });
         runSecrets.delete(runId);
         runSandboxes.delete(runId);
+        // #122: durable artifacts — copied out of the worktree while it
+        // still exists, best-effort, terminal runs only.
+        if (options.artifactStore !== undefined) {
+          await captureTerminalArtifacts({
+            store: options.artifactStore,
+            db,
+            worktrees,
+            runId,
+            log,
+          });
+        }
       }
     },
     resolveApproval(runId, nodeId, approve, note) {
