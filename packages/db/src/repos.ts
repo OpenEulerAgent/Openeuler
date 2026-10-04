@@ -74,6 +74,8 @@ export type StepRunPatch = {
   status?: StepRunStatus;
   output?: string;
   diff?: string | null;
+  /** Attempt count the execution settled on (#119). */
+  attempt?: number;
 };
 
 export interface ProjectRepo {
@@ -844,6 +846,7 @@ export function createStepRunRepo(db: Db): StepRunRepo {
       status: row.status,
       output: row.output,
       ...(row.diff === null ? {} : { diff: row.diff }),
+      ...(row.attempt === null ? {} : { attempt: row.attempt }),
     });
 
   return {
@@ -859,6 +862,7 @@ export function createStepRunRepo(db: Db): StepRunRepo {
           status: value.status,
           output: value.output,
           diff: value.diff ?? null,
+          attempt: value.attempt ?? null,
         })
         .run();
       return value;
@@ -873,6 +877,7 @@ export function createStepRunRepo(db: Db): StepRunRepo {
             : { status: StepRunStatusSchema.parse(patch.status) }),
           ...(patch.output === undefined ? {} : { output: patch.output }),
           ...(patch.diff === undefined ? {} : { diff: patch.diff }),
+          ...(patch.attempt === undefined ? {} : { attempt: patch.attempt }),
         })
         .where(eq(schema.stepRuns.id, id))
         .returning()

@@ -109,12 +109,13 @@ describe("createDatabase", () => {
 
     // Rewind the file to its pre-0008 shape: forget the last applied
     // migrations (0008 hwm + 0009 run ports + 0010 hosting + 0011 sub-workflow
-    // parentRunId + 0012 approval awaiting) and drop the columns they
-    // added. (Journal rows carry no usable id — order by created_at.)
+    // parentRunId + 0012 approval awaiting + 0013 step attempt) and drop the
+    // columns they added. (Journal rows carry no usable id — order by
+    // created_at.)
     const raw = new Database(join(dir, "test.db"));
     try {
       raw.exec(
-        "delete from __drizzle_migrations where created_at >= (select distinct created_at from __drizzle_migrations order by created_at desc limit 1 offset 4)",
+        "delete from __drizzle_migrations where created_at >= (select distinct created_at from __drizzle_migrations order by created_at desc limit 1 offset 5)",
       );
       raw.exec("alter table runs drop column event_seq_hwm");
       raw.exec("alter table runs drop column ports");
@@ -125,6 +126,7 @@ describe("createDatabase", () => {
       raw.exec("alter table runs drop column parent_run_id");
       raw.exec("alter table runs drop column awaiting_node_id");
       raw.exec("alter table runs drop column awaiting_since");
+      raw.exec("alter table step_runs drop column attempt");
     } finally {
       raw.close();
     }
@@ -447,6 +449,18 @@ describe("step runs", () => {
     expect(db.stepRuns.listByRun(run.id)).toEqual([first, second]);
     expect(db.stepRuns.listByRun(otherRun.id)).toHaveLength(1);
     expect(db.stepRuns.listByRun(uuid())).toEqual([]);
+  });
+
+  it("persists the retry attempt count in place (#119); NULL reads back as absent", () => {
+    const project = db.projects.create(makeProject());
+    const run = db.runs.create(makeRun(project.id));
+    const stepRun = db.stepRuns.create(makeStepRun(run.id));
+    expect("attempt" in (db.stepRuns.listByRun(run.id)[0] ?? {})).toBe(false);
+    db.stepRuns.update(stepRun.id, { attempt: 2 });
+    expect(db.stepRuns.listByRun(run.id)[0]).toMatchObject({ attempt: 2 });
+    db.stepRuns.update(stepRun.id, { attempt: 3, status: "success" });
+    expect(db.stepRuns.listByRun(run.id)[0]).toMatchObject({ attempt: 3, status: "success" });
+    expect(() => db.stepRuns.update(stepRun.id, { attempt: 0 })).toThrow();
   });
 });
 

@@ -322,6 +322,7 @@ export function RunDetailView({ runId }: { runId: string }) {
         nowMs={nowMs}
         endedMs={endedMs}
         executions={foldState.totalExecutions}
+        attempts={foldState.totalAttempts}
         extraActions={
           !live && shownRun.status !== "success" ? <RetryRunButton runId={shownRun.id} /> : null
         }

@@ -153,9 +153,39 @@ export const NodeCompletedEventSchema = z.strictObject({
   edgeId: idSchema.optional(),
   /** The child run this sub-workflow node executed (#117), when known. */
   childRunId: idSchema.optional(),
+  /**
+   * Attempt this execution settled on (#119), 1-based: 1 when the node has
+   * no retry policy, higher when earlier attempts were retried. Absent on
+   * pre-#119 events (read as 1).
+   */
+  attempt: z.number().int().min(1, "attempt must be an integer >= 1").optional(),
 });
 
 export type NodeCompletedEvent = z.infer<typeof NodeCompletedEventSchema>;
+
+/**
+ * Engine-emitted event: a node attempt failed (or, with `retryOn:
+ * "always"`, completed) and the engine will re-execute the node (#119).
+ * `attempt` is the 1-based attempt being retried; `nextInMs` is the
+ * backoff delay (exponential base 2 plus jitter) before the next attempt
+ * starts. Emitted between the attempts' driver events, before the node's
+ * final `node.completed`.
+ */
+export const NodeRetryEventSchema = z.strictObject({
+  type: z.literal("node.retry"),
+  seq: seqSchema,
+  nodeId: idSchema,
+  nodeName: z.string().min(1, "nodeName must be a non-empty string"),
+  iteration: iterationSchema,
+  /** The 1-based attempt that just finished and is being retried. */
+  attempt: z.number().int().min(1, "attempt must be an integer >= 1"),
+  /** Delay before the next attempt starts, jitter included. */
+  nextInMs: z.number().int().min(0, "nextInMs must be an integer >= 0"),
+  /** Why the attempt is being retried (the failure message). */
+  error: z.string().optional(),
+});
+
+export type NodeRetryEvent = z.infer<typeof NodeRetryEventSchema>;
 
 /**
  * Engine-emitted event: an approval gate node (#118) opened its wait —
@@ -292,6 +322,7 @@ export const RunEventSchema = z.discriminatedUnion("type", [
   NodeCompletedEventSchema,
   NodeAwaitingEventSchema,
   NodeApprovedEventSchema,
+  NodeRetryEventSchema,
   EdgeTakenEventSchema,
   EdgeCapReachedEventSchema,
   SandboxLogEventSchema,

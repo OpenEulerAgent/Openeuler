@@ -10,6 +10,7 @@ import type {
   GraphEdge,
   GraphNode,
   JoinGraphNode,
+  NodeRetryConfig,
   Run,
   RunStatus,
   StepRun,
@@ -19,7 +20,13 @@ import type {
 import type { Db, EventInput } from "@openeuler/db";
 import type { PersistedEvent } from "@openeuler/core";
 import type { AgentDriver, AgentHandle, DriverRegistry } from "@openeuler/drivers";
-import type { ApprovalGateOutcome, RunControl, RunSandboxContext } from "./flow-engine.js";
+import type {
+  ApprovalGateOutcome,
+  ApprovalTimerFactory,
+  ApprovalTimerHandle,
+  RunControl,
+  RunSandboxContext,
+} from "./flow-engine.js";
 import type { WorktreeManager } from "./worktree.js";
 import {
   compileExitCondition,
@@ -294,7 +301,48 @@ export interface GraphRunOptions {
    * {@link MAX_SUBWORKFLOW_DEPTH} check on sub-workflow nodes.
    */
   depth?: number;
+  /**
+   * Retry seams (#119): backoff timer factory + jitter source, injected by
+   * the flow engine (fake-clock testable). Defaults to an unref'd
+   * `setTimeout` and uniform jitter in `[0, backoffMs)`.
+   */
+  retrySeams?: NodeRetrySeams;
 }
+
+/**
+ * Injectable seams for node retry backoff (#119): the cancellable wait
+ * (default an unref'd `setTimeout`) and the jitter added to each attempt's
+ * exponential base delay (default uniform in `[0, backoffMs)`). The flow
+ * engine owns the defaults so tests drive deterministic timings.
+ */
+export interface NodeRetrySeams {
+  timer: ApprovalTimerFactory;
+  jitter: (backoffMs: number) => number;
+}
+
+/**
+ * Backoff delay before attempt `attempt + 1` (#119): exponential base 2
+ * (`backoffMs * 2^(attempt-1)`) plus jitter. Pure given the jitter source,
+ * so tests pin jitter to 0 and assert exact timings.
+ */
+export function retryBackoffMs(
+  config: NodeRetryConfig,
+  attempt: number,
+  jitter: (backoffMs: number) => number,
+): number {
+  const base = config.backoffMs * 2 ** (attempt - 1);
+  return base + Math.max(0, Math.floor(jitter(config.backoffMs)));
+}
+
+/** Default retry seams when none are injected (unref'd timer, random jitter). */
+export const DEFAULT_RETRY_SEAMS: NodeRetrySeams = {
+  timer: (delayMs, fire) => {
+    const timer = setTimeout(fire, delayMs);
+    timer.unref?.();
+    return { cancel: () => clearTimeout(timer) };
+  },
+  jitter: (backoffMs) => Math.floor(Math.random() * backoffMs),
+};
 
 /** Terminal outcome of one node execution. */
 interface NodeOutcome {
@@ -1056,8 +1104,13 @@ function reconstructGraphResume(
  * Executes one node execution: StepRun lifecycle (reuse/restart aware),
  * `node.*` events, prompt rendering against the graph variable map, driver
  * invocation, streamed-event persistence, per-step diff, session recording.
- * Sub-workflow nodes (#117) dispatch to {@link runSubworkflowNode} instead
- * of a driver. Never throws — failures land in the returned outcome.
+ * A `config.retry` policy (#119) re-executes failed attempts (or every
+ * attempt, `retryOn: "always"`) up to `maxAttempts`, emitting an ordered
+ * `node.retry` event per retried attempt — retries stay INSIDE the
+ * execution: one StepRun row (its `attempt` field bumps in place), no edge
+ * traversal, no consumption of edge cycle/iteration caps. Sub-workflow
+ * nodes (#117) dispatch to {@link runSubworkflowNode} instead of a driver.
+ * Never throws — failures land in the returned outcome.
  */
 async function runNode(
   deps: GraphEngineDeps,
@@ -1070,6 +1123,7 @@ async function runNode(
   ctx: ExecContext,
   diffBase: { ref: string },
   depth: number,
+  retrySeams: NodeRetrySeams = DEFAULT_RETRY_SEAMS,
 ): Promise<NodeOutcome> {
   if (node.type === "subworkflow") {
     return runSubworkflowNode(deps, runId, node, exec, state, control, ctx, depth);
@@ -1143,72 +1197,150 @@ async function runNode(
             ?.sessionId ?? exec.prevSessionId)
         : exec.prevSessionId;
   }
-  const sessionId = exec.restartSessionId ?? inherited;
+  let sessionId = exec.restartSessionId ?? inherited;
   // Project secrets (#93): decrypted env merged into the driver process.
   const secretEnv = deps.runSecretsEnv(runId);
   // Sandboxed runs (#102): driver cwd becomes the CONTAINER workspace and
   // the command runs through the sandbox exec seam.
   const sandbox = deps.runSandbox(runId);
-  const handle = driver.start({
-    cwd: sandbox?.workspacePath ?? worktreePath,
-    prompt,
-    mode: node.config.mode,
-    ...(node.config.model === undefined ? {} : { model: node.config.model }),
-    ...(node.config.agent === undefined ? {} : { agent: node.config.agent }),
-    ...(sessionId === undefined ? {} : { sessionId }),
-    ...(secretEnv === undefined || Object.keys(secretEnv).length === 0
-      ? {}
-      : { env: { ...secretEnv } }),
-    ...(sandbox === undefined ? {} : { exec: sandbox.exec }),
-  });
-  ctx.handle = handle;
-  control.onHandle?.(handle);
 
+  const retry = node.config.retry;
+  const maxAttempts = retry?.maxAttempts ?? 1;
+
+  /**
+   * Backoff wait before the next attempt (#119): cancellable — a run abort
+   * (or branch cancellation) wakes it so the execution settles `aborted`
+   * instead of sleeping on a dying run.
+   */
+  const waitBackoff = (nextInMs: number): Promise<void> =>
+    new Promise<void>((resolve) => {
+      let settled = false;
+      // Holder so `settle` can cancel/unsubscribe handles that are attached
+      // after its definition (the timer factory may fire synchronously).
+      const live: { timer?: ApprovalTimerHandle; off?: () => void } = {};
+      const settle = (): void => {
+        if (settled) return;
+        settled = true;
+        live.timer?.cancel();
+        live.off?.();
+        resolve();
+      };
+      live.timer = retrySeams.timer(nextInMs, settle);
+      live.off = control.onAbort?.(settle);
+      // A fake timer may have fired synchronously before `off` existed.
+      if (settled) live.off?.();
+    });
+
+  let attempt = 1;
+  let exit: Awaited<AgentHandle["exited"]>;
   let lastErrorMessage: string | undefined;
   let sessionFromEvents: string | undefined;
-  try {
-    for await (const event of handle.events) {
-      deps.appendEvent(runId, event);
-      if (event.type === "session") {
-        sessionFromEvents = event.sessionId;
-        deps.db.stepRuns.update(stepRun.id, { sessionId: event.sessionId });
-      }
-      if (event.type === "error") {
-        lastErrorMessage = event.message;
-      }
-    }
-  } catch (err) {
-    await handle.abort().catch(() => {});
-    throw err;
-  }
-
-  const exit = await handle.exited;
-  ctx.handle = undefined;
-  const diff = await deps.captureDiff(runId, worktreePath, diffBase);
-
   let status: RunStatus;
   let error: string | undefined;
-  if (ctx.cancelRequested) {
-    // Branch cancellation (any-trigger / fail-fast) raced the exit — a
-    // driver that ignored its abort and finished naturally included: the
-    // superseded result is discarded, settling exactly like an aborted
-    // driver so it can never deliver into its join and re-trigger it.
-    status = "aborted";
-  } else if (exit.reason === "exit" && exit.code === 0) {
-    status = "success";
-  } else if (exit.reason === "aborted" && control.isAbortRequested()) {
-    status = "aborted";
-  } else {
-    status = "failed";
-    error =
-      exit.reason === "error"
-        ? (lastErrorMessage ?? "agent run errored")
-        : exit.reason === "aborted"
-          ? "agent run aborted unexpectedly"
-          : `agent exited with code ${exit.code ?? "unknown"}`;
+  for (;;) {
+    lastErrorMessage = undefined;
+    sessionFromEvents = undefined;
+    const handle = driver.start({
+      cwd: sandbox?.workspacePath ?? worktreePath,
+      prompt,
+      mode: node.config.mode,
+      ...(node.config.model === undefined ? {} : { model: node.config.model }),
+      ...(node.config.agent === undefined ? {} : { agent: node.config.agent }),
+      ...(sessionId === undefined ? {} : { sessionId }),
+      ...(secretEnv === undefined || Object.keys(secretEnv).length === 0
+        ? {}
+        : { env: { ...secretEnv } }),
+      ...(sandbox === undefined ? {} : { exec: sandbox.exec }),
+    });
+    ctx.handle = handle;
+    control.onHandle?.(handle);
+
+    try {
+      for await (const event of handle.events) {
+        deps.appendEvent(runId, event);
+        if (event.type === "session") {
+          sessionFromEvents = event.sessionId;
+          deps.db.stepRuns.update(stepRun.id, { sessionId: event.sessionId });
+        }
+        if (event.type === "error") {
+          lastErrorMessage = event.message;
+        }
+      }
+    } catch (err) {
+      await handle.abort().catch(() => {});
+      throw err;
+    }
+
+    exit = await handle.exited;
+    ctx.handle = undefined;
+
+    if (ctx.cancelRequested) {
+      // Branch cancellation (any-trigger / fail-fast) raced the exit — a
+      // driver that ignored its abort and finished naturally included: the
+      // superseded result is discarded, settling exactly like an aborted
+      // driver so it can never deliver into its join and re-trigger it.
+      status = "aborted";
+    } else if (exit.reason === "exit" && exit.code === 0) {
+      status = "success";
+    } else if (exit.reason === "aborted" && control.isAbortRequested()) {
+      status = "aborted";
+    } else {
+      status = "failed";
+      error =
+        exit.reason === "error"
+          ? (lastErrorMessage ?? "agent run errored")
+          : exit.reason === "aborted"
+            ? "agent run aborted unexpectedly"
+            : `agent exited with code ${exit.code ?? "unknown"}`;
+    }
+
+    // Retry decision (#119): never on aborts (the run/branch is going
+    // down); `failure` retries failed attempts only, `always` any outcome.
+    if (
+      retry === undefined ||
+      attempt >= maxAttempts ||
+      status === "aborted" ||
+      (retry.retryOn === "failure" && status !== "failed")
+    ) {
+      break;
+    }
+
+    const nextInMs = retryBackoffMs(retry, attempt, retrySeams.jitter);
+    deps.appendEvent(runId, {
+      type: "node.retry",
+      nodeId: node.id,
+      nodeName: node.name,
+      iteration,
+      attempt,
+      nextInMs,
+      ...(error === undefined ? {} : { error: deps.redactText(runId, error) }),
+    });
+    deps.log.warn(
+      { runId, nodeId: node.id, iteration, attempt, nextInMs, status },
+      "node attempt retried",
+    );
+    await waitBackoff(nextInMs);
+    if (ctx.cancelRequested || control.isAbortRequested()) {
+      // The run died during the backoff: settle aborted, no further starts.
+      status = "aborted";
+      error = undefined;
+      break;
+    }
+    attempt += 1;
+    deps.db.stepRuns.update(stepRun.id, { attempt });
+    // Session preservation across attempts (#119): a continueSession node
+    // keeps the session its previous attempt announced (drivers may not
+    // re-emit `session` when resuming); anything else starts fresh.
+    sessionId = node.config.continueSession ? (sessionFromEvents ?? sessionId) : undefined;
   }
 
-  const effectiveSessionId = sessionFromEvents ?? exec.restartSessionId ?? inherited;
+  const diff = await deps.captureDiff(runId, worktreePath, diffBase);
+
+  const effectiveSessionId = sessionFromEvents ?? sessionId ?? exec.restartSessionId ?? inherited;
+  // Attempt detail on the settled failure (#119): the exhaustion attribution.
+  const attemptDetail =
+    maxAttempts > 1 && status === "failed" ? ` (attempt ${attempt}/${maxAttempts})` : "";
+  const settledError = error === undefined ? undefined : `${error}${attemptDetail}`;
   deps.db.stepRuns.update(stepRun.id, {
     status,
     output: deps.redactText(runId, exit.output),
@@ -1222,13 +1354,19 @@ async function runNode(
     status,
     output: exit.output === "" ? "" : deps.redactText(runId, exit.output),
     durationMs: Math.max(0, Date.now() - startedAtMs),
-    ...(error === undefined ? {} : { error: deps.redactText(runId, error) }),
+    ...(settledError === undefined ? {} : { error: deps.redactText(runId, settledError) }),
     ...(exec.viaEdgeId === undefined ? {} : { edgeId: exec.viaEdgeId }),
+    ...(attempt > 1 ? { attempt } : {}),
   });
   appendBreadcrumb(deps, runId, state, { kind: "node", nodeId: node.id, iteration });
-  deps.log.info({ runId, nodeId: node.id, iteration, status }, "node finished");
+  deps.log.info({ runId, nodeId: node.id, iteration, status, attempt }, "node finished");
 
-  return { status, output: exit.output, error, sessionId: effectiveSessionId };
+  return {
+    status,
+    output: exit.output,
+    error: settledError,
+    sessionId: effectiveSessionId,
+  };
 }
 
 /**
@@ -1563,6 +1701,8 @@ export async function executeGraphRun(
   );
   /** Sub-workflow nesting depth of THIS run (#117); 0 for top-level runs. */
   const depth = options?.depth ?? 0;
+  /** Retry seams (#119): injectable backoff timer + jitter. */
+  const retrySeams = options?.retrySeams ?? DEFAULT_RETRY_SEAMS;
 
   // Compile every edge condition once per run (regex compile failures on
   // schema-bypassing data fail the run with a clear error up front).
@@ -2145,6 +2285,7 @@ export async function executeGraphRun(
         ctx,
         diffBase,
         depth,
+        retrySeams,
       );
       return processCompletion(ctx, outcome);
     } catch (err) {

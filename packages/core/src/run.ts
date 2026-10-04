@@ -234,6 +234,13 @@ export const StepRunSchema = z.strictObject({
   status: StepRunStatusSchema,
   output: z.string(),
   diff: z.string().optional(),
+  /**
+   * Attempt count this execution settled on (#119): 1 (or absent, on
+   * pre-#119 rows) when the node ran once; higher when a retry policy
+   * re-executed the node. One row per node execution — attempts update it
+   * in place.
+   */
+  attempt: z.number().int().min(1, "attempt must be an integer >= 1").optional(),
 });
 
 export type StepRun = z.infer<typeof StepRunSchema>;

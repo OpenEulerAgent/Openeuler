@@ -27,7 +27,12 @@ import {
   evaluateExitCondition,
   type ExitEvaluator,
 } from "./conditions.js";
-import { executeGraphRun, MAX_SUBWORKFLOW_DEPTH, type GraphEngineDeps } from "./graph-engine.js";
+import {
+  executeGraphRun,
+  MAX_SUBWORKFLOW_DEPTH,
+  type GraphEngineDeps,
+  type NodeRetrySeams,
+} from "./graph-engine.js";
 import { detectPorts, mergeDetectedPorts } from "./port-detect.js";
 import type { WorktreeManager } from "./worktree.js";
 import { branchForRun } from "./worktree.js";
@@ -203,6 +208,19 @@ export interface FlowEngineOptions {
    * `setTimeout`.
    */
   approvalTimer?: ApprovalTimerFactory;
+  /**
+   * Timer factory for node retry backoff waits (#119); injectable so tests
+   * drive the delays through a fake clock. Defaults to an unref'd
+   * `setTimeout` (never holds the daemon open).
+   */
+  retryTimer?: ApprovalTimerFactory;
+  /**
+   * Jitter source for node retry backoff (#119): returns the jitter to add
+   * to an attempt's exponential base delay, given the configured
+   * `backoffMs`. Injectable so tests pin it to 0 for deterministic
+   * timings. Defaults to a uniform random value in `[0, backoffMs)`.
+   */
+  retryJitter?: (backoffMs: number) => number;
 }
 
 export interface FlowEngine {
@@ -392,6 +410,22 @@ export function createFlowEngine(options: FlowEngineOptions): FlowEngine {
       timer.unref?.();
       return { cancel: () => clearTimeout(timer) };
     });
+
+  /**
+   * Retry seams (#119): the backoff timer (unref'd by default) and the
+   * jitter added to each exponential base delay (uniform in `[0, backoffMs)`
+   * by default). Both injectable for deterministic fake-clock tests.
+   */
+  const retrySeams: NodeRetrySeams = {
+    timer:
+      options.retryTimer ??
+      ((delayMs, fire) => {
+        const timer = setTimeout(fire, delayMs);
+        timer.unref?.();
+        return { cancel: () => clearTimeout(timer) };
+      }),
+    jitter: options.retryJitter ?? ((backoffMs) => Math.floor(Math.random() * backoffMs)),
+  };
 
   /** Drops a gate from the registry (idempotent; cancels its timer). */
   function dismissApprovalGate(runId: string): ApprovalGate | undefined {
@@ -1218,6 +1252,7 @@ export function createFlowEngine(options: FlowEngineOptions): FlowEngine {
           ? {}
           : { innerConcurrency: options.graphInnerConcurrency }),
         depth,
+        retrySeams,
       });
       return;
     }

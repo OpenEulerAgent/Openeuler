@@ -24,6 +24,12 @@ export interface FakeDriverOptions {
    * single scripted driver vary its output across loop iterations.
    */
   outputs?: string[];
+  /**
+   * Per-start exit codes, cycling by call count: start `n` exits with
+   * `exitCodes[n % exitCodes.length]` (wins over {@link exitCode} when set).
+   * Lets a single scripted driver fail N times then succeed (#119 retries).
+   */
+  exitCodes?: number[];
   /** Exit code reported by `exited` on normal completion. Defaults to `0`. */
   exitCode?: number;
   /** When true, `abort()` rejects with `DriverError` (`DRIVER_ABORT_FAILED`). */
@@ -192,12 +198,17 @@ export class FakeDriver implements AgentDriver {
       outputs !== undefined && outputs.length > 0
         ? outputs[(this.calls.length - 1) % outputs.length]
         : this.options.output;
+    const exitCodes = this.options.exitCodes;
+    const exitCode =
+      exitCodes !== undefined && exitCodes.length > 0
+        ? exitCodes[(this.calls.length - 1) % exitCodes.length]
+        : this.options.exitCode;
     return new FakeAgentHandle({
       id: this.id,
       script: effective,
       delayMs: Math.max(0, this.options.delayMs ?? 0),
       output,
-      exitCode: this.options.exitCode,
+      exitCode,
       failOnAbort: this.options.failOnAbort ?? false,
       started,
       // Recorded on the handle so tests can drive it and abort() can stop

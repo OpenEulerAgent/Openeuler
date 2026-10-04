@@ -93,3 +93,45 @@ describe("FeedItem: sandbox.log (#104)", () => {
     expect(line?.textContent).toContain("100 dropped");
   });
 });
+
+describe("FeedItem: node.retry (#119)", () => {
+  it("renders the retried attempt with its backoff delay and next attempt", async () => {
+    const el = await render({
+      kind: "event",
+      id: "seq-4",
+      event: {
+        type: "node.retry",
+        seq: 4,
+        nodeId: "a",
+        nodeName: "implement",
+        iteration: 1,
+        attempt: 1,
+        nextInMs: 200,
+        error: "agent exited with code 1",
+      },
+    });
+    const line = el.querySelector("p");
+    expect(line?.textContent).toContain("node implement attempt 1 retried");
+    expect(line?.textContent).toContain("agent exited with code 1");
+    expect(line?.textContent).toContain("next attempt in 200ms (attempt 2)");
+  });
+
+  it("renders retryOn 'always' events without an error clause", async () => {
+    const el = await render({
+      kind: "event",
+      id: "seq-5",
+      event: {
+        type: "node.retry",
+        seq: 5,
+        nodeId: "a",
+        nodeName: "implement",
+        iteration: 1,
+        attempt: 1,
+        nextInMs: 100,
+      },
+    });
+    const line = el.querySelector("p");
+    expect(line?.textContent).toContain("attempt 1 retried");
+    expect(line?.textContent).not.toContain("undefined");
+  });
+});
