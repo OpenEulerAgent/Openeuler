@@ -60,10 +60,10 @@ export async function realpathWithinRoot(
   } catch (err) {
     const code = (err as NodeJS.ErrnoException).code;
     if (code === "ENOENT" || code === "ENOTDIR") {
-      throw new HttpError(404, "PATH_NOT_FOUND", `path does not exist: ${resolved}`);
+      throw new HttpError(404, "PATH_NOT_FOUND", "requested path does not exist");
     }
     if (code === "EINVAL" || code === "ERR_INVALID_ARG_VALUE") {
-      throw new HttpError(422, "INVALID_PATH", `path is not a valid filesystem path: ${resolved}`);
+      throw new HttpError(422, "INVALID_PATH", "path is not a valid filesystem path");
     }
     throw err;
   }

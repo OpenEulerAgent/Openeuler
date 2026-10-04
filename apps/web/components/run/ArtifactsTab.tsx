@@ -37,39 +37,64 @@ export function ArtifactsTab({ runId, terminal }: { runId: string; terminal: boo
   const [reloadNonce, setReloadNonce] = useState(0);
   const [copied, setCopied] = useState<string | null>(null);
   const [downloadError, setDownloadError] = useState<string | null>(null);
+  const [downloading, setDownloading] = useState<string | null>(null);
 
   useEffect(() => {
     let cancelled = false;
+    let retryTimer: ReturnType<typeof setTimeout> | undefined;
+    let missingAttempts = 0;
+    let pendingAttempts = 0;
     setState({ phase: "loading" });
     if (!terminal) {
       setState({ phase: "pending" });
       return;
     }
-    fetchRunArtifacts(runId)
-      .then((manifest) => {
-        if (!cancelled) setState({ phase: "ready", manifest });
-      })
-      .catch((err: { status?: number; message?: string }) => {
-        if (cancelled) return;
-        setState(classifyFailure(err?.status ?? 0, err?.message ?? "Failed to load artifacts"));
-      });
+    // The terminal run.status event lands just before artifact capture. Poll
+    // ARTIFACTS_PENDING briefly (and retry one transient 404) so a slow copy
+    // never renders a permanent empty/pending state.
+    const load = (): void => {
+      fetchRunArtifacts(runId)
+        .then((manifest) => {
+          if (!cancelled) setState({ phase: "ready", manifest });
+        })
+        .catch((err: { status?: number; message?: string }) => {
+          if (cancelled) return;
+          const status = err?.status ?? 0;
+          const shouldRetry =
+            (status === 404 && missingAttempts === 0) || (status === 409 && pendingAttempts < 10);
+          if (shouldRetry) {
+            if (status === 404) missingAttempts += 1;
+            else pendingAttempts += 1;
+            retryTimer = setTimeout(load, 750);
+            return;
+          }
+          setState(classifyFailure(status, err?.message ?? "Failed to load artifacts"));
+        });
+    };
+    load();
     return () => {
       cancelled = true;
+      if (retryTimer !== undefined) clearTimeout(retryTimer);
     };
   }, [runId, terminal, reloadNonce]);
 
   const copyPath = useCallback((path: string) => {
-    setCopied(path);
-    void navigator.clipboard?.writeText(path).then(undefined, () => undefined);
+    void navigator.clipboard
+      ?.writeText(path)
+      .then(() => setCopied(path))
+      .catch(() => undefined);
     setTimeout(() => setCopied((current) => (current === path ? null : current)), 1500);
   }, []);
 
   const download = useCallback(
     (path: string) => {
       setDownloadError(null);
-      void downloadRunArtifact(runId, path).catch((err: unknown) => {
-        setDownloadError(err instanceof Error ? err.message : "Download failed");
-      });
+      setDownloading(path);
+      void downloadRunArtifact(runId, path)
+        .catch((err: unknown) => {
+          setDownloadError(err instanceof Error ? err.message : "Download failed");
+        })
+        .finally(() => setDownloading(null));
     },
     [runId],
   );
@@ -127,7 +152,7 @@ export function ArtifactsTab({ runId, terminal }: { runId: string; terminal: boo
         </div>
       ) : null}
       {downloadError ? (
-        <p className="text-xs text-danger" data-testid="artifacts-download-error">
+        <p className="text-xs text-danger" role="status" data-testid="artifacts-download-error">
           {downloadError}
         </p>
       ) : null}
@@ -170,8 +195,10 @@ export function ArtifactsTab({ runId, terminal }: { runId: string; terminal: boo
                           size="sm"
                           onClick={() => download(file.path)}
                           aria-label={`Download ${file.path}`}
+                          loading={downloading === file.path}
+                          disabled={downloading !== null}
                         >
-                          Download
+                          {downloading === file.path ? "Downloading…" : "Download"}
                         </Button>
                         <Button
                           variant="secondary"

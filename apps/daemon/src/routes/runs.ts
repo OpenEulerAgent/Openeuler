@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { existsSync } from "node:fs";
 import { readFile, stat } from "node:fs/promises";
 import type {
   PersistedEvent,
@@ -958,8 +959,8 @@ export function createRunsRouter(options: CreateRunsRouterOptions = {}): Hono<Ap
 
   /**
    * The run's capture manifest — 409 while the run is live (artifacts are
-   * captured at terminal), 404 when no capture exists (the workflow declared
-   * no artifact patterns, or capture never matched).
+   * captured at terminal), 409 when a capture directory exists but its
+   * manifest has not landed yet, and 404 when no capture exists.
    */
   const requireArtifactManifest = (
     artifacts: ArtifactStore,
@@ -974,6 +975,13 @@ export function createRunsRouter(options: CreateRunsRouterOptions = {}): Hono<Ap
     }
     const manifest = artifacts.manifest(run.id);
     if (manifest === null) {
+      if (existsSync(artifacts.dirFor(run.id))) {
+        throw new HttpError(
+          409,
+          "ARTIFACTS_PENDING",
+          `run ${run.id} is terminal but its artifact capture has not finished yet`,
+        );
+      }
       throw new HttpError(
         404,
         "ARTIFACTS_NOT_FOUND",
@@ -998,6 +1006,15 @@ export function createRunsRouter(options: CreateRunsRouterOptions = {}): Hono<Ap
     const manifest = requireArtifactManifest(artifacts, run);
 
     const file = c.req.param("file") ?? "";
+    // Defense in depth (and no filesystem probing): only files the manifest
+    // recorded are servable, so a stray leftover cannot be probed.
+    if (!manifest.files.some((entry) => entry.path === file)) {
+      throw new HttpError(
+        404,
+        "ARTIFACT_NOT_FOUND",
+        `artifact "${file}" is not part of run ${run.id}'s captured set`,
+      );
+    }
     // Two independent guards (#122): lexical containment (resolveWithinRoot
     // → 403 PATH_ESCAPE on `..`/absolute traversal) and realpath containment
     // (a symlink planted in the store cannot serve bytes from outside it).
@@ -1017,17 +1034,17 @@ export function createRunsRouter(options: CreateRunsRouterOptions = {}): Hono<Ap
     if (!stats.isFile()) {
       throw new HttpError(422, "ARTIFACT_NOT_FILE", `artifact "${file}" is not a regular file`);
     }
-    // Defense in depth: only files the manifest recorded are servable, so a
-    // stray leftover in the store directory cannot be probed.
-    if (!manifest.files.some((entry) => entry.path === file)) {
+
+    let bytes;
+    try {
+      bytes = await readFile(real);
+    } catch {
       throw new HttpError(
         404,
         "ARTIFACT_NOT_FOUND",
-        `artifact "${file}" is not part of run ${run.id}'s captured set`,
+        `artifact "${file}" of run ${run.id} disappeared while being read`,
       );
     }
-
-    const bytes = await readFile(real);
     const basename = file.split("/").pop() ?? "artifact";
     const safeName = basename.replace(/[^\w.-]+/g, "_") || "artifact";
     c.header("Content-Type", "application/octet-stream");

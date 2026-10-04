@@ -33,10 +33,9 @@ export function artifactPatternIssue(pattern: string): string | undefined {
   }
   if (pattern.includes("\0")) return "pattern must not contain null bytes";
   if (pattern.includes("\\")) return "pattern must use '/' separators (no backslashes)";
-  if (pattern.startsWith("/"))
-    return "pattern must be relative to the worktree root (no leading '/')";
-  if (/^[A-Za-z]:/.test(pattern)) return "pattern must not be an absolute path";
   const body = pattern.startsWith("!") ? pattern.slice(1) : pattern;
+  if (body.startsWith("/")) return "pattern must be relative to the worktree root (no leading '/')";
+  if (/^[A-Za-z]:/.test(body)) return "pattern must not be an absolute path";
   if (body.length === 0) return "'!' alone is not a pattern";
   if (body.includes("!")) return "'!' is only allowed as the leading negation marker";
   if (/[{}[\]]/.test(body)) {
@@ -90,7 +89,14 @@ function segmentToRegex(segment: string): string {
  */
 export function compileArtifactPattern(pattern: string): (relPath: string) => boolean {
   const anchored = pattern.includes("/");
-  const segments = pattern.split("/");
+  const rawSegments = pattern.split("/");
+  // Collapse consecutive `**` segments (semantically identical) so nested
+  // quantifiers cannot create an exponential backtracking surface.
+  const segments: string[] = [];
+  for (const segment of rawSegments) {
+    if (segment === "**" && segments[segments.length - 1] === "**") continue;
+    segments.push(segment);
+  }
   const parts: string[] = [];
   for (const [index, segment] of segments.entries()) {
     if (segment === "**") {

@@ -1,4 +1,5 @@
 import { apiFetch, daemonBaseUrl } from "./api";
+import { notifyUnauthorized, setPendingRetry } from "./auth-gate";
 import { authorizationHeaderValue, getStoredToken } from "./token";
 
 /**
@@ -66,7 +67,8 @@ export async function downloadRunArtifact(
       document.body.appendChild(anchor);
       anchor.click();
       anchor.remove();
-      URL.revokeObjectURL(url);
+      // Give Safari's download handler a turn before invalidating the URL.
+      setTimeout(() => URL.revokeObjectURL(url), 0);
     });
   const auth = authorizationHeaderValue(getStoredToken());
   const response = await doFetch(
@@ -76,6 +78,11 @@ export async function downloadRunArtifact(
     },
   );
   if (!response.ok) {
+    if (response.status === 401) {
+      // Mirror apiFetch's token-gate behavior for this raw blob fetch.
+      setPendingRetry(() => downloadRunArtifact(runId, path, deps));
+      notifyUnauthorized();
+    }
     let message = `download failed (${response.status})`;
     try {
       const body = (await response.json()) as { error?: { message?: string } };

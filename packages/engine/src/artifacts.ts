@@ -1,8 +1,10 @@
 import {
-  copyFileSync,
+  closeSync,
+  constants as fsConstants,
   existsSync,
-  lstatSync,
+  fstatSync,
   mkdirSync,
+  openSync,
   readdirSync,
   readFileSync,
   renameSync,
@@ -52,7 +54,7 @@ export interface ArtifactManifest {
   patterns: string[];
   files: ArtifactFileEntry[];
   totalBytes: number;
-  /** True when the file-count or byte cap truncated the capture. */
+  /** True when caps or per-file copy problems truncated the capture. */
   truncated: boolean;
   /** Partial-capture warning, present iff `truncated`. */
   warning?: string;
@@ -183,10 +185,14 @@ export class ArtifactStore {
   }): Promise<ArtifactCaptureResult> {
     const { runId, worktreePath, patterns, runStatus } = options;
     const dir = this.dirFor(runId);
+    // Stage the replacement: a crash mid-copy leaves the previous complete
+    // set (and its manifest) untouched. The final directory is created up
+    // front so the API can distinguish "capture pending" from "no capture".
+    const staging = `${dir}.staging`;
     const warnings: string[] = [];
-
-    rmSync(dir, { recursive: true, force: true });
+    rmSync(staging, { recursive: true, force: true });
     mkdirSync(dir, { recursive: true });
+    mkdirSync(staging, { recursive: true });
 
     const matched = [...walkMatches(resolve(worktreePath), "", patterns)].sort((a, b) =>
       a.relPath < b.relPath ? -1 : a.relPath > b.relPath ? 1 : 0,
@@ -201,27 +207,37 @@ export class ArtifactStore {
         truncated = true;
         break;
       }
+      let bytes: Buffer;
       let size: number;
+      let source: number | undefined;
       try {
-        // lstat (not stat): a symlink swapped in since the walk is skipped,
-        // not followed — same escape rule as the walk itself.
-        const stats = lstatSync(match.absPath);
+        // O_NOFOLLOW closes the walk-to-copy symlink race: a link swapped in
+        // after the walk fails the open instead of copying outside bytes.
+        source = openSync(match.absPath, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+        const stats = fstatSync(source);
         if (!stats.isFile()) continue;
         size = stats.size;
+        if (totalBytes + size > this.#maxTotalBytes) {
+          truncated = true;
+          break;
+        }
+        bytes = readFileSync(source);
+        if (bytes.length !== size) {
+          warnings.push(`skipped ${match.relPath}: the file changed while being captured`);
+          continue;
+        }
       } catch (err) {
         warnings.push(
           `skipped ${match.relPath}: ${err instanceof Error ? err.message : String(err)}`,
         );
         continue;
-      }
-      if (totalBytes + size > this.#maxTotalBytes) {
-        truncated = true;
-        break;
+      } finally {
+        if (source !== undefined) closeSync(source);
       }
       try {
-        const target = join(dir, ...match.relPath.split("/"));
+        const target = join(staging, ...match.relPath.split("/"));
         mkdirSync(dirname(target), { recursive: true });
-        copyFileSync(match.absPath, target);
+        writeFileSync(target, bytes);
       } catch (err) {
         warnings.push(
           `failed to copy ${match.relPath}: ${err instanceof Error ? err.message : String(err)}`,
@@ -233,6 +249,7 @@ export class ArtifactStore {
       copied += 1;
     }
 
+    const partial = truncated || warnings.length > 0;
     const manifest: ArtifactManifest = {
       runId,
       runStatus,
@@ -240,20 +257,26 @@ export class ArtifactStore {
       patterns: [...patterns],
       files,
       totalBytes,
-      truncated,
-      ...(truncated
+      truncated: partial,
+      ...(partial
         ? {
-            warning:
-              `partial capture: stopped after ${files.length} file(s) / ${totalBytes} bytes ` +
-              `(caps: ${this.#maxFiles} files, ${this.#maxTotalBytes} bytes); ` +
-              `${matched.length - copied} matching file(s) left behind`,
+            warning: truncated
+              ? `partial capture: stopped after ${files.length} file(s) / ${totalBytes} bytes ` +
+                `(caps: ${this.#maxFiles} files, ${this.#maxTotalBytes} bytes); ` +
+                `${matched.length - copied} matching file(s) left behind`
+              : `partial capture: ${warnings.length} matching file(s) could not be read or copied`,
           }
         : {}),
     };
-    const manifestFile = join(dir, ARTIFACT_MANIFEST_FILE);
-    const tmp = `${manifestFile}.tmp`;
-    writeFileSync(tmp, `${JSON.stringify(manifest, null, 2)}\n`, "utf8");
-    renameSync(tmp, manifestFile);
+    const manifestFile = join(staging, ARTIFACT_MANIFEST_FILE);
+    writeFileSync(manifestFile, `${JSON.stringify(manifest, null, 2)}\n`, "utf8");
+    rmSync(dir, { recursive: true, force: true });
+    try {
+      renameSync(staging, dir);
+    } catch (err) {
+      rmSync(staging, { recursive: true, force: true });
+      throw err;
+    }
     return { manifest, warnings };
   }
 
@@ -276,10 +299,15 @@ export class ArtifactStore {
     const removed: string[] = [];
     for (const entry of readdirSync(this.#storeRoot, { withFileTypes: true })) {
       if (!entry.isDirectory()) continue;
-      if (known.has(entry.name)) continue;
-      if (!RUN_ID_PATTERN.test(entry.name) || entry.name === "." || entry.name === "..") continue;
+      // A capture in progress stages beside its run directory; it belongs to
+      // that run and must survive a concurrent orphan sweep.
+      const baseName = entry.name.endsWith(".staging")
+        ? entry.name.slice(0, -".staging".length)
+        : entry.name;
+      if (known.has(baseName)) continue;
+      if (!RUN_ID_PATTERN.test(baseName) || baseName === "." || baseName === "..") continue;
       rmSync(join(this.#storeRoot, entry.name), { recursive: true, force: true });
-      removed.push(entry.name);
+      removed.push(baseName);
     }
     return removed.sort();
   }

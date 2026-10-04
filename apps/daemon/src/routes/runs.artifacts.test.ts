@@ -214,6 +214,17 @@ describe("GET /api/runs/:id/artifacts (#122)", () => {
     expect(((await res.json()) as ErrorResponseBody).error.code).toBe("ARTIFACTS_NOT_FOUND");
   });
 
+  it("answers 409 ARTIFACTS_PENDING when a terminal capture directory has no manifest", async () => {
+    const h = setup(writerDriver());
+    const workflowId = await makeWorkflow(h, []);
+    const run = await runToStatus(h, workflowId, "success");
+    mkdirSync(h.artifacts.dirFor(run.id), { recursive: true });
+
+    const res = await h.request(`/api/runs/${encodeURIComponent(run.id)}/artifacts`);
+    expect(res.status).toBe(409);
+    expect(((await res.json()) as ErrorResponseBody).error.code).toBe("ARTIFACTS_PENDING");
+  });
+
   it("answers 404 RUN_NOT_FOUND for unknown runs", async () => {
     const h = setup();
     const res = await h.request("/api/runs/nope/artifacts");
@@ -374,16 +385,23 @@ describe("GET /api/runs/:id/artifacts/:file (#122)", () => {
     }
   });
 
-  it("rejects a symlink inside the store that points outside with 403 PATH_ESCAPE", async () => {
+  it("rejects a manifest-member symlink that points outside with 403 PATH_ESCAPE", async () => {
     const h = setup(writerDriver());
     const workflowId = await makeWorkflow(h, ["dist/**"]);
     const run = await runToStatus(h, workflowId, "success");
 
+    const listed = (await (
+      await h.request(`/api/runs/${encodeURIComponent(run.id)}/artifacts`)
+    ).json()) as ArtifactManifest;
+    const member = listed.files[0]?.path;
+    if (member === undefined) throw new Error("expected at least one captured artifact");
     const secret = join(h.dir, "secret.txt");
     writeFileSync(secret, "top secret\n");
-    symlinkSync(secret, join(h.artifacts.dirFor(run.id), "leak.txt"));
+    const captured = join(h.artifacts.dirFor(run.id), ...member.split("/"));
+    rmSync(captured, { force: true });
+    symlinkSync(secret, captured);
 
-    const res = await h.request(`/api/runs/${encodeURIComponent(run.id)}/artifacts/leak.txt`);
+    const res = await h.request(`/api/runs/${encodeURIComponent(run.id)}/artifacts/${member}`);
     expect(res.status).toBe(403);
     expect(((await res.json()) as ErrorResponseBody).error.code).toBe("PATH_ESCAPE");
   });

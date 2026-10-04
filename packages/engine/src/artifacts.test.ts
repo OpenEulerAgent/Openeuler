@@ -220,6 +220,7 @@ describe("ArtifactStore.capture", () => {
       "dist/nested/deep.css",
     ]);
     expect(existsSync(join(h.artifacts.dirFor("run-6"), "src"))).toBe(false);
+    expect(existsSync(`${h.artifacts.dirFor("run-6")}.staging`)).toBe(false);
   });
 
   it("rejects run ids that are unsafe directory names", () => {

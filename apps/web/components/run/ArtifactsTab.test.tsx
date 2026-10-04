@@ -155,9 +155,37 @@ describe("ArtifactsTab", () => {
     expect(api.fetchRunArtifacts).not.toHaveBeenCalled();
   });
 
+  it("retries once when the terminal event beats artifact capture", async () => {
+    api.fetchRunArtifacts
+      .mockRejectedValueOnce(Object.assign(new Error("not yet"), { status: 404 }))
+      .mockResolvedValueOnce(manifest);
+    await render(() => createElement(ArtifactsTab, { runId: "run-1", terminal: true }));
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 800));
+    });
+    expect(api.fetchRunArtifacts).toHaveBeenCalledTimes(2);
+    expect(document.querySelector('[data-testid="artifacts-table"]')).not.toBeNull();
+  });
+
+  it("polls ARTIFACTS_PENDING until the manifest lands", async () => {
+    api.fetchRunArtifacts
+      .mockRejectedValueOnce(Object.assign(new Error("capture running"), { status: 409 }))
+      .mockResolvedValueOnce(manifest);
+    await render(() => createElement(ArtifactsTab, { runId: "run-1", terminal: true }));
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 800));
+    });
+    expect(api.fetchRunArtifacts).toHaveBeenCalledTimes(2);
+    expect(document.querySelector('[data-testid="artifacts-table"]')).not.toBeNull();
+  });
+
   it("shows the empty state for runs without a capture", async () => {
     api.fetchRunArtifacts.mockRejectedValue(Object.assign(new Error("none"), { status: 404 }));
     await render(() => createElement(ArtifactsTab, { runId: "run-1", terminal: true }));
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 800));
+    });
+    expect(api.fetchRunArtifacts).toHaveBeenCalledTimes(2);
     expect(document.querySelector('[data-testid="artifacts-empty"]')).not.toBeNull();
   });
 

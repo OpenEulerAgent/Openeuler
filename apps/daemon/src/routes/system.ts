@@ -121,7 +121,7 @@ export interface SystemSettings {
 
 /** One `POST /api/system/maintenance` outcome (#95), keyed by `action`. */
 export type MaintenanceResult =
-  | { action: "prune-worktrees"; removed: number; remaining: number }
+  | { action: "prune-worktrees"; removed: number; remaining: number; artifactsPruned: number }
   | { action: "purge-events"; deleted: number; dbBytes: number | null }
   | { action: "vacuum"; dbBytes: number | null };
 
