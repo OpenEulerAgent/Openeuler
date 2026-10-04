@@ -25,6 +25,26 @@
   animation: run-node-pulse 1.6s ease-in-out infinite;
 }
 
+@keyframes run-node-await-pulse {
+  0%,
+  100% {
+    box-shadow:
+      0 0 0 0 color-mix(in srgb, var(--warning) 55%, transparent),
+      var(--elevation-2);
+  }
+  50% {
+    box-shadow:
+      0 0 0 6px color-mix(in srgb, var(--warning) 18%, transparent),
+      var(--elevation-2);
+  }
+}
+
+/* #118: an approval gate's wait — amber pulse while a human decides. */
+.run-node-awaiting {
+  border-color: var(--warning);
+  animation: run-node-await-pulse 1.6s ease-in-out infinite;
+}
+
 @keyframes run-edge-march {
   to {
     stroke-dashoffset: -28;

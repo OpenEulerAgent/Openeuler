@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { redactJson, redactSecrets, renderPromptTemplate } from "@openeuler/core";
 import type {
+  ApprovalGraphNode,
   LoopBack,
   LoopVerdict,
   PersistedEvent,
@@ -9,6 +10,7 @@ import type {
   SecretForRedaction,
   Step,
   StepRun,
+  StepRunStatus,
   WorkflowGraph,
 } from "@openeuler/core";
 import type { Db, EventInput } from "@openeuler/db";
@@ -82,7 +84,40 @@ export interface RunControl {
   isAbortRequested(): boolean;
   /** Called with the live driver handle (and `undefined` when it settles). */
   onHandle?(handle: AgentHandle | undefined): void;
+  /**
+   * Subscribes an abort listener (#118): fired when the executor flags the
+   * run aborted, so mid-run WAITS that hold no driver handle (approval
+   * gates) wake and settle like an aborted driver. Returns the
+   * unsubscribe function. Optional — gates without it still exit on the
+   * next scheduler observation of `isAbortRequested`.
+   */
+  onAbort?(listener: () => void): () => void;
 }
+
+/**
+ * How one approval-gate wait ended (#118): a human decision (approve or
+ * reject, optionally with a note), the configured timeout firing
+ * (treated as a rejection with note `"timed out"`), the run aborting
+ * mid-wait (the node settles `aborted`), or a graceful daemon shutdown
+ * (the node settles `interrupted` and the awaiting row survives restart).
+ */
+export type ApprovalGateOutcome =
+  | { reason: "decision"; approved: boolean; note: string | undefined }
+  | { reason: "timeout" }
+  | { reason: "abort" }
+  | { reason: "suspend" };
+
+/** Cancellable timer handle returned by an {@link ApprovalTimerFactory}. */
+export interface ApprovalTimerHandle {
+  cancel(): void;
+}
+
+/**
+ * Timer seam for approval-gate timeouts (#118): injectable so tests drive
+ * timeouts with a fake clock instead of waiting real minutes. The default
+ * arms an unref'd `setTimeout` (never holds the daemon open).
+ */
+export type ApprovalTimerFactory = (delayMs: number, fire: () => void) => ApprovalTimerHandle;
 
 /**
  * Per-run secret context (#93), resolved once at run start by the daemon:
@@ -162,6 +197,12 @@ export interface FlowEngineOptions {
    * creation failed, no image configured).
    */
   acquireRunSandbox?: RunSandboxAcquirer;
+  /**
+   * Timer factory for approval-gate timeouts (#118); injectable so tests
+   * fire timeouts through a fake clock. Defaults to an unref'd
+   * `setTimeout`.
+   */
+  approvalTimer?: ApprovalTimerFactory;
 }
 
 export interface FlowEngine {
@@ -189,6 +230,19 @@ export interface FlowEngine {
    * from the StepRun rows plus the run's breadcrumb instead.
    */
   executeRun(runId: string, control: RunControl, opts?: ExecuteRunOptions): Promise<void>;
+  /**
+   * Resolves an approval gate (#118): `POST /api/runs/:id/approvals/:nodeId`
+   * lands here. Only valid while the run is CURRENTLY awaiting that exact
+   * node — anything else reports `not_awaiting` (the route maps it to 409).
+   * The decision settles the gate's wait; the graph engine then completes
+   * the node and routes on its output.
+   */
+  resolveApproval(
+    runId: string,
+    nodeId: string,
+    approve: boolean,
+    note?: string,
+  ): { outcome: "resolved" } | { outcome: "not_awaiting" };
 }
 
 /** Terminal outcome of one step, fed into the next step's prompt/session. */
@@ -207,9 +261,14 @@ interface RunPlan {
   loopBack: LoopBack | undefined;
 }
 
-const TERMINAL_STATUSES = new Set<RunStatus>(["success", "failed", "aborted", "interrupted"]);
+const TERMINAL_STATUSES = new Set<RunStatus | StepRunStatus>([
+  "success",
+  "failed",
+  "aborted",
+  "interrupted",
+]);
 
-const isTerminal = (status: RunStatus): boolean => TERMINAL_STATUSES.has(status);
+const isTerminal = (status: RunStatus | StepRunStatus): boolean => TERMINAL_STATUSES.has(status);
 
 /** Maps a workflow step (legacy or translated from a graph node) to a plan step. */
 function toStepDefinition(step: Step): StepDefinition {
@@ -314,6 +373,145 @@ export function createFlowEngine(options: FlowEngineOptions): FlowEngine {
     error: (obj: object, msg: string): void => logger?.error(redactLogObj(obj), msg),
   };
 
+  /**
+   * Live approval gates (#118): runId → the open wait. Graph validation keeps
+   * approval gates out of parallel fan-out branches, so a run opens at most
+   * one gate. Keyed by runId so the daemon's approval API reaches the exact
+   * wait through {@link FlowEngine.resolveApproval}.
+   */
+  interface ApprovalGate {
+    nodeId: string;
+    resolve: (outcome: ApprovalGateOutcome) => void;
+    timer: ApprovalTimerHandle | undefined;
+  }
+  const approvalGates = new Map<string, ApprovalGate>();
+  const approvalTimer: ApprovalTimerFactory =
+    options.approvalTimer ??
+    ((delayMs, fire) => {
+      const timer = setTimeout(fire, delayMs);
+      timer.unref?.();
+      return { cancel: () => clearTimeout(timer) };
+    });
+
+  /** Drops a gate from the registry (idempotent; cancels its timer). */
+  function dismissApprovalGate(runId: string): ApprovalGate | undefined {
+    const gate = approvalGates.get(runId);
+    if (gate === undefined) return undefined;
+    approvalGates.delete(runId);
+    gate.timer?.cancel();
+    return gate;
+  }
+
+  /**
+   * Opens one approval gate (#118) and waits for its resolution. The graph
+   * engine calls this with the node's StepRun already `running`; this wait
+   * owns the awaiting persistence (run row `awaitingNodeId`/`awaitingSince`
+   * + the `node.awaiting` event on a FRESH wait — a resumed wait keeps the
+   * pre-restart event and timestamp), the timeout timer (auto-reject) and
+   * the abort race (run abort settles the gate so the node can settle
+   * `aborted` exactly like an aborted driver). Never throws.
+   */
+  async function awaitApproval(params: {
+    runId: string;
+    node: ApprovalGraphNode;
+    iteration: number;
+    control: RunControl;
+    /** True when re-entering a persisted wait after a restart (#118). */
+    resumed: boolean;
+  }): Promise<ApprovalGateOutcome> {
+    const { runId, node, control } = params;
+    // Defensive: a stale gate (should not exist) settles aborted, never leaks.
+    dismissApprovalGate(runId)?.resolve({ reason: "abort" });
+
+    let resolver!: (outcome: ApprovalGateOutcome) => void;
+    const wait = new Promise<ApprovalGateOutcome>((resolve) => {
+      resolver = resolve;
+    });
+    const gate: ApprovalGate = { nodeId: node.id, resolve: resolver, timer: undefined };
+    approvalGates.set(runId, gate);
+
+    const row = db.runs.get(runId);
+    const sameGateResumed = params.resumed && row?.awaitingNodeId === node.id;
+    db.runs.update(runId, {
+      awaitingNodeId: node.id,
+      // A fresh wait timestamps now; a resumed one keeps the original start.
+      ...(sameGateResumed && row?.awaitingSince !== undefined
+        ? {}
+        : { awaitingSince: new Date().toISOString() }),
+    });
+    if (!params.resumed) {
+      appendEvent(runId, {
+        type: "node.awaiting",
+        nodeId: node.id,
+        nodeName: node.name,
+        iteration: params.iteration,
+        prompt: node.config.prompt,
+        ...(node.config.timeoutMinutes === undefined
+          ? {}
+          : { timeoutMinutes: node.config.timeoutMinutes }),
+      });
+    }
+    log.info({ runId, nodeId: node.id, iteration: params.iteration }, "approval gate opened");
+
+    const clearAwaiting = (): void => {
+      const current = db.runs.get(runId);
+      if (current?.awaitingNodeId === node.id) {
+        db.runs.update(runId, { awaitingNodeId: null, awaitingSince: null });
+      }
+    };
+
+    // Timeout: auto-reject (treated downstream as a rejection with note
+    // "timed out"). A resumed wait subtracts the time already spent from the
+    // persisted `awaitingSince` — downtime counts, and an expired gate
+    // rejects immediately. The timer is unref'd (default factory) so it never
+    // holds the daemon open, and cancelled on any other resolution.
+    if (node.config.timeoutMinutes !== undefined) {
+      const timeoutMs = node.config.timeoutMinutes * 60_000;
+      const sinceMs =
+        sameGateResumed && row?.awaitingSince !== undefined
+          ? Date.parse(row.awaitingSince)
+          : Number.NaN;
+      const remainingMs = Number.isFinite(sinceMs) ? timeoutMs - (Date.now() - sinceMs) : timeoutMs;
+      if (remainingMs <= 0) {
+        resolver({ reason: "timeout" });
+      } else {
+        gate.timer = approvalTimer(remainingMs, () => {
+          if (approvalGates.get(runId) !== gate) return;
+          dismissApprovalGate(runId);
+          clearAwaiting();
+          resolver({ reason: "timeout" });
+        });
+      }
+    }
+
+    const offAbort = control.onAbort?.(() => {
+      if (approvalGates.get(runId) !== gate) return;
+      dismissApprovalGate(runId);
+      // Graceful shutdown terminalizes the row BEFORE waking the gate; that
+      // is a suspend, not an abort — the awaiting row survives for resume.
+      const suspended = db.runs.get(runId)?.status === "interrupted";
+      if (!suspended) clearAwaiting();
+      resolver({ reason: suspended ? "suspend" : "abort" });
+    });
+    // The abort may have landed before the listener subscribed.
+    if (approvalGates.get(runId) === gate && control.isAbortRequested()) {
+      dismissApprovalGate(runId);
+      const suspended = db.runs.get(runId)?.status === "interrupted";
+      if (!suspended) clearAwaiting();
+      resolver({ reason: suspended ? "suspend" : "abort" });
+    }
+
+    let settled: ApprovalGateOutcome | undefined;
+    try {
+      settled = await wait;
+      return settled;
+    } finally {
+      dismissApprovalGate(runId);
+      if (settled?.reason !== "suspend") clearAwaiting();
+      offAbort?.();
+    }
+  }
+
   function emitRunStatus(runId: string, status: RunStatus, error?: string): void {
     appendEvent(runId, {
       type: "run.status",
@@ -332,6 +530,8 @@ export function createFlowEngine(options: FlowEngineOptions): FlowEngine {
   /** Moves queued/live step runs to a terminal status (run-level failure). */
   function settleStepRuns(runId: string, status: RunStatus): void {
     for (const stepRun of db.stepRuns.listByRun(runId)) {
+      // StepRun statuses include `awaiting_approval` (#118) — terminal
+      // ONLY in run-status terms, so it settles here like queued/running.
       if (!isTerminal(stepRun.status)) {
         db.stepRuns.update(stepRun.id, { status });
       }
@@ -456,14 +656,15 @@ export function createFlowEngine(options: FlowEngineOptions): FlowEngine {
    * node's own execution number as the iteration.
    */
   function beginStepRun(runId: string, step: { stepId: string }, iteration: number): StepRun {
-    const existing = db.stepRuns
-      .listByRun(runId)
-      .find(
-        (row) =>
-          row.stepId === step.stepId &&
-          row.iteration === iteration &&
-          (row.status === "queued" || row.status === "interrupted"),
-      );
+    const existing = db.stepRuns.listByRun(runId).find(
+      (row) =>
+        row.stepId === step.stepId &&
+        row.iteration === iteration &&
+        (row.status === "queued" ||
+          row.status === "interrupted" ||
+          // #118: an approval gate's row re-enters the wait on resume.
+          row.status === "awaiting_approval"),
+    );
     if (existing) {
       return db.stepRuns.update(existing.id, { status: "running" }) ?? existing;
     }
@@ -484,14 +685,16 @@ export function createFlowEngine(options: FlowEngineOptions): FlowEngine {
    * restart). Flipped to running by {@link beginStepRun} when they start.
    */
   function scheduleStepRun(runId: string, step: { stepId: string }, iteration: number): StepRun {
-    const existing = db.stepRuns
-      .listByRun(runId)
-      .find(
-        (row) =>
-          row.stepId === step.stepId &&
-          row.iteration === iteration &&
-          (row.status === "queued" || row.status === "interrupted"),
-      );
+    const existing = db.stepRuns.listByRun(runId).find(
+      (row) =>
+        row.stepId === step.stepId &&
+        row.iteration === iteration &&
+        (row.status === "queued" ||
+          row.status === "interrupted" ||
+          // #118: adopt an awaiting row (defensive — the sweep settles
+          // it to interrupted across a restart).
+          row.status === "awaiting_approval"),
+    );
     if (existing) return existing;
     return db.stepRuns.create({
       id: randomUUID(),
@@ -858,6 +1061,8 @@ export function createFlowEngine(options: FlowEngineOptions): FlowEngine {
     recordDetectedPorts,
     /** #117: inline child-run execution for sub-workflow nodes. */
     executeChildRun,
+    /** #118: opens an approval gate and waits for its resolution. */
+    awaitApproval,
   };
 
   async function execute(
@@ -1140,9 +1345,29 @@ export function createFlowEngine(options: FlowEngineOptions): FlowEngine {
           emitRunStatus(runId, "failed", message);
         }
       } finally {
+        // #118: a gate still registered (engine crashed / run aborted
+        // without an abort listener) settles and is discarded — its timer is
+        // cancelled, never fires into a dead execution. A row already marked
+        // interrupted (graceful shutdown) suspends for resume.
+        dismissApprovalGate(runId)?.resolve({
+          reason: db.runs.get(runId)?.status === "interrupted" ? "suspend" : "abort",
+        });
         runSecrets.delete(runId);
         runSandboxes.delete(runId);
       }
+    },
+    resolveApproval(runId, nodeId, approve, note) {
+      const gate = approvalGates.get(runId);
+      if (gate === undefined || gate.nodeId !== nodeId) {
+        return { outcome: "not_awaiting" };
+      }
+      dismissApprovalGate(runId);
+      const current = db.runs.get(runId);
+      if (current?.awaitingNodeId === nodeId) {
+        db.runs.update(runId, { awaitingNodeId: null, awaitingSince: null });
+      }
+      gate.resolve({ reason: "decision", approved: approve, note });
+      return { outcome: "resolved" };
     },
   };
 }

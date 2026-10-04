@@ -83,6 +83,21 @@ const ExtendHostingBodySchema = z.strictObject({
     .max(1440, "minutes must be <= 1440 (24h)"),
 });
 
+/**
+ * `POST /api/runs/:id/approvals/:nodeId` body (#118): the decision plus an
+ * optional note (≤2000 chars) recorded on the `node.approved` event and,
+ * on approve, used as the node's output.
+ */
+const ApprovalBodySchema = z.strictObject({
+  approve: z.boolean(),
+  note: z
+    .string({
+      message: "note must be a string of at most 2000 characters (use an empty value to omit it)",
+    })
+    .max(2000, "note must be at most 2000 characters")
+    .optional(),
+});
+
 /** Cursor for SSE resume: `?afterSeq=` or `Last-Event-ID` (a run event seq). */
 const EventCursorSchema = z.coerce
   .number()
@@ -161,6 +176,13 @@ export interface RunDetailBody {
    * host mappings of the kept sandbox. `null`/absent when not hosted.
    */
   hosting?: RunHostingView | null;
+  /**
+   * The approval gate the run is currently waiting on (#118), when its row
+   * carries `awaitingNodeId`: which node, the prompt shown to the
+   * approver, and when the wait opened. Absent when the run is not
+   * paused at a gate.
+   */
+  awaiting?: { nodeId: string; nodeName?: string; prompt: string; since: string };
 }
 
 /** Run list payload: runs plus computed queue metadata for queued rows. */
@@ -344,6 +366,50 @@ function requireRun(db: Db, id: string): Run {
   const run = db.runs.get(id);
   if (!run) throw new HttpError(404, "RUN_NOT_FOUND", `no run with id ${id}`);
   return run;
+}
+
+/**
+ * The run's open approval gate (#118), as served by `GET /api/runs/:id`:
+ * `{nodeId, nodeName?, prompt, since}` from the run row
+ * (`awaitingNodeId`/`awaitingSince`) plus the last persisted
+ * `node.awaiting` event (prompt + node name; falls back to the pinned
+ * graph's node config). Undefined when the run waits on nothing.
+ */
+export function buildRunAwaitingView(
+  db: Db,
+  run: Run,
+): { nodeId: string; nodeName?: string; prompt: string; since: string } | undefined {
+  if (run.awaitingNodeId === undefined) return undefined;
+  const nodeId = run.awaitingNodeId;
+  let prompt: string | undefined;
+  let nodeName: string | undefined;
+  const events = db.events.getSince(run.id);
+  for (let i = events.length - 1; i >= 0; i -= 1) {
+    const event = events[i];
+    if (event !== undefined && event.type === "node.awaiting" && event.nodeId === nodeId) {
+      prompt = event.prompt;
+      nodeName = event.nodeName;
+      break;
+    }
+  }
+  if (prompt === undefined && run.workflowRevisionId !== undefined) {
+    const revision = db.workflowRevisions.get(run.workflowRevisionId);
+    const parsed =
+      revision === undefined ? undefined : WorkflowGraphSchema.safeParse(revision.graph);
+    if (parsed !== undefined && parsed.success) {
+      const node = parsed.data.nodes.find((candidate) => candidate.id === nodeId);
+      if (node !== undefined && node.type === "approval") {
+        prompt = node.config.prompt;
+        nodeName = node.name;
+      }
+    }
+  }
+  return {
+    nodeId,
+    ...(nodeName === undefined ? {} : { nodeName }),
+    prompt: prompt ?? "",
+    since: run.awaitingSince ?? run.updatedAt,
+  };
 }
 
 /**
@@ -756,6 +822,8 @@ export function createRunsRouter(options: CreateRunsRouterOptions = {}): Hono<Ap
     // #110: hosting view — expiry + live host mappings while the hosted
     // sandbox lives (null when the run is not hosted).
     const hosting = buildRunHostingView(run, sandbox);
+    // #118: the open approval gate, when the run is paused at one.
+    const awaiting = buildRunAwaitingView(db, run);
     const body: RunDetailBody = {
       run: decorateRun(db, run, queuePositionsByRunId(db)),
       steps: sorted,
@@ -764,6 +832,7 @@ export function createRunsRouter(options: CreateRunsRouterOptions = {}): Hono<Ap
       ...(sandbox === undefined ? {} : { sandbox }),
       ...(ports.length === 0 ? {} : { ports }),
       hosting,
+      ...(awaiting === undefined ? {} : { awaiting }),
     };
     return c.json(body);
   });
@@ -1062,6 +1131,55 @@ export function createRunsRouter(options: CreateRunsRouterOptions = {}): Hono<Ap
     return c.json({ hosting: buildRunHostingView(db.runs.get(id) as Run, sandbox) });
   });
 
+  // Resolve an approval gate (#118): `POST /api/runs/:id/approvals/:nodeId`
+  // with `{approve: boolean, note?}`. 404 when the run or the node (in the
+  // run's pinned graph) does not exist; 409 when the run is not currently
+  // awaiting THAT node (already resolved, different node, restarted
+  // daemon, or the node is not an approval node). Resolving wakes the run
+  // in place — it continues on the normal execution path.
+  runs.post("/:id/approvals/:nodeId", async (c) => {
+    const db = requireDb(c);
+    const executor = requireExecutor(c);
+    const id = c.req.param("id");
+    const nodeId = c.req.param("nodeId");
+    const run = requireRun(db, id);
+    const body = ApprovalBodySchema.parse(await parseJsonBody(c));
+
+    // The node must exist in the run's pinned graph revision.
+    if (run.workflowRevisionId === undefined) {
+      throw new HttpError(
+        404,
+        "NODE_NOT_FOUND",
+        `run ${id} has no graph revision, so it has no node ${nodeId}`,
+      );
+    }
+    const revision = db.workflowRevisions.get(run.workflowRevisionId);
+    const parsed =
+      revision === undefined ? undefined : WorkflowGraphSchema.safeParse(revision.graph);
+    const node =
+      parsed !== undefined && parsed.success
+        ? parsed.data.nodes.find((candidate) => candidate.id === nodeId)
+        : undefined;
+    if (node === undefined) {
+      throw new HttpError(
+        404,
+        "NODE_NOT_FOUND",
+        `node ${nodeId} does not exist in the graph revision pinned by run ${id}`,
+      );
+    }
+
+    const result = executor.resolveApproval(id, nodeId, body.approve, body.note);
+    if (result.outcome === "not_awaiting") {
+      throw new HttpError(
+        409,
+        "RUN_NOT_AWAITING",
+        `run ${id} (status ${run.status}) is not currently awaiting approval on node ${nodeId}`,
+      );
+    }
+    c.get("logger").info({ runId: id, nodeId, approved: body.approve }, "approval resolved");
+    return c.json({ run: decorateRun(db, db.runs.get(id) as Run) });
+  });
+
   // Resume an interrupted run in place: the engine continues from the current
   // step/iteration, restarting the interrupted step with its recorded
   // sessionId and reusing the existing worktree. Only possible when every
@@ -1081,22 +1199,26 @@ export function createRunsRouter(options: CreateRunsRouterOptions = {}): Hono<Ap
       );
     }
     // Sub-workflow node executions (#117) never record a sessionId (the
-    // child run's own StepRuns carry the sessions) — only AGENT rows need
-    // one for context-preserving resume. Look up the pinned graph's node
-    // kinds to exempt subworkflow steps from the guard.
-    const subworkflowStepIds = new Set<string>();
+    // child run's own StepRuns carry the sessions) — and neither do
+    // approval gates (#118, a human wait, no driver) — only AGENT rows
+    // need one for context-preserving resume. Look up the pinned graph's
+    // node kinds to exempt them from the guard.
+    const sessionlessStepIds = new Set<string>();
     if (run.workflowRevisionId !== undefined) {
       const revision = db.workflowRevisions.get(run.workflowRevisionId);
-      const parsed = revision === undefined ? undefined : WorkflowGraphSchema.safeParse(revision.graph);
+      const parsed =
+        revision === undefined ? undefined : WorkflowGraphSchema.safeParse(revision.graph);
       if (parsed !== undefined && parsed.success) {
         for (const node of parsed.data.nodes) {
-          if (node.type === "subworkflow") subworkflowStepIds.add(node.id);
+          if (node.type === "subworkflow" || node.type === "approval") {
+            sessionlessStepIds.add(node.id);
+          }
         }
       }
     }
     const withoutSession = db.stepRuns
       .listByRun(id)
-      .filter((step) => step.sessionId === undefined && !subworkflowStepIds.has(step.stepId));
+      .filter((step) => step.sessionId === undefined && !sessionlessStepIds.has(step.stepId));
     if (withoutSession.length > 0) {
       throw new HttpError(
         409,

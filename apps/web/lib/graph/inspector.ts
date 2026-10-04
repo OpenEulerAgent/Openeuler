@@ -1,5 +1,6 @@
 import {
   AgentGraphNodeSchema,
+  ApprovalGraphNodeSchema,
   SubworkflowGraphNodeSchema,
   extractOutputReferences,
   renderPromptTemplate,
@@ -116,7 +117,9 @@ export type InspectorField =
   | "config.sandboxOverrides.memoryMb"
   | "config.sandboxOverrides.network"
   | "config.workflowId"
-  | "config.revision";
+  | "config.revision"
+  | "config.prompt"
+  | "config.timeoutMinutes";
 
 export type InspectorFieldErrors = Partial<Record<InspectorField, string>>;
 
@@ -144,6 +147,25 @@ export function inspectorFieldErrors(doc: CanvasDocument, nodeId: string): Inspe
       for (const issue of parsed.error.issues) {
         const field = issue.path.join(".");
         if (field === "name" || field === "config.workflowId" || field === "config.revision") {
+          errors[field as InspectorField] ??= issue.message;
+        }
+      }
+    }
+    return errors;
+  }
+  if (node.data.kind === "approval") {
+    const errors: InspectorFieldErrors = {};
+    const parsed = ApprovalGraphNodeSchema.safeParse({
+      id: node.id,
+      type: "approval",
+      name: node.data.name,
+      position: node.position,
+      config: node.data.config,
+    });
+    if (!parsed.success) {
+      for (const issue of parsed.error.issues) {
+        const field = issue.path.join(".");
+        if (field === "name" || field === "config.prompt" || field === "config.timeoutMinutes") {
           errors[field as InspectorField] ??= issue.message;
         }
       }
@@ -211,6 +233,16 @@ export type InspectorAction =
    * workflow resets the revision to `'latest'`.
    */
   | { type: "patchSubworkflow"; nodeId: string; workflowId?: string; revision?: "latest" | number }
+  /**
+   * Approval gate edits (#118): the prompt shown to the approver and the
+   * optional auto-reject window. `timeoutMinutes: null` clears the
+   * timeout (wait indefinitely).
+   */
+  | {
+      type: "patchApproval";
+      nodeId: string;
+      patch: { prompt?: string; timeoutMinutes?: number | null };
+    }
   | { type: "insertVariable"; nodeId: string; token: string; at: number }
   /**
    * Detach from the preset (#49): drops `presetId`, keeps the node's config
@@ -283,6 +315,32 @@ export function applyInspectorAction(doc: CanvasDocument, action: InspectorActio
             }
           : candidate,
       ),
+    };
+  }
+
+  if (action.type === "patchApproval") {
+    if (node.data.kind !== "approval") return doc;
+    return {
+      ...doc,
+      nodes: doc.nodes.map((candidate) => {
+        if (candidate.id !== action.nodeId || candidate.data.kind !== "approval") {
+          return candidate;
+        }
+        const prompt = action.patch.prompt ?? candidate.data.config.prompt;
+        const timeoutMinutes =
+          action.patch.timeoutMinutes === undefined
+            ? candidate.data.config.timeoutMinutes
+            : action.patch.timeoutMinutes === null
+              ? undefined
+              : action.patch.timeoutMinutes;
+        return {
+          ...candidate,
+          data: {
+            ...candidate.data,
+            config: { prompt, ...(timeoutMinutes === undefined ? {} : { timeoutMinutes }) },
+          },
+        };
+      }),
     };
   }
 

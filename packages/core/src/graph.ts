@@ -122,11 +122,60 @@ export const SubworkflowGraphNodeSchema = z.strictObject({
 
 export type SubworkflowGraphNode = z.infer<typeof SubworkflowGraphNodeSchema>;
 
+/**
+ * Smallest accepted `approval.timeoutMinutes` (#118): a gate must leave a
+ * real review window, not flap.
+ */
+export const MIN_APPROVAL_TIMEOUT_MINUTES = 1;
+
+/** Largest accepted `approval.timeoutMinutes` — 24h (#118). */
+export const MAX_APPROVAL_TIMEOUT_MINUTES = 24 * 60;
+
+const approvalTimeoutMinutesSchema = z
+  .number()
+  .int("timeoutMinutes must be an integer")
+  .min(MIN_APPROVAL_TIMEOUT_MINUTES, `timeoutMinutes must be >= ${MIN_APPROVAL_TIMEOUT_MINUTES}`)
+  .max(
+    MAX_APPROVAL_TIMEOUT_MINUTES,
+    `timeoutMinutes must be <= ${MAX_APPROVAL_TIMEOUT_MINUTES} (24h)`,
+  );
+
+/**
+ * Human approval gate node (#118): a PAUSE in the run. On execution the
+ * engine emits `node.awaiting` (carrying `config.prompt` for the approver),
+ * flips the node's StepRun to `awaiting_approval`, records the gate on the
+ * run row (`awaitingNodeId` + `awaitingSince`) and WAITS — no driver runs.
+ * Resolution: approve → node completes with the note (default
+ * `"approved"`) as output; reject/timeout → the node still completes
+ * (output `rejected: <note>`), and ROUTING decides: conditional outgoing
+ * edges branch on the `"approved"`/`"rejected"` sentinels (never the note
+ * text), while a rejection with no matching conditional branch fails the
+ * run. A timeout is a rejection with note `"timed out"`. For graph-shape
+ * rules the node behaves like an agent node mid-graph (chain/router
+ * outgoing, join feeding) but may not be the entry, may not be a fan-out
+ * branch target, and may not run in parallel with another gate.
+ */
+export const ApprovalGraphNodeSchema = z.strictObject({
+  id: idSchema,
+  type: z.literal("approval"),
+  name: z.string().min(1, "node name must be a non-empty string"),
+  position: GraphNodePositionSchema,
+  config: z.strictObject({
+    /** Question shown to the approver in the banner/feed. */
+    prompt: z.string().min(1, "prompt must be a non-empty string"),
+    /** Auto-reject after this many minutes; absent = wait indefinitely. */
+    timeoutMinutes: approvalTimeoutMinutesSchema.optional(),
+  }),
+});
+
+export type ApprovalGraphNode = z.infer<typeof ApprovalGraphNodeSchema>;
+
 export const GraphNodeSchema = z.discriminatedUnion("type", [
   AgentGraphNodeSchema,
   ExitGraphNodeSchema,
   JoinGraphNodeSchema,
   SubworkflowGraphNodeSchema,
+  ApprovalGraphNodeSchema,
 ]);
 
 export type GraphNode = z.infer<typeof GraphNodeSchema>;
@@ -284,6 +333,9 @@ function indexGraph(graph: WorkflowGraphShape): GraphIndex {
  * - `agent` nodes never receive unconditional edges from PARALLEL branches
  *   (sources sharing a fan-out ancestor) — fan-in is a join's job; serial
  *   loop shapes (`always` back-edges into a router node) stay valid
+ * - approval gates never sit in PARALLEL branches (#118): a run exposes one
+ *   open gate (`awaitingNodeId`), so distinct fan-out branch subtrees may not
+ *   each contain an approval node; merge the branches before the next gate
  * - exit nodes are terminals (no outgoing edges)
  * - router `order` unique among a node's conditional outgoing edges
  * - `{{output:<nodeId>}}` template references point at upstream nodes only
@@ -377,6 +429,25 @@ export function validateWorkflowGraph(graph: WorkflowGraphShape): GraphValidatio
     );
   }
 
+  /** Direct branch targets of every fan-out (≥ 2 unconditional out-edges). */
+  const fanOuts = [...index.outgoing.values()]
+    .map((edges) =>
+      edges.filter((item) => isUnconditional(item.edge)).map((item) => item.edge.target),
+    )
+    .filter((targets) => targets.length >= 2);
+  const reaches = (from: string, nodeId: string): boolean =>
+    from === nodeId || (index.reach.get(from) ?? new Set<string>()).has(nodeId);
+  /** Whether two nodes live in EXCLUSIVE subtrees of one fan-out. */
+  const inParallelBranches = (a: string, b: string): boolean =>
+    fanOuts.some((targets) =>
+      targets.some((t1) =>
+        targets.some(
+          (t2) =>
+            t1 !== t2 && reaches(t1, a) && !reaches(t2, a) && reaches(t2, b) && !reaches(t1, b),
+        ),
+      ),
+    );
+
   for (const [nodeIndex, node] of graph.nodes.entries()) {
     const siblings = index.outgoing.get(node.id) ?? [];
     const unconditional = siblings.filter((item) => isUnconditional(item.edge));
@@ -408,14 +479,14 @@ export function validateWorkflowGraph(graph: WorkflowGraphShape): GraphValidatio
           `join node "${node.id}" must not have conditional outgoing edges (a join synchronizes branches, it does not route)`,
         );
       }
-    } else if (node.type === "agent" || node.type === "subworkflow") {
-      // Parallel fan-in is a join's job: an executable node (agent or
-      // sub-workflow, #117) may not receive unconditional edges from two
-      // sources that can run CONCURRENTLY — i.e. sources sharing a fan-out
-      // ancestor. Serial shapes stay valid: legacy loops and template loops
-      // re-enter a router node through an `always` back-edge (one delivery
-      // at a time), and conditional incoming edges are unrestricted (one
-      // delivery per source routing).
+    } else if (node.type === "agent" || node.type === "subworkflow" || node.type === "approval") {
+      // Parallel fan-in is a join's job: an executable node (agent,
+      // sub-workflow, #117 — or an approval gate, #118) may not receive
+      // unconditional edges from two sources that can run CONCURRENTLY —
+      // i.e. sources sharing a fan-out ancestor. Serial shapes stay valid:
+      // legacy loops and template loops re-enter a router node through an
+      // `always` back-edge (one delivery at a time), and conditional
+      // incoming edges are unrestricted (one delivery per source routing).
       const incoming = index.incoming.get(node.id) ?? [];
       const incomingAlways = incoming.filter((item) => isUnconditional(item.edge));
       if (incomingAlways.length > 1) {
@@ -439,7 +510,25 @@ export function validateWorkflowGraph(graph: WorkflowGraphShape): GraphValidatio
         if (parallelConvergence) {
           push(
             ["nodes", nodeIndex, "type"],
-            `agent node "${node.id}" receives unconditional (always) edges from parallel branches; merge them at a join node instead`,
+            `node "${node.id}" receives unconditional (always) edges from parallel branches; merge them at a join node instead`,
+          );
+        }
+      }
+
+      if (node.type === "approval") {
+        // ANY two deliveries into one gate can overlap while it waits —
+        // including a conditional edge from a sibling branch (#118) — so
+        // parallel incoming sources are rejected regardless of edge kind.
+        const sources = [
+          ...new Set((index.incoming.get(node.id) ?? []).map((item) => item.edge.source)),
+        ];
+        const parallelSources = sources.some((source) =>
+          sources.some((other) => other !== source && inParallelBranches(source, other)),
+        );
+        if (parallelSources) {
+          push(
+            ["nodes", nodeIndex, "type"],
+            `approval node "${node.id}" receives edges from parallel branches; merge them at a join node instead (one delivery may wait at a time)`,
           );
         }
       }
@@ -494,6 +583,25 @@ export function validateWorkflowGraph(graph: WorkflowGraphShape): GraphValidatio
         } else {
           byOrder.set(order, item.edge.id);
         }
+      }
+    }
+  }
+
+  // Approval gates in parallel branches (#118): a run carries ONE open gate
+  // (`awaitingNodeId`), so two approval nodes may not live in distinct branch
+  // subtrees of the same fan-out. Reachability through a common join makes a
+  // later gate serial (each branch's fan-out target reaches it), so only
+  // branch-EXCLUSIVE gates are rejected.
+  const approvals = graph.nodes
+    .map((node, nodeIndex) => ({ node, nodeIndex }))
+    .filter((item) => item.node.type === "approval");
+  for (const [i, first] of approvals.entries()) {
+    for (const second of approvals.slice(i + 1)) {
+      if (inParallelBranches(first.node.id, second.node.id)) {
+        push(
+          ["nodes", second.nodeIndex, "type"],
+          `approval nodes "${first.node.id}" and "${second.node.id}" would run in parallel branches; a run supports one open approval gate — merge the branches first`,
+        );
       }
     }
   }

@@ -106,6 +106,7 @@ const stubExecutor = (sandboxFor: (runId: string) => RunSandboxInfo | undefined)
   sandboxInfo: async (runId) => sandboxFor(runId),
   stopHosting: async () => ({ outcome: "not_hosted" }),
   extendHosting: async () => ({ outcome: "not_hosted" }),
+  resolveApproval: () => ({ outcome: "not_awaiting" }),
   maxConcurrentRuns: 1,
   shutdown: async () => {},
 });

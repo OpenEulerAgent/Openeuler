@@ -176,7 +176,9 @@ export function toRunFlowNodes(
           ? "run-join"
           : node.type === "subworkflow"
             ? "run-subworkflow"
-            : "run-exit",
+            : node.type === "approval"
+              ? "run-approval"
+              : "run-exit",
     position: node.position,
     data: runNodeData(node.data, (visuals[node.id] as NodeVisualSlice | undefined) ?? null),
     draggable: false,

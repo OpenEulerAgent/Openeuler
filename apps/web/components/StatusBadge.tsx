@@ -9,7 +9,8 @@ export { statusMeta as statusBadgeStyle } from "@/components/ui/badge";
 /**
  * Status badge for runs/steps/nodes: a thin wrapper over the Badge primitive
  * mapping every status (queued/running/success/failed/aborted/interrupted,
- * plus neutral) to the canonical variant + label from the design system.
+ * the approval-gate awaiting statuses (#118), plus neutral) to the canonical
+ * variant + label from the design system.
  */
 export function StatusBadge({
   status,
@@ -26,7 +27,7 @@ export function StatusBadge({
       <span
         aria-hidden
         className={
-          status === "running"
+          status === "running" || status === "awaiting" || status === "awaiting_approval"
             ? "size-1.5 animate-pulse rounded-full bg-current"
             : "size-1.5 rounded-full bg-current"
         }

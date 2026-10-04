@@ -12,7 +12,11 @@ export const RunStatusSchema = z.enum([
 
 export type RunStatus = z.infer<typeof RunStatusSchema>;
 
-/** Statuses a run never leaves; the SSE layer closes streams on these. */
+/**
+ * Statuses a run never leaves; the SSE layer closes streams on these.
+ * `awaiting_approval` is deliberately NOT here — a run stays `running`
+ * while paused at an approval gate (#118).
+ */
 export const TERMINAL_RUN_STATUSES = ["success", "failed", "aborted", "interrupted"] as const;
 
 export type TerminalRunStatus = (typeof TERMINAL_RUN_STATUSES)[number];
@@ -186,11 +190,35 @@ export const RunSchema = z.strictObject({
    * itself stays `success`.
    */
   hostedUntil: timestampSchema.optional(),
+  /**
+   * Set while the run is paused at an approval gate (#118): the id of the
+   * APPROVAL node the engine is waiting on. Written when the gate opens,
+   * cleared on resolution/timeout/abort; survives a daemon restart (the
+   * boot sweep keeps it) so resume re-enters the await without
+   * re-executing the node.
+   */
+  awaitingNodeId: idSchema.optional(),
+  /**
+   * When the current approval gate opened (#118): ISO timestamp, written
+   * alongside `awaitingNodeId`. Powers the run detail banner's "waiting
+   * since" line.
+   */
+  awaitingSince: timestampSchema.optional(),
   createdAt: timestampSchema,
   updatedAt: timestampSchema,
 });
 
 export type Run = z.infer<typeof RunSchema>;
+
+/**
+ * Statuses a StepRun row may carry: the run statuses plus
+ * `awaiting_approval` (#118) — an approval gate node's execution paused
+ * mid-run waiting for a human decision (or its timeout). Additive over
+ * {@link RunStatusSchema}; runs themselves never carry this status.
+ */
+export const StepRunStatusSchema = z.enum([...RunStatusSchema.options, "awaiting_approval"]);
+
+export type StepRunStatus = z.infer<typeof StepRunStatusSchema>;
 
 /**
  * One step's execution inside a run, tied to an agent session when kept.
@@ -203,7 +231,7 @@ export const StepRunSchema = z.strictObject({
   stepId: idSchema,
   iteration: z.number().int().min(1, "iteration must be an integer >= 1"),
   sessionId: z.string().optional(),
-  status: RunStatusSchema,
+  status: StepRunStatusSchema,
   output: z.string(),
   diff: z.string().optional(),
 });

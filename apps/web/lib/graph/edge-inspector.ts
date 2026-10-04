@@ -37,6 +37,15 @@ export const MISSING_FALLBACK_MESSAGE =
  */
 export const FAN_OUT_NOTICE = "fan-out: branches run in parallel — converge them at a join node";
 
+/**
+ * Advisory notice for an approval gate's conditional outgoing edges (#118):
+ * the gate's output is the note on approve (default "approved") and
+ * `rejected: <note>` on reject/timeout, so branches usually test
+ * `outputContains "approved"` / `"rejected"`.
+ */
+export const APPROVAL_OUTCOME_MESSAGE =
+  'approval outcome branches on the node output — conditions usually test outputContains "approved" / "rejected"';
+
 /** Advisory finding for a node (never blocks saving, unlike CanvasIssue). */
 export interface CanvasWarning {
   nodeId: string;
@@ -408,6 +417,51 @@ export function fanOutNotices(doc: CanvasDocument): CanvasWarning[] {
       ).length;
       if (converged >= 2) continue;
       notices.push({ nodeId: node.id, message: FAN_OUT_NOTICE });
+    }
+  }
+  return notices;
+}
+
+// ---------------------------------------------------------------------------
+// Approval outcome notices (#118)
+//
+
+/** Whether a conditional edge's text references the approval verdicts. */
+const conditionReferencesOutcome = (data: CanvasEdgeData): boolean => {
+  const condition = data.condition;
+  const text =
+    condition.type === "outputContains" || condition.type === "outputNotContains"
+      ? condition.pattern
+      : condition.type === "outputMatches"
+        ? condition.regex
+        : "";
+  return /approved|rejected/i.test(text);
+};
+
+/**
+ * Advisory notices for approval gate nodes (#118): a gate with conditional
+ * outgoing edges whose conditions reference neither `approved` nor
+ * `rejected` probably branches on the wrong thing — the gate's output is
+ * the approval note (`"approved"` by default) or `rejected: <note>`.
+ * Rejections with NO conditional outgoing fail the run, so the notice also
+ * nudges gates whose edges are all `always`.
+ */
+export function approvalOutcomeNotices(doc: CanvasDocument): CanvasWarning[] {
+  const notices: CanvasWarning[] = [];
+  for (const node of doc.nodes) {
+    if (node.data.kind !== "approval") continue;
+    const siblings = doc.edges.filter((edge) => edge.source === node.id);
+    if (siblings.length === 0) continue;
+    const conditional = siblings.filter((edge) => !isUnconditionalEdge(edge.data));
+    if (conditional.length === 0) {
+      notices.push({
+        nodeId: node.id,
+        message: APPROVAL_OUTCOME_MESSAGE,
+      });
+      continue;
+    }
+    if (conditional.some((edge) => !conditionReferencesOutcome(edge.data))) {
+      notices.push({ nodeId: node.id, message: APPROVAL_OUTCOME_MESSAGE });
     }
   }
   return notices;

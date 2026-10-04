@@ -1,5 +1,6 @@
 import type {
   AgentGraphNode,
+  ApprovalGraphNode,
   ExitCondition,
   ExitGraphNode,
   GraphEdge,
@@ -70,11 +71,23 @@ export interface SubworkflowNodeData extends Record<string, unknown> {
   isEntry?: boolean;
 }
 
-export type CanvasNodeData = AgentNodeData | ExitNodeData | JoinNodeData | SubworkflowNodeData;
+/**
+ * Approval gate payload (#118): the question shown to the approver plus
+ * the optional auto-reject window (minutes). No driver — reaching the
+ * node PAUSES the run until a human decides (or the timeout rejects).
+ */
+export interface ApprovalNodeData extends Record<string, unknown> {
+  kind: "approval";
+  name: string;
+  config: { prompt: string; timeoutMinutes?: number };
+}
+
+export type CanvasNodeData =
+  AgentNodeData | ExitNodeData | JoinNodeData | SubworkflowNodeData | ApprovalNodeData;
 
 export type CanvasNode = {
   id: string;
-  type: "agent" | "exit" | "join" | "subworkflow";
+  type: "agent" | "exit" | "join" | "subworkflow" | "approval";
   position: GraphNodePosition;
   data: CanvasNodeData;
   /** React Flow selection flag; runtime-only, never serialized. */
@@ -207,6 +220,25 @@ export function createSubworkflowNode(
   };
 }
 
+/**
+ * A fresh approval gate node as the palette creates it (#118): a
+ * placeholder prompt (a live validation blocker until the inspector fills
+ * a real question) and no timeout by default — the gate waits
+ * indefinitely until a human decides.
+ */
+export function createApprovalNode(
+  position: GraphNodePosition = { x: 0, y: 0 },
+  name = "Approval",
+  prompt = "",
+): CanvasNode {
+  return {
+    id: newCanvasNodeId(),
+    type: "approval",
+    position,
+    data: { kind: "approval", name, config: { prompt } },
+  };
+}
+
 /** Structural slice of an {@link AgentPreset} the canvas needs to build a node. */
 export type PresetSource = {
   id: string;
@@ -301,6 +333,24 @@ export function toCanvasDocument(graph: WorkflowGraph): CanvasDocument {
         },
       };
     }
+    if (node.type === "approval") {
+      const approval = node as ApprovalGraphNode;
+      return {
+        id: approval.id,
+        type: "approval" as const,
+        position: approval.position,
+        data: {
+          kind: "approval" as const,
+          name: approval.name,
+          config: {
+            prompt: approval.config.prompt,
+            ...(approval.config.timeoutMinutes === undefined
+              ? {}
+              : { timeoutMinutes: approval.config.timeoutMinutes }),
+          },
+        },
+      };
+    }
     const exit = node as ExitGraphNode;
     return {
       id: exit.id,
@@ -355,6 +405,20 @@ export function fromCanvasDocument(doc: CanvasDocument): WorkflowGraph {
         name: node.data.name,
         position: node.position,
         config: { workflowId: node.data.config.workflowId, revision: node.data.config.revision },
+      };
+    }
+    if (node.data.kind === "approval") {
+      return {
+        id: node.id,
+        type: "approval" as const,
+        name: node.data.name,
+        position: node.position,
+        config: {
+          prompt: node.data.config.prompt,
+          ...(node.data.config.timeoutMinutes === undefined
+            ? {}
+            : { timeoutMinutes: node.data.config.timeoutMinutes }),
+        },
       };
     }
     return {

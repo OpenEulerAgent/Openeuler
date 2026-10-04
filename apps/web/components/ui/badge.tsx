@@ -1,4 +1,4 @@
-import type { RunStatus } from "@openeuler/core";
+import type { RunStatus, StepRunStatus } from "@openeuler/core";
 import type { HTMLAttributes, ReactNode } from "react";
 import { cn } from "@/lib/cn";
 
@@ -41,8 +41,12 @@ export function Badge({
   );
 }
 
-/** Every status a run/step/node can carry, plus a neutral non-status. */
-export type BadgeStatus = RunStatus | "neutral";
+/**
+ * Every status a run/step/node can carry, plus a neutral non-status.
+ * `awaiting` mirrors the run-graph fold's visual status for an approval
+ * gate wait (#118); `awaiting_approval` is the StepRun row status.
+ */
+export type BadgeStatus = RunStatus | StepRunStatus | "awaiting" | "neutral";
 
 export interface StatusMeta {
   label: string;
@@ -59,6 +63,8 @@ export const STATUS_META: Record<BadgeStatus, StatusMeta> = {
   neutral: { label: "Neutral", variant: "neutral" },
   queued: { label: "Queued", variant: "neutral" },
   running: { label: "Running", variant: "info" },
+  awaiting: { label: "Awaiting approval", variant: "warning" },
+  awaiting_approval: { label: "Awaiting approval", variant: "warning" },
   success: { label: "Success", variant: "success" },
   failed: { label: "Failed", variant: "danger" },
   aborted: { label: "Aborted", variant: "warning" },

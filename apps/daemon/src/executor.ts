@@ -1,4 +1,4 @@
-import type { ProjectSandboxPolicy, Run, RunStatus } from "@openeuler/core";
+import type { ProjectSandboxPolicy, Run, RunStatus, StepRunStatus } from "@openeuler/core";
 import { hostingKeepAliveMinutes, MAX_HOSTING_EXTEND_MINUTES } from "@openeuler/core";
 import type { Db } from "@openeuler/db";
 import type {
@@ -186,6 +186,9 @@ export type HostingStopResult = { outcome: "stopped" } | { outcome: "not_hosted"
 export type HostingExtendResult =
   { outcome: "extended"; until: string } | { outcome: "not_hosted" };
 
+/** Outcome of {@link Executor.resolveApproval}; routes map this to HTTP statuses. */
+export type ApprovalResolution = { outcome: "resolved" } | { outcome: "not_awaiting" };
+
 export interface Executor {
   /**
    * Begins background execution of a queued run. Never throws and never
@@ -231,6 +234,18 @@ export interface Executor {
   extendHosting(runId: string, minutes: number): Promise<HostingExtendResult>;
   /** Configured global concurrency cap (`MAX_CONCURRENT_RUNS`). */
   maxConcurrentRuns: number;
+  /**
+   * Resolves an approval gate the run is currently waiting on (#118):
+   * `POST /api/runs/:id/approvals/:nodeId` lands here and is forwarded
+   * to the flow engine, which holds the gate. `not_awaiting` when no
+   * gate is open for that (run, node) — the route maps it to 409.
+   */
+  resolveApproval(
+    runId: string,
+    nodeId: string,
+    approve: boolean,
+    note?: string,
+  ): ApprovalResolution;
   /** Best-effort graceful stop: aborts active runs and waits briefly for them. */
   shutdown(): Promise<void>;
 }
@@ -309,6 +324,12 @@ interface ActiveRun {
   /** Live driver handle of the step currently executing, if any. */
   handle?: AgentHandle;
   abortRequested: boolean;
+  /**
+   * Abort listeners (#118): fired when the run is flagged aborted, so
+   * mid-run waits without a driver handle (approval gates) wake and
+   * settle. Unsubscribed when the listener's gate resolves.
+   */
+  abortListeners: Set<() => void>;
   done: Promise<void>;
 }
 
@@ -350,9 +371,14 @@ interface ProjectGate {
   waiters: Array<{ runId: string; resolve: () => void }>;
 }
 
-const TERMINAL_STATUSES = new Set<RunStatus>(["success", "failed", "aborted", "interrupted"]);
+const TERMINAL_STATUSES = new Set<RunStatus | StepRunStatus>([
+  "success",
+  "failed",
+  "aborted",
+  "interrupted",
+]);
 
-const isTerminal = (status: RunStatus): boolean => TERMINAL_STATUSES.has(status);
+const isTerminal = (status: RunStatus | StepRunStatus): boolean => TERMINAL_STATUSES.has(status);
 
 const describeError = (err: unknown): string => (err instanceof Error ? err.message : String(err));
 
@@ -952,6 +978,7 @@ export function createExecutor(options: ExecutorOptions): Executor {
   /** Moves queued/live step runs to a terminal status (abort before engine start). */
   function settleStepRuns(runId: string, status: RunStatus): void {
     for (const step of db.stepRuns.listByRun(runId)) {
+      // StepRun statuses include `awaiting_approval` (#118) — non-terminal.
       if (!isTerminal(step.status)) {
         db.stepRuns.update(step.id, { status });
       }
@@ -976,6 +1003,14 @@ export function createExecutor(options: ExecutorOptions): Executor {
           isAbortRequested: () => entry.abortRequested,
           onHandle: (handle) => {
             entry.handle = handle;
+          },
+          // #118: wake approval gates (no driver handle to abort) when
+          // the run is flagged aborted — they settle like aborted drivers.
+          onAbort: (listener) => {
+            entry.abortListeners.add(listener);
+            return () => {
+              entry.abortListeners.delete(listener);
+            };
           },
         },
         { driverId, ...opts },
@@ -1014,6 +1049,7 @@ export function createExecutor(options: ExecutorOptions): Executor {
       runId,
       projectId: run.projectId,
       abortRequested: false,
+      abortListeners: new Set(),
       done: Promise.resolve(),
     };
     active.set(runId, entry);
@@ -1081,6 +1117,15 @@ export function createExecutor(options: ExecutorOptions): Executor {
     }
 
     entry.abortRequested = true;
+    // #118: approval gates hold no driver handle — wake their waits so
+    // the engine settles the node `aborted` and drains.
+    for (const listener of [...entry.abortListeners]) {
+      try {
+        listener();
+      } catch (err) {
+        logger.warn({ err, runId }, "abort listener failed");
+      }
+    }
     if (run.status === "queued" && entry.handle === undefined) {
       // Still waiting in the scheduler: drop it from the queue and finalize
       // directly; the engine no-ops if a slot is acquired afterwards.
@@ -1123,8 +1168,23 @@ export function createExecutor(options: ExecutorOptions): Executor {
     for (const entry of entries) {
       entry.abortRequested = true;
       const run = db.runs.get(entry.runId);
-      if (run && !isTerminal(run.status)) {
-        if (run.status === "queued") {
+      // #118: a run paused on a human SUSPENDS across a graceful restart —
+      // terminalize interrupted BEFORE waking the gate so the engine settles
+      // suspend and keeps the awaiting row for resume.
+      if (run && !isTerminal(run.status) && run.awaitingNodeId !== undefined) {
+        db.runs.updateStatus(entry.runId, "interrupted");
+      }
+      // #118: wake approval-gate waits so the engine can drain.
+      for (const listener of [...entry.abortListeners]) {
+        try {
+          listener();
+        } catch {
+          // A dead listener cannot block shutdown.
+        }
+      }
+      const current = db.runs.get(entry.runId);
+      if (current && !isTerminal(current.status)) {
+        if (current.status === "queued") {
           // Scheduler-queued: drop from the queue and finalize without start.
           cancelProjectWaiter(entry.projectId, entry.runId);
           db.runs.updateStatus(entry.runId, "aborted");
@@ -1220,5 +1280,7 @@ export function createExecutor(options: ExecutorOptions): Executor {
     maxConcurrentRuns,
     stopHosting,
     extendHosting,
+    resolveApproval: (runId, nodeId, approve, note) =>
+      engine.resolveApproval(runId, nodeId, approve, note),
   };
 }

@@ -9,6 +9,7 @@ import type {
   RunStatus,
   Step,
   StepRun,
+  StepRunStatus,
   Workflow,
 } from "./index.js";
 
@@ -65,7 +66,7 @@ describe("inferred z.infer types compile", () => {
     expectTypeOf<StepRun["runId"]>().toEqualTypeOf<string>();
     expectTypeOf<StepRun["stepId"]>().toEqualTypeOf<string>();
     expectTypeOf<StepRun["sessionId"]>().toEqualTypeOf<string | undefined>();
-    expectTypeOf<StepRun["status"]>().toEqualTypeOf<RunStatus>();
+    expectTypeOf<StepRun["status"]>().toEqualTypeOf<StepRunStatus>();
     expectTypeOf<StepRun["output"]>().toEqualTypeOf<string>();
     expectTypeOf<StepRun["diff"]>().toEqualTypeOf<string | undefined>();
   });

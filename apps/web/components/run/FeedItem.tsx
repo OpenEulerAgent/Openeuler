@@ -5,6 +5,8 @@ import type {
   EdgeCapReachedEvent,
   EdgeTakenEvent,
   LoopIterationEvent,
+  NodeApprovedEvent,
+  NodeAwaitingEvent,
   NodeCompletedEvent,
   NodeQueuedEvent,
   NodeStartedEvent,
@@ -146,6 +148,29 @@ function EdgeTakenItem({ event }: { event: EdgeTakenEvent }) {
   );
 }
 
+// --- approval gate events (#118): the wait and the decision. ---
+
+function NodeAwaitingItem({ event }: { event: NodeAwaitingEvent }) {
+  return (
+    <p className="rounded-lg border border-warning/40 bg-warning-subtle px-3 py-2 font-mono text-xs text-warning">
+      ⏸ node {event.nodeName} awaiting approval (pass {event.iteration})
+      {event.timeoutMinutes === undefined ? "" : ` · times out in ${event.timeoutMinutes}m`}
+      {event.prompt.length > 0 ? ` — ${event.prompt}` : ""}
+    </p>
+  );
+}
+
+function NodeApprovedItem({ event }: { event: NodeApprovedEvent }) {
+  return (
+    <SystemLine>
+      <span className={event.approved ? "text-success" : "text-warning"}>
+        node {event.nodeName} {event.approved ? "approved" : "rejected"}
+        {event.note === undefined || event.note.length === 0 ? "" : `: ${event.note}`}
+      </span>
+    </SystemLine>
+  );
+}
+
 function EdgeCapReachedItem({ event }: { event: EdgeCapReachedEvent }) {
   return (
     <SystemLine>
@@ -232,6 +257,10 @@ export function FeedItem({ entry }: { entry: FeedEntry }) {
       return <NodeStartedItem event={event} />;
     case "node.completed":
       return <NodeCompletedItem event={event} />;
+    case "node.awaiting":
+      return <NodeAwaitingItem event={event} />;
+    case "node.approved":
+      return <NodeApprovedItem event={event} />;
     case "edge.taken":
       return <EdgeTakenItem event={event} />;
     case "edge.cap-reached":

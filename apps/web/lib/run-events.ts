@@ -19,6 +19,8 @@ export const RUN_EVENT_TYPES = [
   "node.queued",
   "node.started",
   "node.completed",
+  "node.awaiting",
+  "node.approved",
   "edge.taken",
   "edge.cap-reached",
   "sandbox.log",

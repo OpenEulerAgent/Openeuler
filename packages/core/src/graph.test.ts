@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   DEFAULT_EDGE_MAX_ITERATIONS,
   ExitConditionSchema,
+  StepRunStatusSchema,
   WorkflowGraphSchema,
   extractOutputReferences,
   graphToLinear,
@@ -871,6 +872,209 @@ describe("sub-workflow nodes (#117)", () => {
     );
     expect(result.ok).toBe(false);
     if (!result.ok) expect(result.reason).toContain("subworkflow");
+  });
+});
+
+describe("approval gate nodes (#118)", () => {
+  const approvalNode = (id: string, timeoutMinutes?: number) => ({
+    id,
+    type: "approval" as const,
+    name: id,
+    position: { x: 0, y: 0 },
+    config:
+      timeoutMinutes === undefined
+        ? { prompt: "Ship it?" }
+        : { prompt: "Ship it?", timeoutMinutes },
+  });
+
+  it("parses an approval node with and without a timeout", () => {
+    const parsed = WorkflowGraphSchema.parse({
+      entryNodeId: "a",
+      nodes: [agentNode("a"), approvalNode("gate"), approvalNode("timed", 30), exitNode()],
+      edges: [edge("e1", "a", "gate"), edge("e2", "gate", "timed"), edge("e3", "timed", "exit")],
+    });
+    expect(parsed.nodes[1]).toEqual(approvalNode("gate"));
+    expect(parsed.nodes[2]).toEqual(approvalNode("timed", 30));
+  });
+
+  it("rejects an empty prompt and out-of-bounds timeouts", () => {
+    expectIssue(
+      {
+        entryNodeId: "a",
+        nodes: [agentNode("a"), { ...approvalNode("gate"), config: { prompt: "" } }, exitNode()],
+        edges: [edge("e1", "a", "gate"), edge("e2", "gate", "exit")],
+      },
+      ["nodes", 1, "config", "prompt"],
+      "prompt must be a non-empty string",
+    );
+    expectIssue(
+      {
+        entryNodeId: "a",
+        nodes: [agentNode("a"), approvalNode("gate", 0), exitNode()],
+        edges: [edge("e1", "a", "gate"), edge("e2", "gate", "exit")],
+      },
+      ["nodes", 1, "config", "timeoutMinutes"],
+      "timeoutMinutes must be >= 1",
+    );
+    expectIssue(
+      {
+        entryNodeId: "a",
+        nodes: [agentNode("a"), approvalNode("gate", 1441), exitNode()],
+        edges: [edge("e1", "a", "gate"), edge("e2", "gate", "exit")],
+      },
+      ["nodes", 1, "config", "timeoutMinutes"],
+      "timeoutMinutes must be <= 1440 (24h)",
+    );
+  });
+
+  it("an approval node may not be the entry", () => {
+    expectIssue(
+      {
+        entryNodeId: "gate",
+        nodes: [approvalNode("gate"), exitNode()],
+        edges: [edge("e1", "gate", "exit")],
+      },
+      ["entryNodeId"],
+      "must reference an agent or subworkflow node",
+    );
+  });
+
+  it("an approval node may not be a fan-out branch target (branch work only)", () => {
+    expectIssue(
+      {
+        entryNodeId: "a",
+        nodes: [agentNode("a"), agentNode("b"), approvalNode("gate"), exitNode()],
+        edges: [
+          edge("e1", "a", "b"),
+          edge("e2", "a", "gate"),
+          edge("e3", "b", "exit"),
+          edge("e4", "gate", "exit"),
+        ],
+      },
+      ["edges", 1],
+      "parallel branches must start at agent or subworkflow nodes",
+    );
+  });
+
+  it("rejects approval gates in parallel fan-out branches (one open gate per run)", () => {
+    expectIssue(
+      {
+        entryNodeId: "a",
+        nodes: [
+          agentNode("a"),
+          agentNode("b"),
+          agentNode("c"),
+          approvalNode("gate1"),
+          approvalNode("gate2"),
+          {
+            id: "join",
+            type: "join" as const,
+            name: "Join",
+            position: { x: 0, y: 300 },
+            config: { mode: "all" as const },
+          },
+          exitNode(),
+        ],
+        edges: [
+          edge("e-a-b", "a", "b"),
+          edge("e-a-c", "a", "c"),
+          edge("e-b-g1", "b", "gate1"),
+          edge("e-c-g2", "c", "gate2"),
+          edge("e-g1-join", "gate1", "join"),
+          edge("e-g2-join", "gate2", "join"),
+          edge("e-join-exit", "join", "exit"),
+        ],
+      },
+      ["nodes", 4, "type"],
+      'approval nodes "gate1" and "gate2" would run in parallel branches',
+    );
+  });
+
+  it("rejects an approval gate fed by parallel branches through mixed edge kinds", () => {
+    expectIssue(
+      {
+        entryNodeId: "a",
+        nodes: [agentNode("a"), agentNode("b"), agentNode("c"), approvalNode("gate"), exitNode()],
+        edges: [
+          edge("e-a-b", "a", "b"),
+          edge("e-a-c", "a", "c"),
+          edge("e-b-gate", "b", "gate"),
+          {
+            id: "e-c-gate",
+            source: "c",
+            target: "gate",
+            condition: { type: "outputContains", pattern: "GO" },
+          },
+          edge("e-gate-exit", "gate", "exit"),
+        ],
+      },
+      ["nodes", 3, "type"],
+      'approval node "gate" receives edges from parallel branches',
+    );
+  });
+
+  it("routes out of an approval node with conditional approved/rejected edges + fallback", () => {
+    const parsed = WorkflowGraphSchema.parse({
+      entryNodeId: "a",
+      nodes: [
+        agentNode("a"),
+        approvalNode("gate"),
+        agentNode("ship"),
+        agentNode("fix"),
+        exitNode(),
+      ],
+      edges: [
+        edge("e1", "a", "gate"),
+        {
+          id: "e-approved",
+          source: "gate",
+          target: "ship",
+          condition: { type: "outputContains", pattern: "approved" },
+          order: 0,
+        },
+        {
+          id: "e-rejected",
+          source: "gate",
+          target: "fix",
+          condition: { type: "outputContains", pattern: "rejected" },
+          order: 1,
+        },
+        edge("e-ship", "ship", "exit"),
+        edge("e-fix", "fix", "exit"),
+      ],
+    });
+    expect(parsed.edges.map((e) => e.id)).toContain("e-approved");
+    expect(parsed.edges.map((e) => e.id)).toContain("e-rejected");
+  });
+
+  it("rejects mixed unconditional + conditional outgoing on an approval node (router rules)", () => {
+    expectIssue(
+      {
+        entryNodeId: "a",
+        nodes: [agentNode("a"), approvalNode("gate"), agentNode("b"), agentNode("c"), exitNode()],
+        edges: [
+          edge("e1", "a", "gate"),
+          edge("e-always-1", "gate", "b"),
+          edge("e-always-2", "gate", "c"),
+          {
+            id: "e-cond",
+            source: "gate",
+            target: "exit",
+            condition: { type: "outputContains", pattern: "approved" },
+          },
+          edge("e-b", "b", "exit"),
+          edge("e-c", "c", "exit"),
+        ],
+      },
+      ["edges", 2],
+      "mixes 2 unconditional (always) outgoing edges with conditional edges",
+    );
+  });
+
+  it("StepRunStatusSchema accepts awaiting_approval alongside the run statuses", () => {
+    expect(StepRunStatusSchema.safeParse("awaiting_approval").success).toBe(true);
+    expect(StepRunStatusSchema.safeParse("running").success).toBe(true);
+    expect(StepRunStatusSchema.safeParse("nonsense").success).toBe(false);
   });
 });
 

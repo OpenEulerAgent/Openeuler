@@ -2,6 +2,8 @@ import { describe, expect, it } from "vitest";
 import type {
   EdgeCapReachedEvent,
   EdgeTakenEvent,
+  NodeApprovedEvent,
+  NodeAwaitingEvent,
   NodeCompletedEvent,
   NodeQueuedEvent,
   NodeStartedEvent,
@@ -109,6 +111,35 @@ const stepCompleted = (
   status,
 });
 
+const awaiting = (
+  nodeId: string,
+  iteration = 1,
+  extra: Partial<NodeAwaitingEvent> = {},
+): NodeAwaitingEvent => ({
+  type: "node.awaiting",
+  seq: seq(),
+  nodeId,
+  nodeName: nodeId,
+  iteration,
+  prompt: "Ship it?",
+  ...extra,
+});
+
+const approved = (
+  nodeId: string,
+  approvedFlag: boolean,
+  iteration = 1,
+  note?: string,
+): NodeApprovedEvent => ({
+  type: "node.approved",
+  seq: seq(),
+  nodeId,
+  nodeName: nodeId,
+  iteration,
+  approved: approvedFlag,
+  ...(note === undefined ? {} : { note }),
+});
+
 /** One full loop-graph execution: a → b → (loop b) → b → exit. */
 function loopRunEvents(): RunStreamEvent[] {
   return [
@@ -204,6 +235,50 @@ describe("fold: node state transitions", () => {
       "s2#1",
       "s1#2",
     ]);
+  });
+});
+
+describe("fold: approval gates (#118)", () => {
+  it("node.awaiting flips the node to the awaiting visual state", () => {
+    const state = buildRunGraphState([queued("gate"), started("gate"), awaiting("gate")]);
+    expect(state.nodes["gate"]?.status).toBe("awaiting");
+    expect(state.nodes["gate"]?.executions[0]).toMatchObject({
+      iteration: 1,
+      status: "awaiting",
+    });
+    // No timeline/breadcrumb rows: node.started already announced it.
+    expect(state.breadcrumb).toHaveLength(0);
+  });
+
+  it("node.approved records the decision on the execution; completion follows", () => {
+    const state = buildRunGraphState([
+      queued("gate"),
+      started("gate"),
+      awaiting("gate"),
+      approved("gate", false, 1, "needs work"),
+      completed("gate", 1),
+    ]);
+    expect(state.nodes["gate"]?.status).toBe("success");
+    expect(state.nodes["gate"]?.executions[0]).toMatchObject({
+      approval: { approved: false, note: "needs work" },
+      output: "out:gate:1",
+    });
+  });
+
+  it("a terminal run.status settles an awaiting node (interrupted sweep)", () => {
+    const state = buildRunGraphState([
+      queued("gate"),
+      started("gate"),
+      awaiting("gate"),
+      runStatus("interrupted"),
+    ]);
+    expect(state.nodes["gate"]?.status).toBe("interrupted");
+    expect(state.nodes["gate"]?.executions[0]?.status).toBe("interrupted");
+  });
+
+  it("node.awaiting carries the timeout window through", () => {
+    const state = buildRunGraphState([awaiting("gate", 1, { timeoutMinutes: 5 })]);
+    expect(state.nodes["gate"]?.executions[0]?.status).toBe("awaiting");
   });
 });
 

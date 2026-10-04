@@ -173,7 +173,14 @@ function requireRevisionNumber(number: string): number {
  */
 function placeholderSteps(graph: WorkflowGraph): Step[] {
   const entry = graph.nodes.find((node) => node.id === graph.entryNodeId);
-  if (entry === undefined || entry.type === "exit" || entry.type === "join") {
+  if (
+    entry === undefined ||
+    entry.type === "exit" ||
+    entry.type === "join" ||
+    // #118: an approval gate may not be the entry (core validation
+    // enforces the same); defensive parity here.
+    entry.type === "approval"
+  ) {
     throw new HttpError(422, "VALIDATION_ERROR", "graph entry node must be executable");
   }
   if (entry.type === "subworkflow") {
