@@ -13,8 +13,10 @@ import {
   createProjectSecretRepo,
   createRunRepo,
   createStepRunRepo,
+  createWebhookDeliveryRepo,
   createWorkflowRepo,
   createWorkflowRevisionRepo,
+  createWorkflowWebhookRepo,
 } from "./repos.js";
 import type {
   ActivityRepo,
@@ -24,8 +26,10 @@ import type {
   ProjectSecretRepo,
   RunRepo,
   StepRunRepo,
+  WebhookDeliveryRepo,
   WorkflowRepo,
   WorkflowRevisionRepo,
+  WorkflowWebhookRepo,
 } from "./repos.js";
 
 export * from "./schema.js";
@@ -39,9 +43,15 @@ export type {
   ProjectSecretName,
   RunPatch,
   StepRunPatch,
+  WebhookDelivery,
+  WebhookDeliveryInput,
+  WebhookDeliveryOutcome,
   WorkflowPatch,
   WorkflowRevision,
   WorkflowRevisionRepo,
+  WorkflowWebhook,
+  WorkflowWebhookPatch,
+  WorkflowWebhookRepo,
 } from "./repos.js";
 export type {
   ActivityRepo,
@@ -51,8 +61,10 @@ export type {
   ProjectSecretRepo,
   RunRepo,
   StepRunRepo,
+  WebhookDeliveryRepo,
   WorkflowRepo,
 } from "./repos.js";
+export { WEBHOOK_DELIVERY_LOG_LIMIT } from "./repos.js";
 export { migrateLinearWorkflowsToGraphs } from "./migrate.js";
 export type { LinearMigrationResult } from "./migrate.js";
 
@@ -68,6 +80,8 @@ export interface Db {
   readonly agentPresets: AgentPresetRepo;
   readonly workflows: WorkflowRepo;
   readonly workflowRevisions: WorkflowRevisionRepo;
+  readonly workflowWebhooks: WorkflowWebhookRepo;
+  readonly webhookDeliveries: WebhookDeliveryRepo;
   readonly runs: RunRepo;
   readonly stepRuns: StepRunRepo;
   readonly events: EventRepo;
@@ -123,6 +137,8 @@ export function createDatabase(opts: CreateDatabaseOptions = {}): Db {
     agentPresets: createAgentPresetRepo(db),
     workflows: createWorkflowRepo(db),
     workflowRevisions: createWorkflowRevisionRepo(db),
+    workflowWebhooks: createWorkflowWebhookRepo(db),
+    webhookDeliveries: createWebhookDeliveryRepo(db),
     runs: createRunRepo(db),
     stepRuns: createStepRunRepo(db),
     events: createEventRepo(db),

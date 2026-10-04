@@ -146,6 +146,7 @@ import { ReadOnlyRevisionView } from "./ReadOnlyRevisionView";
 import { RevisionHistoryDrawer } from "./RevisionHistoryDrawer";
 import { ShortcutsPopover } from "./ShortcutsPopover";
 import { ValidationPanel } from "./ValidationPanel";
+import { WebhookDrawer } from "./WebhookDrawer";
 
 /** Debounce window that collapses a burst of inspector edits into one undo entry. */
 const EDIT_COMMIT_DEBOUNCE_MS = 500;
@@ -472,6 +473,8 @@ function GraphCanvasInner({
   // "View" loads a snapshot into the read-only render. The editing canvas
   // (history + dirty state) is only ever hidden, so Close restores it as-was.
   const [revisionsOpen, setRevisionsOpen] = useState(false);
+  // Webhook settings (#120): trigger management + delivery log drawer.
+  const [webhookOpen, setWebhookOpen] = useState(false);
   const [viewingRevision, setViewingRevision] = useState<{
     number: number;
     doc: CanvasDocument | null;
@@ -1465,6 +1468,18 @@ function GraphCanvasInner({
             rev {revision}
           </button>
         ) : null}
+        {/* Webhook settings affordance (#120): trigger URL, one-time secret,
+            delivery log. */}
+        <button
+          type="button"
+          data-webhook-button
+          aria-label="Webhook trigger settings"
+          title="Webhook trigger settings"
+          onClick={() => setWebhookOpen(true)}
+          className="inline-flex items-center rounded-full bg-elevated px-2.5 py-0.5 text-xs font-medium text-muted-fg transition-colors hover:text-fg focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
+        >
+          webhook
+        </button>
         {/* Focus-probe banner (#76): someone saved a newer revision while
             this tab was away; dismissible, and it self-clears once the
             editor catches up (reload or a successful save). */}
@@ -1848,6 +1863,12 @@ function GraphCanvasInner({
         currentRevision={revision ?? null}
         onClose={() => setRevisionsOpen(false)}
         onView={(revisionNumber) => void viewRevision(revisionNumber)}
+      />
+
+      <WebhookDrawer
+        open={webhookOpen}
+        workflowId={workflow.id}
+        onClose={() => setWebhookOpen(false)}
       />
 
       <Dialog open={leaveGuard.confirmOpen} onClose={leaveGuard.stay} label="Unsaved changes">

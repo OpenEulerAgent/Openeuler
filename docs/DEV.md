@@ -22,6 +22,7 @@ SQLite tables (`packages/db/src/schema.ts`), all timestamps ISO-8601 TEXT:
 
 ```
 projects 1──* workflows 1──* workflow_revisions *──1 runs (runs.workflow_revision_id pins a snapshot)
+    │              │ 1──1 workflow_webhooks 1──* webhook_deliveries (ring, no FKs)
     │              └──────────────────────────────────* runs 1──* step_runs
     └──* agent_presets (project-scoped "team" roster)
 runs 1──* events        activity (dashboard feed, no FKs)
@@ -177,6 +178,17 @@ Before serving, `sweepInterruptedRuns` marks any run left `queued`/`running` by 
 - `GET /api/workflows/:id/revisions` — list (`id`, `number`, `createdAt`; no graph blobs); `GET /api/workflows/:id/revisions/:number` — the full snapshot.
 - `POST /api/workflows/:id/runs` — pins the latest revision on the run (`runs.workflowRevisionId`; run responses carry `workflowRevision: { id, number }`).
 - `GET/POST /api/projects/:id/presets`, `GET/PATCH/DELETE /api/projects/:id/presets/:presetId` — the agent-preset roster (see [Agent presets](#agent-presets-your-team)).
+
+### Workflow webhooks (`POST /api/hooks/:id`, #120)
+
+Per-workflow inbound triggers. Management lives on the workflow resource (`POST/GET/PATCH/DELETE /api/workflows/:id/webhook`, one webhook per workflow — unique index); the trigger is a separate mount so it can carry its own auth. Storage: `workflow_webhooks` (id, workflow FK, `secret_enc` AES-256-GCM envelope under the secrets master key, optional `default_task`) and `webhook_deliveries` (ring, newest 50 per webhook kept atomically with each append — plain-text webhook id, no FK, same shape as `activity`).
+
+- **Auth (either/or)**: an HMAC-SHA256 signature — `X-Openeuler-Signature: sha256=<hex>` over `<timestamp>.<raw body>`, with `X-Openeuler-Timestamp` (unix seconds) and `X-Openeuler-Nonce` — or, when `OPENEULER_TOKEN` is set, the normal bearer token. The bearer gate exempts `/api/hooks/*` (`HOOKS_PATH_PREFIX` in `auth.ts`) because the router re-implements it: in open mode the signature is the _only_ accepted credential; anonymous triggers always 401.
+- **Verification order** (nothing runs before it fully passes): hook exists (404) → timestamp parse (401 `HOOK_TIMESTAMP_INVALID`) → ±300s window (401 `HOOK_TIMESTAMP_STALE`) → constant-time HMAC compare (401 `HOOK_SIGNATURE_INVALID`; both hex digests are sha256-hashed first so `timingSafeEqual` sees equal lengths) → nonce shape + replay cache (409 `HOOK_NONCE_REPLAYED`) → JSON/zod body (422) → run creation via the same `createAndStartWorkflowRun` helper as `POST /api/workflows/:id/runs` (revision pinning + #93 redaction identical). The raw body is read exactly once (`arrayBuffer`) — signatures cover those exact bytes, the parse reuses the buffer.
+- **Nonce cache**: in-memory `${webhookId}:${nonce}` → expiry, written _only_ after a valid signature (unauthenticated callers cannot flood it) and expiring exactly when the timestamp can no longer pass the window (+5s margin) — a nonce never needs to outlive its own freshness. Swept opportunistically past 10k entries.
+- **Delivery log**: every attempt appends a row — `accepted` (with `runId`) or `rejected` (with `errorCode`), plus `statusCode` and `authMode` (`signature`/`token`). The body and signature are deliberately NOT stored (no secret leakage surface). 404s for unknown hook ids log nothing (nowhere to log against).
+- **Secrets hygiene**: the plaintext secret exists in exactly two responses — create (201) and rotate (200) — and never in `GET`, logs, or the delivery ring. Rotation (`PATCH {rotateSecret: true}`) mints a fresh 48-hex-char secret; ids are 12-char base64url.
+- **Middleware interplay**: the trigger sits under the global `/api` rate limits (mutate class) and the payload cap; `apps/daemon/src/routes/webhooks.test.ts` covers the 429. Deleting a workflow cascades its webhook + delivery ring (after the existing no-runs guard). Web UI: canvas editor header → **webhook** chip opens `WebhookDrawer` (create/rotate with one-time secret + curl snippet, default task, delivery ring).
 
 ### SSE protocol (`GET /api/runs/:id/events`)
 

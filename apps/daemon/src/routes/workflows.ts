@@ -1,5 +1,12 @@
 import { randomUUID } from "node:crypto";
-import type { GraphSummary, Run, Step, Workflow, WorkflowGraph } from "@openeuler/core";
+import type {
+  GraphSummary,
+  Run,
+  RunHostingOptions,
+  Step,
+  Workflow,
+  WorkflowGraph,
+} from "@openeuler/core";
 import {
   LoopBackSchema,
   RunHostingOptionsSchema,
@@ -314,6 +321,48 @@ export function workflowBody(
   };
 }
 
+/**
+ * Creates a queued run for the workflow pinned to its latest revision,
+ * persists it (task redacted at rest, #93) and hands it to the executor.
+ * Shared by `POST /:id/runs` and the webhook trigger (#120) so both paths
+ * pin revisions and redact identically.
+ */
+export function createAndStartWorkflowRun(options: {
+  db: Db;
+  executor: Executor;
+  secretsKey: Buffer | undefined;
+  workflow: Workflow;
+  task: string;
+  ports?: number[];
+  hosting?: RunHostingOptions;
+}): { run: Run; revision: WorkflowRevision } {
+  const { db, executor, secretsKey, workflow, task, ports, hosting } = options;
+  const revision = ensureLatestRevision(db, workflow);
+
+  const now = new Date().toISOString();
+  const runId = randomUUID();
+  const run: Run = {
+    id: runId,
+    projectId: workflow.projectId,
+    workflowId: workflow.id,
+    workflowRevisionId: revision.id,
+    status: "queued",
+    branch: branchForRun(runId),
+    iteration: 0,
+    // #93 redacted-at-rest (same rule as POST /api/runs): the task is
+    // scrubbed before the row is written; run detail shows the redacted
+    // task and the engine renders the same redacted text.
+    task: redactorForProject(db, secretsKey, workflow.projectId)(task),
+    ...(ports === undefined || ports.length === 0 ? {} : { ports }),
+    ...(hosting === undefined ? {} : { hosting }),
+    createdAt: now,
+    updatedAt: now,
+  };
+  db.runs.create(run);
+  executor.startRun(runId);
+  return { run, revision };
+}
+
 export function createWorkflowsRouter(): Hono<AppEnv> {
   const workflows = new Hono<AppEnv>();
 
@@ -416,6 +465,12 @@ export function createWorkflowsRouter(): Hono<AppEnv> {
     }
     // Runs are gone (checked above), so the revision snapshots have nothing
     // left to pin; drop them before the row (the FK would otherwise refuse).
+    // #120: the workflow's webhook (and its delivery ring) goes with it.
+    const webhook = db.workflowWebhooks.getByWorkflow(id);
+    if (webhook) {
+      db.webhookDeliveries.deleteForWebhook(webhook.id);
+      db.workflowWebhooks.delete(webhook.id);
+    }
     db.workflowRevisions.deleteAllForWorkflow(id);
     if (!db.workflows.delete(id)) {
       throw new HttpError(404, "WORKFLOW_NOT_FOUND", `no workflow with id ${id}`);
@@ -499,43 +554,25 @@ export function createWorkflowsRouter(): Hono<AppEnv> {
     const workflow = requireWorkflow(db, id);
     const body = CreateWorkflowRunBodySchema.parse(await parseJsonBody(c));
 
-    const revision = ensureLatestRevision(db, workflow);
-
-    const now = new Date().toISOString();
-    const runId = randomUUID();
-    const run: Run = {
-      id: runId,
-      projectId: workflow.projectId,
-      workflowId: workflow.id,
-      workflowRevisionId: revision.id,
-      status: "queued",
-      branch: branchForRun(runId),
-      iteration: 0,
-      // #93 redacted-at-rest (same rule as POST /api/runs): the task is
-      // scrubbed before the row is written; run detail shows the redacted
-      // task and the engine renders the same redacted text.
-      task: redactorForProject(db, c.get("secretsKey"), workflow.projectId)(body.task),
-      // #107: declared container ports, persisted on the row; the run's
-      // sandbox publishes them for its lifetime.
-      ...(body.ports === undefined || body.ports.length === 0 ? {} : { ports: body.ports }),
-      // #110: hosting request, persisted on the row; the executor arms it
-      // when the run turns success sandboxed with declared ports.
+    const { run, revision } = createAndStartWorkflowRun({
+      db,
+      executor,
+      secretsKey: c.get("secretsKey"),
+      workflow,
+      task: body.task,
+      ...(body.ports === undefined ? {} : { ports: body.ports }),
       ...(body.hosting === undefined ? {} : { hosting: body.hosting }),
-      createdAt: now,
-      updatedAt: now,
-    };
-    db.runs.create(run);
+    });
 
     c.get("logger").info(
       {
-        runId,
+        runId: run.id,
         workflowId: workflow.id,
         workflowRevisionId: revision.id,
         revision: revision.number,
       },
       "workflow run accepted",
     );
-    executor.startRun(runId);
 
     return c.json(
       { run: { ...run, workflowRevision: { id: revision.id, number: revision.number } } },
